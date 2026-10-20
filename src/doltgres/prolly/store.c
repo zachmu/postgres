@@ -3,7 +3,7 @@
 #include <openssl/evp.h>
 #include <limits.h>
 
-static const uint8_t node_magic[8] = {'D','G','P','T','R','0','0','1'};
+static const uint8_t node_magic[8] = {'D', 'G', 'P', 'T', 'R', '0', '0', '1'};
 
 uint32_t
 pl_read32(const uint8_t *p)
@@ -21,8 +21,10 @@ pl_read64(const uint8_t *p)
 void
 pl_write32(uint8_t *p, uint32_t v)
 {
-	p[0] = (uint8_t) (v >> 24); p[1] = (uint8_t) (v >> 16);
-	p[2] = (uint8_t) (v >> 8); p[3] = (uint8_t) v;
+	p[0] = (uint8_t) (v >> 24);
+	p[1] = (uint8_t) (v >> 16);
+	p[2] = (uint8_t) (v >> 8);
+	p[3] = (uint8_t) v;
 }
 
 void
@@ -36,6 +38,7 @@ static bool
 hash_bytes(PLSlice bytes, PLHash *out)
 {
 	unsigned int length = 0;
+
 	return EVP_Digest(bytes.data, bytes.len, out->bytes, &length,
 					  EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
 }
@@ -43,8 +46,9 @@ hash_bytes(PLSlice bytes, PLHash *out)
 int
 pl_compare(PLSlice a, PLSlice b)
 {
-	size_t common = a.len < b.len ? a.len : b.len;
-	int cmp = common ? memcmp(a.data, b.data, common) : 0;
+	size_t		common = a.len < b.len ? a.len : b.len;
+	int			cmp = common ? memcmp(a.data, b.data, common) : 0;
+
 	return cmp ? cmp : (a.len > b.len) - (a.len < b.len);
 }
 
@@ -58,14 +62,16 @@ const char *
 pl_status_string(PLStatus status)
 {
 	static const char *const names[] = {"ok", "not found", "invalid input",
-		"out of memory", "corrupt content", "merge conflict", "stopped"};
+	"out of memory", "corrupt content", "merge conflict", "stopped"};
+
 	return (unsigned) status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown";
 }
 
 PLStore *
 pl_store_create(void)
 {
-	PLStore *store = calloc(1, sizeof(*store));
+	PLStore    *store = calloc(1, sizeof(*store));
+
 	if (!store)
 		return NULL;
 	store->capacity = 256;
@@ -81,15 +87,18 @@ pl_store_create(void)
 void
 pl_store_free(PLStore *store)
 {
-	size_t i;
+	size_t		i;
+
 	if (!store)
 		return;
 	for (i = 0; i < store->capacity; i++)
 	{
-		PLNode *node = store->buckets[i];
+		PLNode	   *node = store->buckets[i];
+
 		while (node)
 		{
-			PLNode *next = node->next;
+			PLNode	   *next = node->next;
+
 			free(node->data);
 			free(node);
 			node = next;
@@ -108,7 +117,8 @@ pl_store_stats(const PLStore *store)
 PLNode *
 pl_find(PLStore *store, PLHash hash)
 {
-	PLNode *node;
+	PLNode	   *node;
+
 	if (!store)
 		return NULL;
 	for (node = store->buckets[pl_read64(hash.bytes) % store->capacity];
@@ -122,9 +132,10 @@ PLSlice
 pl_node_key(const PLNode *node, uint32_t index)
 {
 	const uint8_t *offsets = node->data + PL_HEADER;
-	uint32_t start = pl_read32(offsets + 4 * index);
-	PLSlice result = {node->data + PL_HEADER + 8 * (node->count + 1) + start,
-		pl_read32(offsets + 4 * (index + 1)) - start};
+	uint32_t	start = pl_read32(offsets + 4 * index);
+	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) + start,
+	pl_read32(offsets + 4 * (index + 1)) - start};
+
 	return result;
 }
 
@@ -132,17 +143,19 @@ PLSlice
 pl_node_value(const PLNode *node, uint32_t index)
 {
 	const uint8_t *offsets = node->data + PL_HEADER + 4 * (node->count + 1);
-	uint32_t start = pl_read32(offsets + 4 * index);
-	PLSlice result = {node->data + PL_HEADER + 8 * (node->count + 1) +
-		node->key_bytes + start, pl_read32(offsets + 4 * (index + 1)) - start};
+	uint32_t	start = pl_read32(offsets + 4 * index);
+	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) +
+	node->key_bytes + start, pl_read32(offsets + 4 * (index + 1)) - start};
+
 	return result;
 }
 
 uint64_t
 pl_node_rows(const PLNode *node)
 {
-	uint64_t rows = 0;
-	uint32_t i;
+	uint64_t	rows = 0;
+	uint32_t	i;
+
 	if (node->level == 0)
 		return node->count;
 	for (i = 0; i < node->count; i++)
@@ -154,9 +167,11 @@ pl_node_rows(const PLNode *node)
 static PLStatus
 parse_node(PLNode *node)
 {
-	uint32_t i, which;
-	size_t directory;
-	uint64_t rows = 0;
+	uint32_t	i,
+				which;
+	size_t		directory;
+	uint64_t	rows = 0;
+
 	if (node->size < PL_HEADER || memcmp(node->data, node_magic, 8) != 0)
 		return PL_CORRUPT;
 	node->level = pl_read32(node->data + 8);
@@ -172,13 +187,15 @@ parse_node(PLNode *node)
 	for (which = 0; which < 2; which++)
 	{
 		const uint8_t *offsets = node->data + PL_HEADER + which * 4 * (node->count + 1);
-		uint32_t limit = which ? node->value_bytes : node->key_bytes;
+		uint32_t	limit = which ? node->value_bytes : node->key_bytes;
+
 		if (pl_read32(offsets) != 0 || pl_read32(offsets + 4 * node->count) != limit)
 			return PL_CORRUPT;
 		for (i = 0; i < node->count; i++)
 		{
-			uint32_t start = pl_read32(offsets + 4 * i);
-			uint32_t end = pl_read32(offsets + 4 * (i + 1));
+			uint32_t	start = pl_read32(offsets + 4 * i);
+			uint32_t	end = pl_read32(offsets + 4 * (i + 1));
+
 			if (end < start || end > limit || end - start > PL_MAX_ITEM ||
 				(which && node->level && end - start != PL_CHILD_SIZE))
 				return PL_CORRUPT;
@@ -190,7 +207,8 @@ parse_node(PLNode *node)
 			return PL_CORRUPT;
 		if (node->level)
 		{
-			uint64_t child_rows = pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+			uint64_t	child_rows = pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+
 			if (!child_rows || UINT64_MAX - rows < child_rows)
 				return PL_CORRUPT;
 			rows += child_rows;
@@ -202,8 +220,9 @@ parse_node(PLNode *node)
 static PLStatus
 store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, PLNode **out)
 {
-	PLNode *node = pl_find(store, hash);
-	size_t bucket;
+	PLNode	   *node = pl_find(store, hash);
+	size_t		bucket;
+
 	if (node)
 	{
 		if (node->size != length || memcmp(node->data, bytes, length) != 0)
@@ -232,8 +251,10 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 	}
 	if (store->stats.chunks >= store->capacity * 2)
 	{
-		size_t capacity = store->capacity * 2, i;
-		PLNode **buckets = calloc(capacity, sizeof(*buckets));
+		size_t		capacity = store->capacity * 2,
+					i;
+		PLNode	  **buckets = calloc(capacity, sizeof(*buckets));
+
 		if (!buckets)
 		{
 			free(node->data);
@@ -242,10 +263,12 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 		}
 		for (i = 0; i < store->capacity; i++)
 		{
-			PLNode *current = store->buckets[i];
+			PLNode	   *current = store->buckets[i];
+
 			while (current)
 			{
-				PLNode *next = current->next;
+				PLNode	   *next = current->next;
+
 				bucket = pl_read64(current->hash.bytes) % capacity;
 				current->next = buckets[bucket];
 				buckets[bucket] = current;
@@ -268,7 +291,8 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 PLStatus
 pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes)
 {
-	PLNode *node = pl_find(store, hash);
+	PLNode	   *node = pl_find(store, hash);
+
 	if (!bytes || !store)
 		return PL_INVALID;
 	if (!node)
@@ -281,8 +305,9 @@ pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes)
 PLStatus
 pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 {
-	PLHash actual;
-	PLNode *node;
+	PLHash		actual;
+	PLNode	   *node;
+
 	if (!store || !bytes.data || bytes.len > 2ULL * PL_MAX_ITEM * PL_MAX_ENTRIES + 2048)
 		return PL_INVALID;
 	if (!hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
@@ -293,12 +318,16 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 PLStatus
 pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, PLNode **out)
 {
-	size_t key_bytes = 0, value_bytes = 0, length, start;
-	uint32_t i;
-	uint8_t *data;
-	PLHash hash;
-	PLSlice bytes;
-	PLStatus status;
+	size_t		key_bytes = 0,
+				value_bytes = 0,
+				length,
+				start;
+	uint32_t	i;
+	uint8_t    *data;
+	PLHash		hash;
+	PLSlice		bytes;
+	PLStatus	status;
+
 	for (i = 0; i < count; i++)
 	{
 		key_bytes += entries[i].key.len;
@@ -311,8 +340,10 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	if (!data)
 		return PL_NOMEM;
 	memcpy(data, node_magic, 8);
-	pl_write32(data + 8, level); pl_write32(data + 12, count);
-	pl_write32(data + 16, (uint32_t) key_bytes); pl_write32(data + 20, (uint32_t) value_bytes);
+	pl_write32(data + 8, level);
+	pl_write32(data + 12, count);
+	pl_write32(data + 16, (uint32_t) key_bytes);
+	pl_write32(data + 20, (uint32_t) value_bytes);
 	start = PL_HEADER + 8 * (count + 1);
 	key_bytes = value_bytes = 0;
 	for (i = 0; i < count; i++)
@@ -329,7 +360,8 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 		value_bytes += entries[i].value.len;
 		pl_write32(data + PL_HEADER + 4 * (count + 1) + 4 * (i + 1), (uint32_t) value_bytes);
 	}
-	bytes.data = data; bytes.len = length;
+	bytes.data = data;
+	bytes.len = length;
 	if (!hash_bytes(bytes, &hash))
 	{
 		free(data);
@@ -344,9 +376,13 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 bool
 pl_boundary(uint32_t level, uint32_t count, size_t bytes, PLSlice key)
 {
-	/* Key-local, level-salted fingerprint; no dependence on insertion history. */
-	uint64_t fingerprint = UINT64_C(14695981039346656037) ^ level;
-	size_t i;
+	/*
+	 * Key-local, level-salted fingerprint; no dependence on insertion
+	 * history.
+	 */
+	uint64_t	fingerprint = UINT64_C(14695981039346656037) ^ level;
+	size_t		i;
+
 	if (count < 2)
 		return false;
 	if (count >= PL_MAX_ENTRIES || bytes >= PL_MAX_BYTES)

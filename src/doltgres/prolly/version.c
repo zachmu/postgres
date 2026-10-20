@@ -10,22 +10,26 @@ same_value(PLValue a, PLValue b)
 static PLValue
 present(PLSlice value)
 {
-	PLValue result = {true, value};
+	PLValue		result = {true, value};
+
 	return result;
 }
 
 static PLStatus
 diff_cursors(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg)
 {
-	PLCursor a, b;
-	PLStatus status = pl_cursor_init(&a, before, NULL);
+	PLCursor	a,
+				b;
+	PLStatus	status = pl_cursor_init(&a, before, NULL);
+
 	if (status == PL_OK)
 		status = pl_cursor_init(&b, after, NULL);
 	while (status == PL_OK && (a.valid || b.valid))
 	{
-		PLEntry x = {{NULL, 0}, {NULL, 0}}, y = x;
-		PLValue absent = {false, {NULL, 0}};
-		int comparison;
+		PLEntry		x = {{NULL, 0}, {NULL, 0}}, y = x;
+		PLValue		absent = {false, {NULL, 0}};
+		int			comparison;
+
 		if (a.valid && b.valid && a.index[a.depth - 1] == 0 && b.index[b.depth - 1] == 0 &&
 			pl_hash_equal(a.path[a.depth - 1]->hash, b.path[b.depth - 1]->hash))
 		{
@@ -58,9 +62,10 @@ static PLStatus
 diff_nodes(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg,
 		   unsigned depth)
 {
-	PLNode *a = pl_find(before->store, before->root);
-	PLNode *b = pl_find(after->store, after->root);
-	uint32_t i;
+	PLNode	   *a = pl_find(before->store, before->root);
+	PLNode	   *b = pl_find(after->store, after->root);
+	uint32_t	i;
+
 	if (!a || !b || depth >= PL_MAX_DEPTH)
 		return PL_CORRUPT;
 	if (pl_hash_equal(a->hash, b->hash))
@@ -77,8 +82,9 @@ diff_nodes(const PLTree *before, const PLTree *after, PLDiffFn callback, void *a
 		{
 			for (i = 0; i < a->count; i++)
 			{
-				PLTree left = {before->store, {{0}}}, right = {after->store, {{0}}};
-				PLStatus status;
+				PLTree		left = {before->store, {{0}}}, right = {after->store, {{0}}};
+				PLStatus	status;
+
 				memcpy(left.root.bytes, pl_node_value(a, i).data, PL_HASH_SIZE);
 				memcpy(right.root.bytes, pl_node_value(b, i).data, PL_HASH_SIZE);
 				status = diff_nodes(&left, &right, callback, arg, depth + 1);
@@ -88,7 +94,11 @@ diff_nodes(const PLTree *before, const PLTree *after, PLDiffFn callback, void *a
 			return PL_OK;
 		}
 	}
-	/* A boundary shifted or height changed: reconcile ordered ranges by cursor. */
+
+	/*
+	 * A boundary shifted or height changed: reconcile ordered ranges by
+	 * cursor.
+	 */
 	return diff_cursors(before, after, callback, arg);
 }
 
@@ -102,20 +112,22 @@ pl_diff(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg)
 
 typedef struct PLChanges
 {
-	PLEdit *edits;
-	size_t used;
-	size_t capacity;
+	PLEdit	   *edits;
+	size_t		used;
+	size_t		capacity;
 } PLChanges;
 
 static PLStatus
 record_change(void *arg, PLSlice key, PLValue before, PLValue after)
 {
-	PLChanges *changes = arg;
+	PLChanges  *changes = arg;
+
 	(void) before;
 	if (changes->used == changes->capacity)
 	{
-		size_t capacity = changes->capacity ? changes->capacity * 2 : 16;
-		PLEdit *edits;
+		size_t		capacity = changes->capacity ? changes->capacity * 2 : 16;
+		PLEdit	   *edits;
+
 		if (capacity < changes->capacity || capacity > SIZE_MAX / sizeof(*edits))
 			return PL_NOMEM;
 		edits = realloc(changes->edits, capacity * sizeof(*edits));
@@ -124,7 +136,10 @@ record_change(void *arg, PLSlice key, PLValue before, PLValue after)
 		changes->edits = edits;
 		changes->capacity = capacity;
 	}
-	changes->edits[changes->used++] = (PLEdit) {key, after};
+	changes->edits[changes->used++] = (PLEdit)
+	{
+		key, after
+	};
 	return PL_OK;
 }
 
@@ -132,10 +147,13 @@ PLStatus
 pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
 		 PLResolveFn resolver, void *arg, PLTree *out)
 {
-	PLChanges a = {0}, b = {0}, result = {0};
-	PLStatus status;
-	uint8_t **owned = NULL;
-	size_t i = 0, j = 0, allocated = 0;
+	PLChanges	a = {0}, b = {0}, result = {0};
+	PLStatus	status;
+	uint8_t   **owned = NULL;
+	size_t		i = 0,
+				j = 0,
+				allocated = 0;
+
 	if (!base || !left || !right || !out || !base->store ||
 		base->store != left->store || base->store != right->store)
 		return PL_INVALID;
@@ -157,29 +175,43 @@ pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
 		status = pl_diff(base, right, record_change, &b);
 	if (status != PL_OK)
 		goto done;
-	owned = calloc(a.used + b.used, sizeof(*owned));
-	if (!owned)
+	if (a.used > SIZE_MAX - b.used || a.used + b.used > SIZE_MAX / sizeof(*owned))
 	{
 		status = PL_NOMEM;
 		goto done;
 	}
+	if (a.used + b.used)
+	{
+		owned = calloc(a.used + b.used, sizeof(*owned));
+		if (!owned)
+		{
+			status = PL_NOMEM;
+			goto done;
+		}
+	}
+
 	while (status == PL_OK && (i < a.used || j < b.used))
 	{
-		PLValue absent = {false, {NULL, 0}};
-		int comparison = i == a.used ? 1 : j == b.used ? -1 :
+		PLValue		absent = {false, {NULL, 0}};
+		int			comparison = i == a.used ? 1 : j == b.used ? -1 :
 			pl_compare(a.edits[i].key, b.edits[j].key);
-		PLEdit chosen;
+		PLEdit		chosen;
+
 		if (comparison < 0)
 			chosen = a.edits[i++];
 		else if (comparison > 0)
 			chosen = b.edits[j++];
 		else
 		{
-			PLValue av = a.edits[i].value, bv = b.edits[j].value;
+			PLValue		av = a.edits[i].value,
+						bv = b.edits[j].value;
+
 			chosen = a.edits[i];
 			if (!same_value(av, bv))
 			{
-				PLValue original, resolved = absent;
+				PLValue		original,
+							resolved = absent;
+
 				if (!resolver)
 				{
 					status = PL_CONFLICT;
@@ -191,7 +223,7 @@ pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
 				if (status != PL_OK)
 					break;
 				if (resolved.present && (resolved.bytes.len > PL_MAX_ITEM ||
-					(resolved.bytes.len && !resolved.bytes.data)))
+										 (resolved.bytes.len && !resolved.bytes.data)))
 				{
 					status = PL_INVALID;
 					break;
@@ -199,7 +231,8 @@ pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
 				chosen.value = resolved;
 				if (resolved.present && resolved.bytes.len)
 				{
-					uint8_t *copy = malloc(resolved.bytes.len);
+					uint8_t    *copy = malloc(resolved.bytes.len);
+
 					if (!copy)
 					{
 						status = PL_NOMEM;
@@ -210,7 +243,8 @@ pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
 					chosen.value.bytes.data = copy;
 				}
 			}
-			i++; j++;
+			i++;
+			j++;
 		}
 		status = record_change(&result, chosen.key, absent, chosen.value);
 	}
@@ -220,6 +254,8 @@ done:
 	for (i = 0; i < allocated; i++)
 		free(owned[i]);
 	free(owned);
-	free(a.edits); free(b.edits); free(result.edits);
+	free(a.edits);
+	free(b.edits);
+	free(result.edits);
 	return status;
 }

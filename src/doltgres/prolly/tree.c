@@ -4,13 +4,13 @@
 
 typedef struct PLBuilder
 {
-	PLStore *store;
-	PLEntry pending[PL_MAX_ENTRIES];
-	uint32_t count;
-	size_t bytes;
-	PLNode **nodes;
-	size_t used;
-	size_t capacity;
+	PLStore    *store;
+	PLEntry		pending[PL_MAX_ENTRIES];
+	uint32_t	count;
+	size_t		bytes;
+	PLNode	  **nodes;
+	size_t		used;
+	size_t		capacity;
 } PLBuilder;
 
 static bool
@@ -22,10 +22,13 @@ valid_slice(PLSlice slice)
 static uint32_t
 lower_bound(const PLNode *node, PLSlice key)
 {
-	uint32_t lo = 0, hi = node->count;
+	uint32_t	lo = 0,
+				hi = node->count;
+
 	while (lo < hi)
 	{
-		uint32_t mid = lo + (hi - lo) / 2;
+		uint32_t	mid = lo + (hi - lo) / 2;
+
 		if (pl_compare(pl_node_key(node, mid), key) < 0)
 			lo = mid + 1;
 		else
@@ -39,7 +42,8 @@ cursor_descend(PLCursor *cursor, PLNode *node, const PLSlice *lower)
 {
 	while (true)
 	{
-		uint32_t index = lower ? lower_bound(node, *lower) : 0;
+		uint32_t	index = lower ? lower_bound(node, *lower) : 0;
+
 		if (cursor->depth >= PL_MAX_DEPTH)
 			return PL_CORRUPT;
 		cursor->path[cursor->depth] = node;
@@ -56,8 +60,9 @@ cursor_descend(PLCursor *cursor, PLNode *node, const PLSlice *lower)
 		}
 		else
 		{
-			PLHash hash;
-			PLNode *child;
+			PLHash		hash;
+			PLNode	   *child;
+
 			memcpy(hash.bytes, pl_node_value(node, index).data, PL_HASH_SIZE);
 			child = pl_find(cursor->store, hash);
 			if (!child || child->level + 1 != node->level)
@@ -70,7 +75,8 @@ cursor_descend(PLCursor *cursor, PLNode *node, const PLSlice *lower)
 PLStatus
 pl_cursor_init(PLCursor *cursor, const PLTree *tree, const PLSlice *lower)
 {
-	PLNode *root;
+	PLNode	   *root;
+
 	memset(cursor, 0, sizeof(*cursor));
 	if (!tree || !tree->store || (lower && !valid_slice(*lower)))
 		return PL_INVALID;
@@ -84,9 +90,10 @@ pl_cursor_init(PLCursor *cursor, const PLTree *tree, const PLSlice *lower)
 PLEntry
 pl_cursor_entry(const PLCursor *cursor)
 {
-	uint32_t depth = cursor->depth - 1;
-	PLEntry entry = {pl_node_key(cursor->path[depth], cursor->index[depth]),
-		pl_node_value(cursor->path[depth], cursor->index[depth])};
+	uint32_t	depth = cursor->depth - 1;
+	PLEntry		entry = {pl_node_key(cursor->path[depth], cursor->index[depth]),
+	pl_node_value(cursor->path[depth], cursor->index[depth])};
+
 	return entry;
 }
 
@@ -98,12 +105,14 @@ pl_cursor_skip_leaf(PLCursor *cursor)
 	cursor->depth--;
 	while (cursor->depth)
 	{
-		uint32_t depth = cursor->depth - 1;
-		PLNode *parent = cursor->path[depth];
+		uint32_t	depth = cursor->depth - 1;
+		PLNode	   *parent = cursor->path[depth];
+
 		if (++cursor->index[depth] < parent->count)
 		{
-			PLHash hash;
-			PLNode *child;
+			PLHash		hash;
+			PLNode	   *child;
+
 			memcpy(hash.bytes, pl_node_value(parent, cursor->index[depth]).data, PL_HASH_SIZE);
 			child = pl_find(cursor->store, hash);
 			if (!child || child->level + 1 != parent->level)
@@ -119,7 +128,8 @@ pl_cursor_skip_leaf(PLCursor *cursor)
 PLStatus
 pl_cursor_next(PLCursor *cursor)
 {
-	uint32_t depth;
+	uint32_t	depth;
+
 	if (!cursor->valid)
 		return PL_OK;
 	depth = cursor->depth - 1;
@@ -133,8 +143,9 @@ append_node(PLBuilder *builder, PLNode *node)
 {
 	if (builder->used == builder->capacity)
 	{
-		size_t capacity = builder->capacity ? builder->capacity * 2 : 16;
-		PLNode **nodes;
+		size_t		capacity = builder->capacity ? builder->capacity * 2 : 16;
+		PLNode	  **nodes;
+
 		if (capacity < builder->capacity || capacity > SIZE_MAX / sizeof(*nodes))
 			return PL_NOMEM;
 		nodes = realloc(builder->nodes, capacity * sizeof(*nodes));
@@ -150,8 +161,9 @@ append_node(PLBuilder *builder, PLNode *node)
 static PLStatus
 flush(PLBuilder *builder, uint32_t level)
 {
-	PLNode *node;
-	PLStatus status = pl_save(builder->store, level, builder->pending, builder->count, &node);
+	PLNode	   *node;
+	PLStatus	status = pl_save(builder->store, level, builder->pending, builder->count, &node);
+
 	if (status != PL_OK)
 		return status;
 	status = append_node(builder, node);
@@ -173,15 +185,18 @@ add(PLBuilder *builder, PLEntry entry, uint32_t level)
 static PLStatus
 finish(PLBuilder *builder, PLTree *out)
 {
-	uint32_t level = 0;
-	PLStatus status = PL_OK;
+	uint32_t	level = 0;
+	PLStatus	status = PL_OK;
+
 	if (builder->count || !builder->used)
 		status = flush(builder, 0);
 	while (status == PL_OK && builder->used > 1)
 	{
-		PLNode **old = builder->nodes;
-		size_t count = builder->used, i;
-		uint8_t child_data[PL_MAX_ENTRIES][PL_CHILD_SIZE];
+		PLNode	  **old = builder->nodes;
+		size_t		count = builder->used,
+					i;
+		uint8_t		child_data[PL_MAX_ENTRIES][PL_CHILD_SIZE];
+
 		builder->nodes = NULL;
 		builder->used = builder->capacity = 0;
 		if (++level >= PL_MAX_DEPTH)
@@ -191,12 +206,14 @@ finish(PLBuilder *builder, PLTree *out)
 		}
 		for (i = 0; i < count && status == PL_OK; i++)
 		{
-			PLEntry entry;
-			uint8_t *child = child_data[builder->count];
+			PLEntry		entry;
+			uint8_t    *child = child_data[builder->count];
+
 			memcpy(child, old[i]->hash.bytes, PL_HASH_SIZE);
 			pl_write64(child + PL_HASH_SIZE, pl_node_rows(old[i]));
 			entry.key = pl_node_key(old[i], old[i]->count - 1);
-			entry.value.data = child; entry.value.len = PL_CHILD_SIZE;
+			entry.value.data = child;
+			entry.value.len = PL_CHILD_SIZE;
 			status = add(builder, entry, level);
 		}
 		if (status == PL_OK && builder->count)
@@ -214,9 +231,10 @@ finish(PLBuilder *builder, PLTree *out)
 PLStatus
 pl_build(PLStore *store, const PLEntry *entries, size_t count, PLTree *out)
 {
-	PLBuilder builder = {0};
-	PLStatus status = PL_OK;
-	size_t i;
+	PLBuilder	builder = {0};
+	PLStatus	status = PL_OK;
+	size_t		i;
+
 	if (!store || !out || (count && !entries))
 		return PL_INVALID;
 	for (i = 0; i < count; i++)
@@ -241,10 +259,11 @@ pl_branch(const PLTree *tree)
 PLStatus
 pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 {
-	PLCursor cursor;
-	PLBuilder builder = {0};
-	PLStatus status;
-	size_t i;
+	PLCursor	cursor;
+	PLBuilder	builder = {0};
+	PLStatus	status;
+	size_t		i;
+
 	if (!tree || !out || (count && !edits))
 		return PL_INVALID;
 	for (i = 0; i < count; i++)
@@ -263,13 +282,18 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 	i = 0;
 	while (status == PL_OK && (cursor.valid || i < count))
 	{
-		PLEntry entry = {{NULL, 0}, {NULL, 0}};
-		int comparison;
+		PLEntry		entry = {{NULL, 0}, {NULL, 0}};
+		int			comparison;
+
 		if (cursor.valid)
 		{
-			PLNode *leaf = cursor.path[cursor.depth - 1];
-			PLSlice last = pl_node_key(leaf, leaf->count - 1);
-			/* Copy whole untouched chunks once chunk boundaries resynchronize. */
+			PLNode	   *leaf = cursor.path[cursor.depth - 1];
+			PLSlice		last = pl_node_key(leaf, leaf->count - 1);
+
+			/*
+			 * Copy whole untouched chunks once chunk boundaries
+			 * resynchronize.
+			 */
 			if (builder.count == 0 && cursor.index[cursor.depth - 1] == 0 &&
 				(i == count || pl_compare(edits[i].key, last) > 0) &&
 				(i == count || pl_boundary(0, leaf->count, leaf->size - PL_HEADER - 8, last)))
@@ -293,7 +317,8 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 		{
 			if (edits[i].value.present)
 			{
-				entry.key = edits[i].key; entry.value = edits[i].value.bytes;
+				entry.key = edits[i].key;
+				entry.value = edits[i].value.bytes;
 				status = add(&builder, entry, 0);
 			}
 			if (comparison == 0 && status == PL_OK)
@@ -310,8 +335,9 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 PLStatus
 pl_get(const PLTree *tree, PLSlice key, PLValue *out)
 {
-	PLCursor cursor;
-	PLStatus status;
+	PLCursor	cursor;
+	PLStatus	status;
+
 	if (!out)
 		return PL_INVALID;
 	status = pl_cursor_init(&cursor, tree, &key);
@@ -325,7 +351,10 @@ pl_get(const PLTree *tree, PLSlice key, PLValue *out)
 	else
 	{
 		out->present = false;
-		out->bytes = (PLSlice) {NULL, 0};
+		out->bytes = (PLSlice)
+		{
+			NULL, 0
+		};
 	}
 	return PL_OK;
 }
@@ -334,14 +363,16 @@ PLStatus
 pl_scan(const PLTree *tree, const PLSlice *lower, const PLSlice *upper,
 		PLScanFn callback, void *arg)
 {
-	PLCursor cursor;
-	PLStatus status;
+	PLCursor	cursor;
+	PLStatus	status;
+
 	if (!callback || (upper && !valid_slice(*upper)))
 		return PL_INVALID;
 	status = pl_cursor_init(&cursor, tree, lower);
 	while (status == PL_OK && cursor.valid)
 	{
-		PLEntry entry = pl_cursor_entry(&cursor);
+		PLEntry		entry = pl_cursor_entry(&cursor);
+
 		if (upper && pl_compare(entry.key, *upper) >= 0)
 			break;
 		status = callback(arg, entry.key, entry.value);
@@ -354,7 +385,8 @@ pl_scan(const PLTree *tree, const PLSlice *lower, const PLSlice *upper,
 static PLStatus
 validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows)
 {
-	uint32_t i;
+	uint32_t	i;
+
 	*rows = 0;
 	if (lower && (!node->count || pl_compare(pl_node_key(node, 0), *lower) <= 0))
 		return PL_CORRUPT;
@@ -365,13 +397,15 @@ validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows
 	}
 	for (i = 0; i < node->count; i++)
 	{
-		PLSlice value = pl_node_value(node, i), upper = pl_node_key(node, i);
-		PLHash hash;
-		PLNode *child;
-		uint64_t child_rows;
-		PLStatus status;
-		PLSlice previous;
+		PLSlice		value = pl_node_value(node, i),
+					upper = pl_node_key(node, i);
+		PLHash		hash;
+		PLNode	   *child;
+		uint64_t	child_rows;
+		PLStatus	status;
+		PLSlice		previous;
 		const PLSlice *child_lower = lower;
+
 		if (i)
 		{
 			previous = pl_node_key(node, i - 1);
@@ -394,8 +428,9 @@ validate_node(PLStore *store, PLNode *node, const PLSlice *lower, uint64_t *rows
 PLStatus
 pl_validate(const PLTree *tree)
 {
-	PLNode *root;
-	uint64_t rows;
+	PLNode	   *root;
+	uint64_t	rows;
+
 	if (!tree || !tree->store)
 		return PL_INVALID;
 	root = pl_find(tree->store, tree->root);
@@ -407,8 +442,9 @@ pl_validate(const PLTree *tree)
 PLStatus
 pl_open(PLStore *store, PLHash root, PLTree *out)
 {
-	PLTree candidate = {store, root};
-	PLStatus status;
+	PLTree		candidate = {store, root};
+	PLStatus	status;
+
 	if (!out)
 		return PL_INVALID;
 	status = pl_validate(&candidate);
@@ -420,6 +456,7 @@ pl_open(PLStore *store, PLHash root, PLTree *out)
 uint64_t
 pl_count(const PLTree *tree)
 {
-	PLNode *node = tree ? pl_find(tree->store, tree->root) : NULL;
+	PLNode	   *node = tree ? pl_find(tree->store, tree->root) : NULL;
+
 	return node ? pl_node_rows(node) : 0;
 }

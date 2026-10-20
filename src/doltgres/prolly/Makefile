@@ -3,7 +3,7 @@ CC ?= cc
 AR ?= ar
 CPPFLAGS += $(shell pkg-config --cflags openssl)
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -Wmissing-prototypes -Wstrict-prototypes
 LDLIBS += $(shell pkg-config --libs openssl)
 OBJECTS = store.o tree.o tuple.o version.o
 
@@ -18,6 +18,6 @@ check: test_prolly
 	./test_prolly
 sanitize:
 	$(MAKE) clean
-	$(MAKE) check CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
+	$(MAKE) check CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -Wmissing-prototypes -Wstrict-prototypes -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
 clean:
 	rm -f $(OBJECTS) test_prolly.o libprolly.a test_prolly

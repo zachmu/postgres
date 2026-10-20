@@ -1,7 +1,7 @@
 /* PostgreSQL-inspired schema-driven attribute storage, without heap MVCC fields. */
 #include "internal.h"
 
-static const uint8_t tuple_magic[8] = {'D','G','T','U','P','0','0','1'};
+static const uint8_t tuple_magic[8] = {'D', 'G', 'T', 'U', 'P', '0', '0', '1'};
 
 void
 pl_key_int64(int64_t value, uint8_t out[8])
@@ -12,8 +12,13 @@ pl_key_int64(int64_t value, uint8_t out[8])
 PLStatus
 pl_tuple_pack(const PLValue *fields, size_t count, uint8_t **buffer, size_t *length)
 {
-	size_t bitmap, header, bytes = 0, i, offset = 0;
-	uint8_t *data;
+	size_t		bitmap,
+				header,
+				bytes = 0,
+				i,
+				offset = 0;
+	uint8_t    *data;
+
 	if (!buffer || !length || count > 1600 || (count && !fields))
 		return PL_INVALID;
 	bitmap = (count + 7) / 8;
@@ -54,9 +59,13 @@ pl_tuple_pack(const PLValue *fields, size_t count, uint8_t **buffer, size_t *len
 PLStatus
 pl_tuple_get(PLSlice tuple, size_t attribute, PLValue *out)
 {
-	size_t count, bitmap, header, i;
+	size_t		count,
+				bitmap,
+				header,
+				i;
 	const uint8_t *offsets;
-	PLValue result;
+	PLValue		result;
+
 	if (!out || !tuple.data || tuple.len < 12 || tuple.len > PL_MAX_ITEM ||
 		memcmp(tuple.data, tuple_magic, 8) != 0)
 		return PL_CORRUPT;
@@ -74,8 +83,10 @@ pl_tuple_get(PLSlice tuple, size_t attribute, PLValue *out)
 		return PL_CORRUPT;
 	for (i = 0; i < count; i++)
 	{
-		uint32_t start = pl_read32(offsets + 4 * i), end = pl_read32(offsets + 4 * (i + 1));
-		bool present = (tuple.data[12 + i / 8] & (1 << (i % 8))) != 0;
+		uint32_t	start = pl_read32(offsets + 4 * i),
+					end = pl_read32(offsets + 4 * (i + 1));
+		bool		present = (tuple.data[12 + i / 8] & (1 << (i % 8))) != 0;
+
 		if (end < start || end > tuple.len - header || (!present && end != start))
 			return PL_CORRUPT;
 	}
