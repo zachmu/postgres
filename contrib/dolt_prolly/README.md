@@ -55,8 +55,8 @@ A separate runtime tree maps monotonically allocated 64-bit occurrence handles
 to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
-XIDs, tuple padding and lock bits are not in canonical row encodings. OID-valued
-SQL data is preserved as supplied; see the serialization scope below.
+XIDs, tuple padding and lock bits are not in canonical row encodings.
+Identifier-bearing SQL types are rejected pending portable translation.
 Row fetches resolve the handle to a digest, then look up the actual tuple in the
 canonical content tree. Both trees physically live in the relation's chunk container.
 
@@ -143,11 +143,10 @@ version envelope. These functions run with database encoding, then restore the
 client's encoding even on errors. Binary XML reads use CONTENT mode so stored
 fragments remain readable when a session selects DOCUMENT mode.
 
-Supported table values include all ordinary PostgreSQL built-in scalar families:
+Supported table values include the portable PostgreSQL built-in scalar families:
 booleans, integers, floats, numeric, money, character/string and binary types,
 dates/times/intervals, bit strings, UUIDs, network addresses, geometric types,
-JSON/JSONB/JSONPath, XML (with libxml), full-text values, OIDs and reg* aliases,
-transaction/command IDs, TIDs, LSNs, snapshots, refcursors, ACL items, and every
+JSON/JSONB/JSONPath, XML (with libxml), full-text values, and every
 built-in range and multirange. Table values accept any column collation.
 
 Arrays recursively encode dimensions, lower bounds, NULLs and element values;
@@ -155,17 +154,16 @@ named composites recursively encode their fields. Both use the versioned
 `DGTUP001` packed-field envelope and avoid heap padding and embedded TOAST
 pointers. Domains use their base-type codec: assignment still enforces domain
 constraints, but reads do not revalidate already stored values. Enums use their
-standard binary label serialization. Custom types with binary send/receive
-functions use the same path; deterministic custom serialization remains the
-type author's responsibility. Custom types with only text I/O are not supported.
+standard binary label serialization, which omits enum value OIDs. Only reviewed
+built-in binary codecs may use the generic binary path. Opaque custom base-type
+serializers and user-defined ranges/multiranges are rejected for now: a binary
+I/O pair does not prove that its payload excludes local identifiers. In particular,
+a custom range can delegate to PostgreSQL's array/composite binary senders, which
+embed type OIDs even when the element/field values themselves are portable.
 
 Explicit exceptions to generic binary I/O:
 
-* `aclitem` has no binary I/O pair; it encodes grantee OID, grantor OID and
-  privilege bits as 4/4/8 big-endian bytes. Recursive arrays also support ACLs.
-* `pg_node_tree` copies existing catalog payload bytes, without calling its
-  deliberately disabled input function or enabling SQL input of arbitrary nodes.
-* Empty `int2vector`/`oidvector` retain the one-dimensional, zero-based catalog
+* Empty `int2vector` values retain the one-dimensional, zero-based catalog
   vector layout instead of the ordinary empty-array layout.
 * PostgreSQL 18's binary `tsquery` receiver rejects a zero-item query. The adapter
   recognizes its exact four-byte zero-count payload and reconstructs an empty
@@ -177,11 +175,26 @@ zeros can retain distinct bytes. Comparisons, ordering and uniqueness still
 belong to PostgreSQL's operators and the index adapter.
 
 These formats are experimental and tied to this PostgreSQL/type-codec version.
-OID-valued data, ACL role identifiers and embedded references in `pg_node_tree`
-remain local identities. Portable symbolic references and clone/restore remapping
-are future catalog integration work; this change does not make such values
-portable across independently allocated catalogs. Changing a composite type's
-schema after storing values is not supported by the historical decoding design.
+Until identifier translation is implemented, the following SQL types are rejected:
+`oid`, `oidvector`, every `reg*` alias, `aclitem`, `pg_node_tree`, `xid`, `xid8`,
+`cid`, `tid`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`, and `refcursor`. This also
+rejects catalog composites whose fields include those types. Their numbers or
+names identify local catalog objects, transactions, physical locations or
+session objects; they are not portable value encodings.
+
+Validation recursively checks domains, array elements and composite fields at
+table creation and before encoding/decoding or rebuilding an index. It validates
+the schema even for NULL fields and empty arrays, and repeats the check after
+nested type changes. Existing tables using now-rejected types are not migrated
+or translated; affected reads/writes fail explicitly. Original data is not
+rewritten. Changing a supported composite type's schema after storing values
+still lacks historical schema decoding.
+
+Enums, portable arrays/composites/domains and built-in ranges remain supported:
+their storage codecs omit in-memory type/value OIDs. Plain integers, text,
+bytea, UUIDs and other ordinary data are not inspected for numbers or bytes that
+happen to resemble identifiers. Runtime TID/OID machinery outside canonical
+contents remains necessary for PostgreSQL integration.
 
 Incoming TOAST values are detoasted before serialization, including nested
 values. Canonical payloads remain inline in the tuple leaf, fragmented over
@@ -245,3 +258,9 @@ index-only payloads, and WAL crash recovery. It also checks database/client
 encoding isolation, XML parsing settings, binary float/numeric fidelity, and
 unchanged domain constraint enforcement. XML cases run when PostgreSQL was built
 with libxml.
+
+`004_portability.pl` tests rejected identifier types through domains and nested
+composite arrays, NULL/empty/CTAS bypass attempts, opaque custom OID senders,
+user ranges, and nested type changes affecting scans and index rebuilds. It also
+checks identical serialized roots for enum/array/composite values instantiated
+with independently allocated runtime type OIDs.
