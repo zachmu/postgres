@@ -1,0 +1,4 @@
+comment = 'Experimental single-branch prolly table and ordered index storage'
+default_version = '1.0'
+module_pathname = '$libdir/dolt_prolly'
+relocatable = false
