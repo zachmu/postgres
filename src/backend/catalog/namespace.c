@@ -210,6 +210,9 @@ static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
  */
 char	   *namespace_search_path = NULL;
 
+/* Opt-in experimental branch catalog projection; NULL in ordinary servers. */
+rangevar_projection_hook_type rangevar_projection_hook = NULL;
+
 
 /* Local functions */
 static bool RelationIsVisibleExt(Oid relid, bool *is_missing);
@@ -447,6 +450,14 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	Oid			oldRelId = InvalidOid;
 	bool		retry = false;
 	bool		missing_ok = (flags & RVR_MISSING_OK) != 0;
+
+	/* Project names before lookup; retain the normal permission/lock path. */
+	if (rangevar_projection_hook)
+	{
+		relation = rangevar_projection_hook(relation);
+		if (relation == NULL)
+			elog(ERROR, "relation projection hook returned NULL");
+	}
 
 	/* verify that flags do no conflict */
 	Assert(!((flags & RVR_NOWAIT) && (flags & RVR_SKIP_LOCKED)));

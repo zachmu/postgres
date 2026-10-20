@@ -65,6 +65,15 @@ typedef struct SearchPathMatcher
 } SearchPathMatcher;
 
 /*
+ * Experimental relation-name projection hook.  The returned RangeVar must be
+ * non-NULL and live in the caller's memory context.  Do not modify the input.
+ * Normal namespace permission checks, locking, and invalidation still apply.
+ * This is relation lookup only, not type/function lookup or CREATE resolution.
+ */
+typedef const RangeVar *(*rangevar_projection_hook_type) (const RangeVar *relation);
+extern PGDLLIMPORT rangevar_projection_hook_type rangevar_projection_hook;
+
+/*
  * Option flag bits for RangeVarGetRelidExtended().
  */
 typedef enum RVROption
