@@ -284,3 +284,12 @@ preservation, repeatable replay, callback ordering/rejection, payload/header
 corruption, exclusive ownership, write errors and a separate process exiting
 without cleanup. These are controlled recovery tests, not a hardware power-loss
 simulation or a claim that PostgreSQL crash recovery has been integrated.
+
+## Native backend integration
+
+The same library is compiled into `src/backend/access/dolt_prolly`; its SQL
+access methods are built-ins initialized by initdb, not an extension. Backend
+hashing uses PostgreSQL's cryptohash API (`PL_POSTGRES`), while this independent
+build continues to use OpenSSL. Both paths preserve the SHA-256 addresses and
+existing node/file encodings. See `src/backend/access/dolt_prolly/README.md` for
+SQL behavior and limitations.
