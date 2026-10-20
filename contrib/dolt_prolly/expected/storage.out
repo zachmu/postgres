@@ -179,8 +179,8 @@ ERROR:  prolly phase 2 does not support custom index operators
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
 ALTER TABLE p ADD COLUMN bad int;
 ERROR:  prolly phase 2 does not support ALTER TABLE (schema versioning is not implemented)
-CREATE TABLE bad_type(v numeric) USING dolt_prolly_table;
-ERROR:  prolly phase 2 does not support this column type (supported: boolean, smallint, integer, bigint, text COLLATE C, bytea)
+CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
+ERROR:  prolly phase 2 does not support internal-only or pseudo column types
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
 ERROR:  prolly phase 2 does not support non-MVCC snapshots
 SELECT * FROM p FOR UPDATE;
