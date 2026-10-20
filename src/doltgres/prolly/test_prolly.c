@@ -1,6 +1,7 @@
 #include "internal.h"
 #include <stdio.h>
 #include <inttypes.h>
+#include <openssl/evp.h>
 
 static unsigned checks;
 #define CHECK(condition) do { checks++; if (!(condition)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); exit(1); } } while (0)
@@ -145,10 +146,273 @@ test_versions(void)
  pl_store_free(store);
 }
 
+static uint32_t
+random_value(uint32_t *state)
+{
+ *state ^= *state << 13; *state ^= *state >> 17; *state ^= *state << 5;
+ return *state;
+}
+
+static PLStatus
+scan_count(void *arg, PLSlice key, PLSlice value)
+{
+ size_t *count = arg;
+ (void) key; (void) value;
+ (*count)++;
+ return PL_OK;
+}
+
+static PLStatus
+stop_scan(void *arg, PLSlice key, PLSlice value)
+{
+ (void) arg; (void) key; (void) value;
+ return PL_STOP;
+}
+
+static PLStatus
+stop_diff(void *arg, PLSlice key, PLValue before, PLValue after)
+{
+ (void) arg; (void) key; (void) before; (void) after;
+ return PL_STOP;
+}
+
+static void
+test_random_history(void)
+{
+ enum {SLOTS = 400, STEPS = 1200};
+ PLStore *store = pl_store_create();
+ PLTree tree, fresh, empty;
+ int32_t expected[SLOTS];
+ uint8_t keys[SLOTS][8], values[SLOTS][4];
+ PLEntry entries[SLOTS];
+ uint32_t rng = 0x1ab3def;
+ unsigned step, i;
+ OK(pl_build(store, NULL, 0, &tree)); empty = tree;
+ for (i = 0; i < SLOTS; i++)
+ {
+  expected[i] = -1;
+  pl_key_int64(i, keys[i]);
+ }
+ for (step = 0; step < STEPS; step++)
+ {
+  unsigned which = random_value(&rng) % SLOTS;
+  int32_t value = random_value(&rng) % 4 ? (int32_t) (random_value(&rng) % 100000) : -1;
+  uint8_t encoded[4];
+  PLEdit edit;
+  PLTree old = tree;
+  PLValue previous, current;
+  size_t count = 0;
+  PLStore *independent = pl_store_create();
+  CHECK(independent != NULL);
+  pl_write32(encoded, (uint32_t) value);
+  edit = (PLEdit) {{keys[which], 8}, {value >= 0, {encoded, 4}}};
+  OK(pl_get(&old, edit.key, &previous));
+  OK(pl_apply(&tree, &edit, 1, &tree));
+  expected[which] = value;
+  for (i = 0; i < SLOTS; i++)
+   if (expected[i] >= 0)
+   {
+    pl_write32(values[i], (uint32_t) expected[i]);
+    entries[count++] = (PLEntry) {{keys[i], 8}, {values[i], 4}};
+   }
+  OK(pl_build(independent, entries, count, &fresh));
+  CHECK(pl_hash_equal(tree.root, fresh.root));
+  CHECK(pl_count(&tree) == count);
+  OK(pl_validate(&tree));
+  OK(pl_get(&tree, edit.key, &current));
+  CHECK(current.present == (value >= 0));
+  if (current.present) CHECK(pl_read32(current.bytes.data) == (uint32_t) value);
+  OK(pl_get(&old, edit.key, &current));
+  CHECK(current.present == previous.present);
+  if (current.present) CHECK(pl_compare(current.bytes, previous.bytes) == 0);
+  if (step % 37 == 0)
+  {
+   DiffResult result = {0};
+   OK(pl_diff(&tree, &fresh, count_diff, &result));
+   CHECK(!result.inserts && !result.removes && !result.updates);
+  }
+  pl_store_free(independent);
+ }
+ /* Delete all keys in batches and compare final empty root. */
+ for (i = 0; i < SLOTS; i++)
+ {
+  PLEdit edit = {{keys[i], 8}, {false, {NULL, 0}}};
+  OK(pl_apply(&tree, &edit, 1, &tree));
+ }
+ CHECK(pl_hash_equal(tree.root, empty.root));
+ pl_store_free(store);
+}
+
+static void
+test_conflict_matrix(void)
+{
+ PLStore *store = pl_store_create();
+ unsigned b, l, r;
+ PLSlice key = slice("key");
+ PLValue variants[] = {{false, {NULL, 0}}, {true, {NULL, 0}},
+                       {true, {(const uint8_t *) "A", 1}},
+                       {true, {(const uint8_t *) "B", 1}}};
+ for (b = 0; b < 4; b++) for (l = 0; l < 4; l++) for (r = 0; r < 4; r++)
+ {
+  PLTree trees[3], merged, original;
+  unsigned ids[] = {b,l,r}, i, selected;
+  bool conflict = l != r && l != b && r != b;
+  PLValue value;
+  unsigned calls = 0;
+  for (i = 0; i < 3; i++)
+  {
+   PLEntry entry = {key, variants[ids[i]].bytes};
+   OK(pl_build(store, &entry, variants[ids[i]].present ? 1 : 0, &trees[i]));
+  }
+  merged = original = trees[0];
+  CHECK(pl_merge(&trees[0], &trees[1], &trees[2], NULL, NULL, &merged) ==
+        (conflict ? PL_CONFLICT : PL_OK));
+  if (conflict) CHECK(pl_hash_equal(merged.root, original.root));
+  OK(pl_merge(&trees[0], &trees[1], &trees[2], choose_right, &calls, &merged));
+  CHECK(calls == (conflict ? 1U : 0U));
+  selected = l == r ? l : l == b ? r : r == b ? l : r;
+  OK(pl_get(&merged, key, &value));
+  CHECK(value.present == variants[selected].present);
+  if (value.present) CHECK(pl_compare(value.bytes, variants[selected].bytes) == 0);
+ }
+ pl_store_free(store);
+}
+
+static void
+test_ranges_and_shifted_boundaries(void)
+{
+ PLStore *store = pl_store_create();
+ PLTree before, after, empty, merged;
+ PLEntry entries[2000];
+ PLEdit edits[2000];
+ uint8_t keys[2000][8];
+ size_t i, count = 0;
+ DiffResult result = {0};
+ for (i = 0; i < 2000; i++)
+ {
+  pl_key_int64((int64_t) i, keys[i]);
+  entries[i] = (PLEntry) {{keys[i], 8}, slice("longer tuple to change chunk boundaries")};
+  edits[i] = (PLEdit) {{keys[i], 8}, {i % 3 != 0, slice("x")}};
+ }
+ OK(pl_build(store, entries, 2000, &before));
+ OK(pl_apply(&before, edits, 2000, &after));
+ OK(pl_diff(&before, &after, count_diff, &result));
+ CHECK(result.removes == 667 && result.updates == 1333 && result.inserts == 0);
+ OK(pl_scan(&before, &entries[100].key, &entries[200].key, scan_count, &count));
+ CHECK(count == 100);
+ CHECK(pl_scan(&before, NULL, NULL, stop_scan, NULL) == PL_STOP);
+ CHECK(pl_diff(&before, &after, stop_diff, NULL) == PL_STOP);
+ OK(pl_build(store, NULL, 0, &empty));
+ result = (DiffResult) {0};
+ OK(pl_diff(&empty, &before, count_diff, &result)); CHECK(result.inserts == 2000);
+ result = (DiffResult) {0};
+ OK(pl_diff(&before, &empty, count_diff, &result)); CHECK(result.removes == 2000);
+ CHECK(pl_merge(&before, &after, &empty, NULL, NULL, &merged) == PL_CONFLICT);
+ {
+  unsigned calls = 0;
+  OK(pl_merge(&before, &after, &empty, choose_right, &calls, &merged));
+  CHECK(calls == 1333 && pl_hash_equal(merged.root, empty.root));
+ }
+ count = 0;
+ OK(pl_scan(&before, &entries[200].key, &entries[100].key, scan_count, &count));
+ CHECK(count == 0);
+ pl_store_free(store);
+}
+
+static void
+test_import_and_malformed(void)
+{
+ PLStore *source = pl_store_create(), *target = pl_store_create();
+ PLTree tree, opened, untouched;
+ PLEntry entries[1000];
+ uint8_t keys[1000][8];
+ size_t i;
+ for (i = 0; i < 1000; i++)
+ {
+  pl_key_int64((int64_t) i, keys[i]);
+  entries[i] = (PLEntry) {{keys[i], 8}, slice("payload")};
+ }
+ OK(pl_build(source, entries, 1000, &tree));
+ untouched = tree;
+ CHECK(pl_open(target, tree.root, &opened) == PL_CORRUPT);
+ for (i = 0; i < source->capacity; i++)
+ {
+  PLNode *node;
+  for (node = source->buckets[i]; node; node = node->next)
+  {
+   PLSlice data;
+   uint8_t *bad;
+   OK(pl_store_export(source, node->hash, &data));
+   OK(pl_store_import(target, node->hash, data));
+   bad = malloc(data.len); CHECK(bad != NULL);
+   memcpy(bad, data.data, data.len); bad[data.len - 1] ^= 1;
+   CHECK(pl_store_import(target, node->hash, (PLSlice) {bad, data.len}) == PL_CORRUPT);
+   free(bad);
+  }
+ }
+ OK(pl_open(target, tree.root, &opened));
+ CHECK(pl_count(&opened) == 1000);
+ {
+  DiffResult result = {0};
+  OK(pl_diff(&tree, &opened, count_diff, &result));
+  CHECK(!result.inserts && !result.removes && !result.updates);
+ }
+ /* Digest-valid invalid encodings must fail import too. */
+ {
+  PLSlice data; PLHash hash; unsigned length;
+  uint8_t *bad;
+  OK(pl_store_export(source, tree.root, &data));
+  bad = malloc(data.len); CHECK(bad != NULL);
+  memcpy(bad, data.data, data.len);
+  pl_write32(bad + PL_HEADER, 1); /* first key offset must be zero */
+  CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+  CHECK(pl_store_import(target, hash, (PLSlice) {bad, data.len}) == PL_CORRUPT);
+  memcpy(bad, data.data, data.len);
+  /* Valid local encoding, but nonexistent child address. */
+  bad[PL_HEADER + 8 * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
+  CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+  OK(pl_store_import(target, hash, (PLSlice) {bad, data.len}));
+  CHECK(pl_open(target, hash, &untouched) == PL_CORRUPT);
+  CHECK(pl_hash_equal(untouched.root, tree.root));
+  free(bad);
+ }
+ pl_store_free(source); pl_store_free(target);
+}
+
+static void
+test_large_and_binary_tuples(void)
+{
+ PLStore *store = pl_store_create();
+ PLTree tree, changed, fresh;
+ uint8_t *large = malloc(100000);
+ const uint8_t binary[] = {0, 255, 0, 128};
+ PLEntry entries[] = {{{NULL, 0}, {NULL, 0}}, {{binary, 4}, {NULL, 0}}};
+ PLEdit edit;
+ PLValue got;
+ CHECK(large != NULL);
+ memset(large, 97, 100000);
+ entries[1].value = (PLSlice) {large, 100000};
+ OK(pl_build(store, entries, 2, &tree));
+ OK(pl_get(&tree, entries[0].key, &got)); CHECK(got.present && got.bytes.len == 0);
+ OK(pl_get(&tree, entries[1].key, &got)); CHECK(got.present && got.bytes.len == 100000);
+ edit = (PLEdit) {entries[1].key, {true, slice("short")}};
+ OK(pl_apply(&tree, &edit, 1, &changed));
+ entries[1].value = slice("short");
+ OK(pl_build(store, entries, 2, &fresh)); CHECK(pl_hash_equal(changed.root, fresh.root));
+ entries[0].key = entries[1].key;
+ CHECK(pl_build(store, entries, 2, &changed) == PL_INVALID);
+ CHECK(pl_hash_equal(changed.root, fresh.root));
+ entries[0].key = (PLSlice) {NULL, 1};
+ CHECK(pl_build(store, entries, 2, &changed) == PL_INVALID);
+ free(large); pl_store_free(store);
+}
+
 int
 main(void)
 {
 	test_tuples(); test_tree(); test_versions();
+ test_random_history(); test_conflict_matrix(); test_ranges_and_shifted_boundaries();
+ test_import_and_malformed(); test_large_and_binary_tuples();
 	printf("passed %u checks\n", checks);
 	return 0;
 }
