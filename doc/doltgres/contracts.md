@@ -26,7 +26,7 @@ Base: PostgreSQL REL_18_6. Authority: workspace PLAN.md and design-questions.txt
 ## Canonical format v1 experiment
 
 SHA-256 with domain-separated, length-framed inputs. Integers use big-endian
-signed-order-preserving encoding, text uses UTF-8 with bytewise C ordering,
+signed-order-preserving encoding, text uses UTF-8 with C-collation equality,
 booleans use one byte, bytea is literal bytes, and NULL has its own tag. Numeric
 encoding removes redundant decimal zeros and canonicalizes zero; NaN and
 infinities have explicit codes. No pickle, native struct padding, OID, TOAST
@@ -36,8 +36,8 @@ The first experiment supports bool, int8, text (C collation), bytea, and numeric
 Unsupported type/collation encodings fail explicitly. NULL and duplicate
 multiplicity are explicit. Format, encoding, and comparator identities belong
 in the schema representation. Byte ordering of the generic tree is separate
-from SQL operator-class ordering: prototype numeric encoding is canonical but
-is NOT an ordered PostgreSQL numeric index key. Phase 2 must implement ordered
+from SQL operator-class ordering: prototype framed text/numeric/composite encodings are canonical but
+are NOT general ordered PostgreSQL index keys. Phase 2 must implement ordered
 encodings/comparators for every advertised index capability.
 
 Equality means SQL equality for supported values under a fixed type/collation.
