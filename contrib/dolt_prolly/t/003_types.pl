@@ -12,7 +12,7 @@ $node->safe_psql('postgres', q{
 CREATE EXTENSION dolt_prolly;
 CREATE TYPE mood AS ENUM ('happy','sad');
 CREATE DOMAIN positive AS numeric(20,4) CHECK (VALUE > 0);
-CREATE TYPE payload AS (n numeric, a aclitem[], t text, d positive);
+CREATE TYPE payload AS (n numeric, a integer[], t text, d positive);
 });
 
 # Ordinary built-ins, including less-common OID aliases and every built-in range.
@@ -105,7 +105,7 @@ my @cases = (
  ['mood', q{'happy'}, q{'sad'}],
  ['positive', '1.2345', '99.0000'],
  ['positive[]', q{ARRAY[1.2345::positive,NULL]}, q{'{}'}],
- ['payload', q{ROW(1.00,ARRAY[('=r/'||current_user)::aclitem],repeat('é',12000),1.5)::payload}, q{ROW(NULL,NULL,'',NULL)::payload}],
+ ['payload', q{ROW(1.00,ARRAY[1,2],repeat('é',12000),1.5)::payload}, q{ROW(NULL,NULL,'',NULL)::payload}],
  ['payload[]', q{ARRAY[ROW(1.00,NULL,'é',1)::payload,NULL]}, q{'{}'}],
 );
 my $has_xml = $node->safe_psql('postgres', q{SELECT position('--with-libxml' in setting)>0 FROM pg_config WHERE name='CONFIGURE'}) eq 't';
@@ -134,6 +134,24 @@ $covered{bpchar} = 1; # char(n)
 $covered{xml} = 1 unless $has_xml; # build-time PostgreSQL feature
 is_deeply([grep { !$covered{$_} } split /\n/, $ordinary], [], 'every ordinary built-in scalar/range has a fixture');
 
+# The catalog inventory above includes explicitly rejected identity-bearing
+# fixtures. Exercise their rejection rather than silently dropping coverage.
+my %nonportable = map { $_ => 1 } qw(pg_type pg_proc pg_class oid oidvector tid xid xid8 cid pg_lsn txid_snapshot pg_snapshot refcursor regproc regprocedure regoper regoperator regclass regcollation regtype regrole regnamespace regconfig regdictionary aclitem);
+my @portable;
+for my $case (@cases)
+{
+ my $type = $case->[0];
+ (my $base = $type) =~ s/\[\]//g;
+ if ($nonportable{$base})
+ {
+  my ($status, $out, $err) = $node->psql('postgres', "CREATE TABLE rejected(v $type) USING dolt_prolly_table");
+  isnt($status, 0, "$type rejected at table creation");
+  like($err, qr/prolly storage rejects type/, "$type portability diagnostic");
+ }
+ else { push @portable, $case; }
+}
+@cases = @portable;
+
 my @checks;
 my $n = 0;
 for my $case (@cases)
@@ -151,14 +169,9 @@ for my $case (@cases)
  push @checks, [sprintf($query,"p$n"), $expected, $type];
 }
 
-# pg_node_tree cannot be supplied by SQL input; copy a real catalog value.
-$node->safe_psql('postgres', q{
-CREATE TABLE defaults_source(a int DEFAULT (1+2));
-CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table;
-INSERT INTO nodes SELECT adbin FROM pg_attrdef WHERE adrelid='defaults_source'::regclass;
-});
-is($node->safe_psql('postgres', q{SELECT v::text FROM nodes}),
- $node->safe_psql('postgres', q{SELECT adbin::text FROM pg_attrdef WHERE adrelid='defaults_source'::regclass}), 'pg_node_tree copies actual catalog payload');
+my ($node_status, $node_out, $node_err) = $node->psql('postgres', q{CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table});
+isnt($node_status, 0, 'pg_node_tree rejects embedded local object references');
+like($node_err, qr/prolly storage rejects type pg_node_tree/, 'node tree portability diagnostic');
 
 # Table codecs must not require the old C collation restriction.
 $node->safe_psql('postgres', q{
