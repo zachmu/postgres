@@ -104,8 +104,9 @@ rows into ordinary scans.
 Table and index root records, along with ordinary catalog/heap changes, share the
 SQL transaction outcome. There is no independently mutable latest-root file and
 no postcommit rename gap. This is the initial relation-local working-set
-publication mechanism, not a database-wide branch manifest. Named refs,
-versioned schema roots and historical commit lookup remain phase 4 work.
+publication mechanism. Separate heap catalogs now provide explicit refs and
+retained history objects (see below). Automatic working-set publication,
+versioned schema resolution and historical SQL reads remain later work.
 
 ### Concurrency and retention
 
@@ -292,3 +293,15 @@ existing equivalence-class planning. Complete cross-type integer membership
 preserves normal integer equivalences. Tests that deliberately extend only the
 btree family with incomplete custom alias operators can have different plans;
 no planner algorithm or upstream AM implementation is changed by this packaging.
+
+## Manifest foundation
+
+The backend now also provides heap-backed per-database object/ref catalogs and
+privileged `dolt_manifest_*` building blocks. See
+[the publication contract](../../../../doc/doltgres/manifest.md) for formats,
+APIs, snapshot/CAS behavior, recovery tests and boundaries. The exporter retains
+canonical table/index chunks independently of their source relations. These APIs
+do not yet provide `dolt_commit`, checkout, automatic schema capture or live
+working-set publication on ordinary DML. The table writer lock remains unchanged.
+Physical backups include history; logical pg_dump currently omits it. This
+catalog revision requires fresh initdb.
