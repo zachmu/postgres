@@ -140,11 +140,23 @@ CREATE TABLE h(id int);
 CREATE TABLE live(id int PRIMARY KEY) USING dolt_prolly_table;
 INSERT INTO p SELECT g,repeat(md5(g::text),10) FROM generate_series(1,100) g;
 });
+# Export uses the statement snapshot, even though object insertion does writes.
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $old_root = $reader->query_safe(q{SELECT dolt_prolly_root('p')});
+sql(q{UPDATE p SET value='changed after snapshot' WHERE id=1});
+my $old_chunk = $reader->query_safe(q{SELECT encode(dolt_manifest_export('p'),'hex')});
+is($reader->query_safe("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
+$reader->query_safe('COMMIT'); $reader->quit;
 my $root = sql(q{SELECT dolt_prolly_root('p')});
 my $chunk = sql(q{SELECT encode(dolt_manifest_export('p'),'hex')});
 my $indexchunk = sql(q{SELECT encode(dolt_manifest_export('p_pkey'),'hex')});
 is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
 is(sql(q{SELECT encode(dolt_manifest_export('p'),'hex')}), $chunk, 'export deterministic and deduplicated');
+sql(q{CREATE TABLE same(LIKE p) USING dolt_prolly_table; INSERT INTO same SELECT * FROM p ORDER BY id DESC});
+is(sql(q{SELECT encode(dolt_manifest_export('same'),'hex')}), $chunk, 'export ignores relation identity and insertion history');
+sql('DROP TABLE same');
+
 my $table = put('table', 'test-table-v1:public.p', $schema, $chunk);
 my $index = put('index', 'test-index-v1:public.p_pkey', $schema, $indexchunk);
 my $database = put('database', 'test-db-v1:public.p,public.p_pkey', $table, $index);
@@ -159,15 +171,31 @@ sql('TRUNCATE p; DROP TABLE p');
 is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
 is(sql('SELECT count(*) FROM pg_dolt_object'), $objects, 'all historical chunks retained');
 
+# Large opaque payloads exercise heap TOAST separately from prolly page storage.
+my $large = sql(q{SELECT encode(dolt_manifest_put('chunk',convert_to(string_agg(md5(g::text),''),'UTF8'),ARRAY[]::bytea[]),'hex') FROM generate_series(1,2000) g});
+is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'large object payload stored through heap TOAST');
+
 # Atomic mixed transactions, prepared outcomes, crash recovery.
 my $main_token = token('heads/main');
-sql('BEGIN; '.cas('heads/main', $main_token, $commit).'; '.cas('working/main', undef, $database).q{; INSERT INTO h VALUES(1); INSERT INTO live VALUES(1); PREPARE TRANSACTION 'manifest_commit'});
+my $preparer = $node->background_psql('postgres');
+$preparer->query_safe('BEGIN');
+my $prepared_db = $preparer->query_safe(q{SELECT encode(dolt_manifest_put('database','prepared-state'::bytea,ARRAY[]::bytea[]),'hex')});
+my $prepared_commit = $preparer->query_safe("SELECT encode(dolt_manifest_put('commit','prepared-history'::bytea,ARRAY[".hasharg($prepared_db).','.hasharg($commit)."]),'hex')");
+$preparer->query_safe(cas('heads/main', $main_token, $prepared_commit));
+$preparer->query_safe(cas('working/main', undef, $prepared_db));
+$preparer->query_safe(q{INSERT INTO h VALUES(1); INSERT INTO live VALUES(1); PREPARE TRANSACTION 'manifest_commit'});
+$preparer->quit;
+is(sql("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($prepared_commit).")"), 't', 'prepared new history object invisible');
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c2, 'snapshot taken before prepared commit');
 is(readref('heads/main'), $c2, 'prepared HEAD invisible');
 is(readref('working/main'), '', 'prepared working ref invisible');
 my $abandoned = $node->background_psql('postgres');
 $abandoned->query_safe('BEGIN');
 $abandoned->query_safe(cas('tags/abandoned', undef, $commit));
 my $aborted_hash = $abandoned->query_safe(q{SELECT encode(dolt_manifest_put('schema','crash-aborted'::bytea,ARRAY[]::bytea[]),'hex')});
+$reader->quit;
 $node->stop('immediate'); $abandoned->quit;
 $node->start;
 is(readref('tags/captured'), $commit, 'committed history survives crash');
@@ -176,9 +204,15 @@ is(sql("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($aborted_hash).")")
 is(readref('heads/main'), $c2, 'prepared ref still invisible after recovery');
 failure("SET lock_timeout='100ms'; ".cas('heads/main', $main_token, $c1), qr/lock timeout/, 'prepared ref lock survives restart');
 is(sql('SELECT count(*) FROM live'), '0', 'prepared prolly changes remain invisible');
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_dolt_ref');
 sql(q{COMMIT PREPARED 'manifest_commit'});
-is(readref('heads/main'), $commit, 'prepared HEAD commits after recovery');
-is(readref('working/main'), $database, 'working ref commits with HEAD');
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c2, 'old snapshot keeps pre-publication HEAD');
+is($reader->query_safe(q{SELECT target IS NULL FROM dolt_manifest_read('working/main')}), 't', 'old snapshot excludes other ref in same publication');
+$reader->query_safe('COMMIT'); $reader->quit;
+is(readref('heads/main'), $prepared_commit, 'prepared HEAD commits after recovery');
+is(sql("SELECT kind FROM dolt_manifest_get(".hasharg($prepared_commit).")"), 'commit', 'new target object commits with prepared HEAD');
+is(readref('working/main'), $prepared_db, 'working ref commits with HEAD');
 is(sql('SELECT id FROM h'), '1', 'ordinary heap shares commit decision');
 is(sql('SET enable_seqscan=off; SELECT id FROM live WHERE id=1'), '1', 'prolly table and index share manifest commit decision');
 sql('BEGIN; '.cas('tags/prepare_abort', undef, $commit).q{; INSERT INTO h VALUES(2); PREPARE TRANSACTION 'manifest_abort'});
@@ -187,6 +221,8 @@ sql(q{ROLLBACK PREPARED 'manifest_abort'});
 is(readref('tags/prepare_abort'), '', 'prepared abort remains invisible');
 is(sql('SELECT count(*) FROM h'), '1', 'prepared abort rolls back heap with ref');
 is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
+is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'TOAST object survives recovery');
+
 
 sql('CREATE ROLE reader');
 failure(q{SET ROLE reader; SELECT * FROM pg_dolt_object}, qr/permission denied/, 'objects not a public data oracle');
