@@ -1,0 +1,243 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+use Digest::SHA qw(sha256_hex);
+
+my $node = PostgreSQL::Test::Cluster->new('manifest');
+$node->init(allows_streaming => 'physical', extra => ['--encoding=UTF8', '--locale=C']);
+$node->append_conf('postgresql.conf', "max_parallel_workers_per_gather=0\nmax_prepared_transactions=10\n");
+$node->start;
+sub sql { return $node->safe_psql('postgres', $_[0]); }
+sub failure {
+ my ($query, $pattern, $label) = @_;
+ my ($status, $out, $err) = $node->psql('postgres', $query);
+ isnt($status, 0, $label);
+ like($err, $pattern, "$label diagnostic");
+}
+sub readref { return sql("SELECT encode(target,'hex') FROM dolt_manifest_read('$_[0]')"); }
+sub token { return sql("SELECT encode(token,'hex') FROM dolt_manifest_read('$_[0]')"); }
+sub hasharg { return "decode('$_[0]','hex')"; }
+sub put {
+ my ($kind, $payload, @children) = @_;
+ return sql("SELECT encode(dolt_manifest_put('$kind',convert_to('$payload','UTF8'),ARRAY[" . join(',', map {hasharg($_)} @children) . "]::bytea[]),'hex')");
+}
+sub cas {
+ my ($name, $expected, $target) = @_;
+ return "SELECT encode(dolt_manifest_cas('$name'," . (defined($expected) ? hasharg($expected) : 'NULL') . ',' . (defined($target) ? hasharg($target) : 'NULL') . "),'hex')";
+}
+
+is(sql(q{SELECT count(*) FROM pg_class c JOIN pg_am a ON a.oid=c.relam WHERE c.relname IN ('pg_dolt_ref','pg_dolt_object') AND a.amname='heap'}), '2', 'manifest uses native heap');
+my $schema = put('schema', 'test-schema-v1:id=int4,value=text');
+is(put('schema', 'test-schema-v1:id=int4,value=text'), $schema, 'immutable object deduplication');
+my $schema_payload = 'test-schema-v1:id=int4,value=text';
+is($schema, sha256_hex('DGMOBJ01' . pack('NNN', 1, 0, length($schema_payload)) . $schema_payload), 'object envelope matches independent SHA-256 encoding');
+my $empty = put('database', 'test-db-v1:empty');
+my $c1 = put('commit', 'author=test;message=initial', $empty);
+my $c2 = put('commit', 'author=test;message=second', $empty, $c1);
+is(put('commit', 'author=test;message=initial', $empty), $c1, 'identical commit encoding deterministic');
+isnt($c1, $c2, 'history identity differs while database target is equal');
+my $t1 = sql(cas('heads/main', undef, $c1));
+is(readref('heads/main'), $c1, 'create and read HEAD');
+is(readref('heads/missing'), '', 'absent ref returns null fields');
+failure(cas('heads/main', undef, $c1), qr/duplicate key/, 'concurrent-style duplicate creation rejected');
+failure(cas('heads/bad', undef, $empty), qr/requires commit/, 'HEAD requires commit object');
+failure(q{SELECT dolt_manifest_put('commit',''::bytea,ARRAY[]::bytea[])}, qr/child count/, 'commit needs database child');
+failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex')])}, qr/not visible/, 'dangling children rejected');
+failure(q{SELECT dolt_manifest_put('schema',''::bytea,ARRAY[NULL]::bytea[])}, qr/child count/, 'schema child count validated');
+failure(q{SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[NULL]::bytea[])}, qr/cannot be null/, 'null children rejected');
+failure(q{SELECT dolt_manifest_get('\x00'::bytea)}, qr/32 bytes/, 'invalid hash size rejected');
+failure(cas('main', undef, $c1), qr/heads\//, 'ref namespace checked');
+failure("SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[".hasharg($c1)."])", qr/invalid commit child/, 'typed DAG edges enforced');
+
+# Snapshot semantics, own writes, rollback and ABA.
+my $reader = $node->background_psql('postgres', on_error_stop => 0);
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c1, 'RR pins initial HEAD');
+my $t2 = sql(cas('heads/main', $t1, $c2));
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c1, 'RR retains old HEAD');
+my ($out, $error) = $reader->query(cas('heads/main', $t1, $c2));
+is($error, 1, 'RR stale update fails');
+$reader->query('ROLLBACK'); $reader->quit;
+is(readref('heads/main'), $c2, 'new statement sees new HEAD');
+failure(cas('heads/main', $t1, $c1), qr/ref changed/, 'stale CAS rejected');
+my $t3 = sql(cas('heads/main', $t2, $c1));
+isnt($t3, $t1, 'move-back changes token');
+failure(cas('heads/main', $t1, $c2), qr/ref changed/, 'ABA move-back rejected');
+my $own = $node->background_psql('postgres');
+$own->query_safe('BEGIN');
+$own->query_safe(cas('working/private', undef, $empty));
+is($own->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('working/private')}), $empty, 'own ref visible after command boundary');
+is(readref('working/private'), '', 'uncommitted ref invisible to others');
+$own->query_safe('SAVEPOINT s');
+$own->query_safe(cas('tags/rolledback', undef, $c1));
+$own->query_safe('ROLLBACK TO s');
+is($own->query_safe(q{SELECT target IS NULL FROM dolt_manifest_read('tags/rolledback')}), 't', 'savepoint removes ref');
+$own->query_safe('ROLLBACK'); $own->quit;
+is(readref('working/private'), '', 'abort removes working ref');
+sql(cas('heads/main', $t3, undef));
+is(readref('heads/main'), '', 'delete with expected token');
+my $t4 = sql(cas('heads/main', undef, $c1));
+failure(cas('heads/main', $t3, $c2), qr/ref changed/, 'delete-recreate ABA rejected');
+
+# Two writers: same ref waits, rechecks token; different refs proceed.
+my $a = $node->background_psql('postgres');
+my $b = $node->background_psql('postgres', on_error_stop => 0);
+my $pid = $b->query_safe('SELECT pg_backend_pid()');
+$a->query_safe('BEGIN');
+$a->query_safe(cas('heads/main', $t4, $c2));
+$b->query_until(qr/waiting/, "\\echo waiting\n" . cas('heads/main', $t4, $c1) . ";\n");
+ok($node->poll_query_until('postgres', "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$pid"), 'competing HEAD writer waits on PostgreSQL lock');
+is(length(sql(cas('heads/independent', undef, $c1))), 64, 'different ref writer proceeds while HEAD locked');
+$a->query_safe('COMMIT');
+($out, $error) = $b->query('SELECT 1');
+is($error, 1, 'waiting writer rejects changed token after winner commits');
+$a->quit; $b->quit;
+is(readref('heads/main'), $c2, 'winner not overwritten');
+# If the competing updater aborts, the waiting CAS can use the original token.
+my $retry_token = token('heads/main');
+$a = $node->background_psql('postgres');
+$b = $node->background_psql('postgres');
+$pid = $b->query_safe('SELECT pg_backend_pid()');
+$a->query_safe('BEGIN');
+$a->query_safe(cas('heads/main', $retry_token, $c1));
+$b->query_until(qr/waiting_abort/, "\\echo waiting_abort\n" . cas('heads/main', $retry_token, $c2) . ";\n");
+ok($node->poll_query_until('postgres', "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$pid"), 'writer waits before abort outcome');
+$a->query_safe('ROLLBACK');
+$b->query_safe('SELECT 1');
+$a->quit; $b->quit;
+is(readref('heads/main'), $c2, 'waiting writer succeeds after competitor aborts');
+
+
+# Concurrent creators deduplicate only after the first transaction commits.
+$a = $node->background_psql('postgres');
+$b = $node->background_psql('postgres');
+$pid = $b->query_safe('SELECT pg_backend_pid()');
+$a->query_safe('BEGIN');
+my $shared_sql = q{SELECT encode(dolt_manifest_put('schema','shared-concurrent'::bytea,ARRAY[]::bytea[]),'hex')};
+my $shared = $a->query_safe($shared_sql);
+$b->query_until(qr/object_wait/, "\\echo object_wait\n$shared_sql;\n");
+ok($node->poll_query_until('postgres', "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$pid"), 'same new immutable object waits for creator');
+$a->query_safe('COMMIT');
+like($b->query_safe('SELECT 1'), qr/$shared/, 'waiting creator returns identical object hash');
+$a->quit; $b->quit;
+is(sql("SELECT count(*) FROM pg_dolt_object WHERE objhash=".hasharg($shared)), '1', 'concurrent insertion deduplicated');
+
+# An old RR snapshot cannot adopt an object committed after its snapshot.
+$a = $node->background_psql('postgres', on_error_stop => 0);
+$a->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_dolt_object');
+my $late = put('schema', 'created-after-snapshot');
+is($a->query_safe("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($late).")"), 't', 'object lookup respects old snapshot');
+($out, $error) = $a->query(q{SELECT dolt_manifest_put('schema','created-after-snapshot'::bytea,ARRAY[]::bytea[])});
+is($error, 1, 'RR object insertion requires retry if matching object is outside snapshot');
+$a->query('ROLLBACK'); $a->quit;
+
+# Copy real multi-node table and index content into relation-independent objects.
+sql(q{
+CREATE TABLE p(id int PRIMARY KEY, value text COLLATE "C") USING dolt_prolly_table;
+CREATE TABLE h(id int);
+CREATE TABLE live(id int PRIMARY KEY) USING dolt_prolly_table;
+INSERT INTO p SELECT g,repeat(md5(g::text),10) FROM generate_series(1,100) g;
+});
+# Export uses the statement snapshot, even though object insertion does writes.
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $old_root = $reader->query_safe(q{SELECT dolt_prolly_root('p')});
+sql(q{UPDATE p SET value='changed after snapshot' WHERE id=1});
+my $old_chunk = $reader->query_safe(q{SELECT encode(dolt_manifest_export('p'),'hex')});
+is($reader->query_safe("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
+$reader->query_safe('COMMIT'); $reader->quit;
+my $root = sql(q{SELECT dolt_prolly_root('p')});
+my $chunk = sql(q{SELECT encode(dolt_manifest_export('p'),'hex')});
+my $indexchunk = sql(q{SELECT encode(dolt_manifest_export('p_pkey'),'hex')});
+is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
+is(sql(q{SELECT encode(dolt_manifest_export('p'),'hex')}), $chunk, 'export deterministic and deduplicated');
+sql(q{CREATE TABLE same(LIKE p) USING dolt_prolly_table; INSERT INTO same SELECT * FROM p ORDER BY id DESC});
+is(sql(q{SELECT encode(dolt_manifest_export('same'),'hex')}), $chunk, 'export ignores relation identity and insertion history');
+sql('DROP TABLE same');
+
+my $table = put('table', 'test-table-v1:public.p', $schema, $chunk);
+my $index = put('index', 'test-index-v1:public.p_pkey', $schema, $indexchunk);
+my $database = put('database', 'test-db-v1:public.p,public.p_pkey', $table, $index);
+my $commit = put('commit', 'author=test;message=captured', $database, $c2);
+sql(cas('tags/captured', undef, $commit));
+# Every exported node must remain reachable and its envelope verifiable.
+my $reachable = sql("WITH RECURSIVE graph(hash) AS (SELECT ".hasharg($chunk)." UNION SELECT unnest(o.objchildren) FROM graph g JOIN pg_dolt_object o ON o.objhash=g.hash) SELECT count(*) FROM graph");
+ok($reachable > 1, 'export includes reachable descendants, not just root');
+my $objects = sql('SELECT count(*) FROM pg_dolt_object');
+ok($objects > 10, 'multi-node tree exported as DAG');
+sql('TRUNCATE p; DROP TABLE p');
+is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
+is(sql('SELECT count(*) FROM pg_dolt_object'), $objects, 'all historical chunks retained');
+
+# Large opaque payloads exercise heap TOAST separately from prolly page storage.
+my $large = sql(q{SELECT encode(dolt_manifest_put('chunk',convert_to(string_agg(md5(g::text),''),'UTF8'),ARRAY[]::bytea[]),'hex') FROM generate_series(1,2000) g});
+is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'large object payload stored through heap TOAST');
+
+# Atomic mixed transactions, prepared outcomes, crash recovery.
+my $main_token = token('heads/main');
+my $preparer = $node->background_psql('postgres');
+$preparer->query_safe('BEGIN');
+my $prepared_db = $preparer->query_safe(q{SELECT encode(dolt_manifest_put('database','prepared-state'::bytea,ARRAY[]::bytea[]),'hex')});
+my $prepared_commit = $preparer->query_safe("SELECT encode(dolt_manifest_put('commit','prepared-history'::bytea,ARRAY[".hasharg($prepared_db).','.hasharg($commit)."]),'hex')");
+$preparer->query_safe(cas('heads/main', $main_token, $prepared_commit));
+$preparer->query_safe(cas('working/main', undef, $prepared_db));
+$preparer->query_safe(q{INSERT INTO h VALUES(1); INSERT INTO live VALUES(1); PREPARE TRANSACTION 'manifest_commit'});
+$preparer->quit;
+is(sql("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($prepared_commit).")"), 't', 'prepared new history object invisible');
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c2, 'snapshot taken before prepared commit');
+is(readref('heads/main'), $c2, 'prepared HEAD invisible');
+is(readref('working/main'), '', 'prepared working ref invisible');
+my $abandoned = $node->background_psql('postgres');
+$abandoned->query_safe('BEGIN');
+$abandoned->query_safe(cas('tags/abandoned', undef, $commit));
+my $aborted_hash = $abandoned->query_safe(q{SELECT encode(dolt_manifest_put('schema','crash-aborted'::bytea,ARRAY[]::bytea[]),'hex')});
+$reader->quit;
+$node->stop('immediate'); $abandoned->quit;
+$node->start;
+is(readref('tags/captured'), $commit, 'committed history survives crash');
+is(readref('tags/abandoned'), '', 'uncommitted ref absent after crash');
+is(sql("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($aborted_hash).")"), 't', 'crash-aborted immutable object invisible');
+is(readref('heads/main'), $c2, 'prepared ref still invisible after recovery');
+failure("SET lock_timeout='100ms'; ".cas('heads/main', $main_token, $c1), qr/lock timeout/, 'prepared ref lock survives restart');
+is(sql('SELECT count(*) FROM live'), '0', 'prepared prolly changes remain invisible');
+$reader = $node->background_psql('postgres');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_dolt_ref');
+sql(q{COMMIT PREPARED 'manifest_commit'});
+is($reader->query_safe(q{SELECT encode(target,'hex') FROM dolt_manifest_read('heads/main')}), $c2, 'old snapshot keeps pre-publication HEAD');
+is($reader->query_safe(q{SELECT target IS NULL FROM dolt_manifest_read('working/main')}), 't', 'old snapshot excludes other ref in same publication');
+$reader->query_safe('COMMIT'); $reader->quit;
+is(readref('heads/main'), $prepared_commit, 'prepared HEAD commits after recovery');
+is(sql("SELECT kind FROM dolt_manifest_get(".hasharg($prepared_commit).")"), 'commit', 'new target object commits with prepared HEAD');
+is(readref('working/main'), $prepared_db, 'working ref commits with HEAD');
+is(sql('SELECT id FROM h'), '1', 'ordinary heap shares commit decision');
+is(sql('SET enable_seqscan=off; SELECT id FROM live WHERE id=1'), '1', 'prolly table and index share manifest commit decision');
+sql('BEGIN; '.cas('tags/prepare_abort', undef, $commit).q{; INSERT INTO h VALUES(2); PREPARE TRANSACTION 'manifest_abort'});
+$node->stop('immediate'); $node->start;
+sql(q{ROLLBACK PREPARED 'manifest_abort'});
+is(readref('tags/prepare_abort'), '', 'prepared abort remains invisible');
+is(sql('SELECT count(*) FROM h'), '1', 'prepared abort rolls back heap with ref');
+is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
+is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'TOAST object survives recovery');
+
+
+sql('CREATE ROLE reader');
+failure(q{SET ROLE reader; SELECT * FROM pg_dolt_object}, qr/permission denied/, 'objects not a public data oracle');
+failure(q{SET ROLE reader; SELECT dolt_manifest_read('heads/main')}, qr/permission denied/, 'internal functions restricted');
+sql('GRANT EXECUTE ON FUNCTION dolt_manifest_read(text) TO reader');
+failure(q{SET ROLE reader; SELECT dolt_manifest_read('heads/main')}, qr/require superuser/, 'C permission check survives accidental execute grant');
+sql('CREATE DATABASE other');
+is($node->safe_psql('other', q{SELECT count(*) FROM pg_dolt_ref}), '0', 'refs database-local');
+# Physical backup includes manifest metadata and historical chunks.
+$node->backup('history');
+my $restore = PostgreSQL::Test::Cluster->new('manifest_restore');
+$restore->init_from_backup($node, 'history');
+$restore->start;
+is($restore->safe_psql('postgres', q{SELECT encode(target,'hex') FROM dolt_manifest_read('tags/captured')}), $commit, 'physical backup preserves history ref');
+is($restore->safe_psql('postgres', "SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'physical backup preserves historical chunks');
+$restore->stop;
+$node->stop;
+done_testing();

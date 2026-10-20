@@ -9,5 +9,6 @@ tests += {
     't/003_types.pl',
     't/004_portability.pl',
     't/005_native.pl',
+    't/006_manifest.pl',
   ]},
 }
