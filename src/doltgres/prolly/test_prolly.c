@@ -79,10 +79,76 @@ test_tree(void)
 	free(keys); free(entries); pl_store_free(store);
 }
 
+typedef struct DiffResult
+{
+ unsigned inserts, removes, updates;
+ PLSlice previous;
+ bool have_previous;
+} DiffResult;
+
+static PLStatus
+count_diff(void *arg, PLSlice key, PLValue before, PLValue after)
+{
+ DiffResult *result = arg;
+ CHECK(!result->have_previous || pl_compare(result->previous, key) < 0);
+ result->previous = key; result->have_previous = true;
+ if (!before.present) result->inserts++;
+ else if (!after.present) result->removes++;
+ else result->updates++;
+ return PL_OK;
+}
+
+static PLStatus
+choose_right(void *arg, PLSlice key, PLValue base, PLValue left, PLValue right, PLValue *out)
+{
+ unsigned *calls = arg;
+ (void) key; (void) base; (void) left;
+ (*calls)++;
+ *out = right;
+ return PL_OK;
+}
+
+static void
+test_versions(void)
+{
+ PLStore *store = pl_store_create();
+ PLTree base, left, right, merged, expected, unchanged;
+ PLEntry entries[] = {{slice("a"), slice("one")}, {slice("b"), slice("two")},
+                     {slice("c"), slice("three")}};
+ PLEdit le[] = {{slice("a"), {true, slice("ONE")}}, {slice("d"), {true, slice("four")}}};
+ PLEdit re[] = {{slice("b"), {false, {NULL, 0}}}, {slice("z"), {true, {NULL, 0}}}};
+ DiffResult diff = {0};
+ unsigned calls = 0;
+ CHECK(store != NULL);
+ OK(pl_build(store, entries, 3, &base));
+ left = pl_branch(&base); right = pl_branch(&base);
+ OK(pl_apply(&left, le, 2, &left)); OK(pl_apply(&right, re, 2, &right));
+ OK(pl_diff(&base, &left, count_diff, &diff));
+ CHECK(diff.inserts == 1 && diff.updates == 1 && diff.removes == 0);
+ OK(pl_merge(&base, &left, &right, NULL, NULL, &merged));
+ OK(pl_apply(&left, re, 2, &expected));
+ CHECK(pl_hash_equal(merged.root, expected.root));
+ OK(pl_merge(&base, &right, &left, NULL, NULL, &expected));
+ CHECK(pl_hash_equal(merged.root, expected.root));
+ OK(pl_merge(&base, &base, &left, NULL, NULL, &expected));
+ CHECK(pl_hash_equal(expected.root, left.root));
+ re[0] = (PLEdit) {slice("a"), {false, {NULL, 0}}};
+ OK(pl_apply(&base, re, 2, &right));
+ unchanged = merged;
+ CHECK(pl_merge(&base, &left, &right, NULL, NULL, &merged) == PL_CONFLICT);
+ CHECK(pl_hash_equal(merged.root, unchanged.root));
+ OK(pl_merge(&base, &left, &right, choose_right, &calls, &merged));
+ CHECK(calls == 1);
+ OK(pl_apply(&left, re, 2, &expected));
+ CHECK(pl_hash_equal(merged.root, expected.root));
+ OK(pl_validate(&merged));
+ pl_store_free(store);
+}
+
 int
 main(void)
 {
-	test_tuples(); test_tree();
+	test_tuples(); test_tree(); test_versions();
 	printf("passed %u checks\n", checks);
 	return 0;
 }
