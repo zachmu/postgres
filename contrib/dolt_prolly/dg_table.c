@@ -12,6 +12,7 @@
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
 #include "fmgr.h"
+#include <openssl/evp.h>
 
 PG_FUNCTION_INFO_V1(dolt_prolly_table_handler);
 static TableAmRoutine methods;
@@ -99,6 +100,31 @@ dg_encode(Relation rel, TupleTableSlot *slot)
 	pfree(fields);
 	pfree(fixed);
 	return result;
+}
+PLHash
+dg_rowhash(PLSlice row)
+{
+	PLHash		hash;
+	unsigned int length = 0;
+
+	if (EVP_Digest(row.data, row.len, hash.bytes, &length, EVP_sha256(), NULL) != 1 || length != PL_HASH_SIZE)
+		elog(ERROR, "could not hash canonical row");
+	return hash;
+}
+static PLSlice
+row_for_handle(DGState *state, PLSlice hash)
+{
+	PLValue		value;
+	PLSlice		row;
+
+	if (hash.len != PL_HASH_SIZE)
+		elog(ERROR, "invalid prolly row reference");
+	dg_check(pl_get(&state->content, hash, &value));
+	if (!value.present || value.bytes.len < 8)
+		elog(ERROR, "missing canonical row contents");
+	row.data = value.bytes.data + 8;
+	row.len = value.bytes.len - 8;
+	return row;
 }
 void
 dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
@@ -214,7 +240,7 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	}
 	entry = &scan->rows.items[scan->position];
 	dg_tid(pl_read64(entry->key.data), &tid);
-	dg_decode(base->rs_rd, entry->value, &tid, slot);
+	dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
 	return true;
 }
 static bool
@@ -235,7 +261,7 @@ fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 		return false;
 	}
 	dg_check(status);
-	dg_decode(rel, value.bytes, tid, slot);
+	dg_decode(rel, row_for_handle(s, value.bytes), tid, slot);
 	dg_release(s);
 	return true;
 }
@@ -294,30 +320,36 @@ writer(Relation rel)
 static void
 multiplicity(DGState *s, PLSlice row, int delta)
 {
+	PLHash		hash = dg_rowhash(row);
+	PLSlice		key = {hash.bytes, PL_HASH_SIZE};
 	PLValue		old;
-	PLStatus	status = pl_get(&s->content, row, &old);
 	uint64		count;
-	uint8		bytes[8];
+	uint8	   *bytes;
 	PLEdit		edit;
 
-	if (status != PL_OK && status != PL_NOT_FOUND)
-		dg_check(status);
-	count = !old.present ? 0 : pl_read64(old.bytes.data);
+	dg_check(pl_get(&s->content, key, &old));
+	count = old.present ? pl_read64(old.bytes.data) : 0;
+	if (old.present && (old.bytes.len != row.len + 8 || memcmp(old.bytes.data + 8, row.data, row.len)))
+		elog(ERROR, "canonical row hash collision");
 	if (delta < 0 && !count)
 		elog(ERROR, "missing canonical row");
 	count = delta > 0 ? count + 1 : count - 1;
+	bytes = palloc(8 + row.len);
 	pl_write64(bytes, count);
-	edit.key = row;
+	memcpy(bytes + 8, row.data, row.len);
+	edit.key = key;
 	edit.value.present = count > 0;
 	edit.value.bytes.data = bytes;
-	edit.value.bytes.len = 8;
+	edit.value.bytes.len = 8 + row.len;
 	dg_check(pl_apply(&s->content, &edit, 1, &s->content));
+	pfree(bytes);
 }
 static void
 insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate)
 {
 	DGState    *s;
 	PLSlice		row;
+	PLHash		hash;
 	PLEdit		edit;
 	uint8		key[8];
 
@@ -329,7 +361,9 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	edit.key.data = key;
 	edit.key.len = 8;
 	edit.value.present = true;
-	edit.value.bytes = row;
+	hash = dg_rowhash(row);
+	edit.value.bytes.data = hash.bytes;
+	edit.value.bytes.len = PL_HASH_SIZE;
 	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
 	dg_tid(s->nextid++, &slot->tts_tid);
 	dg_save(rel, s, cid);
@@ -376,7 +410,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("prolly row changed; retry transaction")));
 	}
 	dg_check(status);
-	multiplicity(s, old.bytes, -1);
+	multiplicity(s, row_for_handle(s, old.bytes), -1);
 	edit.value.present = false;
 	edit.value.bytes.data = NULL;
 	edit.value.bytes.len = 0;

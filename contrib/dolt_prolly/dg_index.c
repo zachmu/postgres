@@ -5,6 +5,7 @@
 #include "access/table.h"
 #include "access/relscan.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_namespace_d.h"
 #include "lib/stringinfo.h"
@@ -63,7 +64,6 @@ dg_index_rebuild(Relation table, Relation index)
 	PLEntry    *entries;
 	size_t		i;
 	int			j;
-	uint64		total = 0;
 
 	if (table->rd_tableam != dg_table_routine())
 		dg_unsupported("prolly indexes on another table AM");
@@ -77,6 +77,8 @@ dg_index_rebuild(Relation table, Relation index)
 		Oid			type,
 					function = index->rd_support[j];
 		const char *expected;
+		static const char *operators[] = {"<", "<=", "=", ">=", ">"};
+		int			strategy;
 
 		if (att <= 0)
 			dg_unsupported("system-column indexes");
@@ -86,6 +88,15 @@ dg_index_rebuild(Relation table, Relation index)
 		expected = type == BOOLOID ? "btboolcmp" : type == INT2OID ? "btint2cmp" : type == INT4OID ? "btint4cmp" : type == INT8OID ? "btint8cmp" : type == TEXTOID ? "bttextcmp" : "byteacmp";
 		if (get_func_namespace(function) != PG_CATALOG_NAMESPACE || strcmp(get_func_name(function), expected))
 			dg_unsupported("custom index comparators");
+		for (strategy = 1; strategy <= 5; strategy++)
+		{
+			Oid			actual = get_opfamily_member(index->rd_opfamily[j], type, type, strategy);
+			Oid			wanted = OpernameGetOprid(list_make2(makeString("pg_catalog"), makeString(pstrdup(operators[strategy - 1]))), type, type);
+
+			if (!OidIsValid(actual) || actual != wanted)
+				dg_unsupported("custom index operators");
+		}
+
 	}
 	source = dg_load(table, SnapshotSelf);
 	target = dg_load(index, SnapshotSelf);
@@ -96,10 +107,10 @@ dg_index_rebuild(Relation table, Relation index)
 	{
 		StringInfoData key;
 		uint64		count = pl_read64(rows.items[i].value.data);
+		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
 		uint8	   *value;
 
 		initStringInfo(&key);
-		total += count;
 		for (j = 0; j < index->rd_index->indnkeyatts; j++)
 		{
 			int			attribute = index->rd_index->indkey.values[j] - 1;
@@ -109,7 +120,7 @@ dg_index_rebuild(Relation table, Relation index)
 
 			if (attribute < 0)
 				dg_unsupported("system-column indexes");
-			dg_check(pl_tuple_get(rows.items[i].key, attribute, &field));
+			dg_check(pl_tuple_get(row, attribute, &field));
 			appendStringInfoChar(&key, field.present ? 1 : (nullfirst ? 0 : 2));
 			if (field.present)
 				escaped(&key, field.bytes, desc);
@@ -120,11 +131,11 @@ dg_index_rebuild(Relation table, Relation index)
 		escaped(&key, rows.items[i].key, false);
 		sorted[i].entry.key.data = (uint8 *) key.data;
 		sorted[i].entry.key.len = key.len;
-		value = palloc(8 + rows.items[i].key.len);
+		value = palloc(8 + row.len);
 		pl_write64(value, count);
-		memcpy(value + 8, rows.items[i].key.data, rows.items[i].key.len);
+		memcpy(value + 8, row.data, row.len);
 		sorted[i].entry.value.data = value;
-		sorted[i].entry.value.len = 8 + rows.items[i].key.len;
+		sorted[i].entry.value.len = 8 + row.len;
 	}
 	qsort(sorted, rows.count, sizeof(*sorted), compare_entries);
 	for (i = 0; i < rows.count; i++)
@@ -299,9 +310,11 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	for (i = 0; i < rows.count; i++)
 	{
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+		PLHash		hash = dg_rowhash(row);
+		PLSlice		rowkey = {hash.bytes, PL_HASH_SIZE};
 
 		for (j = 0; j < handles.count; j++)
-			if (pl_compare(row, handles.items[j].value) == 0)
+			if (pl_compare(rowkey, handles.items[j].value) == 0)
 			{
 				ItemPointerData tid;
 

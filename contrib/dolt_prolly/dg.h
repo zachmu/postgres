@@ -27,6 +27,7 @@ typedef struct DGRows
 	size_t		capacity;
 } DGRows;
 extern void dg_check(PLStatus status);
+extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
