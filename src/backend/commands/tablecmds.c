@@ -4918,6 +4918,9 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 	AlteredTableInfo *tab;
 	AlterTablePass pass = AT_PASS_UNSET;
 
+	if (rel->rd_tableam && rel->rd_tableam->relation_validate_alter)
+		rel->rd_tableam->relation_validate_alter(rel, cmd);
+
 	/* Find or create work queue entry for this table */
 	tab = ATGetQueueEntry(wqueue, rel);
 

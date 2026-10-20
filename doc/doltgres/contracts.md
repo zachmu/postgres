@@ -1,6 +1,7 @@
 # Doltgres phase 0 contracts
 
-Status: executable design contracts for phase 1, not a production table AM.
+Status: design contracts with phase 1 evidence and an opt-in phase 2 AM baseline.
+The implementation remains experimental; see `contrib/dolt_prolly/README.md`.
 Base: PostgreSQL REL_18_6. Authority: workspace PLAN.md and design-questions.txt.
 
 ## Representation and identity
@@ -18,7 +19,8 @@ Base: PostgreSQL REL_18_6. Authority: workspace PLAN.md and design-questions.txt
   reconstructs mappings. Allocation is not truncation of a content hash.
 * Runtime occurrence/version handles distinguish duplicate rows and updates.
   They are retained while snapshots, index fetches, portals or prepared work
-  can reference them. TID adaptation is a phase 2 obligation, not yet selected.
+  can reference them. Phase 2 adapts runtime occurrence handles to ItemPointers, separately from
+  canonical row digests; full row-version chains and locking remain deferred.
 * Prototype keyless candidate: canonical row bytes -> multiplicity. This is an
   experiment, not a requirement to adopt Dolt's representation. Its criterion
   is equal multiset roots despite different occurrence handle allocation.
@@ -50,8 +52,10 @@ representations. No runtime OID, XID, padding or allocator state may enter them.
 Native tests compare fresh construction with incremental mutation, branching,
 merging, deletion, empty-value handling and old-root persistence. The former
 keyless multiplicity policy and canonical table/index wrapper were removed with
-the Python prototype; their eventual representation remains open. The current
-request prioritizes general C tree operations before PostgreSQL API integration.
+the Python prototype; their eventual representation remains open. The phase 2 adapter now implements a canonical digest-keyed row multiset,
+separate runtime handle roots, and ordered SQL indexes for a restricted type set.
+Canonical table leaves contain counts and packed tuples; internal keys are row
+digests. Full schema/SQL type canonicalization remains outside this baseline.
 
 ## Snapshots and publication
 
@@ -80,16 +84,16 @@ logical decoding. Production integration belongs to phases 2–3.
 
 ## Compatibility matrix
 
-| Feature | Requirement | Phase 1 experiment |
+| Feature | Requirement | Current evidence |
 | --- | --- | --- |
-| Heap replacement | PostgreSQL table-AM semantics | Native C byte-map/tuple prototype; no table AM |
-| User btree | Actual prolly index trees, unique/order/include semantics | Generic keyed maps; no SQL index AM replacement yet |
-| Other user index AMs | Explicit rejection in first product draft | Existing server unchanged until phase 2 |
+| Heap replacement | PostgreSQL table-AM semantics | Opt-in C table AM; restricted types, serialized writers |
+| User btree | Actual prolly index trees, unique/order/include semantics | Prolly ordered index AM, btree routing, unique/order/INCLUDE tests |
+| Other user index AMs | Explicit rejection in first product draft | Explicit rejection on prolly tables; heap tables unchanged |
 | Catalogs | Divergent branch definitions in one query | Test projection with real relation/type OIDs |
 | OIDs | Built-ins unchanged, stable runtime mappings desirable | Exclude from hashes; test distinct branch objects |
-| MVCC/locking | PostgreSQL semantics, separate metadata | Snapshot/publication contract model plus real SQL catalog tests |
-| WAL | Recovery authority for chunks and decisions | Crash-prefix model; no custom rmgr yet |
-| PREPARE/savepoints | Preserve PostgreSQL behavior | Publication model / real catalog DDL rollback |
+| MVCC/locking | PostgreSQL semantics, separate metadata | MVCC root records and retained snapshots; fine-grained locking deferred |
+| WAL | Recovery authority for chunks and decisions | Generic WAL relation pages; real immediate-restart tests |
+| PREPARE/savepoints | Preserve PostgreSQL behavior | Basic prepared mixed heap/prolly recovery and savepoint tests |
 | Implicit commit | Standalone top-level form initially | Not enabled by phase 1 |
 | Sequences | Shared local allocator, versioned definition | Definition-only canonical state; bootstrap deferred |
 | Replication | WAL and logical replication to fork instances | Explicit later integration, not provided by the model |

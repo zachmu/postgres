@@ -33,6 +33,7 @@ extern PGDLLIMPORT char *default_table_access_method;
 extern PGDLLIMPORT bool synchronize_seqscans;
 
 
+struct AlterTableCmd;
 struct BulkInsertStateData;
 struct IndexInfo;
 struct SampleScanState;
@@ -580,6 +581,10 @@ typedef struct TableAmRoutine
 	 * DDL related functionality.
 	 * ------------------------------------------------------------------------
 	 */
+
+	/* Optional policy hooks, called before catalog changes are prepared. */
+	const char *(*relation_index_am) (Relation rel, const char *requested);
+	void (*relation_validate_alter) (Relation rel, struct AlterTableCmd *cmd);
 
 	/*
 	 * This callback needs to create new relation storage for `rel`, with
