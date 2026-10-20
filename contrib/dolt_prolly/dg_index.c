@@ -101,6 +101,7 @@ dg_index_rebuild(Relation table, Relation index)
 		}
 
 	}
+	dg_validate_descriptor(RelationGetDescr(table));
 	source = dg_load(table, SnapshotSelf);
 	target = dg_load(index, SnapshotSelf);
 	rows = dg_rows(&source->content);

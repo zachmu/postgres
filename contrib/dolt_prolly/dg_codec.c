@@ -10,7 +10,6 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
-#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -36,24 +35,120 @@ pack_fields(PLValue *fields, int count)
 	return result;
 }
 
+/*
+ * Validate schema, not just non-NULL datums. The recursive codecs strip array
+ * element/composite type OIDs; arbitrary binary senders need not do so. Only
+ * audited built-in binary formats and enum labels may reach that fallback.
+ * Do not cache this check: ALTER TYPE can change a nested composite descriptor.
+ */
+static void
+check_type_recursive(Oid type, List *ancestors)
+{
+	Oid			element;
+	char		kind;
+
+	check_stack_depth();
+	type = getBaseType(type);
+	if (list_member_oid(ancestors, type))
+		return;
+	ancestors = lappend_oid(list_copy(ancestors), type);
+	element = get_element_type(type);
+	kind = get_typtype(type);
+	if (OidIsValid(element))
+		check_type_recursive(element, ancestors);
+	else if (kind == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
+		int			i;
+
+		for (i = 0; i < desc->natts; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				check_type_recursive(TupleDescAttr(desc, i)->atttypid, ancestors);
+		ReleaseTupleDesc(desc);
+	}
+	else if (kind != TYPTYPE_ENUM)
+	{
+		switch (type)
+		{
+				/*
+				 * Scalar senders below serialize values, never local object
+				 * IDs.
+				 */
+			case BOOLOID:
+			case BYTEAOID:
+			case CHAROID:
+			case NAMEOID:
+			case INT2OID:
+			case INT4OID:
+			case INT8OID:
+			case TEXTOID:
+			case BPCHAROID:
+			case VARCHAROID:
+			case FLOAT4OID:
+			case FLOAT8OID:
+			case NUMERICOID:
+			case CASHOID:
+			case DATEOID:
+			case TIMEOID:
+			case TIMETZOID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+			case INTERVALOID:
+			case BITOID:
+			case VARBITOID:
+			case UUIDOID:
+			case INETOID:
+			case CIDROID:
+			case MACADDROID:
+			case MACADDR8OID:
+			case POINTOID:
+			case LSEGOID:
+			case PATHOID:
+			case BOXOID:
+			case POLYGONOID:
+			case LINEOID:
+			case CIRCLEOID:
+			case JSONOID:
+			case JSONBOID:
+			case JSONPATHOID:
+			case XMLOID:
+			case TSVECTOROID:
+			case TSQUERYOID:
+
+				/*
+				 * These senders omit the in-memory range type OID. Their
+				 * bound types are known portable scalars. User-defined range
+				 * senders may delegate to array_send/record_send, which embed
+				 * type OIDs.
+				 */
+			case INT4RANGEOID:
+			case INT8RANGEOID:
+			case NUMRANGEOID:
+			case TSRANGEOID:
+			case TSTZRANGEOID:
+			case DATERANGEOID:
+			case INT4MULTIRANGEOID:
+			case INT8MULTIRANGEOID:
+			case NUMMULTIRANGEOID:
+			case TSMULTIRANGEOID:
+			case TSTZMULTIRANGEOID:
+			case DATEMULTIRANGEOID:
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("prolly storage rejects type %s", format_type_be(type)),
+						 errdetail("Only codecs verified to exclude non-portable identifiers are supported."),
+						 errhint("OID and other local identifier translation is not implemented.")));
+		}
+	}
+	list_free(ancestors);
+}
+
 static void
 check_type(Oid type)
 {
-	Oid			function,
-				parameter;
-	bool		varlena;
-
-	type = getBaseType(type);
-	if (type == ACLITEMOID || type == PG_NODE_TREEOID)
-		return;
-	if (type == GTSVECTOROID || type == PG_NDISTINCTOID ||
-		type == PG_DEPENDENCIESOID || type == PG_MCV_LISTOID ||
-		type == PG_BRIN_BLOOM_SUMMARYOID ||
-		type == PG_BRIN_MINMAX_MULTI_SUMMARYOID || get_typtype(type) == TYPTYPE_PSEUDO)
-		dg_unsupported("internal-only or pseudo column types");
-	/* Arrays and composites validate their component codecs when used. */
-	getTypeBinaryOutputInfo(type, &function, &varlena);
-	getTypeBinaryInputInfo(type, &function, &parameter);
+	check_type_recursive(type, NIL);
 }
 
 void
@@ -219,8 +314,6 @@ decode_array(Oid type, Oid element, PLSlice bytes)
 	/* Catalog vectors keep one zero-length dimension, unlike empty arrays. */
 	if (count == 0 && type == INT2VECTOROID)
 		return PointerGetDatum(buildint2vector(NULL, 0));
-	if (count == 0 && type == OIDVECTOROID)
-		return PointerGetDatum(buildoidvector(NULL, 0));
 	values = palloc0(sizeof(*values) * Max(count, 1));
 	nulls = palloc(sizeof(*nulls) * Max(count, 1));
 	for (i = 0; i < count; i++)
@@ -307,7 +400,7 @@ encode_value(Oid type, Datum value)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
+	if (type == TEXTOID || type == BYTEAOID)
 	{
 		struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
 
@@ -327,19 +420,7 @@ encode_value(Oid type, Datum value)
 			data, 8
 		};
 	}
-	if (type == ACLITEMOID)
-	{
-		AclItem    *acl = DatumGetAclItemP(value);
 
-		data = palloc(16);
-		pl_write32(data, acl->ai_grantee);
-		pl_write32(data + 4, acl->ai_grantor);
-		pl_write64(data + 8, acl->ai_privs);
-		return (PLSlice)
-		{
-			data, 16
-		};
-	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return encode_array(element, value);
@@ -363,7 +444,7 @@ decode_value(Oid type, PLSlice bytes)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
+	if (type == TEXTOID || type == BYTEAOID)
 	{
 		struct varlena *v = palloc(VARHDRSZ + bytes.len);
 
@@ -380,17 +461,7 @@ decode_value(Oid type, PLSlice bytes)
 		n = (int64) (pl_read64(bytes.data) ^ UINT64CONST(0x8000000000000000));
 		return type == BOOLOID ? BoolGetDatum(n != 0) : type == INT2OID ? Int16GetDatum(n) : type == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
 	}
-	if (type == ACLITEMOID)
-	{
-		AclItem    *acl = palloc(sizeof(*acl));
 
-		if (bytes.len != 16)
-			elog(ERROR, "invalid prolly ACL encoding");
-		acl->ai_grantee = pl_read32(bytes.data);
-		acl->ai_grantor = pl_read32(bytes.data + 4);
-		acl->ai_privs = pl_read64(bytes.data + 8);
-		return PointerGetDatum(acl);
-	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return decode_array(type, element, bytes);
@@ -444,7 +515,10 @@ dg_encode(Relation rel, TupleTableSlot *slot)
 void
 dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 {
-	HeapTuple	tuple = decode_fields(RelationGetDescr(rel), bytes);
+	HeapTuple	tuple;
+
+	dg_validate_descriptor(RelationGetDescr(rel));
+	tuple = decode_fields(RelationGetDescr(rel), bytes);
 
 	tuple->t_self = *tid;
 	tuple->t_tableOid = RelationGetRelid(rel);
