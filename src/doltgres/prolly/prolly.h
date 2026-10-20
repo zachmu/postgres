@@ -71,6 +71,11 @@ typedef PLStatus (*PLResolveFn) (void *arg, PLSlice key, PLValue base,
  * Replay bypasses this callback; duplicate chunks do not invoke it.
  */
 typedef PLStatus (*PLBeforeWriteFn) (void *arg, PLHash hash, PLSlice bytes);
+
+/* File open loads all chunks, locks exclusively, and leaves out unchanged on error.
+ * repair_tail permits truncating an incomplete final record for subsequent replay.
+ * sync is explicit; free does not promise durability. Root refs are external.
+ */
 PLStatus	pl_store_open_file(const char *path, bool repair_tail,
 							   PLBeforeWriteFn before_write, void *arg, PLStore **out);
 PLStatus	pl_store_sync(PLStore *store);
