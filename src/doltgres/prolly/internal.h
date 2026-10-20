@@ -28,8 +28,15 @@ struct PLStore
 	PLNode	  **buckets;
 	size_t		capacity;
 	PLStats		stats;
+	int			fd;
+	bool		loading;
+	bool		replaying;
+	bool		failed;
+	PLBeforeWriteFn before_write;
+	void	   *write_arg;
 };
 
+PLStatus	pl_file_append(PLStore *store, PLHash hash, PLSlice bytes);
 uint32_t	pl_read32(const uint8_t *p);
 uint64_t	pl_read64(const uint8_t *p);
 void		pl_write32(uint8_t *p, uint32_t v);

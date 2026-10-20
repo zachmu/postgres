@@ -2,6 +2,7 @@
 #include "internal.h"
 #include <openssl/evp.h>
 #include <limits.h>
+#include <unistd.h>
 
 static const uint8_t node_magic[8] = {'D', 'G', 'P', 'T', 'R', '0', '0', '1'};
 
@@ -62,7 +63,7 @@ const char *
 pl_status_string(PLStatus status)
 {
 	static const char *const names[] = {"ok", "not found", "invalid input",
-	"out of memory", "corrupt content", "merge conflict", "stopped"};
+	"out of memory", "corrupt content", "merge conflict", "stopped", "I/O error", "store busy"};
 
 	return (unsigned) status < sizeof(names) / sizeof(names[0]) ? names[status] : "unknown";
 }
@@ -74,6 +75,7 @@ pl_store_create(void)
 
 	if (!store)
 		return NULL;
+	store->fd = -1;
 	store->capacity = 256;
 	store->buckets = calloc(store->capacity, sizeof(*store->buckets));
 	if (!store->buckets)
@@ -104,6 +106,8 @@ pl_store_free(PLStore *store)
 			node = next;
 		}
 	}
+	if (store->fd >= 0)
+		close(store->fd);
 	free(store->buckets);
 	free(store);
 }
@@ -223,6 +227,10 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 	PLNode	   *node = pl_find(store, hash);
 	size_t		bucket;
 
+	if (!store)
+		return PL_INVALID;
+	if (store->failed)
+		return PL_IO;
 	if (node)
 	{
 		if (node->size != length || memcmp(node->data, bytes, length) != 0)
@@ -278,6 +286,18 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 		free(store->buckets);
 		store->buckets = buckets;
 		store->capacity = capacity;
+	}
+	if (store->fd >= 0 && !store->loading)
+	{
+		PLSlice		data = {bytes, length};
+		PLStatus	status = pl_file_append(store, hash, data);
+
+		if (status != PL_OK)
+		{
+			free(node->data);
+			free(node);
+			return status;
+		}
 	}
 	bucket = pl_read64(hash.bytes) % store->capacity;
 	node->next = store->buckets[bucket];

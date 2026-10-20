@@ -11,7 +11,7 @@
 
 typedef enum PLStatus
 {
-	PL_OK, PL_NOT_FOUND, PL_INVALID, PL_NOMEM, PL_CORRUPT, PL_CONFLICT, PL_STOP
+	PL_OK, PL_NOT_FOUND, PL_INVALID, PL_NOMEM, PL_CORRUPT, PL_CONFLICT, PL_STOP, PL_IO, PL_BUSY
 } PLStatus;
 
 typedef struct PLSlice
@@ -65,6 +65,21 @@ typedef PLStatus (*PLDiffFn) (void *arg, PLSlice key, PLValue before, PLValue af
 /* Resolver output is copied immediately; input values are borrowed from stores. */
 typedef PLStatus (*PLResolveFn) (void *arg, PLSlice key, PLValue base,
 								 PLValue left, PLValue right, PLValue *result);
+
+/* Called before a new chunk can reach disk. A WAL adapter must insert AND
+ * flush its chunk record before returning PL_OK. Never reenter this store.
+ * Replay bypasses this callback; duplicate chunks do not invoke it.
+ */
+typedef PLStatus (*PLBeforeWriteFn) (void *arg, PLHash hash, PLSlice bytes);
+
+/* File open loads all chunks, locks exclusively, and leaves out unchanged on error.
+ * repair_tail permits truncating an incomplete final record for subsequent replay.
+ * sync is explicit; free does not promise durability. Root refs are external.
+ */
+PLStatus	pl_store_open_file(const char *path, bool repair_tail,
+							   PLBeforeWriteFn before_write, void *arg, PLStore **out);
+PLStatus	pl_store_sync(PLStore *store);
+PLStatus	pl_store_replay(PLStore *store, PLHash hash, PLSlice bytes);
 
 PLStore    *pl_store_create(void);
 void		pl_store_free(PLStore *store);

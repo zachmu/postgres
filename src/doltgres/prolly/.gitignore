@@ -1,3 +1,4 @@
 *.o
 *.a
 /test_prolly
+/test_file_store

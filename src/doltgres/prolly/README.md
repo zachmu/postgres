@@ -194,9 +194,93 @@ The 5,000-entry localized-edit test creates three new chunks and reuses 119
 unchanged leaf chunks with current parameters. These are regression observations,
 not guarantees for arbitrary inputs.
 
-Not implemented: on-disk chunk files, GC/ref persistence, WAL, SQL transactions,
+Not implemented: GC/ref persistence, PostgreSQL WAL integration, SQL transactions,
 PostgreSQL AM callbacks, collation/operator classes, schema/catalog versioning,
 compression, prefix-truncated keys, parallel/thread-safe access, or out-of-line
 large values. Store destruction releases all chunks; every retained root is
 valid for the full store lifetime. No PostgreSQL core behavior is changed by
 building this library.
+
+## File-backed chunk storage and recovery boundary
+
+`pl_store_create()` retains the memory-only option. The POSIX file backend is
+opened with `pl_store_open_file(path, repair_tail, before_write, arg, &store)`.
+It creates a file if absent, takes a nonblocking exclusive advisory file lock,
+validates existing records, and reconstructs the node cache. A second cooperating
+opener gets `PL_BUSY`. A failed open leaves the output unchanged. Parent
+directories must already exist. Do not rename/unlink the file or modify it outside
+this API while it is open; all users must respect the lock.
+
+New unique chunks append to the file before becoming visible in the cache.
+Existing chunks deduplicate without appending. Opening currently scans and
+retains **all** chunks in memory; this adds actual persistent storage, not bounded
+memory use. The store lock is an initial single-owner constraint, not a final
+PostgreSQL multi-process concurrency design. This backend targets POSIX systems.
+
+Each append has this endian-independent framing:
+
+```
+magic "DGCHNK01"       8 bytes
+payload length        uint64 big-endian
+chunk SHA-256         32 bytes (hash of canonical node payload)
+header SHA-256        32 bytes (hash of preceding 48 header bytes)
+payload               canonical DGPTR001 node bytes
+```
+
+Both checksums and the node encoding are verified on open. Child DAG validation
+still occurs when `pl_open` opens a root. Chunks can arrive out of order during
+replay, so the file loader does not require their children to precede them.
+The file is a chunk container, **not PostgreSQL WAL**. Its format is experimental.
+
+`pl_store_sync()` fsyncs the chunk file and reports failure. Open also fsyncs the
+file and its parent directory to persist a newly created pathname. Successful
+writes alone do not promise durability; `pl_store_free()` closes without an
+implicit durability promise. A write or sync failure poisons the handle: further
+writes and syncs return `PL_IO`. Reads of previously cached chunks remain possible.
+Close and recover/reopen before writing again. A callback rejection before any
+file write leaves the handle usable and the chunk uninstalled.
+
+### Future WAL contract
+
+The optional `PLBeforeWriteFn` receives the hash and complete serialized bytes
+before a new chunk can reach the operating system. A future PostgreSQL adapter
+must insert the corresponding redo record **and flush WAL through that record**
+before returning `PL_OK`. Kernel writeback can persist a chunk even without an
+explicit chunk fsync, so delaying that WAL flush until `pl_store_sync()` would
+violate the ordering contract. The callback must not reenter the store. Without
+a callback the file store is standalone and has no WAL protection.
+
+This is deliberately a conservative flush-per-chunk boundary. A production
+adapter can later batch WAL flushes using staged chunks and explicit LSN tracking;
+no PostgreSQL LSN type, resource manager or WAL record implementation exists here.
+
+`pl_store_replay()` validates and installs an immutable chunk while bypassing the
+normal WAL callback. Duplicate replay is idempotent. It does not sync, commit a
+transaction, publish a root or infer which roots were committed. The recovery
+caller must replay required chunks, validate referenced roots and sync recovered
+storage as appropriate before exposing it.
+
+Root publication belongs above the chunk store. Standalone durable publication
+must sync chunks before durably publishing a referencing root. WAL-based
+publication will instead require a durable commit/root record and sufficient
+retained redo to reconstruct every referenced chunk; checkpoints may retire redo
+only after chunks and root metadata are safely persisted. Neither root refs nor
+commit/checkpoint/retention logic are implemented in this library.
+
+### Incomplete tails and recovery tests
+
+Strict open (`repair_tail=false`) rejects incomplete headers or payloads without
+truncating anything. Explicit recovery open (`true`) truncates an incomplete last
+record to the last validated record boundary and fsyncs the repair. It never
+silently skips a complete record with a bad header/payload checksum or encoding.
+Only use repair when recovery owns the file and can replay any missing chunks.
+A loss at an exact record boundary cannot be detected by framing alone; the
+transaction layer must know required roots/chunks and recover them from WAL.
+
+`make check` runs the entire tree/branch/diff/merge suite twice, using memory and
+real file stores. Additional file tests cover reopening multi-level trees,
+historical roots, diffs after reopen, every partial-record prefix, prefix
+preservation, repeatable replay, callback ordering/rejection, payload/header
+corruption, exclusive ownership, write errors and a separate process exiting
+without cleanup. These are controlled recovery tests, not a hardware power-loss
+simulation or a claim that PostgreSQL crash recovery has been integrated.
