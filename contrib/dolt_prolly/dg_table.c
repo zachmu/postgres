@@ -27,80 +27,6 @@ typedef struct DGScan
 	int64		position;
 } DGScan;
 
-void
-dg_validate_descriptor(TupleDesc desc)
-{
-	int			i;
-
-	for (i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute a = TupleDescAttr(desc, i);
-
-		if (a->attisdropped)
-			dg_unsupported("dropped columns");
-		switch (a->atttypid)
-		{
-			case BOOLOID:
-			case INT2OID:
-			case INT4OID:
-			case INT8OID:
-			case BYTEAOID:
-				break;
-			case TEXTOID:
-				if (!pg_newlocale_from_collation(a->attcollation)->collate_is_c)
-					dg_unsupported("non-C text collations");
-				break;
-			default:
-				dg_unsupported("this column type (supported: boolean, smallint, integer, bigint, text COLLATE C, bytea)");
-		}
-	}
-}
-PLSlice
-dg_encode(Relation rel, TupleTableSlot *slot)
-{
-	TupleDesc	desc = RelationGetDescr(rel);
-	PLValue    *fields = palloc0(sizeof(PLValue) * desc->natts);
-	uint8		(*fixed)[8] = palloc0(8 * desc->natts);
-	uint8	   *packed;
-	size_t		length;
-	int			i;
-	PLSlice		result;
-
-	dg_validate_descriptor(desc);
-	slot_getallattrs(slot);
-	for (i = 0; i < desc->natts; i++)
-	{
-		Datum		d = slot->tts_values[i];
-		Oid			type = TupleDescAttr(desc, i)->atttypid;
-
-		fields[i].present = !slot->tts_isnull[i];
-		if (!fields[i].present)
-			continue;
-		if (type == TEXTOID || type == BYTEAOID)
-		{
-			struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
-
-			fields[i].bytes.data = (uint8 *) VARDATA_ANY(v);
-			fields[i].bytes.len = VARSIZE_ANY_EXHDR(v);
-		}
-		else
-		{
-			int64		n = type == BOOLOID ? DatumGetBool(d) : type == INT2OID ? DatumGetInt16(d) : type == INT4OID ? DatumGetInt32(d) : DatumGetInt64(d);
-
-			pl_key_int64(n, fixed[i]);
-			fields[i].bytes.data = fixed[i];
-			fields[i].bytes.len = 8;
-		}
-	}
-	dg_check(pl_tuple_pack(fields, desc->natts, &packed, &length));
-	result.data = palloc(length);
-	result.len = length;
-	memcpy((void *) result.data, packed, length);
-	free(packed);
-	pfree(fields);
-	pfree(fixed);
-	return result;
-}
 PLHash
 dg_rowhash(PLSlice row)
 {
@@ -125,56 +51,6 @@ row_for_handle(DGState *state, PLSlice hash)
 	row.data = value.bytes.data + 8;
 	row.len = value.bytes.len - 8;
 	return row;
-}
-void
-dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
-{
-	TupleDesc	desc = RelationGetDescr(rel);
-	Datum	   *values = palloc0(sizeof(Datum) * desc->natts);
-	bool	   *nulls = palloc0(sizeof(bool) * desc->natts);
-	HeapTuple	tuple;
-	int			i;
-
-	if (bytes.len < 12 || pl_read32(bytes.data + 8) != (uint32) desc->natts)
-		dg_unsupported("schema changes to stored tuples");
-	for (i = 0; i < desc->natts; i++)
-	{
-		PLValue		field;
-		Oid			type = TupleDescAttr(desc, i)->atttypid;
-
-		dg_check(pl_tuple_get(bytes, i, &field));
-		nulls[i] = !field.present;
-		if (!field.present)
-			continue;
-		if (type == TEXTOID || type == BYTEAOID)
-		{
-			struct varlena *v = palloc(VARHDRSZ + field.bytes.len);
-
-			SET_VARSIZE(v, VARHDRSZ + field.bytes.len);
-			memcpy(VARDATA(v), field.bytes.data, field.bytes.len);
-			values[i] = PointerGetDatum(v);
-		}
-		else
-		{
-			int64		n;
-
-			if (field.bytes.len != 8)
-				elog(ERROR, "invalid prolly integer encoding");
-			n = (int64) (pl_read64(field.bytes.data) ^ UINT64CONST(0x8000000000000000));
-			values[i] = type == BOOLOID ? BoolGetDatum(n != 0) : type == INT2OID ? Int16GetDatum(n) : type == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
-		}
-	}
-	tuple = heap_form_tuple(desc, values, nulls);
-	tuple->t_self = *tid;
-	tuple->t_tableOid = RelationGetRelid(rel);
-	for (i = 0; i < desc->natts; i++)
-		if (!nulls[i] && !TupleDescAttr(desc, i)->attbyval)
-			pfree(DatumGetPointer(values[i]));
-	pfree(values);
-	pfree(nulls);
-	ExecForceStoreHeapTuple(tuple, slot, true);
-	slot->tts_tid = *tid;
-	slot->tts_tableOid = RelationGetRelid(rel);
 }
 static const TupleTableSlotOps *
 slots(Relation rel)

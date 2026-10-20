@@ -50,7 +50,7 @@ CREATE OPERATOR CLASS misleading_ops FOR TYPE int USING dolt_prolly_index AS
 CREATE INDEX bad_operators ON p(id misleading_ops);
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
 ALTER TABLE p ADD COLUMN bad int;
-CREATE TABLE bad_type(v numeric) USING dolt_prolly_table;
+CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
 SELECT * FROM p FOR UPDATE;
 DROP TABLE p,q,u,large_text;

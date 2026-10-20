@@ -83,6 +83,9 @@ dg_index_rebuild(Relation table, Relation index)
 		if (att <= 0)
 			dg_unsupported("system-column indexes");
 		type = TupleDescAttr(RelationGetDescr(table), att - 1)->atttypid;
+		if (type != BOOLOID && type != INT2OID && type != INT4OID &&
+			type != INT8OID && type != TEXTOID && type != BYTEAOID)
+			dg_unsupported("ordered index keys of this type");
 		if (type == TEXTOID && !pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
 			dg_unsupported("non-C index collations");
 		expected = type == BOOLOID ? "btboolcmp" : type == INT2OID ? "btint2cmp" : type == INT4OID ? "btint4cmp" : type == INT8OID ? "btint8cmp" : type == TEXTOID ? "bttextcmp" : "byteacmp";

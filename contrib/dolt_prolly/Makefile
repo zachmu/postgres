@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := all
 MODULE_big = dolt_prolly
-OBJS = dg_store.o dg_table.o dg_index.o pl_store.o pl_tree.o pl_tuple.o pl_version.o pl_file.o
+OBJS = dg_store.o dg_table.o dg_codec.o dg_index.o pl_store.o pl_tree.o pl_tuple.o pl_version.o pl_file.o
 EXTENSION = dolt_prolly
 DATA = dolt_prolly--1.0.sql
 SHLIB_LINK = -lcrypto
