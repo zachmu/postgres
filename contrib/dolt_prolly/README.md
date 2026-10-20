@@ -11,6 +11,7 @@ Build and install this PostgreSQL fork, including the new TableAmRoutine policy
 callbacks. When changing that header, rebuild the server and extension together;
 a full clean build avoids stale objects in builds without dependency tracking.
 OpenSSL development headers and libcrypto are required by the prolly library.
+Build PostgreSQL with `--with-libxml` to enable XML values and their tests.
 
 ```
 make -C contrib/dolt_prolly USE_PGXS=1 PG_CONFIG=/path/to/installed/pg_config
@@ -54,7 +55,8 @@ A separate runtime tree maps monotonically allocated 64-bit occurrence handles
 to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
-XIDs, tuple padding, OIDs and lock bits are not in canonical row encodings.
+XIDs, tuple padding and lock bits are not in canonical row encodings. OID-valued
+SQL data is preserved as supplied; see the serialization scope below.
 Row fetches resolve the handle to a digest, then look up the actual tuple in the
 canonical content tree. Both trees physically live in the relation's chunk container.
 
@@ -132,23 +134,90 @@ Existing planner search, executor operators, lock tags, caches and transaction
 commit logic are unchanged. Index planner integration supplies capabilities,
 operator classes and a generic cost estimate. Estimates are deliberately crude.
 
+### Tuple serialization and type coverage
+
+`dg_codec.c` owns value serialization independently of ordered index keys. The
+original boolean, int2/int4/int8, text and bytea encodings remain compatible.
+Other scalar types use PostgreSQL binary send/receive functions with a `DGB1`
+version envelope. These functions run with database encoding, then restore the
+client's encoding even on errors. Binary XML reads use CONTENT mode so stored
+fragments remain readable when a session selects DOCUMENT mode.
+
+Supported table values include all ordinary PostgreSQL built-in scalar families:
+booleans, integers, floats, numeric, money, character/string and binary types,
+dates/times/intervals, bit strings, UUIDs, network addresses, geometric types,
+JSON/JSONB/JSONPath, XML (with libxml), full-text values, OIDs and reg* aliases,
+transaction/command IDs, TIDs, LSNs, snapshots, refcursors, ACL items, and every
+built-in range and multirange. Table values accept any column collation.
+
+Arrays recursively encode dimensions, lower bounds, NULLs and element values;
+named composites recursively encode their fields. Both use the versioned
+`DGTUP001` packed-field envelope and avoid heap padding and embedded TOAST
+pointers. Domains use their base-type codec: assignment still enforces domain
+constraints, but reads do not revalidate already stored values. Enums use their
+standard binary label serialization. Custom types with binary send/receive
+functions use the same path; deterministic custom serialization remains the
+type author's responsibility. Custom types with only text I/O are not supported.
+
+Explicit exceptions to generic binary I/O:
+
+* `aclitem` has no binary I/O pair; it encodes grantee OID, grantor OID and
+  privilege bits as 4/4/8 big-endian bytes. Recursive arrays also support ACLs.
+* `pg_node_tree` copies existing catalog payload bytes, without calling its
+  deliberately disabled input function or enabling SQL input of arbitrary nodes.
+* Empty `int2vector`/`oidvector` retain the one-dimensional, zero-based catalog
+  vector layout instead of the ordinary empty-array layout.
+* PostgreSQL 18's binary `tsquery` receiver rejects a zero-item query. The adapter
+  recognizes its exact four-byte zero-count payload and reconstructs an empty
+  query; nonempty queries use the standard receiver.
+
+History independence is about serialized value contents under fixed schema and
+format definitions, not SQL equality. Numeric scales and signed floating-point
+zeros can retain distinct bytes. Comparisons, ordering and uniqueness still
+belong to PostgreSQL's operators and the index adapter.
+
+These formats are experimental and tied to this PostgreSQL/type-codec version.
+OID-valued data, ACL role identifiers and embedded references in `pg_node_tree`
+remain local identities. Portable symbolic references and clone/restore remapping
+are future catalog integration work; this change does not make such values
+portable across independently allocated catalogs. Changing a composite type's
+schema after storing values is not supported by the historical decoding design.
+
+Incoming TOAST values are detoasted before serialization, including nested
+values. Canonical payloads remain inline in the tuple leaf, fragmented over
+relation pages as needed. The PLAN's content-addressed out-of-line payload chunks
+are a separate, pending implementation. The standalone codec's 16 MiB packed
+item limit remains; PostgreSQL's maximum varlena size is not yet supported.
+
 ## Supported and deferred surface
 
-Tested: permanent tables containing boolean, int2/int4/int8, text COLLATE "C",
-and bytea; NULL and empty values; duplicate rows; large inline canonical values;
-sequential scans; ordered and index-only scans; simple multicolumn indexes with
-ASC/DESC, NULL ordering and INCLUDE; immediate unique/primary-key constraints;
+Tested: permanent tables with the value types described above; NULL and empty
+values; duplicate rows; large inline canonical values; sequential scans;
+ordered and index-only scans; simple multicolumn indexes with ASC/DESC, NULL
+ordering and INCLUDE; immediate unique/primary-key constraints;
 insert/update/delete and RETURNING; joins; transaction/savepoint rollback;
 transactional TRUNCATE; retained reader snapshots and crash recovery.
 
-Explicitly unsupported: other SQL types/collations, expression/partial indexes,
-custom comparators, other index families, deferred uniqueness, ON CONFLICT,
-row locking, concurrent index builds, SERIALIZABLE isolation, parallel scans,
-TABLESAMPLE, ANALYZE, VACUUM/FULL, CLUSTER and most ALTER TABLE. CTID/tableoid are
-available; heap transaction system columns are not supplied by virtual slots.
-Temporary/unlogged tables are rejected. Runtime tuple-version chain following
-is not implemented. General concurrent update/recheck behavior, foreign keys,
-logical decoding/replication and complete DDL coverage are not claimed.
+Ordered index keys still support only boolean, int2/int4/int8, text with C-like
+collation, and bytea. New types may appear in other table columns and INCLUDE
+payloads. Their binary serialization is not an order-preserving key encoding;
+new ordered opclasses require separate implementation. Non-C index collations
+and custom comparators remain rejected.
+
+Internal-only types `gtsvector`, `pg_ndistinct`, `pg_dependencies`, `pg_mcv_list`,
+`pg_brin_bloom_summary` and `pg_brin_minmax_multi_summary` are explicitly rejected.
+They do not provide general value I/O round trips; copying opaque native bytes
+would not establish a portable storage codec. Pseudo-types are also unsupported;
+PostgreSQL itself disallows ordinary table columns of these types.
+
+Other explicitly unsupported features: expression/partial indexes, other index
+families, deferred uniqueness, ON CONFLICT, row locking, concurrent index builds,
+SERIALIZABLE isolation, parallel scans, TABLESAMPLE, ANALYZE, VACUUM/FULL, CLUSTER
+and most ALTER TABLE. CTID/tableoid are available; heap transaction system
+columns are not supplied by virtual slots. Temporary/unlogged tables are
+rejected. Runtime tuple-version chain following is not implemented. General
+concurrent update/recheck behavior, foreign keys, logical decoding/replication
+and complete DDL coverage are not claimed.
 
 Roots contain table/index contents, not the external canonical schema identity;
 hash comparisons assume the same schema and encoding contract. Standalone Dolt
@@ -168,3 +237,11 @@ backend's commit, reject a stale writer, exercise prepared mixed heap/prolly
 transactions, and restart after immediate shutdown with committed, aborted and
 fragmented data. Run the full core regression suite after changes to the policy
 callbacks. The standalone C tree/file tests remain in `src/doltgres/prolly`.
+
+`003_types.pl` audits built-in scalar/range coverage against `pg_type`, compares
+heap and prolly values, tests arrays (including empty, multidimensional and
+non-default lower bounds), composites/domains/enums, mixed edit histories,
+index-only payloads, and WAL crash recovery. It also checks database/client
+encoding isolation, XML parsing settings, binary float/numeric fidelity, and
+unchanged domain constraint enforcement. XML cases run when PostgreSQL was built
+with libxml.
