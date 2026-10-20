@@ -12560,4 +12560,29 @@
   proname => 'dolt_prolly_root', provolatile => 'v',
   prorettype => 'text', proargtypes => 'regclass', prosrc => 'dolt_prolly_root' },
 
+
+# Internal manifest building blocks; superuser-only, not version-control commands.
+{ oid => '9120', descr => 'internal manifest foundation',
+  proname => 'dolt_manifest_put', provolatile => 'v', proparallel => 'u',
+  proisstrict => 't', prorettype => 'bytea', proargtypes => 'text bytea _bytea',
+  prosrc => 'dolt_manifest_put' },
+{ oid => '9121', descr => 'internal manifest foundation',
+  proname => 'dolt_manifest_get', provolatile => 's', proparallel => 'u',
+  proisstrict => 't', prorettype => 'record', proargtypes => 'bytea',
+  proallargtypes => '{bytea,text,bytea,_bytea}', proargmodes => '{i,o,o,o}', proargnames => '{hash,kind,payload,children}',
+  prosrc => 'dolt_manifest_get' },
+{ oid => '9122', descr => 'internal manifest foundation',
+  proname => 'dolt_manifest_read', provolatile => 's', proparallel => 'u',
+  proisstrict => 't', prorettype => 'record', proargtypes => 'text',
+  proallargtypes => '{text,bytea,bytea}', proargmodes => '{i,o,o}', proargnames => '{name,target,token}',
+  prosrc => 'dolt_manifest_read' },
+{ oid => '9123', descr => 'internal manifest foundation',
+  proname => 'dolt_manifest_cas', provolatile => 'v', proparallel => 'u',
+  proisstrict => 'f', prorettype => 'bytea', proargtypes => 'text bytea bytea',
+  prosrc => 'dolt_manifest_cas' },
+{ oid => '9124', descr => 'internal manifest foundation',
+  proname => 'dolt_manifest_export', provolatile => 'v', proparallel => 'u',
+  proisstrict => 't', prorettype => 'bytea', proargtypes => 'regclass',
+  prosrc => 'dolt_manifest_export' },
+
 ]

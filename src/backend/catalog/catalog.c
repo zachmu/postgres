@@ -30,6 +30,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_dolt_ref.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_parameter_acl.h"
@@ -157,6 +158,7 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 {
 	switch (relid)
 	{
+		case DoltRefKeyIndexId:
 		case ParameterAclParnameIndexId:
 		case ReplicationOriginNameIndex:
 		case SecLabelObjectIndexId:
