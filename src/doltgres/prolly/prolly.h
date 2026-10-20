@@ -1,0 +1,104 @@
+/* Standalone prolly tree prototype. See README.md for format and ownership. */
+#ifndef DOLTGRES_PROLLY_H
+#define DOLTGRES_PROLLY_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define PL_HASH_SIZE 32
+#define PL_MAX_ITEM (16U * 1024U * 1024U)
+
+typedef enum PLStatus
+{
+	PL_OK, PL_NOT_FOUND, PL_INVALID, PL_NOMEM, PL_CORRUPT, PL_CONFLICT, PL_STOP
+} PLStatus;
+
+typedef struct PLSlice
+{
+	const uint8_t *data;
+	size_t len;
+} PLSlice;
+
+typedef struct PLValue
+{
+	bool present;               /* false = absent/deleted, not an empty value */
+	PLSlice bytes;
+} PLValue;
+
+typedef struct PLHash
+{
+	uint8_t bytes[PL_HASH_SIZE];
+} PLHash;
+
+typedef struct PLStore PLStore;
+typedef struct PLTree
+{
+	PLStore *store;
+	PLHash root;
+} PLTree;
+
+typedef struct PLEntry
+{
+	PLSlice key;
+	PLSlice value;
+} PLEntry;
+
+typedef struct PLEdit
+{
+	PLSlice key;
+	PLValue value;
+} PLEdit;
+
+typedef struct PLStats
+{
+	size_t chunks;
+	size_t bytes;
+	uint64_t writes;
+	uint64_t reused;
+	uint64_t skipped;
+} PLStats;
+
+typedef PLStatus (*PLScanFn)(void *arg, PLSlice key, PLSlice value);
+typedef PLStatus (*PLDiffFn)(void *arg, PLSlice key, PLValue before, PLValue after);
+/* Resolver output is copied immediately; input values are borrowed from stores. */
+typedef PLStatus (*PLResolveFn)(void *arg, PLSlice key, PLValue base,
+								 PLValue left, PLValue right, PLValue *result);
+
+PLStore *pl_store_create(void);
+void pl_store_free(PLStore *store);
+PLStats pl_store_stats(const PLStore *store);
+/* Exported bytes are immutable and borrowed until store_free. */
+PLStatus pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes);
+/* Import checks hash and local encoding. pl_open also validates the whole DAG. */
+PLStatus pl_store_import(PLStore *store, PLHash hash, PLSlice bytes);
+PLStatus pl_open(PLStore *store, PLHash root, PLTree *out);
+PLStatus pl_validate(const PLTree *tree);
+
+/* Bulk input and edits must be strictly ordered by unsigned byte comparison. */
+PLStatus pl_build(PLStore *store, const PLEntry *entries, size_t count, PLTree *out);
+PLStatus pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out);
+/* Branch is O(1); branches share store ownership, which remains with the caller. */
+PLTree pl_branch(const PLTree *tree);
+PLStatus pl_get(const PLTree *tree, PLSlice key, PLValue *out);
+/* Ordered [lower, upper) scan; NULL bound = unbounded. Values are borrowed. */
+PLStatus pl_scan(const PLTree *tree, const PLSlice *lower, const PLSlice *upper,
+				 PLScanFn callback, void *arg);
+PLStatus pl_diff(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg);
+/* Without a resolver, divergent changes return PL_CONFLICT. Output unchanged on error. */
+PLStatus pl_merge(const PLTree *base, const PLTree *left, const PLTree *right,
+				  PLResolveFn resolver, void *arg, PLTree *out);
+uint64_t pl_count(const PLTree *tree);
+int pl_compare(PLSlice a, PLSlice b);
+bool pl_hash_equal(PLHash a, PLHash b);
+const char *pl_status_string(PLStatus status);
+
+/* Schema-driven tuple payload: null bitmap, offsets, concatenated attribute bytes.
+ * Fields must already be canonical for their types. No OIDs/XIDs/padding are stored.
+ * Pack allocates *buffer with malloc; caller frees it. Get returns a borrowed slice.
+ */
+PLStatus pl_tuple_pack(const PLValue *fields, size_t count, uint8_t **buffer, size_t *length);
+PLStatus pl_tuple_get(PLSlice tuple, size_t attribute, PLValue *out);
+void pl_key_int64(int64_t value, uint8_t out[8]);
+
+#endif
