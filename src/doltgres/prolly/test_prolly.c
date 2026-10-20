@@ -2,10 +2,35 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <openssl/evp.h>
+#include <unistd.h>
 
 static unsigned checks;
 #define CHECK(condition) do { checks++; if (!(condition)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); exit(1); } } while (0)
 #define OK(expression) CHECK((expression) == PL_OK)
+
+static bool file_mode;
+
+static PLStore *
+test_store_create(void)
+{
+	PLStore    *store = NULL;
+	char		path[] = "/tmp/prolly-suite-XXXXXX";
+	int			fd;
+
+	if (!file_mode)
+		return pl_store_create();
+	fd = mkstemp(path);
+	CHECK(fd >= 0);
+	CHECK(close(fd) == 0);
+	OK(pl_store_open_file(path, false, NULL, NULL, &store));
+
+	/*
+	 * These fixtures need no pathname after open; unlink prevents test
+	 * litter.
+	 */
+	CHECK(unlink(path) == 0);
+	return store;
+}
 
 static PLSlice
 bytes(const void *data, size_t length)
@@ -61,7 +86,7 @@ test_tuples(void)
 static void
 test_tree(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		tree,
 				branch,
 				fresh;
@@ -161,7 +186,7 @@ choose_right(void *arg, PLSlice key, PLValue base, PLValue left, PLValue right, 
 static void
 test_versions(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		base,
 				left,
 				right,
@@ -257,7 +282,7 @@ test_random_history(void)
 	enum
 	{
 	SLOTS = 400, STEPS = 1200};
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		tree,
 				fresh,
 				empty;
@@ -286,7 +311,7 @@ test_random_history(void)
 		PLValue		previous,
 					current;
 		size_t		count = 0;
-		PLStore    *independent = pl_store_create();
+		PLStore    *independent = test_store_create();
 
 		CHECK(independent != NULL);
 		pl_write32(encoded, (uint32_t) value);
@@ -354,7 +379,7 @@ test_random_history(void)
 static void
 test_conflict_matrix(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	unsigned	b,
 				l,
 				r;
@@ -400,7 +425,7 @@ test_conflict_matrix(void)
 static void
 test_ranges_and_shifted_boundaries(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		before,
 				after,
 				empty,
@@ -468,8 +493,8 @@ test_ranges_and_shifted_boundaries(void)
 static void
 test_import_and_malformed(void)
 {
-	PLStore    *source = pl_store_create(),
-			   *target = pl_store_create();
+	PLStore    *source = test_store_create(),
+			   *target = test_store_create();
 	PLTree		tree,
 				opened,
 				untouched;
@@ -547,7 +572,7 @@ test_import_and_malformed(void)
 static void
 test_large_and_binary_tuples(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		tree,
 				changed,
 				fresh;
@@ -616,7 +641,7 @@ resolve_scratch(void *arg, PLSlice key, PLValue base, PLValue left, PLValue righ
 static void
 test_format_and_resolver_lifetime(void)
 {
-	PLStore    *store = pl_store_create();
+	PLStore    *store = test_store_create();
 	PLTree		empty,
 				left,
 				right,
@@ -647,8 +672,9 @@ test_format_and_resolver_lifetime(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	file_mode = argc == 2 && strcmp(argv[1], "--file") == 0;
 	test_tuples();
 	test_tree();
 	test_versions();
