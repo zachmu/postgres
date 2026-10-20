@@ -9,7 +9,6 @@ $node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->append_conf('postgresql.conf', "max_parallel_workers_per_gather=0\n");
 $node->start;
 $node->safe_psql('postgres', q{
-CREATE EXTENSION dolt_prolly;
 CREATE TYPE mood AS ENUM ('happy','sad');
 CREATE DOMAIN positive AS numeric(20,4) CHECK (VALUE > 0);
 CREATE TYPE payload AS (n numeric, a integer[], t text, d positive);

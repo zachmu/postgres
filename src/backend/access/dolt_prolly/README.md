@@ -1,4 +1,4 @@
-# Experimental PostgreSQL prolly access methods
+# Built-in PostgreSQL prolly access methods
 
 This is the phase 2 single-branch integration baseline. All runtime code is C.
 It is opt-in, with a deliberately limited SQL surface and substantial performance
@@ -7,19 +7,22 @@ heap. It is not a production storage engine or a complete phase 3 implementation
 
 ## Build and use
 
-Build and install this PostgreSQL fork, including the new TableAmRoutine policy
-callbacks. When changing that header, rebuild the server and extension together;
-a full clean build avoids stale objects in builds without dependency tracking.
-OpenSSL development headers and libcrypto are required by the prolly library.
-Build PostgreSQL with `--with-libxml` to enable XML values and their tests.
+Build and install this PostgreSQL fork normally, using Make or Meson. The AMs,
+handlers and operator classes are initialized in `pg_catalog` by `initdb`; no
+extension, shared module or `CREATE EXTENSION` is needed. Select prolly explicitly
+with `USING dolt_prolly_table`. Heap remains the default table AM; all existing
+PostgreSQL AMs and their operator classes remain available.
 
-```
-make -C contrib/dolt_prolly USE_PGXS=1 PG_CONFIG=/path/to/installed/pg_config
-make -C contrib/dolt_prolly USE_PGXS=1 PG_CONFIG=/path/to/installed/pg_config install
-```
+This catalog change requires a fresh cluster initialized by the new binary.
+The catalog version was bumped; existing prototype clusters are not upgraded
+in place. Bootstrap OIDs 9000–9010 are reserved for this fork's prolly objects
+(with gaps for future use). Existing PostgreSQL catalog OIDs are unchanged.
 
-```
-CREATE EXTENSION dolt_prolly;
+The backend uses PostgreSQL's SHA-256 API and builds with or without OpenSSL.
+The independently testable standalone library still uses OpenSSL. Build PostgreSQL
+with `--with-libxml` (Make) or `-Dlibxml=enabled` (Meson) for XML value support.
+
+```sql
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE example(id integer PRIMARY KEY, value text COLLATE "C")
   USING dolt_prolly_table;
@@ -30,13 +33,13 @@ SELECT * FROM example WHERE id = 1;
 
 A table-AM callback routes SQL `btree` indexes on these tables to
 `dolt_prolly_index`. Other index families fail explicitly. This does not change
-btree indexes on heap tables. The extension supplies six default operator classes
+btree indexes on heap tables. Core catalogs supply six default operator classes
 for its AM, reusing PostgreSQL's built-in operators/comparison support functions.
 Custom comparator functions, nonstandard strategy operators and non-C index
 collations are rejected.
 
-The extension owner's `dolt_prolly_root(regclass)` diagnostic reports the
-canonical content hash of a table or prolly index. PUBLIC execution is revoked;
+The bootstrap-superuser-owned `pg_catalog.dolt_prolly_root(regclass)` diagnostic reports the
+canonical content hash of a table or prolly index. PUBLIC execution is revoked by initdb;
 this bypasses normal SQL row selection and must not become a hash oracle for
 unauthorized tables. The function is a diagnostic, not a branch/ref API.
 
@@ -128,8 +131,10 @@ Two optional callbacks are added to TableAmRoutine:
 * `relation_index_am`: select/validate an index AM before opclass selection.
 * `relation_validate_alter`: validate ALTER TABLE before catalog changes.
 
-The extension uses the second callback to reject tuple-schema changes whose
-historical decoding has not been implemented. Heap leaves both callbacks NULL.
+The prolly table AM uses the second callback to reject tuple-schema changes whose
+historical decoding has not been implemented. Metadata-only ownership changes, immediate primary/unique constraint creation,
+and idempotent SET NOT NULL on already-NOT-NULL columns are allowed for ordinary
+dump/restore. Other layout-changing ALTER TABLE operations remain rejected. Heap leaves both callbacks NULL.
 Existing planner search, executor operators, lock tags, caches and transaction
 commit logic are unchanged. Index planner integration supplies capabilities,
 operator classes and a generic cost estimate. Estimates are deliberately crude.
@@ -234,13 +239,14 @@ and complete DDL coverage are not claimed.
 
 Roots contain table/index contents, not the external canonical schema identity;
 hash comparisons assume the same schema and encoding contract. Standalone Dolt
-branch/diff/merge APIs are not yet exposed through SQL by this extension.
+branch/diff/merge APIs are not yet exposed through SQL by these access methods.
 
 ## Tests
 
 ```
-PGHOST=... PGPORT=... make -C contrib/dolt_prolly USE_PGXS=1 \
-  PG_CONFIG=/path/to/installed/pg_config installcheck
+make -C /path/to/build/src/test/modules/test_prolly check
+# Or, with Meson:
+meson test -C /path/to/build --suite setup --suite test_prolly
 ```
 
 The SQL regression covers supported operations and explicit rejections. TAP tests
@@ -264,3 +270,25 @@ composite arrays, NULL/empty/CTAS bypass attempts, opaque custom OID senders,
 user ranges, and nested type changes affecting scans and index rebuilds. It also
 checks identical serialized roots for enum/array/composite values instantiated
 with independently allocated runtime type OIDs.
+
+`005_native.pl` verifies built-in availability without extension installation,
+unchanged heap/btree defaults and availability of upstream AMs, diagnostic
+permissions, cross-type integer predicates, ownership changes and dump/restore
+into a fresh database. The full core regression suite also checks catalog
+consistency and ordinary heap/index behavior.
+
+## Source layout
+
+* `src/backend/access/dolt_prolly/`: runtime adapter and core build integration.
+* `src/doltgres/prolly/`: independently testable C prolly library, compiled into
+  the backend through small wrapper translation units.
+* `src/include/catalog/pg_{am,proc,opfamily,opclass,amop,amproc}.dat`: additive
+  built-in object definitions. The three integer opclasses share a complete
+  cross-type integer family; boolean, text and bytea have separate families.
+* `src/test/modules/test_prolly/`: SQL and TAP tests, with no installable module.
+
+Registering another ordered operator family makes it visible to PostgreSQL's
+existing equivalence-class planning. Complete cross-type integer membership
+preserves normal integer equivalences. Tests that deliberately extend only the
+btree family with incomplete custom alias operators can have different plans;
+no planner algorithm or upstream AM implementation is changed by this packaging.

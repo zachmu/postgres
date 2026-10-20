@@ -1,7 +1,6 @@
 /* Append-only chunk file. Root publication belongs to the transaction layer. */
 #include "internal.h"
 #include <errno.h>
-#include <openssl/evp.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -13,9 +12,13 @@ static const uint8_t record_magic[8] = {'D', 'G', 'C', 'H', 'N', 'K', '0', '1'};
 static bool
 header_digest(const uint8_t *header, uint8_t *digest)
 {
-	unsigned int length = 0;
+	PLHash		hash;
+	PLSlice		bytes = {header, 48};
 
-	return EVP_Digest(header, 48, digest, &length, EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
+	if (!pl_hash_bytes(bytes, &hash))
+		return false;
+	memcpy(digest, hash.bytes, PL_HASH_SIZE);
+	return true;
 }
 
 static PLStatus

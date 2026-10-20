@@ -8,13 +8,13 @@
 #include "commands/vacuum.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
 #include "fmgr.h"
-#include <openssl/evp.h>
+#include "utils/fmgrprotos.h"
 
-PG_FUNCTION_INFO_V1(dolt_prolly_table_handler);
 static TableAmRoutine methods;
 static bool initialized;
 
@@ -31,9 +31,8 @@ PLHash
 dg_rowhash(PLSlice row)
 {
 	PLHash		hash;
-	unsigned int length = 0;
 
-	if (EVP_Digest(row.data, row.len, hash.bytes, &length, EVP_sha256(), NULL) != 1 || length != PL_HASH_SIZE)
+	if (!pl_hash_bytes(row, &hash))
 		elog(ERROR, "could not hash canonical row");
 	return hash;
 }
@@ -395,9 +394,33 @@ index_am(Relation rel, const char *requested)
 static void
 validate_alter(Relation rel, struct AlterTableCmd *cmd)
 {
-	/* Index creation does not change the tuple descriptor. */
-	if (cmd->subtype != AT_AddIndex)
-		dg_unsupported("ALTER TABLE (schema versioning is not implemented)");
+	/*
+	 * These operations do not alter the stored value layout. pg_dump emits
+	 * primary/unique constraints as ALTER TABLE after restoring the data.
+	 */
+	if (cmd->subtype == AT_AddIndex || cmd->subtype == AT_ChangeOwner)
+		return;
+	if (cmd->subtype == AT_AddConstraint && IsA(cmd->def, Constraint))
+	{
+		Constraint *constraint = (Constraint *) cmd->def;
+
+		if ((constraint->contype == CONSTR_PRIMARY || constraint->contype == CONSTR_UNIQUE) &&
+			!constraint->deferrable)
+			return;
+	}
+
+	/*
+	 * Restored primary-key columns are already NOT NULL. Permit only the
+	 * idempotent SET NOT NULL generated while rebuilding their constraint.
+	 */
+	if (cmd->subtype == AT_SetNotNull)
+	{
+		AttrNumber	attnum = get_attnum(RelationGetRelid(rel), cmd->name);
+
+		if (attnum > 0 && TupleDescAttr(RelationGetDescr(rel), attnum - 1)->attnotnull)
+			return;
+	}
+	dg_unsupported("ALTER TABLE (schema versioning is not implemented)");
 }
 const TableAmRoutine *
 dg_table_routine(void)

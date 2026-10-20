@@ -2,6 +2,7 @@
 
 subdir('brin')
 subdir('common')
+subdir('dolt_prolly')
 subdir('gin')
 subdir('gist')
 subdir('hash')

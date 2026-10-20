@@ -488,4 +488,18 @@
 
 # no brin opclass for the geometric types except box
 
+# Native prolly access methods (additional to PostgreSQL defaults).
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_int2_ops',
+  opcfamily => 'dolt_prolly_index/dolt_integer_ops', opcintype => 'int2' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_int4_ops',
+  opcfamily => 'dolt_prolly_index/dolt_integer_ops', opcintype => 'int4' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_int8_ops',
+  opcfamily => 'dolt_prolly_index/dolt_integer_ops', opcintype => 'int8' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_bool_ops',
+  opcfamily => 'dolt_prolly_index/dolt_bool_ops', opcintype => 'bool' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_text_ops',
+  opcfamily => 'dolt_prolly_index/dolt_text_ops', opcintype => 'text' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_bytea_ops',
+  opcfamily => 'dolt_prolly_index/dolt_bytea_ops', opcintype => 'bytea' },
+
 ]

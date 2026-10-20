@@ -8,7 +8,7 @@ my $node = PostgreSQL::Test::Cluster->new('portability');
 $node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->append_conf('postgresql.conf', "max_parallel_workers_per_gather=0\n");
 $node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION dolt_prolly');
+
 
 sub rejected
 {

@@ -1,6 +1,11 @@
 /* Immutable, hash-addressed memory chunk store; explicit endian-safe encoding. */
-#include "internal.h"
+#ifdef PL_POSTGRES
+#include "postgres.h"
+#include "common/cryptohash.h"
+#else
 #include <openssl/evp.h>
+#endif
+#include "internal.h"
 #include <limits.h>
 #include <unistd.h>
 
@@ -35,13 +40,26 @@ pl_write64(uint8_t *p, uint64_t v)
 	pl_write32(p + 4, (uint32_t) v);
 }
 
-static bool
-hash_bytes(PLSlice bytes, PLHash *out)
+bool
+pl_hash_bytes(PLSlice bytes, PLHash *out)
 {
+#ifdef PL_POSTGRES
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	bool		ok;
+
+	if (!ctx)
+		return false;
+	ok = pg_cryptohash_init(ctx) == 0 &&
+		pg_cryptohash_update(ctx, bytes.data, bytes.len) == 0 &&
+		pg_cryptohash_final(ctx, out->bytes, PL_HASH_SIZE) == 0;
+	pg_cryptohash_free(ctx);
+	return ok;
+#else
 	unsigned int length = 0;
 
 	return EVP_Digest(bytes.data, bytes.len, out->bytes, &length,
 					  EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
+#endif
 }
 
 int
@@ -330,7 +348,7 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 
 	if (!store || !bytes.data || bytes.len > 2ULL * PL_MAX_ITEM * PL_MAX_ENTRIES + 2048)
 		return PL_INVALID;
-	if (!hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
+	if (!pl_hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
 		return PL_CORRUPT;
 	return store_buffer(store, hash, bytes.data, bytes.len, &node);
 }
@@ -382,7 +400,7 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	}
 	bytes.data = data;
 	bytes.len = length;
-	if (!hash_bytes(bytes, &hash))
+	if (!pl_hash_bytes(bytes, &hash))
 	{
 		free(data);
 		return PL_CORRUPT;

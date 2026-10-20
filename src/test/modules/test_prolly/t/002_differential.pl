@@ -8,7 +8,6 @@ $node->init;
 $node->append_conf('postgresql.conf', "max_parallel_workers_per_gather=0\n");
 $node->start;
 $node->safe_psql('postgres',q{
-CREATE EXTENSION dolt_prolly;
 CREATE TABLE p(id int PRIMARY KEY,v text COLLATE "C", n int) USING dolt_prolly_table;
 CREATE TABLE h(id int PRIMARY KEY,v text COLLATE "C", n int);
 INSERT INTO p SELECT g,'v'||g,CASE WHEN g%4=0 THEN NULL ELSE g%7 END FROM generate_series(1,40) g;

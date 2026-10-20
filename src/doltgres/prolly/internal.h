@@ -41,6 +41,7 @@ uint32_t	pl_read32(const uint8_t *p);
 uint64_t	pl_read64(const uint8_t *p);
 void		pl_write32(uint8_t *p, uint32_t v);
 void		pl_write64(uint8_t *p, uint64_t v);
+bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);
 PLSlice		pl_node_value(const PLNode *node, uint32_t index);

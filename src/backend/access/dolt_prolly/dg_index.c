@@ -17,8 +17,8 @@
 #include "utils/pg_locale.h"
 #include "utils/selfuncs.h"
 #include "fmgr.h"
+#include "utils/fmgrprotos.h"
 
-PG_FUNCTION_INFO_V1(dolt_prolly_index_handler);
 typedef struct DGIndexEntry
 {
 	PLEntry		entry;

@@ -1,0 +1,9 @@
+# Built-in prolly table and index access methods.
+subdir = src/backend/access/dolt_prolly
+top_builddir = ../../../..
+include $(top_builddir)/src/Makefile.global
+
+OBJS = dg_store.o dg_table.o dg_codec.o dg_index.o pl_store.o pl_tree.o pl_tuple.o pl_version.o pl_file.o
+$(OBJS): dg.h $(top_srcdir)/src/doltgres/prolly/prolly.h $(top_srcdir)/src/doltgres/prolly/internal.h
+
+include $(top_srcdir)/src/backend/common.mk
