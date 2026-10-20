@@ -19,5 +19,6 @@ check: test_prolly
 sanitize:
 	$(MAKE) clean
 	$(MAKE) check CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -Wmissing-prototypes -Wstrict-prototypes -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
+	$(MAKE) clean
 clean:
 	rm -f $(OBJECTS) test_prolly.o libprolly.a test_prolly
