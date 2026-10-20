@@ -19,6 +19,9 @@ CREATE TYPE payload AS (n numeric, a aclitem[], t text, d positive);
 # Expressions are evaluated first in heap, then copied to avoid testing merely
 # whether the prolly encoder and decoder agree with each other.
 my @cases = (
+ ['pg_type', q{(SELECT t FROM pg_type t WHERE oid='int4'::regtype)}, q{(SELECT t FROM pg_type t WHERE oid='text'::regtype)}],
+ ['pg_proc', q{(SELECT p FROM pg_proc p WHERE oid='int4in'::regproc)}, q{(SELECT p FROM pg_proc p WHERE oid='textin'::regproc)}],
+ ['pg_class', q{(SELECT c FROM pg_class c WHERE oid='pg_type'::regclass)}, q{(SELECT c FROM pg_class c WHERE oid='pg_proc'::regclass)}],
  ['bool', 'true', 'false'],
  ['bytea', q{'\x00ff'}, q{''}],
  ['"char"', q{'a'}, q{''}],
@@ -108,6 +111,29 @@ my @cases = (
 my $has_xml = $node->safe_psql('postgres', q{SELECT position('--with-libxml' in setting)>0 FROM pg_config WHERE name='CONFIGURE'}) eq 't';
 push @cases, ['xml', q{XMLPARSE(CONTENT '<a>é</a><b/>')}, q{XMLPARSE(DOCUMENT '<root/>')}] if $has_xml;
 
+# Exercise generated array types too, including enum/composite/domain elements.
+# The dedicated multidimensional cases above verify non-default lower bounds.
+my @scalars = grep { $_->[0] !~ /\[\]/ } @cases;
+for my $case (@scalars)
+{
+ my ($type, $a, $b) = @$case;
+ push @cases, ["$type\[\]", "ARRAY[($a)::$type, NULL, ($b)::$type]", "'{}'"];
+}
+
+# Audit the catalog so an added built-in cannot silently escape this suite.
+my $ordinary = $node->safe_psql('postgres', q{
+SELECT typname FROM pg_type WHERE typnamespace='pg_catalog'::regnamespace
+ AND typtype IN ('b','r','m') AND typcategory <> 'A'
+ AND typname NOT IN ('pg_node_tree','pg_ndistinct','pg_dependencies',
+                    'pg_mcv_list','gtsvector','pg_brin_bloom_summary',
+                    'pg_brin_minmax_multi_summary')
+ ORDER BY typname;
+});
+my %covered = map { my $t = $_->[0]; $t =~ s/\(.*\)//; $t =~ s/"//g; ($t => 1) } @scalars;
+$covered{bpchar} = 1; # char(n)
+$covered{xml} = 1 unless $has_xml; # build-time PostgreSQL feature
+is_deeply([grep { !$covered{$_} } split /\n/, $ordinary], [], 'every ordinary built-in scalar/range has a fixture');
+
 my @checks;
 my $n = 0;
 for my $case (@cases)
@@ -124,6 +150,22 @@ for my $case (@cases)
  is($node->safe_psql('postgres', 'SET enable_seqscan=off; '.sprintf($query,"p$n")), $expected, "$type index-only payload");
  push @checks, [sprintf($query,"p$n"), $expected, $type];
 }
+
+# pg_node_tree cannot be supplied by SQL input; copy a real catalog value.
+$node->safe_psql('postgres', q{
+CREATE TABLE defaults_source(a int DEFAULT (1+2));
+CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table;
+INSERT INTO nodes SELECT adbin FROM pg_attrdef WHERE adrelid='defaults_source'::regclass;
+});
+is($node->safe_psql('postgres', q{SELECT v::text FROM nodes}),
+ $node->safe_psql('postgres', q{SELECT adbin::text FROM pg_attrdef WHERE adrelid='defaults_source'::regclass}), 'pg_node_tree copies actual catalog payload');
+
+# Table codecs must not require the old C collation restriction.
+$node->safe_psql('postgres', q{
+CREATE TABLE default_collation(v text) USING dolt_prolly_table;
+INSERT INTO default_collation VALUES ('éclair');
+});
+is($node->safe_psql('postgres', 'SELECT v FROM default_collation'), 'éclair', 'default collation table values');
 
 # Collation is a column/index semantic, not a table-codec restriction.
 $node->safe_psql('postgres', q{
@@ -150,6 +192,36 @@ if ($has_xml)
  my ($xml) = grep { $_->[2] eq 'xml' } @checks;
  is($node->safe_psql('postgres', 'SET xmloption=DOCUMENT; '.$xml->[0]), $xml->[1], 'stored XML fragments read under DOCUMENT mode');
 }
+# Check binary values that text/equality comparisons alone could miss.
+$node->safe_psql('postgres', q{
+CREATE TABLE edge_heap(id int, f float8, n numeric);
+INSERT INTO edge_heap VALUES (1,'-0',1.00),(2,'0',1.0),
+ (3,'NaN','Infinity'),(4,'-Infinity','-Infinity'),(5,'5e-324',0.00000000000000000001);
+CREATE TABLE edge_prolly(LIKE edge_heap) USING dolt_prolly_table;
+INSERT INTO edge_prolly SELECT * FROM edge_heap;
+});
+my $binary_query = q{SELECT id,encode(float8send(f),'hex'),encode(numeric_send(n),'hex') FROM %s ORDER BY id};
+is($node->safe_psql('postgres', sprintf($binary_query, 'edge_prolly')),
+ $node->safe_psql('postgres', sprintf($binary_query, 'edge_heap')), 'binary float and numeric representations survive storage');
+$node->safe_psql('postgres', q{
+CREATE TABLE one_scale(n numeric) USING dolt_prolly_table;
+CREATE TABLE another_scale(n numeric) USING dolt_prolly_table;
+INSERT INTO one_scale VALUES (1.0); INSERT INTO another_scale VALUES (1.00);
+});
+is($node->safe_psql('postgres', q{SELECT dolt_prolly_root('one_scale')<>dolt_prolly_root('another_scale')}), 't', 'SQL-equal numeric scales may have different content hashes');
+like($node->safe_psql('postgres', 'SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id,v FROM p1 ORDER BY id'), qr/Index Only Scan/, 'payload checks exercise index-only scans');
+
+# Reject unavailable ordered encodings rather than applying byte ordering to a
+# generic binary representation (e.g. numeric or a collation-aware string).
+my ($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE INDEX unsupported_numeric ON one_scale(n)});
+isnt($status, 0, 'new storage support does not claim numeric ordered keys');
+like($stderr, qr/no default operator class/, 'missing ordered opclass is explicit');
+$node->safe_psql('postgres', q{CREATE TABLE domains(v positive, a positive[]) USING dolt_prolly_table; INSERT INTO domains VALUES (1,ARRAY[2::positive])});
+($status, $stdout, $stderr) = $node->psql('postgres', q{INSERT INTO domains VALUES (-1,NULL)});
+isnt($status, 0, 'domain assignment constraints remain enforced');
+$node->safe_psql('postgres', q{ALTER DOMAIN positive ADD CONSTRAINT later CHECK (VALUE > 1000) NOT VALID});
+is($node->safe_psql('postgres', q{SELECT v,a FROM domains}), '1.0000|{2.0000}', 'reads do not recheck new domain constraints');
+
 $node->stop('immediate');
 $node->start;
 for my $check (@checks)
