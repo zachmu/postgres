@@ -23,33 +23,35 @@ Base: PostgreSQL REL_18_6. Authority: workspace PLAN.md and design-questions.txt
   experiment, not a requirement to adopt Dolt's representation. Its criterion
   is equal multiset roots despite different occurrence handle allocation.
 
-## Canonical format v1 experiment
+## Canonical storage experiments and current implementation
 
-SHA-256 with domain-separated, length-framed inputs. Integers use big-endian
-signed-order-preserving encoding, text uses UTF-8 with C-collation equality,
-booleans use one byte, bytea is literal bytes, and NULL has its own tag. Numeric
-encoding removes redundant decimal zeros and canonicalizes zero; NaN and
-infinities have explicit codes. No pickle, native struct padding, OID, TOAST
-pointer, hash-map iteration order, or host-endian scalar enters the format.
+The original Python schema/value/table oracle has been replaced by a standalone
+C implementation in `src/doltgres/prolly`. Its versioned node format is explicit
+big-endian data with separate key/value regions and offset arrays. Leaves store
+opaque tuple bytes; internal values contain child hashes and entry counts.
+SHA-256 addresses immutable nodes. Branch, diff, three-way merge, ordered scans,
+and incremental edits have native tests.
 
-The first experiment supports bool, int8, text (C collation), bytea, and numeric.
-Unsupported type/collation encodings fail explicitly. NULL and duplicate
-multiplicity are explicit. Format, encoding, and comparator identities belong
-in the schema representation. Byte ordering of the generic tree is separate
-from SQL operator-class ordering: prototype framed text/numeric/composite encodings are canonical but
-are NOT general ordered PostgreSQL index keys. Phase 2 must implement ordered
-encodings/comparators for every advertised index capability.
+The C tuple helper supplies a null bitmap and attribute offsets, excluding heap
+MVCC metadata and runtime identities. Type interpretation is external, analogous
+to TupleDesc. It includes a sortable int64 key encoder; arbitrary SQL numeric,
+collation, schema-reference and operator-class encodings are not implemented.
+These remain requirements for the integration layer, not claims about raw
+byte-map semantics. The previous Python encodings were experiments and are not
+compatible with the C node format. See the C README for exact limits and layout.
 
-Equality means SQL equality for supported values under a fixed type/collation.
-SQL-equal values can have different display forms; v1 intentionally normalizes
-those forms. Extending this to nondeterministic collations, domains, custom
-operator classes, composite references and observable text representations
-requires explicit policies, not a fallback to arbitrary binary output.
+Equality of the generic map means equality of canonical input bytes. At the SQL
+boundary, callers must ensure SQL-equal values have canonical encodings under
+fixed type/collation rules. This preserves the original project requirement;
+it does not imply that hashing arbitrary PostgreSQL values satisfies it. NULL,
+SQL duplicate multiplicity and symbolic references need explicit higher-level
+representations. No runtime OID, XID, padding or allocator state may enter them.
 
-Tests must compare fresh construction with incremental edits, reversed and
-random insertion histories, deletes/reinserts, duplicate multiplicities,
-schema changes, index contents, and independently allocated runtime identities.
-Persistent roots must remain readable after later mutations.
+Native tests compare fresh construction with incremental mutation, branching,
+merging, deletion, empty-value handling and old-root persistence. The former
+keyless multiplicity policy and canonical table/index wrapper were removed with
+the Python prototype; their eventual representation remains open. The current
+request prioritizes general C tree operations before PostgreSQL API integration.
 
 ## Snapshots and publication
 
@@ -80,8 +82,8 @@ logical decoding. Production integration belongs to phases 2–3.
 
 | Feature | Requirement | Phase 1 experiment |
 | --- | --- | --- |
-| Heap replacement | PostgreSQL table-AM semantics | Canonical storage oracle only |
-| User btree | Actual prolly index trees, unique/order/include semantics | Canonical index contents; no AM replacement yet |
+| Heap replacement | PostgreSQL table-AM semantics | Native C byte-map/tuple prototype; no table AM |
+| User btree | Actual prolly index trees, unique/order/include semantics | Generic keyed maps; no SQL index AM replacement yet |
 | Other user index AMs | Explicit rejection in first product draft | Existing server unchanged until phase 2 |
 | Catalogs | Divergent branch definitions in one query | Test projection with real relation/type OIDs |
 | OIDs | Built-ins unchanged, stable runtime mappings desirable | Exclude from hashes; test distinct branch objects |
