@@ -1,13 +1,22 @@
 /* Append-only chunk file. Root publication belongs to the transaction layer. */
 #include "internal.h"
 #include <errno.h>
+#include <openssl/evp.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define RECORD_HEADER 48
+#define RECORD_HEADER 80
 static const uint8_t record_magic[8] = {'D', 'G', 'C', 'H', 'N', 'K', '0', '1'};
+
+static bool
+header_digest(const uint8_t *header, uint8_t *digest)
+{
+	unsigned int length = 0;
+
+	return EVP_Digest(header, 48, digest, &length, EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
+}
 
 static PLStatus
 write_all(int fd, const uint8_t *data, size_t length)
@@ -63,6 +72,8 @@ pl_file_append(PLStore *store, PLHash hash, PLSlice bytes)
 	memcpy(header, record_magic, 8);
 	pl_write64(header + 8, bytes.len);
 	memcpy(header + 16, hash.bytes, PL_HASH_SIZE);
+	if (!header_digest(header, header + 48))
+		return PL_CORRUPT;
 	status = write_all(store->fd, header, sizeof(header));
 	if (status == PL_OK)
 		status = write_all(store->fd, bytes.data, bytes.len);
@@ -177,6 +188,7 @@ pl_store_open_file(const char *path, bool repair_tail,
 		size_t		got;
 		uint64_t	length;
 		PLHash		hash;
+		uint8_t		digest[PL_HASH_SIZE];
 		PLSlice		bytes;
 		struct stat statbuf;
 
@@ -187,7 +199,8 @@ pl_store_open_file(const char *path, bool repair_tail,
 			break;
 		if (got != sizeof(header))
 			goto tail;
-		if (memcmp(header, record_magic, 8))
+		if (memcmp(header, record_magic, 8) || !header_digest(header, digest) ||
+			memcmp(digest, header + 48, PL_HASH_SIZE))
 		{
 			status = PL_CORRUPT;
 			goto fail;

@@ -227,6 +227,8 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 	PLNode	   *node = pl_find(store, hash);
 	size_t		bucket;
 
+	if (!store)
+		return PL_INVALID;
 	if (store->failed)
 		return PL_IO;
 	if (node)

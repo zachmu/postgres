@@ -98,7 +98,9 @@ test_tree(void)
 				after;
 	size_t		i;
 
-	CHECK(store && entries && keys);
+	CHECK(store);
+	CHECK(entries);
+	CHECK(keys);
 	for (i = 0; i < 5000; i++)
 	{
 		pl_key_int64((int64_t) i, keys[i]);
