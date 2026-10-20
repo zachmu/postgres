@@ -838,6 +838,9 @@ DefineIndex(Oid tableId,
 	 * look up the access method, verify it can handle the requested features
 	 */
 	accessMethodName = stmt->accessMethod;
+	if (rel->rd_tableam && rel->rd_tableam->relation_index_am)
+		accessMethodName = pstrdup(rel->rd_tableam->relation_index_am(rel, accessMethodName));
+
 	tuple = SearchSysCache1(AMNAME, PointerGetDatum(accessMethodName));
 	if (!HeapTupleIsValid(tuple))
 	{
