@@ -7,9 +7,8 @@
 #include "utils/snapmgr.h"
 #include "utils/builtins.h"
 #include "fmgr.h"
+#include "utils/fmgrprotos.h"
 
-PG_MODULE_MAGIC;
-PG_FUNCTION_INFO_V1(dolt_prolly_root);
 #define DG_MAGIC 0x44475033
 #define DG_HEADER 56
 #define DG_PART (BLCKSZ - 128)

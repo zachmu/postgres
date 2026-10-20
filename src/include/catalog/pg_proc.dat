@@ -12547,4 +12547,17 @@
   proargnames => '{pid,io_id,io_generation,state,operation,off,length,target,handle_data_len,raw_result,result,target_desc,f_sync,f_localmem,f_buffered}',
   prosrc => 'pg_get_aios' },
 
+# Native prolly access methods (additional to PostgreSQL defaults).
+{ oid => '9002', descr => 'prolly table access method handler',
+  proname => 'dolt_prolly_table_handler', provolatile => 'v',
+  prorettype => 'table_am_handler', proargtypes => 'internal',
+  prosrc => 'dolt_prolly_table_handler' },
+{ oid => '9003', descr => 'prolly index access method handler',
+  proname => 'dolt_prolly_index_handler', provolatile => 'v',
+  prorettype => 'index_am_handler', proargtypes => 'internal',
+  prosrc => 'dolt_prolly_index_handler' },
+{ oid => '9004', descr => 'inspect canonical prolly relation root',
+  proname => 'dolt_prolly_root', provolatile => 'v',
+  prorettype => 'text', proargtypes => 'regclass', prosrc => 'dolt_prolly_root' },
+
 ]

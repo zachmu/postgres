@@ -35,6 +35,7 @@ SUBDIRS = \
 		  test_parser \
 		  test_pg_dump \
 		  test_predtest \
+		  test_prolly \
 		  test_radixtree \
 		  test_rbtree \
 		  test_regex \

@@ -34,4 +34,12 @@
   descr => 'block range index (BRIN) access method',
   amname => 'brin', amhandler => 'brinhandler', amtype => 'i' },
 
+# Native prolly access methods (additional to PostgreSQL defaults).
+{ oid => '9000', oid_symbol => 'DOLT_PROLLY_TABLE_AM_OID',
+  descr => 'prolly table access method', amname => 'dolt_prolly_table',
+  amhandler => 'dolt_prolly_table_handler', amtype => 't' },
+{ oid => '9001', oid_symbol => 'DOLT_PROLLY_INDEX_AM_OID',
+  descr => 'prolly ordered index access method', amname => 'dolt_prolly_index',
+  amhandler => 'dolt_prolly_index_handler', amtype => 'i' },
+
 ]

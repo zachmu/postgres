@@ -305,4 +305,10 @@
 { oid => '6158',
   opfmethod => 'gist', opfname => 'multirange_ops' },
 
+# Native prolly access methods (additional to PostgreSQL defaults).
+{ oid => '9005', opfmethod => 'dolt_prolly_index', opfname => 'dolt_integer_ops' },
+{ oid => '9008', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bool_ops' },
+{ oid => '9009', opfmethod => 'dolt_prolly_index', opfname => 'dolt_text_ops' },
+{ oid => '9010', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bytea_ops' },
+
 ]

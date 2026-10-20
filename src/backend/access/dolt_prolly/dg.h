@@ -9,7 +9,7 @@
 #include "executor/tuptable.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "internal.h"
+#include "../../../doltgres/prolly/internal.h"
 
 typedef struct DGState
 {

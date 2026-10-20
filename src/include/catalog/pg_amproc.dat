@@ -2024,4 +2024,32 @@
 { amprocfamily => 'brin/box_inclusion_ops', amproclefttype => 'box',
   amprocrighttype => 'box', amprocnum => '13', amproc => 'box_contain' },
 
+# Native prolly access methods (additional to PostgreSQL defaults).
+{ amprocfamily => 'dolt_prolly_index/dolt_bool_ops', amproclefttype => 'bool',
+  amprocrighttype => 'bool', amprocnum => '1', amproc => 'btboolcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_text_ops', amproclefttype => 'text',
+  amprocrighttype => 'text', amprocnum => '1', amproc => 'bttextcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_bytea_ops', amproclefttype => 'bytea',
+  amprocrighttype => 'bytea', amprocnum => '1', amproc => 'byteacmp' },
+
+# Cross-type integer comparisons share one ordering family.
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int2',
+  amprocrighttype => 'int2', amprocnum => '1', amproc => 'btint2cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int2',
+  amprocrighttype => 'int4', amprocnum => '1', amproc => 'btint24cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int2',
+  amprocrighttype => 'int8', amprocnum => '1', amproc => 'btint28cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int4',
+  amprocrighttype => 'int4', amprocnum => '1', amproc => 'btint4cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int4',
+  amprocrighttype => 'int8', amprocnum => '1', amproc => 'btint48cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int4',
+  amprocrighttype => 'int2', amprocnum => '1', amproc => 'btint42cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int8',
+  amprocrighttype => 'int8', amprocnum => '1', amproc => 'btint8cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int8',
+  amprocrighttype => 'int4', amprocnum => '1', amproc => 'btint84cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_integer_ops', amproclefttype => 'int8',
+  amprocrighttype => 'int2', amprocnum => '1', amproc => 'btint82cmp' },
+
 ]

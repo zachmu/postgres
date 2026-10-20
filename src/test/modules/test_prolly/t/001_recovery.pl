@@ -8,7 +8,6 @@ $node->init;
 $node->append_conf('postgresql.conf', "max_parallel_workers_per_gather=0\nmax_prepared_transactions=10\n");
 $node->start;
 $node->safe_psql('postgres',q{
-CREATE EXTENSION dolt_prolly;
 CREATE TABLE p(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table;
 CREATE TABLE normal(id int);
 INSERT INTO p VALUES(1,'initial');

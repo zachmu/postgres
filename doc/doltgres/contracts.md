@@ -1,7 +1,7 @@
 # Doltgres phase 0 contracts
 
 Status: design contracts with phase 1 evidence and an opt-in phase 2 AM baseline.
-The implementation remains experimental; see `contrib/dolt_prolly/README.md`.
+The implementation remains experimental; see `src/backend/access/dolt_prolly/README.md`.
 Base: PostgreSQL REL_18_6. Authority: workspace PLAN.md and design-questions.txt.
 
 ## Representation and identity
@@ -43,9 +43,9 @@ byte-map semantics. The previous Python encodings were experiments and are not
 compatible with the C node format. See the C README for exact limits and layout.
 
 Equality of the generic map means equality of canonical input bytes. At the SQL
-boundary, callers must ensure SQL-equal values have canonical encodings under
-fixed type/collation rules. This preserves the original project requirement;
-it does not imply that hashing arbitrary PostgreSQL values satisfies it. NULL,
+boundary, callers use standard serialization under fixed type/collation rules.
+History independence concerns identical stored value bytes, not normalization
+of every SQL-equal representation; see the amended workspace PLAN.md. NULL,
 SQL duplicate multiplicity and symbolic references need explicit higher-level
 representations. No runtime OID, XID, padding or allocator state may enter them.
 

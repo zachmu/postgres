@@ -1817,6 +1817,9 @@ setup_privileges(FILE *cmdfd)
 				  escape_quotes(username));
 	PG_CMD_PUTS("GRANT USAGE ON SCHEMA pg_catalog, public TO PUBLIC;\n\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_largeobject FROM PUBLIC;\n\n");
+
+	/* Diagnostic bypasses SQL row selection; preserve restricted access. */
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_prolly_root(regclass) FROM PUBLIC;\n\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"
