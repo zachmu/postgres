@@ -24,3 +24,24 @@ The current standalone SELECT / SQL transaction boundary remains in force for
 checkout and merge. Conflict metadata and pending merge state must survive restart
 and abort/rollback consistently with live roots. Do not add a second publication
 manifest or bypass PostgreSQL WAL.
+
+## Branch binding and future cross-branch queries
+
+This milestone requires independent session branch views. The selected session
+branch supplies the default binding; it must not become the permanent identity
+of every reference to a relation.
+
+Ultimately a single query must be able to reference the same table on multiple
+branches or retained commits, including joining those references. Resolve each
+table reference to an explicit revision binding, carry that binding into its
+plan and scan state, and select its schema and data roots under the appropriate
+snapshot. Separate aliases of the same relation may have different bindings.
+Index scans, tuple fetches and rescans must retain the binding of their own table
+reference. A shared relcache entry or a backend-global branch variable alone
+cannot represent this distinction. Cached plans must preserve explicit bindings
+and revalidate default bindings when checkout changes the session context.
+
+Cross-branch queries and revision-specific schema projection are outside this
+milestone. The current relation lookup boundary is a transitional seam, not a
+complete implementation of per-reference binding. Future writes must likewise
+identify their target working set explicitly; retained commit views are read-only.
