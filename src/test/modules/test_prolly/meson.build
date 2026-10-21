@@ -14,5 +14,6 @@ tests += {
     't/008_publication.pl',
     't/009_merge.pl',
     't/010_branch_sessions.pl',
+    't/011_catalog_binding.pl',
   ]},
 }

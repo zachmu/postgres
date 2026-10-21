@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltbranch.h"
 
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -265,6 +266,8 @@ RenameSchema(const char *oldname, const char *newname)
 
 	nspform = (Form_pg_namespace) GETSTRUCT(tup);
 	nspOid = nspform->oid;
+	if (!dg_projection_building() && dg_projected_namespace(nspOid))
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("retained catalog projections are read-only")));
 
 	/* make sure the new name doesn't exist */
 	if (OidIsValid(get_namespace_oid(newname, true)))
@@ -345,6 +348,8 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
 
 	nspform = (Form_pg_namespace) GETSTRUCT(tup);
 	nspOid = nspform->oid;
+	if (!dg_projection_building() && dg_projected_namespace(nspOid))
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("retained catalog projections are read-only")));
 
 	AlterSchemaOwner_internal(tup, rel, newOwnerId);
 

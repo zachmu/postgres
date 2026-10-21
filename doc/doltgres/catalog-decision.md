@@ -92,3 +92,12 @@ make -C src/test/modules/test_doltgres check
 Run the full core regression suite with `make check`. Test nodes are temporary;
 TAP starts its own servers. Use a filesystem that supports Unix socket chmod
 (for example /tmp) for external servers and socket directories.
+
+## Native retained-generation follow-up
+
+The [retained catalog binding experiment](catalog-binding.md) now exercises real
+canonical descriptors and prolly data. It supports the hybrid direction while
+identifying snapshot-sensitive prepared binding as a required core service. It
+adds native AS OF and revision-qualified reads, but does not complete writable
+branch catalogs, stored-object coverage or branch-aware introspection. The original
+fixture above remains useful evidence with a narrower, explicitly different scope.

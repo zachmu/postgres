@@ -56,6 +56,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/pg_dolt_ref.h"
 
 #include <limits.h>
 
@@ -694,6 +695,15 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		Assert(plansource->is_valid);
 		return NIL;
 	}
+
+	/*
+	 * Ref resolution is MVCC-sensitive, not just invalidation-sensitive: a
+	 * plan rebuilt inside an older transaction snapshot must not escape it.
+	 * Conservatively reanalyze retained projections at each execution until
+	 * bindings carry explicit ref/snapshot validity tokens.
+	 */
+	if (list_member_oid(plansource->relationOids, DoltRefRelationId))
+		plansource->is_valid = false;
 
 	/*
 	 * If the query is currently valid, we should have a saved search_path ---
