@@ -1421,3 +1421,13 @@ CREATE VIEW dolt_tags WITH (security_invoker=true) AS
     FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object o ON o.objhash=r.reftarget
     WHERE r.refname LIKE 'tags/%' AND o.objkind='tag';
 REVOKE ALL ON dolt_log, dolt_tags FROM PUBLIC;
+
+CREATE VIEW dolt_conflicts AS
+ SELECT v->>'table' AS "table", count(*)::bigint AS num_conflicts
+ FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget,
+ LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
+ WHERE r.refname='merge/' || active_branch()
+ GROUP BY v->>'table';
+
+CREATE VIEW dolt_merge_status AS
+ SELECT EXISTS (SELECT 1 FROM pg_dolt_ref WHERE refname='merge/' || active_branch()) AS is_merging;

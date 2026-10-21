@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "miscadmin.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -25,7 +26,7 @@ typedef struct DGScan
 	DGState    *state;
 	DGRows		rows;
 	int64		position;
-} DGScan;
+}			DGScan;
 
 PLHash
 dg_rowhash(PLSlice row)
@@ -476,4 +477,51 @@ Datum
 dolt_prolly_table_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(dg_table_routine());
+}
+
+/* Install a complete canonical state with fresh runtime occurrence handles.
+ * Caller owns an AccessExclusiveLock; never reuse prior executor-visible TIDs. */
+void
+dg_history_handles(DGState *state)
+{
+	DGRows		rows = dg_rows(&state->content);
+	size_t		i;
+
+	dg_check(pl_build(state->store, NULL, 0, &state->handles));
+	for (i = 0; i < rows.count; i++)
+	{
+		uint64		count = pl_read64(rows.items[i].value.data),
+					j;
+
+		CHECK_FOR_INTERRUPTS();
+		for (j = 0; j < count; j++)
+		{
+			uint8		key[8];
+			PLEdit		edit;
+			ItemPointerData tid;
+
+			CHECK_FOR_INTERRUPTS();
+			dg_tid(state->nextid, &tid);
+			pl_write64(key, state->nextid++);
+			edit.key = (PLSlice)
+			{
+				key, 8
+			};
+			edit.value.present = true;
+			edit.value.bytes = rows.items[i].key;
+			dg_check(pl_apply(&state->handles, &edit, 1, &state->handles));
+		}
+	}
+}
+void
+dg_history_install(Relation rel, DGState *state, PLTree contents)
+{
+	state->content = contents;
+	dg_history_handles(state);
+	dg_save(rel, state, GetCurrentCommandId(true));
+	CommandCounterIncrement();
+	UpdateActiveSnapshotCommandId();
+	dg_rebuild_indexes(rel);
+	CommandCounterIncrement();
+	UpdateActiveSnapshotCommandId();
 }
