@@ -16,14 +16,15 @@ is(sql('SELECT count(*) FROM dolt_log()'),'0','no history before lazy initializa
 sql(q{CREATE SCHEMA empty_space; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Test Author <author@example.com>','--date','2020-01-02 03:04:05+00')});
 like($first,qr/^[0-9a-f]{64}$/,'commit returns native SHA256 hash');
-is(sql('SELECT count(*) FROM dolt_log()'),'2','initial commit and first user commit');
+is(sql('SELECT count(*) FROM dolt_log()'),'3','repository, database creation and first user commit');
 is(sql("SELECT message,author,author_email,author_date FROM dolt_log('$first') LIMIT 1"),'first|Test Author|author@example.com|2020-01-02 03:04:05','log metadata matches commit arguments');
-is(sql(q{SELECT message FROM dolt_log('HEAD~1')}),'Initialize data repository','ancestor resolution');
+is(sql(q{SELECT message FROM dolt_log('HEAD~1') LIMIT 1}),'CREATE DATABASE','database creation ancestor');
+is(sql(q{SELECT message FROM dolt_log('HEAD~2')}),'Initialize data repository','repository ancestor');
 is(sql(q{SELECT parents IS NOT NULL, signature IS NULL FROM dolt_log('--parents','-n','1')}),'t|t','reference optional log columns');
 is(sql("SELECT status FROM dolt_branch('feature','$first')"),'0','branch returns named status column');
 is(sql(q{SELECT dolt_tag('v1','HEAD','-m','release','--author','Tagger <tag@example.com>')}),'0','tag creation');
 is(sql(q{SELECT tag_name,tag_hash,tagger,email,message FROM dolt_tags}),"v1|$first|Tagger|tag\@example.com|release",'tag view matches reference metadata');
-is(sql('SELECT count(*) FROM dolt_log'),'2','log system view');
+is(sql('SELECT count(*) FROM dolt_log'),'3','log system view');
 is(sql(q{SELECT commit_hash FROM dolt_log('v1','-n','1')}),$first,'tag resolves commit');
 like(sql(q{SELECT refs FROM dolt_log('-n','1')}),qr/HEAD -> .*feature.*main.*tag: v1/,'reference decoration includes branches and tags');
 fails(q{SELECT dolt_branch('feature')},qr/already exists/,'duplicate branch rejected');
