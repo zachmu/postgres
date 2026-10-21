@@ -12,6 +12,7 @@ sub fails {my($query,$pattern,$label)=@_;my($status,$out,$err)=$node->psql('post
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,10); CREATE INDEX t_v_idx ON t USING dolt_prolly_index(v)});
 my $old=sql(q{SELECT dolt_commit('-Am','integer schema')});
 my $oldshort=substr($old,0,12);
+fails(qq{SELECT * FROM "postgres\@$old".public.t},qr/may have been truncated/,'never reinterpret a truncated full hash as an abbreviation');
 fails(qq{SELECT * FROM "postgres\@${oldshort}".public.t},qr/not materialized/,'lookup never creates catalog objects');
 is(sql("SELECT dolt_catalog_materialize('$old')"),$old,'materialize retained canonical schema and data');
 sql("SELECT dolt_branch('historical')");

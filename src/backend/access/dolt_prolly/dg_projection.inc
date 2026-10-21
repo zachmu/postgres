@@ -92,6 +92,10 @@ dg_project_relation(const RangeVar *input)
 		dbname = pnstrdup(input->catalogname, sep - input->catalogname);
 		if (strcmp(dbname, get_database_name(MyDatabaseId)))
 			return input;
+		/* The lexer truncates identifiers before binding. Never interpret a
+		 * possibly truncated full hash as a valid abbreviated hash. */
+		if (strlen(input->catalogname) == NAMEDATALEN - 1)
+			ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG), errmsg("revision-qualified identifier may have been truncated"), errhint("Use AS OF 'full hash', or a shorter unambiguous revision qualifier.")));
 		revision = pstrdup(sep + 1);
 		if (!*revision || !input->schemaname)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("revision-qualified references require database@revision.schema.table")));
