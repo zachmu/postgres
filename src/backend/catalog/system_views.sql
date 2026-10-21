@@ -1407,3 +1407,17 @@ REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
 REVOKE EXECUTE ON FUNCTION pg_get_aios() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;
+
+-- First version-control slice. History remains privileged until branch ACLs exist.
+CREATE VIEW dolt_log WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_log();
+CREATE VIEW dolt_tags WITH (security_invoker=true) AS
+    SELECT substr(r.refname,6) AS tag_name,
+           encode(o.objchildren[1],'hex') AS tag_hash,
+           (convert_from(o.objpayload,'UTF8')::jsonb)->>'tagger' AS tagger,
+           (convert_from(o.objpayload,'UTF8')::jsonb)->>'email' AS email,
+           timestamp '2000-01-01' + ((convert_from(o.objpayload,'UTF8')::jsonb)->>'date_us')::bigint * interval '1 microsecond' AS date,
+           (convert_from(o.objpayload,'UTF8')::jsonb)->>'message' AS message
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object o ON o.objhash=r.reftarget
+    WHERE r.refname LIKE 'tags/%' AND o.objkind='tag';
+REVOKE ALL ON dolt_log, dolt_tags FROM PUBLIC;

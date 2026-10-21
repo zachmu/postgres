@@ -13,7 +13,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/snapmgr.h"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag"};
 
 static void
 manifest_begin(void)
@@ -112,7 +112,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if ((id == 1 && n != 0) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1))
+	if (((id == 1 || id == 6) && n != 0) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
 	for (i = 0; i < n; i++)
 	{
@@ -124,8 +124,9 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		child = object_kind(DatumGetByteaPP(links[i]), false);
 		valid = id == 0 ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
-			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0) :
-			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 : false;
+			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0) :
+			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
+			id == 7 ? strcmp(child, "commit") == 0 : false;
 		if (!valid)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s child for manifest %s", child, kind)));
 	}
@@ -229,10 +230,10 @@ static void
 check_name(text *name)
 {
 	char	   *s = text_to_cstring(name);
-	int			prefix = strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : 0;
+	int			prefix = strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : strncmp(s, "staged/", 7) == 0 ? 7 : 0;
 
 	if (!prefix || strlen(s) == prefix || strlen(s) > 512)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/ or working/ and a nonempty name (maximum 512 bytes)")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/, staged/ or working/ and a nonempty name (maximum 512 bytes)")));
 }
 
 Datum
@@ -274,9 +275,10 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	else
 	{
 		char	   *kind = object_kind(PG_GETARG_BYTEA_PP(2), false);
-		char	   *expected = strncmp(text_to_cstring(name), "working/", 8) == 0 ? "database" : "commit";
+		char	   *expected = (strncmp(text_to_cstring(name), "working/", 8) == 0 || strncmp(text_to_cstring(name), "staged/", 7) == 0) ? "database" : "commit";
 
-		if (strcmp(kind, expected) != 0)
+		if (strcmp(kind, expected) != 0 &&
+			!(strncmp(text_to_cstring(name), "tags/", 5) == 0 && strcmp(kind, "tag") == 0))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires %s target", expected)));
 	}
 	if (!pg_strong_random(random, sizeof(random)))

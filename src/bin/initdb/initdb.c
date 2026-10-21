@@ -1820,12 +1820,24 @@ setup_privileges(FILE *cmdfd)
 
 	/* Diagnostic bypasses SQL row selection; preserve restricted access. */
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_prolly_root(regclass) FROM PUBLIC;\n\n");
-	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.pg_dolt_object, pg_catalog.pg_dolt_ref FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.pg_dolt_object, pg_catalog.pg_dolt_ref, pg_catalog.dolt_log, pg_catalog.dolt_tags FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_put(text, bytea, bytea[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_get(bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_read(text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_cas(text, bytea, bytea) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_manifest_export(regclass) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_add() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_add(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_commit() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_commit(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branch() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branch(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_tag() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_tag(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_log() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_log(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text, text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"
