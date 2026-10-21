@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include <ctype.h>
 
@@ -2513,6 +2514,32 @@ addRangeTableEntryForCTE(ParseState *pstate,
  * ephemeral named relation.
  */
 ParseNamespaceItem *
+addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	TupleDesc	desc = dg_catalog_bind(pstate, rv, rte);
+	int			i;
+
+	if (!desc)
+		return NULL;
+	rte->rtekind = RTE_DOLT;
+	rte->alias = rv->alias;
+	rte->eref = makeAlias(rv->alias ? rv->alias->aliasname : rv->relname, NIL);
+	buildRelationAliases(desc, rv->alias, rte->eref);
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		rte->coltypes = lappend_oid(rte->coltypes, att->atttypid);
+		rte->coltypmods = lappend_int(rte->coltypmods, att->atttypmod);
+		rte->colcollations = lappend_oid(rte->colcollations, att->attcollation);
+	}
+	rte->inFromCl = true;
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	return buildNSItemFromTupleDesc(rte, list_length(pstate->p_rtable), NULL, desc);
+}
+
+ParseNamespaceItem *
 addRangeTableEntryForENR(ParseState *pstate,
 						 RangeVar *rv,
 						 bool inFromCl)
@@ -3070,6 +3097,7 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
+		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 			{
 				/* Tablefunc, Values, CTE, or ENR RTE */
@@ -3462,6 +3490,7 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 			 */
 			result = false;
 			break;
+		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 			{
 				/* Check dropped-ness by testing for valid coltype */

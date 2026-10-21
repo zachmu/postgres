@@ -13615,13 +13615,23 @@ table_ref:	relation_expr opt_alias_clause
 				}
 			| relation_expr AS OF Sconst opt_alias_clause
 				{
-					$1->dolt_revision = $4;
+					$1->dolt_revision = makeStringConst($4, @4);
 					$1->alias = $5;
+					$$ = (Node *) $1;
+				}
+			| relation_expr AS OF GREATEST '(' expr_list ')' opt_alias_clause
+				{
+					MinMaxExpr *n = makeNode(MinMaxExpr);
+					n->op = IS_GREATEST;
+					n->args = $6;
+					n->location = @4;
+					$1->dolt_revision = (Node *) n;
+					$1->alias = $8;
 					$$ = (Node *) $1;
 				}
 			| relation_expr AS OF SYSTEM_P TIME Sconst opt_alias_clause
 				{
-					$1->dolt_revision = $6;
+					$1->dolt_revision = makeStringConst($6, @6);
 					$1->alias = $7;
 					$$ = (Node *) $1;
 				}

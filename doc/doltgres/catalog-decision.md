@@ -1,3 +1,10 @@
+# Historical catalog experiments — superseded direction
+
+The persistent materializer and projection catalog have been removed. The current
+[versioned provider](catalog-binding.md) must resolve cold queries automatically,
+without catalog writes or preparation. The experiments below document past evidence;
+they do not select persistent runtime relation identities for the final design.
+
 # Phase 1 catalog decision
 
 ## Selected direction
@@ -93,7 +100,7 @@ Run the full core regression suite with `make check`. Test nodes are temporary;
 TAP starts its own servers. Use a filesystem that supports Unix socket chmod
 (for example /tmp) for external servers and socket directories.
 
-## Native retained-generation follow-up
+## Superseded retained-generation follow-up
 
 The [retained catalog binding experiment](catalog-binding.md) now exercises real
 canonical descriptors and prolly data. It supports the hybrid direction while

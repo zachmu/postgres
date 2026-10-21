@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include <limits.h>
 #include <math.h>
@@ -445,6 +446,9 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				else
 					set_cte_pathlist(root, rel, rte);
 				break;
+			case RTE_DOLT:
+				dg_catalog_path(root, rel, rte);
+				break;
 			case RTE_NAMEDTUPLESTORE:
 				/* Might as well just build the path immediately */
 				set_namedtuplestore_pathlist(root, rel, rte);
@@ -521,6 +525,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			case RTE_CTE:
 				/* CTE reference --- fully handled during set_rel_size */
 				break;
+			case RTE_DOLT:
 			case RTE_NAMEDTUPLESTORE:
 				/* tuplestore reference --- fully handled during set_rel_size */
 				break;
@@ -724,6 +729,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 			 */
 			return;
 
+		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 
 			/*

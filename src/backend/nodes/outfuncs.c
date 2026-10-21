@@ -559,6 +559,14 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			WRITE_NODE_FIELD(coltypmods);
 			WRITE_NODE_FIELD(colcollations);
 			break;
+		case RTE_DOLT:
+			WRITE_STRING_FIELD(dolt_table);
+			WRITE_STRING_FIELD(dolt_branch);
+			WRITE_OID_FIELD(dolt_relid);
+			WRITE_NODE_FIELD(coltypes);
+			WRITE_NODE_FIELD(coltypmods);
+			WRITE_NODE_FIELD(colcollations);
+			break;
 		case RTE_NAMEDTUPLESTORE:
 			WRITE_STRING_FIELD(enrname);
 			WRITE_FLOAT_FIELD(enrtuples);

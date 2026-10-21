@@ -98,6 +98,7 @@ extern ParseNamespaceItem *addRangeTableEntryForCTE(ParseState *pstate,
 													Index levelsup,
 													RangeVar *rv,
 													bool inFromCl);
+extern ParseNamespaceItem *addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv);
 extern ParseNamespaceItem *addRangeTableEntryForENR(ParseState *pstate,
 													RangeVar *rv,
 													bool inFromCl);

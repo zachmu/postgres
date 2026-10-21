@@ -18,7 +18,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltbranch.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -460,7 +459,6 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 			elog(ERROR, "relation projection hook returned NULL");
 	}
 
-	relation = dg_project_relation(relation);
 	/* verify that flags do no conflict */
 	Assert(!((flags & RVR_NOWAIT) && (flags & RVR_SKIP_LOCKED)));
 
@@ -651,7 +649,6 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 					 errmsg("relation \"%s\" does not exist",
 							relation->relname)));
 	}
-	dg_projection_relation_check(relId, lockmode);
 	return relId;
 }
 

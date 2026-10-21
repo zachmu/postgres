@@ -1870,6 +1870,7 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
+		case RTE_DOLT:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* Not all of these can have dropped cols, but share code anyway */

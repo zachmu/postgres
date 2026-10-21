@@ -1,5 +1,6 @@
 backend_sources += files(
   'dg_codec.c',
+  'dg_catalog_scan.c',
   'dg_branch.c',
   'dg_manifest.c',
   'dg_version.c',

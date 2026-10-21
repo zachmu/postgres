@@ -71,7 +71,6 @@ catalog_headers = [
   'pg_subscription_rel.h',
   'pg_dolt_object.h',
   'pg_dolt_ref.h',
-  'pg_dolt_projection.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.

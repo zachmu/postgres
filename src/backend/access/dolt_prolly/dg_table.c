@@ -1,5 +1,4 @@
 #include "dg.h"
-#include "access/doltbranch.h"
 #include "miscadmin.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -190,7 +189,6 @@ index_delete(Relation rel, TM_IndexDeleteOp *op)
 static void
 writer(Relation rel)
 {
-	dg_projection_write_check(rel);
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	LockRelationOid(RelationGetRelid(rel), ExclusiveLock);

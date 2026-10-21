@@ -53,12 +53,11 @@ visible(TransactionId xid, CommandId cid, Snapshot snap)
 	return !XidInMVCCSnapshot(xid, snap);
 }
 static DGState *
-load_state(Relation rel, Snapshot snap, const uint64 *wanted)
+load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch, bool use_base)
 {
 	DGState    *s = palloc0(sizeof(*s));
 	bool		found_root = false;
 	PLHash		binding;
-	const char *branch = dg_relation_branch(rel);
 	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
 	HASHCTL		ctl = {0};
 	BlockNumber n = RelationGetNumberOfBlocks(rel),
@@ -187,7 +186,8 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 	}
 	if (assembly)
 		pfree(assembly);		/* An aborted partial append is unreachable. */
-	if (!found_root)
+	s->has_root = found_root;
+	if (!found_root && use_base)
 		dg_branch_base(rel, s);
 	dg_check(pl_validate(&s->content));
 	dg_check(pl_validate(&s->handles));
@@ -196,12 +196,17 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 DGState *
 dg_load(Relation rel, Snapshot snap)
 {
-	return load_state(rel, snap, NULL);
+	return load_state(rel, snap, NULL, dg_relation_branch(rel), true);
+}
+DGState *
+dg_load_branch(Relation rel, Snapshot snap, const char *branch)
+{
+	return load_state(rel, snap, NULL, branch, false);
 }
 DGState *
 dg_load_tid(Relation rel, uint64 id)
 {
-	return load_state(rel, SnapshotSelf, &id);
+	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true);
 }
 static void
 append(Relation rel, const uint8 *data, Size length)

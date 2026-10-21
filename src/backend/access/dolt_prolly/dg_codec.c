@@ -21,7 +21,7 @@ static PLSlice encode_value(Oid type, Datum value);
 static Datum decode_value(Oid type, PLSlice bytes);
 
 static PLSlice
-pack_fields(PLValue *fields, int count)
+pack_fields(PLValue * fields, int count)
 {
 	uint8	   *packed;
 	size_t		length;
@@ -525,4 +525,11 @@ dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 	ExecForceStoreHeapTuple(tuple, slot, true);
 	slot->tts_tid = *tid;
 	slot->tts_tableOid = RelationGetRelid(rel);
+}
+
+HeapTuple
+dg_decode_descriptor(TupleDesc desc, PLSlice bytes)
+{
+	dg_validate_descriptor(desc);
+	return decode_fields(desc, bytes);
 }

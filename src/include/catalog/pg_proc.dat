@@ -12663,6 +12663,4 @@
  provolatile => 's', proparallel => 'u', proretset => 't', prorettype => 'record', proargtypes => 'text',
  proallargtypes => '{text,text,bytea,bytea,bytea,bytea,bool}', proargmodes => '{i,t,t,t,t,t,t}',
  proargnames => '{relation_name,table_name,key,base,ours,theirs,whole_table}', prosrc => 'dolt_conflict_rows' },
-{ oid => '9175', descr => 'materialize retained runtime schema and data identities', proname => 'dolt_catalog_materialize',
- provolatile => 'v', proparallel => 'u', prorettype => 'text', proargtypes => 'text', prosrc => 'dolt_catalog_materialize' },
 ]

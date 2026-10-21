@@ -422,6 +422,9 @@ overexplain_range_table(PlannedStmt *plannedstmt, ExplainState *es)
 			case RTE_CTE:
 				kind = "cte";
 				break;
+			case RTE_DOLT:
+				kind = "versioned relation";
+				break;
 			case RTE_NAMEDTUPLESTORE:
 				kind = "namedtuplestore";
 				break;

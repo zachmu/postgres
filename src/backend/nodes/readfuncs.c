@@ -416,6 +416,14 @@ _readRangeTblEntry(void)
 			READ_NODE_FIELD(coltypmods);
 			READ_NODE_FIELD(colcollations);
 			break;
+		case RTE_DOLT:
+			READ_STRING_FIELD(dolt_table);
+			READ_STRING_FIELD(dolt_branch);
+			READ_OID_FIELD(dolt_relid);
+			READ_NODE_FIELD(coltypes);
+			READ_NODE_FIELD(coltypmods);
+			READ_NODE_FIELD(colcollations);
+			break;
 		case RTE_NAMEDTUPLESTORE:
 			READ_STRING_FIELD(enrname);
 			READ_FLOAT_FIELD(enrtuples);
