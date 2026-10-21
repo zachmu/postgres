@@ -13,7 +13,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltbranch.h"
 
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
@@ -166,25 +165,6 @@ LookupTypeNameExtended(ParseState *pstate,
 		char	   *schemaname;
 		char	   *typname;
 
-		/*
-		 * Bind revision-qualified row types to the same runtime namespace as
-		 * relation references; never modify a cached parse tree in place.
-		 */
-		if (list_length(typeName->names) == 3)
-		{
-			RangeVar   *rv = makeRangeVar(strVal(lsecond(typeName->names)), strVal(lthird(typeName->names)), typeName->location);
-			const RangeVar *bound;
-
-			rv->catalogname = strVal(linitial(typeName->names));
-			bound = dg_project_relation(rv);
-			if (bound != rv)
-			{
-				TypeName   *copy = (TypeName *) copyObject(typeName);
-
-				copy->names = list_make3(makeString(pstrdup(bound->catalogname)), makeString(pstrdup(bound->schemaname)), makeString(pstrdup(bound->relname)));
-				typeName = copy;
-			}
-		}
 		/* deconstruct the name list */
 		DeconstructQualifiedName(typeName->names, &schemaname, &typname);
 

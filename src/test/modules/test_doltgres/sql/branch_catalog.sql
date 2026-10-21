@@ -1,4 +1,4 @@
--- A backend without the module retains PostgreSQL's cross-database rejection.
+-- Native revision lookup requires a repository before the fixture is loaded.
 SELECT * FROM "contrib_regression/main".public.accounts;
 LOAD 'test_doltgres';
 CREATE SCHEMA dg_4_main_public;

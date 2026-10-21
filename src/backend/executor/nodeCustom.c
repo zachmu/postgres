@@ -55,7 +55,7 @@ ExecInitCustomScan(CustomScan *cscan, EState *estate, int eflags)
 	/*
 	 * open the scan relation, if any
 	 */
-	if (scanrelid > 0)
+	if (scanrelid > 0 && exec_rt_fetch(scanrelid, estate)->rtekind != RTE_DOLT)
 	{
 		scan_rel = ExecOpenScanRelation(estate, scanrelid, eflags);
 		css->ss.ss_currentRelation = scan_rel;
@@ -80,8 +80,12 @@ ExecInitCustomScan(CustomScan *cscan, EState *estate, int eflags)
 
 		scan_tupdesc = ExecTypeFromTL(cscan->custom_scan_tlist);
 		ExecInitScanTupleSlot(estate, &css->ss, scan_tupdesc, slotOps);
-		/* Node's targetlist will contain Vars with varno = INDEX_VAR */
-		tlistvarno = INDEX_VAR;
+
+		/*
+		 * Native versioned bindings retain their RTE for whole-row/EPQ
+		 * support.
+		 */
+		tlistvarno = scanrelid > 0 && exec_rt_fetch(scanrelid, estate)->rtekind == RTE_DOLT ? scanrelid : INDEX_VAR;
 	}
 	else
 	{

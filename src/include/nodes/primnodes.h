@@ -91,8 +91,8 @@ typedef struct RangeVar
 	/* table alias & optional column aliases */
 	Alias	   *alias;
 
-	/* Literal retained revision for AS OF; never a runtime object identity. */
-	char	   *dolt_revision;
+	/* Retained revision expression for AS OF; never a runtime object identity. */
+	Node	   *dolt_revision;
 
 	/* token location, or -1 if unknown */
 	ParseLoc	location;

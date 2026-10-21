@@ -1045,6 +1045,7 @@ typedef enum RTEKind
 	RTE_TABLEFUNC,				/* TableFunc(.., column list) */
 	RTE_VALUES,					/* VALUES (<exprlist>), (<exprlist>), ... */
 	RTE_CTE,					/* common table expr (WITH list element) */
+	RTE_DOLT,					/* immutable versioned catalog binding */
 	RTE_NAMEDTUPLESTORE,		/* tuplestore, e.g. for AFTER triggers */
 	RTE_RESULT,					/* RTE represents an empty FROM clause; such
 								 * RTEs are added by the planner, they're not
@@ -1256,6 +1257,11 @@ typedef struct RangeTblEntry
 	/*
 	 * Fields valid for ENR RTEs (else NULL/zero):
 	 */
+	/* RTE_DOLT: retained table descriptor address (hex), not a runtime OID. */
+	char	   *dolt_table;
+	char	   *dolt_branch;
+	Oid			dolt_relid;
+
 	/* name of ephemeral named relation */
 	char	   *enrname;
 	/* estimated or actual from caller */

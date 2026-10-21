@@ -14,7 +14,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltbranch.h"
 #include "catalog/pg_dolt_ref.h"
 
 #include "access/transam.h"
@@ -31,7 +30,6 @@
 #include "rewrite/rewriteManip.h"
 #include "tcop/utility.h"
 #include "utils/syscache.h"
-#include "utils/lsyscache.h"
 
 
 typedef enum
@@ -587,8 +585,6 @@ add_rte_to_flat_rtable(PlannerGlobal *glob, List *rteperminfos,
 		(newrte->rtekind == RTE_SUBQUERY && OidIsValid(newrte->relid)))
 	{
 		glob->relationOids = lappend_oid(glob->relationOids, newrte->relid);
-		if (dg_projected_namespace(get_rel_namespace(newrte->relid)))
-			glob->relationOids = lappend_oid(glob->relationOids, DoltRefRelationId);
 		glob->allRelids = bms_add_member(glob->allRelids,
 										 list_length(glob->finalrtable));
 	}
@@ -1684,12 +1680,14 @@ set_customscan_references(PlannerInfo *root,
 						  int rtoffset)
 {
 	ListCell   *lc;
+	bool		versioned = cscan->scan.scanrelid > 0 &&
+		((RangeTblEntry *) list_nth(root->parse->rtable, cscan->scan.scanrelid - 1))->rtekind == RTE_DOLT;
 
 	/* Adjust scanrelid if it's valid */
 	if (cscan->scan.scanrelid > 0)
 		cscan->scan.scanrelid += rtoffset;
 
-	if (cscan->custom_scan_tlist != NIL || cscan->scan.scanrelid == 0)
+	if (!versioned && (cscan->custom_scan_tlist != NIL || cscan->scan.scanrelid == 0))
 	{
 		/* Adjust tlist, qual, custom_exprs to reference custom scan tuple */
 		indexed_tlist *itlist = build_tlist_index(cscan->custom_scan_tlist);
@@ -1726,6 +1724,13 @@ set_customscan_references(PlannerInfo *root,
 	}
 	else
 	{
+		/*
+		 * Native versioned scans keep base-relation Vars, including whole
+		 * rows.
+		 */
+		if (versioned)
+			cscan->custom_scan_tlist = fix_scan_list(root, cscan->custom_scan_tlist,
+													 rtoffset, NUM_EXEC_TLIST((Plan *) cscan));
 		/* Adjust tlist, qual, custom_exprs in the standard way */
 		cscan->scan.plan.targetlist =
 			fix_scan_list(root, cscan->scan.plan.targetlist,
@@ -3722,15 +3727,20 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 
+			if (rte->rtekind == RTE_DOLT)
+			{
+				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
+				if (OidIsValid(rte->dolt_relid))
+					context->glob->relationOids = lappend_oid(context->glob->relationOids, rte->dolt_relid);
+				context->glob->dependsOnRole = true;
+			}
+
+
 			if (rte->rtekind == RTE_RELATION ||
 				(rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid)) ||
 				(rte->rtekind == RTE_NAMEDTUPLESTORE && OidIsValid(rte->relid)))
-			{
 				context->glob->relationOids =
 					lappend_oid(context->glob->relationOids, rte->relid);
-				if (dg_projected_namespace(get_rel_namespace(rte->relid)))
-					context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
-			}
 		}
 
 		/* And recurse into the query's subexpressions */

@@ -1524,6 +1524,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 					break;
 				case RTE_JOIN:
 				case RTE_CTE:
+				case RTE_DOLT:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
 				case RTE_GROUP:
@@ -2588,6 +2589,7 @@ replace_vars_in_jointree(Node *jtnode,
 						break;
 					case RTE_JOIN:
 					case RTE_CTE:
+					case RTE_DOLT:
 					case RTE_NAMEDTUPLESTORE:
 					case RTE_RESULT:
 					case RTE_GROUP:

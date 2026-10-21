@@ -1,15 +1,18 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
-#include "access/xact.h"
-#include "access/doltbranch.h"
-#include "access/heapam.h"
-#include "access/htup_details.h"
-#include "catalog/pg_dolt_projection.h"
+#include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
-#include "nodes/makefuncs.h"
-#include "parser/parser.h"
-#include "tcop/utility.h"
+#include "utils/acl.h"
+#include "utils/syscache.h"
+#include "utils/regproc.h"
+#include "utils/varlena.h"
+#include "parser/parse_expr.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
+#include "optimizer/optimizer.h"
+#include "access/xact.h"
+#include "access/doltbranch.h"
 #include "catalog/pg_dolt_ref.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -106,7 +109,7 @@ begin_api(void)
 		elog(ERROR, "cannot connect version-control SPI");
 	MemoryContextSwitchTo(c);
 	PushCopiedSnapshot(GetActiveSnapshot());
-	set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
 }
 static void
@@ -939,4 +942,6 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_merge.inc"
 
-#include "dg_projection.inc"
+
+
+#include "dg_catalog.inc"

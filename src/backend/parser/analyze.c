@@ -3654,6 +3654,9 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 											LCS_asString(lc->strength)),
 									 parser_errposition(pstate, thisrel->location)));
 							break;
+						case RTE_DOLT:
+							ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("historical rows cannot be locked")));
+							break;
 						case RTE_NAMEDTUPLESTORE:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

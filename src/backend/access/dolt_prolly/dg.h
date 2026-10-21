@@ -14,6 +14,7 @@
 typedef struct DGState
 {
 	PLStore    *store;
+	bool		has_root;
 	PLTree		content;
 	PLTree		handles;
 	uint64		nextid;
@@ -29,6 +30,7 @@ typedef struct DGRows
 extern void dg_check(PLStatus status);
 extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
+extern DGState *dg_load_branch(Relation rel, Snapshot snapshot, const char *branch);
 extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
 extern void dg_release(DGState *state);
@@ -40,6 +42,7 @@ extern DGRows dg_rows(const PLTree * tree);
 extern void dg_tid(uint64 id, ItemPointer tid);
 extern uint64 dg_id(ItemPointer tid);
 extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);
+extern HeapTuple dg_decode_descriptor(TupleDesc desc, PLSlice bytes);
 extern void dg_decode(Relation rel, PLSlice tuple, ItemPointer tid, TupleTableSlot *slot);
 extern void dg_validate_descriptor(TupleDesc desc);
 extern void dg_rebuild_indexes(Relation rel);

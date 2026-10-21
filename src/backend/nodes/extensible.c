@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "nodes/extensible.h"
 #include "utils/hsearch.h"
@@ -136,6 +137,8 @@ GetExtensibleNodeMethods(const char *extnodename, bool missing_ok)
 const CustomScanMethods *
 GetCustomScanMethods(const char *CustomName, bool missing_ok)
 {
+	if (!strcmp(CustomName, "DoltVersionedScan"))
+		return dg_catalog_scan_methods();
 	return (const CustomScanMethods *)
 		GetExtensibleNodeEntry(custom_scan_methods,
 							   CustomName,

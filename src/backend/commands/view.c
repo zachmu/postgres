@@ -348,6 +348,20 @@ DefineViewRules(Oid viewOid, Query *viewParse, bool replace)
 	 */
 }
 
+/* Versioned bindings are statement-local until stored-query dependencies and
+ * view-owner authorization have a versioned catalog contract. */
+static bool
+versioned_view_walker(Node *node, void *context)
+{
+	if (!node)
+		return false;
+	if (IsA(node, RangeTblEntry))
+		return ((RangeTblEntry *) node)->rtekind == RTE_DOLT;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, versioned_view_walker, context, QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, versioned_view_walker, context);
+}
+
 /*
  * DefineView
  *		Execute a CREATE VIEW command.
@@ -373,6 +387,8 @@ DefineView(ViewStmt *stmt, const char *queryString,
 	rawstmt->stmt_len = stmt_len;
 
 	viewParse = parse_analyze_fixedparams(rawstmt, queryString, NULL, 0, NULL);
+	if (versioned_view_walker((Node *) viewParse, NULL))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("stored views over versioned bindings are not supported yet")));
 
 	/*
 	 * The grammar should ensure that the result is a single SELECT Query.
