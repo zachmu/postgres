@@ -301,11 +301,12 @@ capture_inner(bool persist)
 	if (SPI_processed)
 		unsupported("database capture containing non-prolly relations, routines, custom types or unsupported relation properties");
 	run("SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE " USER_NAMESPACE, 0, NULL, NULL, NULL, true);
-	if (SPI_processed) unsupported("capture of custom collations or operators");
+	if (SPI_processed)
+		unsupported("capture of custom collations or operators");
 	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attoptions IS NOT NULL OR a.atthasdef OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n')", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("capture of defaults, generated/dropped columns, user types, triggers or non-unique constraints");
-	run("SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(n.nspacl) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\"", 0, NULL, NULL, NULL, true);
+	run("SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\"", 0, NULL, NULL, NULL, true);
 	nns = SPI_processed;
 	namespaces = palloc(sizeof(char *) * Max(nns, 1));
 	for (i = 0; i < nns; i++)
@@ -341,7 +342,7 @@ capture_inner(bool persist)
 		run("SELECT format('%I.%I',n.nspname,c.relname),CASE WHEN c.relkind='r' THEN 'table' ELSE 'index' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 		name = strcell(0, 1);
 		kind = strcell(0, 2);
-		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(c.relacl) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
+		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 		schema = strcell(0, 1);
 		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 		schemahash = strcell(0, 1);
@@ -397,6 +398,15 @@ capture_inner(bool persist)
 		}
 	}
 	PopActiveSnapshot();
+
+	/*
+	 * Every historical byte has been copied; no source locator escapes
+	 * capture.
+	 */
+	for (i = nrel - 1; i >= 0; i--)
+		UnlockRelationOid(relations[i], AccessShareLock);
+	for (i = lengthof(catalogs) - 1; i >= 0; i--)
+		UnlockRelationOid(catalogs[i], ShareLock);
 	return result;
 }
 static Capture
@@ -406,6 +416,7 @@ capture(bool persist)
 	int			nest = NewGUCNestLevel();
 
 	set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("quote_all_identifiers", "off", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	PG_TRY();
 	{
 		result = capture_inner(persist);
@@ -475,7 +486,7 @@ valid_name(const char *s)
 {
 	const char *p;
 
-	if (!*s || strlen(s) > 200 || !strcmp(s, "HEAD") || !strcmp(s, "WORKING") || !strcmp(s, "STAGED") || strstr(s, "..") || strstr(s, "@{") || s[0] == '-' || s[0] == '/' || s[strlen(s) - 1] == '/' || s[strlen(s) - 1] == '.' || strstr(s, "//") || (strlen(s) >= 5 && !strcmp(s + strlen(s) - 5, ".lock")))
+	if (!*s || strlen(s) > 200 || !pg_strcasecmp(s, "HEAD") || !pg_strcasecmp(s, "WORKING") || !pg_strcasecmp(s, "STAGED") || strstr(s, "..") || strstr(s, "@{") || s[0] == '-' || s[0] == '/' || s[strlen(s) - 1] == '/' || s[strlen(s) - 1] == '.' || strstr(s, "//") || (strlen(s) >= 5 && !strcmp(s + strlen(s) - 5, ".lock")))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid branch or tag name: %s", s)));
 	for (p = s; *p; p++)
 		if ((unsigned char) *p <= 32 || (unsigned char) *p == 127 || strchr("~^:?*[\\", *p))
@@ -770,7 +781,7 @@ dolt_log(PG_FUNCTION_ARGS)
 {
 	int			n,
 				i,
-				limit = 100000;
+				limit = -1;
 	char	  **args = arguments(fcinfo, &n),
 			   *revision = "HEAD";
 	bool		parents = false,
@@ -808,7 +819,7 @@ dolt_log(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	hash = resolve(revision);
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/main') THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT $4", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
+	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/main') THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -836,12 +847,60 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	int			nest = begin_api();
 
 	from = state_json(text_to_cstring(PG_GETARG_TEXT_PP(0)));
-	to = state_json(text_to_cstring(PG_GETARG_TEXT_PP(1)));
+	to = !strcmp(text_to_cstring(PG_GETARG_TEXT_PP(0)), text_to_cstring(PG_GETARG_TEXT_PP(1))) ? from : state_json(text_to_cstring(PG_GETARG_TEXT_PP(1)));
 	if (PG_NARGS() > 2)
 		table = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	if (table)
+	{
+		run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) SELECT DISTINCT v->>'name' FROM members WHERE v->>'kind'='table' AND (v->>'name'=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(v->>'name'))[2]=(parse_ident($3))[1]))", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), CStringGetTextDatum(table)), NULL, true);
+		if (!SPI_processed)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table does not exist in either revision: %s", table)));
+		if (SPI_processed > 1)
+			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
+		table = strcell(0, 1);
+	}
+
 	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table'),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table'),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,(av->>'content') IS DISTINCT FROM (bv->>'content'),(av->>'schema') IS DISTINCT FROM (bv->>'schema') FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(coalesce(av->>'name',bv->>'name')))[2]=(parse_ident($3))[1])) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
 		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
+}
+
+/* Distinct fmgr entries keep overload arity explicit in the built-in catalog. */
+
+Datum
+dolt_add_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_add(fcinfo);
+}
+
+Datum
+dolt_commit_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_commit(fcinfo);
+}
+
+Datum
+dolt_branch_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_branch(fcinfo);
+}
+
+Datum
+dolt_tag_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_tag(fcinfo);
+}
+
+Datum
+dolt_log_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_log(fcinfo);
+}
+
+Datum
+dolt_diff_summary_table(PG_FUNCTION_ARGS)
+{
+	return dolt_diff_summary(fcinfo);
 }
