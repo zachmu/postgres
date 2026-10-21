@@ -1286,6 +1286,28 @@ drop table cchild;
 SELECT viewname, definition FROM pg_views
 WHERE schemaname = 'pg_catalog'
 ORDER BY viewname;
+dolt_log| SELECT commit_hash,
+    committer,
+    email,
+    date,
+    message,
+    commit_order,
+    parents,
+    refs,
+    signature,
+    author,
+    author_email,
+    author_date
+   FROM dolt_log() dolt_log(commit_hash, committer, email, date, message, commit_order, parents, refs, signature, author, author_email, author_date);
+dolt_tags| SELECT substr(r.refname, 6) AS tag_name,
+    encode(o.objchildren[1], 'hex'::text) AS tag_hash,
+    ((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'tagger'::text) AS tagger,
+    ((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'email'::text) AS email,
+    ('Sat Jan 01 00:00:00 2000'::timestamp without time zone + (((((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'date_us'::text))::bigint)::double precision * '@ 0.000001 secs'::interval)) AS date,
+    ((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'message'::text) AS message
+   FROM (pg_dolt_ref r
+     JOIN pg_dolt_object o ON ((o.objhash = r.reftarget)))
+  WHERE ((r.refname ~~ 'tags/%'::text) AND (o.objkind = 'tag'::text));
 pg_aios| SELECT pid,
     io_id,
     io_generation,

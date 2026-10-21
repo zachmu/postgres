@@ -10,5 +10,6 @@ tests += {
     't/004_portability.pl',
     't/005_native.pl',
     't/006_manifest.pl',
+    't/007_commands.pl',
   ]},
 }
