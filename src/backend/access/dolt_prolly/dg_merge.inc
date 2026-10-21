@@ -691,13 +691,26 @@ dolt_merge(PG_FUNCTION_ARGS)
 	initStringInfo(&conflicts);
 	install_database(same(base, head.target) ? NULL : child(base, 1), oursdb, their_db, &conflicts);
 	database = capture(true).hash;
+
+	/*
+	 * --no-commit cannot stop a fast-forward (there is no new commit to
+	 * create). A squash fast-forward reports its source hash without moving
+	 * HEAD.
+	 */
+	if (same(base, head.target) && !noff)
+	{
+		ff = 1;
+		nocommit = false;
+		if (squash)
+			commit = theirs;
+	}
 	if (conflicts.len || nocommit)
 	{
 		initStringInfo(&json);
 		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", squash ? "true" : "false", conflicts.data);
 		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
 		conflicted = conflicts.len ? 1 : 0;
-		result_message = conflicted ? "conflicts found" : "merge staged";
+		result_message = conflicted ? "conflicts found" : "merge successful";
 	}
 	else if (!squash)
 	{
@@ -754,6 +767,19 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	if (!pending.target)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("no merge in progress")));
 	json = metadata(pending.target, "merge");
+	for (i = 1; i < n; i++)
+	{
+		int			matches;
+
+		if (!strcmp(args[i], "."))
+			continue;
+		run("SELECT count(DISTINCT v->>'table')::int FROM jsonb_array_elements($1::jsonb->'conflicts') v WHERE v->>'table'=$2 OR (array_length(parse_ident($2),1)=1 AND (parse_ident(v->>'table'))[2]=(parse_ident($2))[1])", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(args[i])), NULL, true);
+		matches = DatumGetInt32(cell(0, 1));
+		if (matches > 1)
+			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous conflict table: %s", args[i])));
+		if (!matches)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("no conflicts for table: %s", args[i])));
+	}
 	for (i = 0; i < 3; i++)
 		parents[i] = PointerGetDatum(child(pending.target, i + 1));
 	run("SELECT v::text FROM jsonb_array_elements($1::jsonb->'conflicts') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
