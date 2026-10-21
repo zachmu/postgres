@@ -1,6 +1,7 @@
 # Manifest foundation: publication contract
 
-This is an internal foundation, not the user-facing dolt_commit/checkout API.
+This is the internal foundation underneath the
+[first version-control command slice](version-commands.md).
 Mutable refs and immutable objects live in per-database heap catalogs. Existing
 heap MVCC, row/index locking, WAL, savepoints and two-phase commit are authoritative.
 No external manifest file, postcommit rename or independent commit decision exists.
@@ -16,10 +17,12 @@ PostgreSQL schema serializer or an admission check for arbitrary SQL values.
 Schema descriptors and database member mappings must use canonical symbolic
 names and formats supplied by the eventual schema integration layer.
 
-Kinds are chunk, schema, table, index, database and commit. A table/index names
-its schema and content chunk; a database names table/index descriptors; a commit
+Kinds are chunk, schema, table, index, database, commit, namespace and tag. A table/index names
+its schema and content chunk; a database names namespace/table/index descriptors; a commit
 names a database state followed by zero or more parent commits. Chunk objects may
-link other chunks. Schema objects are opaque canonical descriptors at this stage.
+link other chunks. Namespace objects have no children; annotated tag objects name
+a commit. Schema payloads remain opaque to the generic object API; the command
+layer now supplies a limited canonical schema format.
 A raw chunk's object address includes its envelope and differs from the prolly
 node hash. Snapshot export preserves the original node bytes and a mapping to
 node hashes; these namespaces must not be confused.
@@ -35,10 +38,10 @@ requires an absent ref; update/delete requires the exact previously read token.
 Every create/update generates a fresh random 256-bit token, avoiding ABA after
 move-back or delete/recreate. A stale token fails with serialization_failure;
 concurrent creation uses the unique index and may fail with unique_violation.
-Names are database-local, with heads/, tags/ and working/ namespaces. Heads/tags
-point to commits; working refs point to database states. Tags are mutable only
-through the same explicit compare-and-swap protocol; immutable-tag policy is a
-later user API decision.
+Names are database-local, with heads/, tags/, working/ and staged/ namespaces.
+Heads point to commits; tags permit annotated tag objects or legacy direct commit
+targets; working/staged refs point to database states. The generic CAS API can
+move tags; the public command slice only supports creation.
 
 SQL UPDATE/DELETE performs waiting and predicate rechecking. Read Committed can
 see newer committed versions on subsequent statements; Repeatable Read retains
@@ -69,9 +72,9 @@ The concrete disjoint-writer algorithm remains the row-level milestone's work.
 ## Boundaries
 
 Functions are privileged internal test/building APIs. Ordinary AMs and table
-write paths are unchanged. No branch schema resolution, automatic database
-capture, logical dump/restore of history, GC, ref authorization model or user
-version-control command semantics are claimed. Physical backups include catalogs.
+write paths are unchanged. The command layer provides limited automatic database capture and version-control
+functions. Branch schema resolution, logical dump/restore of history, GC and a
+ref authorization model remain future work. Physical backups include catalogs.
 Fresh initdb is required. Snapshot export initially copies the canonical tree
 only; executor handle trees remain runtime state and are not historical content.
 
@@ -94,7 +97,7 @@ The object hash input is exactly:
 ```
 
 Integers are big-endian; kind IDs 0–5 are chunk, schema, table, index, database,
-commit respectively. Ordered children and payload bytes are significant. For
+commit respectively; IDs 6 and 7 are namespace and tag. Ordered children and payload bytes are significant. For
 example, different commit metadata or parent order changes the commit hash even
 when the database target is identical. The payload format is caller-owned and
 must be versioned; no semantic normalization or symbolic schema encoding is

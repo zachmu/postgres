@@ -300,8 +300,10 @@ The backend now also provides heap-backed per-database object/ref catalogs and
 privileged `dolt_manifest_*` building blocks. See
 [the publication contract](../../../../doc/doltgres/manifest.md) for formats,
 APIs, snapshot/CAS behavior, recovery tests and boundaries. The exporter retains
-canonical table/index chunks independently of their source relations. These APIs
-do not yet provide `dolt_commit`, checkout, automatic schema capture or live
-working-set publication on ordinary DML. The table writer lock remains unchanged.
+canonical table/index chunks independently of their source relations. The
+[first command slice](../../../../doc/doltgres/version-commands.md) builds limited
+automatic schema capture, staging, commit, branch/tag creation, log and table diff
+summary on these APIs. Checkout and live working-set publication on ordinary DML
+remain future work. The table writer lock remains unchanged.
 Physical backups include history; logical pg_dump currently omits it. This
 catalog revision requires fresh initdb.
