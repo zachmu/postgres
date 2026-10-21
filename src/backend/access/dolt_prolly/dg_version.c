@@ -474,10 +474,6 @@ ensure_repository(void)
 		return;
 	db = put("database", "{\"format\":\"DGDB1\",\"members\":[]}", NULL, 0);
 	commit = commit_object(db, NULL, "Initialize data repository", NULL, NULL, GetCurrentTimestamp());
-	/* Match Doltgres history: database creation follows repository bootstrap. */
-	CommandCounterIncrement();
-	UpdateActiveSnapshotCommandId();
-	commit = commit_object(db, commit, "CREATE DATABASE", NULL, NULL, GetCurrentTimestamp());
 	move_ref("heads/main", head, commit);
 	move_ref("staged/main", read_ref("staged/main"), db);
 	move_ref("working/main", read_ref("working/main"), db);
