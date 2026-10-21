@@ -208,10 +208,12 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 				rte->dolt_branch = pstrdup(revision);
 				rte->dolt_relid = live;
 			}
-			else if (!strcmp(revision, dg_current_branch()))
+			else
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 			table_close(rel, NoLock);
 		}
+		if (working && !OidIsValid(live))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 		end_api(nest);
 	} PG_FINALLY();
 	{

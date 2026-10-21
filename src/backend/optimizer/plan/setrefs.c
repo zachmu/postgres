@@ -1680,12 +1680,14 @@ set_customscan_references(PlannerInfo *root,
 						  int rtoffset)
 {
 	ListCell   *lc;
+	bool		versioned = cscan->scan.scanrelid > 0 &&
+		((RangeTblEntry *) list_nth(root->parse->rtable, cscan->scan.scanrelid - 1))->rtekind == RTE_DOLT;
 
 	/* Adjust scanrelid if it's valid */
 	if (cscan->scan.scanrelid > 0)
 		cscan->scan.scanrelid += rtoffset;
 
-	if (cscan->custom_scan_tlist != NIL || cscan->scan.scanrelid == 0)
+	if (!versioned && (cscan->custom_scan_tlist != NIL || cscan->scan.scanrelid == 0))
 	{
 		/* Adjust tlist, qual, custom_exprs to reference custom scan tuple */
 		indexed_tlist *itlist = build_tlist_index(cscan->custom_scan_tlist);
@@ -1722,6 +1724,13 @@ set_customscan_references(PlannerInfo *root,
 	}
 	else
 	{
+		/*
+		 * Native versioned scans keep base-relation Vars, including whole
+		 * rows.
+		 */
+		if (versioned)
+			cscan->custom_scan_tlist = fix_scan_list(root, cscan->custom_scan_tlist,
+													 rtoffset, NUM_EXEC_TLIST((Plan *) cscan));
 		/* Adjust tlist, qual, custom_exprs in the standard way */
 		cscan->scan.plan.targetlist =
 			fix_scan_list(root, cscan->scan.plan.targetlist,

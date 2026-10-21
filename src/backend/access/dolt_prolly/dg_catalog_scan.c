@@ -40,6 +40,7 @@ typedef struct DGCatalogScan
 	uint64		repeats;
 	uint64		chunks;
 	bytea	   *root;
+	bytea	   *initial_root;
 	Relation	objects;
 	Snapshot	snapshot;
 	DGState    *live;
@@ -90,7 +91,7 @@ create_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist, L
 
 	scan->scan.plan.targetlist = tlist;
 	scan->scan.plan.qual = extract_actual_clauses(clauses, false);
-	scan->scan.scanrelid = 0;
+	scan->scan.scanrelid = rel->relid;
 	scan->custom_scan_tlist = build_physical_tlist(root, rel);
 	scan->custom_relids = bms_copy(rel->relids);
 	scan->custom_private = list_make3(makeString(pstrdup(rte->dolt_table)), makeString(pstrdup(rte->dolt_branch ? rte->dolt_branch : "")), makeInteger(rte->dolt_relid));
@@ -180,7 +181,7 @@ push(DGCatalogScan *s, bytea *hash)
 		elog(ERROR, "retained tree too deep");
 	s->chunks++;
 	f = &s->frames[s->depth++];
-	f->context = AllocSetContextCreate(CurrentMemoryContext, "retained chunk", ALLOCSET_SMALL_SIZES);
+	f->context = AllocSetContextCreate(s->css.ss.ps.state->es_query_cxt, "retained chunk", ALLOCSET_SMALL_SIZES);
 	old = MemoryContextSwitchTo(f->context);
 	payload = object(s, hash, "chunk", &f->children, &f->nchildren);
 	bytes.data = (uint8 *) VARDATA_ANY(payload);
@@ -223,6 +224,7 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 	if (count != 2)
 		elog(ERROR, "invalid retained table descriptor");
 	s->root = DatumGetByteaPCopy(children[1]);
+	s->initial_root = s->root;
 	s->cleanup.func = cleanup;
 	s->cleanup.arg = s;
 	MemoryContextRegisterResetCallback(estate->es_query_cxt, &s->cleanup);
@@ -352,9 +354,6 @@ static void
 rescan(CustomScanState *css)
 {
 	DGCatalogScan *s = (DGCatalogScan *) css;
-	CustomScan *plan = (CustomScan *) css->ss.ps.plan;
-	Datum	   *children;
-	int			count;
 
 	while (s->depth)
 		pop(s);
@@ -365,8 +364,7 @@ rescan(CustomScanState *css)
 		dg_check(pl_cursor_init(&s->cursor, &s->live->content, NULL));
 		return;
 	}
-	object(s, address(strVal(linitial(plan->custom_private))), "table", &children, &count);
-	s->root = DatumGetByteaPCopy(children[1]);
+	s->root = s->initial_root;
 }
 
 static void

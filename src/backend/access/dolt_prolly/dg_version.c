@@ -109,7 +109,7 @@ begin_api(void)
 		elog(ERROR, "cannot connect version-control SPI");
 	MemoryContextSwitchTo(c);
 	PushCopiedSnapshot(GetActiveSnapshot());
-	set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
 }
 static void

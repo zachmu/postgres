@@ -4394,6 +4394,14 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 
 	switch (nodeTag(plan))
 	{
+		case T_CustomScan:
+			if (rte->rtekind == RTE_DOLT)
+			{
+				objectname = rte->eref->aliasname;
+				objecttag = "Versioned Relation";
+				break;
+			}
+			/* FALLTHROUGH */
 		case T_SeqScan:
 		case T_SampleScan:
 		case T_IndexScan:
@@ -4402,7 +4410,6 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 		case T_TidScan:
 		case T_TidRangeScan:
 		case T_ForeignScan:
-		case T_CustomScan:
 		case T_ModifyTable:
 			/* Assert it's on a real relation */
 			Assert(rte->rtekind == RTE_RELATION);

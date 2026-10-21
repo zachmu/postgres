@@ -521,7 +521,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	columnDef columnOptions optionalPeriodName
 %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
 %type <node>	def_arg columnElem where_clause where_or_current_clause
-				a_expr b_expr c_expr AexprConst indirection_el opt_slice_bound
+				a_expr b_expr c_expr dolt_revision_expr AexprConst indirection_el opt_slice_bound
 				columnref having_clause func_table xmltable array_expr
 				OptWhereClause operator_def_arg
 %type <list>	opt_column_and_period_list
@@ -13605,33 +13605,42 @@ from_list:
 			| from_list ',' table_ref				{ $$ = lappend($1, $3); }
 		;
 
-/*
- * table_ref is where an alias clause can be attached.
- */
+/* Constant revision expressions; preserve the existing AS of(column) alias. */
+dolt_revision_expr:
+			Sconst { $$ = makeStringConst($1, @1); }
+			| GREATEST '(' expr_list ')'
+				{
+					MinMaxExpr *n = makeNode(MinMaxExpr);
+					n->op = IS_GREATEST;
+					n->args = $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| LEAST '(' expr_list ')'
+				{
+					MinMaxExpr *n = makeNode(MinMaxExpr);
+					n->op = IS_LEAST;
+					n->args = $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			;
+
+/* table_ref is where an alias clause can be attached. */
 table_ref:	relation_expr opt_alias_clause
 				{
 					$1->alias = $2;
 					$$ = (Node *) $1;
 				}
-			| relation_expr AS OF Sconst opt_alias_clause
+			| relation_expr AS OF dolt_revision_expr opt_alias_clause
 				{
-					$1->dolt_revision = makeStringConst($4, @4);
+					$1->dolt_revision = $4;
 					$1->alias = $5;
 					$$ = (Node *) $1;
 				}
-			| relation_expr AS OF GREATEST '(' expr_list ')' opt_alias_clause
+			| relation_expr AS OF SYSTEM_P TIME dolt_revision_expr opt_alias_clause
 				{
-					MinMaxExpr *n = makeNode(MinMaxExpr);
-					n->op = IS_GREATEST;
-					n->args = $6;
-					n->location = @4;
-					$1->dolt_revision = (Node *) n;
-					$1->alias = $8;
-					$$ = (Node *) $1;
-				}
-			| relation_expr AS OF SYSTEM_P TIME Sconst opt_alias_clause
-				{
-					$1->dolt_revision = makeStringConst($6, @6);
+					$1->dolt_revision = $6;
 					$1->alias = $7;
 					$$ = (Node *) $1;
 				}
