@@ -44,8 +44,11 @@ History revisions support HEAD, branch/tag names, full hashes and a single
 `~N` (first-parent distance) or `^N` (parent ordinal) suffix. Diff also accepts
 STAGED and WORKING. Short hashes, compound revision expressions and ranges are
 not supported. A read of history before initialization returns an empty log.
-The first mutation lazily creates repository initialization and CREATE DATABASE
-history nodes, matching Doltgres bootstrap history, then initializes main refs.
+The first mutation lazily creates one repository initialization history node
+and initializes main refs. Doltgres additionally records CREATE DATABASE as an
+artifact of the Dolt storage library; that extra commit is deliberately not
+reproduced here. Cross-engine tests accept either bootstrap count while checking
+user-created history independently. Existing history is not rewritten.
 
 ## Transaction and staging contract
 
