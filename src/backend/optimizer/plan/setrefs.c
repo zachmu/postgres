@@ -14,6 +14,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltbranch.h"
+#include "catalog/pg_dolt_ref.h"
 
 #include "access/transam.h"
 #include "catalog/pg_type.h"
@@ -29,6 +31,7 @@
 #include "rewrite/rewriteManip.h"
 #include "tcop/utility.h"
 #include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 
 typedef enum
@@ -584,6 +587,8 @@ add_rte_to_flat_rtable(PlannerGlobal *glob, List *rteperminfos,
 		(newrte->rtekind == RTE_SUBQUERY && OidIsValid(newrte->relid)))
 	{
 		glob->relationOids = lappend_oid(glob->relationOids, newrte->relid);
+		if (dg_projected_namespace(get_rel_namespace(newrte->relid)))
+			glob->relationOids = lappend_oid(glob->relationOids, DoltRefRelationId);
 		glob->allRelids = bms_add_member(glob->allRelids,
 										 list_length(glob->finalrtable));
 	}
@@ -3720,8 +3725,12 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 			if (rte->rtekind == RTE_RELATION ||
 				(rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid)) ||
 				(rte->rtekind == RTE_NAMEDTUPLESTORE && OidIsValid(rte->relid)))
+			{
 				context->glob->relationOids =
 					lappend_oid(context->glob->relationOids, rte->relid);
+				if (dg_projected_namespace(get_rel_namespace(rte->relid)))
+					context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
+			}
 		}
 
 		/* And recurse into the query's subexpressions */

@@ -28,7 +28,7 @@ dg_current_branch(void)
 const char *
 dg_relation_branch(Relation rel)
 {
-	return dg_current_branch();
+	return dg_projected_namespace(RelationGetNamespace(rel)) ? "main" : dg_current_branch();
 }
 
 static void
@@ -101,7 +101,7 @@ dg_guard_branch_ddl(Node *statement)
 	TableScanDesc scan;
 	HeapTuple	tuple;
 
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster || dg_projection_building())
 		return;
 	guard = GetCommandLogLevel(statement) == LOGSTMT_DDL || IsA(statement, TruncateStmt);
 	if (!guard)

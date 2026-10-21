@@ -2,6 +2,14 @@
 #include "dg.h"
 #include "access/xact.h"
 #include "access/doltbranch.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "catalog/pg_dolt_projection.h"
+#include "catalog/namespace.h"
+#include "commands/dbcommands.h"
+#include "nodes/makefuncs.h"
+#include "parser/parser.h"
+#include "tcop/utility.h"
 #include "catalog/pg_dolt_ref.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -535,6 +543,15 @@ resolve(const char *revision)
 		}
 		if (!hash && strlen(base) == 64)
 			hash = unhex(base);
+		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&
+				 strspn(base, "0123456789abcdef") == strlen(base))
+		{
+			run("SELECT objhash FROM pg_dolt_object WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
+			if (SPI_processed > 1)
+				ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
+			if (SPI_processed)
+				hash = DatumGetByteaPCopy(cell(0, 1));
+		}
 	}
 	if (!hash)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("unknown revision: %s", revision)));
@@ -921,3 +938,5 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 }
 
 #include "dg_merge.inc"
+
+#include "dg_projection.inc"

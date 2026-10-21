@@ -16,6 +16,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/pg_dolt_projection.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -158,6 +159,7 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 {
 	switch (relid)
 	{
+		case DoltProjectionKeyIndexId:
 		case DoltRefKeyIndexId:
 		case ParameterAclParnameIndexId:
 		case ReplicationOriginNameIndex:

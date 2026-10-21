@@ -1,6 +1,8 @@
 /* Heap/MVCC manifest building blocks. See doc/doltgres/manifest.md. */
 #include "dg.h"
 #include "catalog/pg_dolt_object.h"
+#include "catalog/pg_dolt_ref.h"
+#include "utils/inval.h"
 #include "access/relation.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
@@ -293,6 +295,8 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		manifest_execute("UPDATE pg_catalog.pg_dolt_ref SET reftarget=$3,reftoken=$4 WHERE refname=$1 AND reftoken=$2", 4, types, args, nulls, false, 0);
 	if (SPI_processed != 1)
 		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("manifest ref changed; reread and retry transaction")));
+	/* Named revision bindings must be reanalyzed after ref publication. */
+	CacheInvalidateRelcacheByRelid(DoltRefRelationId);
 	SPI_finish();
 	if (PG_ARGISNULL(2))
 		PG_RETURN_NULL();

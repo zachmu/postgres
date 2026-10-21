@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltbranch.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
@@ -1249,6 +1250,11 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	int			nkeys;
 	SysScanDesc scan;
 	HeapTuple	tup;
+
+	/* Retained generation objects must outlive every historical reader. */
+	if (!dg_projection_building() &&
+		dg_projected_namespace(object->classId == NamespaceRelationId ? object->objectId : (object->classId == RelationRelationId ? get_rel_namespace(object->objectId) : InvalidOid)))
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("retained catalog projections are read-only")));
 
 	/* DROP hook of the objects being removed */
 	InvokeObjectDropHookArg(object->classId, object->objectId,
