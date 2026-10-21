@@ -1,8 +1,9 @@
 # First version-control command slice
 
 This is native backend code, with no extension installation. Fresh initdb is
-required after this catalog change. APIs are temporarily superuser-only. The
-single live SQL branch is main; creating a branch does not switch SQL contents.
+required after this catalog change. APIs are temporarily superuser-only. The default session
+branch is main. The subsequent [branch/merge slice](branch-merge.md) adds checkout,
+independent session data views, merge and conflict resolution.
 
 ## Reference and SQL surface
 
@@ -18,7 +19,7 @@ not Dolt's 32-character hashes. Unsupported flags raise errors.
 | Function | Implemented arguments and result |
 |---|---|
 | `dolt_add(...)` | `.`, `-A` or `--all`; stage all supported live objects; `status bigint` = 0. |
-| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message`), `--author 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
+| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
 | `dolt_branch(...)` | `name [start-point]`; create only; `status bigint` = 0. |
 | `dolt_tag(...)` | `name [start-point]`, optional `-m/--message`, `--author`; create annotated tag; `status bigint` = 0. |
 | `dolt_log(...)` | Optional revision, `-n/--max-count`, `--parents`, `--show-signature`; twelve-column history result. |
@@ -61,7 +62,7 @@ its transaction. Argument arrays and prepared-statement parameters are supported
 
 Commit without -A records the staged snapshot. -A stages and commits all live
 supported contents. Later unstaged edits survive a staged commit. WORKING in diff
-means a fresh live capture, not the last persisted working/main ref. Ordinary
+means a fresh live capture, not the last persisted working/<branch> ref. Ordinary
 DML is not yet wired to working refs. All immutable objects and ref changes share
 one PostgreSQL transaction/WAL outcome; expected revision tokens prevent stale
 publishers from overwriting a concurrent move. Concurrent callers may need to
@@ -69,7 +70,7 @@ retry the entire transaction. This is not yet three-way working-set publication.
 
 Created branches receive head, staged and working refs at the selected state;
 tags reference immutable annotated tag objects. Neither operation changes live
-SQL relations. Checkout and branch-aware SQL binding are separate gates.
+SQL relations. Checkout now selects independent session data views; see the branch/merge contract.
 
 ## Capture and formats
 
@@ -116,7 +117,7 @@ the first capture adds public and all other eligible namespaces.
 
 ## Remaining gates and validation
 
-No checkout, historical SQL resolution, branch switching, row diff, merge,
+No revision-qualified historical SQL resolution, cross-branch queries, row diff,
 tracked-only/named-table staging, amend, branch/tag deletion/rename/force or
 history GC/import exists yet. Full schema coverage and authorization remain
 future work. Physical backup preserves history; logical pg_dump omits it. Table

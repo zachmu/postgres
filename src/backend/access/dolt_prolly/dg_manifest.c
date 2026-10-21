@@ -13,7 +13,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/snapmgr.h"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge"};
 
 static void
 manifest_begin(void)
@@ -112,7 +112,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if (((id == 1 || id == 6) && n != 0) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1))
+	if (((id == 1 || id == 6) && n != 0) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
 	for (i = 0; i < n; i++)
 	{
@@ -126,7 +126,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
 			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
-			id == 7 ? strcmp(child, "commit") == 0 : false;
+			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 : false;
 		if (!valid)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s child for manifest %s", child, kind)));
 	}
@@ -230,10 +230,10 @@ static void
 check_name(text *name)
 {
 	char	   *s = text_to_cstring(name);
-	int			prefix = strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : strncmp(s, "staged/", 7) == 0 ? 7 : 0;
+	int			prefix = strncmp(s, "merge/", 6) == 0 ? 6 : strncmp(s, "views/", 6) == 0 ? 6 : strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : strncmp(s, "staged/", 7) == 0 ? 7 : 0;
 
 	if (!prefix || strlen(s) == prefix || strlen(s) > 512)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/, staged/ or working/ and a nonempty name (maximum 512 bytes)")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/, staged/, working/, merge/ or views/ and a nonempty name (maximum 512 bytes)")));
 }
 
 Datum
@@ -275,7 +275,7 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	else
 	{
 		char	   *kind = object_kind(PG_GETARG_BYTEA_PP(2), false);
-		char	   *expected = (strncmp(text_to_cstring(name), "working/", 8) == 0 || strncmp(text_to_cstring(name), "staged/", 7) == 0) ? "database" : "commit";
+		char	   *expected = strncmp(text_to_cstring(name), "merge/", 6) == 0 ? "merge" : (strncmp(text_to_cstring(name), "working/", 8) == 0 || strncmp(text_to_cstring(name), "staged/", 7) == 0) ? "database" : "commit";
 
 		if (strcmp(kind, expected) != 0 &&
 			!(strncmp(text_to_cstring(name), "tags/", 5) == 0 && strcmp(kind, "tag") == 0))
@@ -340,4 +340,56 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 	relation_close(rel, AccessShareLock);
 	SPI_finish();
 	PG_RETURN_BYTEA_P(result);
+}
+
+/* Import retained canonical bytes, independently of the source relation's lifetime. */
+static PLHash
+import_node(PLStore *store, bytea *address, int depth)
+{
+	Oid			types[] = {BYTEAOID};
+	Datum		args[] = {PointerGetDatum(address)};
+	bool		isnull;
+	bytea	   *payload;
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n,
+				i;
+	PLSlice		bytes_;
+	PLHash		hash;
+
+	check_stack_depth();
+	if (depth >= PL_MAX_DEPTH)
+		elog(ERROR, "history chunk tree too deep");
+	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind='chunk'", 1, types, args, NULL, true, 1);
+	if (SPI_processed != 1)
+		elog(ERROR, "missing history chunk");
+	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	children = DatumGetArrayTypePCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	for (i = 0; i < n; i++)
+		import_node(store, DatumGetByteaP(values[i]), depth + 1);
+	bytes_.data = (uint8 *) VARDATA(payload);
+	bytes_.len = VARSIZE(payload) - VARHDRSZ;
+	if (!pl_hash_bytes(bytes_, &hash))
+		elog(ERROR, "history chunk hash failed");
+	dg_check(pl_store_import(store, hash, bytes_));
+	pfree(payload);
+	pfree(children);
+	pfree(values);
+	pfree(nulls);
+	return hash;
+}
+
+PLTree
+dg_history_import(PLStore *store, bytea *address)
+{
+	PLTree		result;
+	PLHash		hash;
+
+	manifest_begin();
+	hash = import_node(store, address, 0);
+	dg_check(pl_open(store, hash, &result));
+	SPI_finish();
+	return result;
 }

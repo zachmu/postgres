@@ -149,3 +149,11 @@ History is included in physical backups. `pg_dump` does not export these system
 catalog contents: a logical dump currently saves ordinary SQL objects/data and
 omits manifest history. Do not use it as a version-history backup. A future
 logical-history format/importer and upgrade strategy are required.
+
+
+The subsequent [branch/merge slice](branch-merge.md) appends object kind 8
+(`merge`, three commit children) and internal ref prefixes `merge/` and `views/`.
+The former targets a pending merge object; the latter targets a commit used as
+an activation marker for shared-schema branch views. Existing object kind IDs
+and hash encodings are unchanged. These are trusted internal APIs, not a general
+user-facing ref editing interface.

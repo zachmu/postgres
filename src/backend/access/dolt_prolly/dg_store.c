@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "access/doltbranch.h"
 #include "access/generic_xlog.h"
 #include "access/relation.h"
 #include "access/transam.h"
@@ -9,7 +10,7 @@
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
 
-#define DG_MAGIC 0x44475033
+#define DG_MAGIC 0x44475034
 #define DG_HEADER 56
 #define DG_PART (BLCKSZ - 128)
 
@@ -55,6 +56,10 @@ static DGState *
 load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 {
 	DGState    *s = palloc0(sizeof(*s));
+	bool		found_root = false;
+	PLHash		binding;
+	const char *branch = dg_relation_branch(rel);
+	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
 	HASHCTL		ctl = {0};
 	BlockNumber n = RelationGetNumberOfBlocks(rel),
 				b;
@@ -65,6 +70,8 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
+	if (!pl_hash_bytes(branchbytes, &binding))
+		elog(ERROR, "branch hash failed");
 	s->store = pl_store_create();
 	if (!s->store)
 		ereport(ERROR, (errmsg("out of memory creating prolly store")));
@@ -134,8 +141,13 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 		}
 		else if (pl_read32(data + 4) == 2)
 		{
-			if (size != DG_HEADER + 80)
+			if (size != DG_HEADER + 112)
 				elog(ERROR, "invalid prolly root record");
+			if (memcmp(data + DG_HEADER + 80, binding.bytes, 32))
+			{
+				pfree(data);
+				continue;
+			}
 			if (snap == SnapshotSelf && ActiveSnapshotSet())
 			{
 				TransactionId xid = pl_read32(data + DG_HEADER);
@@ -163,6 +175,7 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 						continue;
 					}
 				}
+				found_root = true;
 				memcpy(s->content.root.bytes, data + DG_HEADER + 8, 32);
 				memcpy(s->handles.root.bytes, data + DG_HEADER + 40, 32);
 				s->nextid = pl_read64(data + DG_HEADER + 72);
@@ -174,6 +187,8 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted)
 	}
 	if (assembly)
 		pfree(assembly);		/* An aborted partial append is unreachable. */
+	if (!found_root)
+		dg_branch_base(rel, s);
 	dg_check(pl_validate(&s->content));
 	dg_check(pl_validate(&s->handles));
 	return s;
@@ -209,6 +224,12 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 {
 	size_t		i;
 	uint8		data[DG_HEADER + DG_PART];
+	PLHash		binding;
+	const char *branch = dg_relation_branch(rel);
+	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
+
+	if (!pl_hash_bytes(branchbytes, &binding))
+		elog(ERROR, "branch hash failed");
 
 	for (i = 0; i < s->store->capacity; i++)
 	{
@@ -237,7 +258,7 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 			hash_search(s->persisted, &node->hash, HASH_ENTER, NULL);
 		}
 	}
-	memset(data, 0, DG_HEADER + 80);
+	memset(data, 0, DG_HEADER + 112);
 	pl_write32(data, DG_MAGIC);
 	pl_write32(data + 4, 2);
 	pl_write32(data + DG_HEADER, GetCurrentTransactionId());
@@ -245,7 +266,8 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 	memcpy(data + DG_HEADER + 8, s->content.root.bytes, 32);
 	memcpy(data + DG_HEADER + 40, s->handles.root.bytes, 32);
 	pl_write64(data + DG_HEADER + 72, s->nextid);
-	append(rel, data, DG_HEADER + 80);
+	memcpy(data + DG_HEADER + 80, binding.bytes, 32);
+	append(rel, data, DG_HEADER + 112);
 }
 static PLStatus
 collect(void *arg, PLSlice key, PLSlice value)
@@ -261,8 +283,9 @@ collect(void *arg, PLSlice key, PLSlice value)
 	r->items[r->count++].value = value;
 	return PL_OK;
 }
+
 DGRows
-dg_rows(const PLTree *tree)
+dg_rows(const PLTree * tree)
 {
 	DGRows		rows = {0};
 

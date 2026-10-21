@@ -12,5 +12,7 @@ tests += {
     't/006_manifest.pl',
     't/007_commands.pl',
     't/008_publication.pl',
+    't/009_merge.pl',
+    't/010_branch_sessions.pl',
   ]},
 }

@@ -15,6 +15,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltbranch.h"
 
 #include "access/reloptions.h"
 #include "access/twophase.h"
@@ -588,6 +589,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
+
+	dg_guard_branch_ddl(parsetree);
 
 	switch (nodeTag(parsetree))
 	{

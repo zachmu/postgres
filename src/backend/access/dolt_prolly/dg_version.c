@@ -1,6 +1,10 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
 #include "access/xact.h"
+#include "access/doltbranch.h"
+#include "catalog/pg_dolt_ref.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "access/relation.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
@@ -48,6 +52,14 @@ static const VersionRef empty_ref = {NULL, NULL};
 /* Typed argument vectors live for the enclosing block and are consumed synchronously. */
 #define VC_TYPES(...) ((Oid[]) {__VA_ARGS__})
 #define VC_ARGS(...) ((Datum[]) {__VA_ARGS__})
+
+static char *
+branch_ref(const char *prefix)
+{
+	return psprintf("%s/%s", prefix, dg_current_branch());
+}
+static bytea *merge_parent(void);
+static void finish_merge(void);
 
 static void
 run(const char *sql, int n, Oid *types, Datum *args, const char *nulls, bool ro)
@@ -436,7 +448,7 @@ json_value(const char *json, const char *key)
 	return strcell(0, 1);
 }
 static bytea *
-commit_object(bytea *database, bytea *parent, const char *message, const char *author, const char *author_email, TimestampTz author_date)
+commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
 {
 	StringInfoData json;
 	const char *name = GetUserNameFromId(GetUserId(), false);
@@ -452,6 +464,8 @@ commit_object(bytea *database, bytea *parent, const char *message, const char *a
 			unsupported("commit metadata from an incompatible internal format");
 		height = pg_strtoint64(h) + 1;
 	}
+	if (second)
+		height = Max(height, pg_strtoint64(json_value(metadata(second, "commit"), "height")) + 1);
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '{');
 	json_field(&json, "format", "DGCOMMIT1", false);
@@ -461,7 +475,7 @@ commit_object(bytea *database, bytea *parent, const char *message, const char *a
 	json_field(&json, "author_email", author_email ? author_email : email, true);
 	json_field(&json, "message", message, true);
 	appendStringInfo(&json, ",\"date_us\":%lld,\"author_date_us\":%lld,\"height\":%lld}", (long long) GetCurrentTimestamp(), (long long) author_date, (long long) height);
-	return put("commit", json.data, VC_ARGS(PointerGetDatum(database), PointerGetDatum(parent)), parent ? 2 : 1);
+	return put("commit", json.data, VC_ARGS(PointerGetDatum(database), PointerGetDatum(parent), PointerGetDatum(second)), second ? 3 : parent ? 2 : 1);
 }
 static void
 ensure_repository(void)
@@ -473,7 +487,7 @@ ensure_repository(void)
 	if (head.target)
 		return;
 	db = put("database", "{\"format\":\"DGDB1\",\"members\":[]}", NULL, 0);
-	commit = commit_object(db, NULL, "Initialize data repository", NULL, NULL, GetCurrentTimestamp());
+	commit = commit_object(db, NULL, NULL, "Initialize data repository", NULL, NULL, GetCurrentTimestamp());
 	move_ref("heads/main", head, commit);
 	move_ref("staged/main", read_ref("staged/main"), db);
 	move_ref("working/main", read_ref("working/main"), db);
@@ -503,7 +517,7 @@ resolve(const char *revision)
 	if (suffix)
 		*suffix++ = '\0';
 	if (!pg_strcasecmp(base, "HEAD"))
-		hash = read_ref("heads/main").target;
+		hash = read_ref(branch_ref("heads")).target;
 	else
 	{
 		ref = read_ref(psprintf("heads/%s", base));
@@ -576,11 +590,11 @@ dolt_add(PG_FUNCTION_ARGS)
 	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
 		unsupported("dolt_add currently requires '.', '-A' or '--all'");
 	ensure_repository();
-	staged = read_ref("staged/main");
-	working = read_ref("working/main");
+	staged = read_ref(branch_ref("staged"));
+	working = read_ref(branch_ref("working"));
 	current = capture(true);
-	move_ref("staged/main", staged, current.hash);
-	move_ref("working/main", working, current.hash);
+	move_ref(branch_ref("staged"), staged, current.hash);
+	move_ref(branch_ref("working"), working, current.hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
@@ -616,9 +630,9 @@ dolt_commit(PG_FUNCTION_ARGS)
 			allow_empty = true;
 		else if (!strcmp(args[i], "--skip-empty"))
 			skip_empty = true;
-		else if (!strcmp(args[i], "-m") || !strcmp(args[i], "--message") || !strcmp(args[i], "-Am"))
+		else if (!strcmp(args[i], "-m") || !strcmp(args[i], "--message") || (!strcmp(args[i], "-Am") || !strcmp(args[i], "-am")))
 		{
-			if (!strcmp(args[i], "-Am"))
+			if ((!strcmp(args[i], "-Am") || !strcmp(args[i], "-am")))
 				all = true;
 			if (++i == n)
 				unsupported("missing commit message");
@@ -644,14 +658,14 @@ dolt_commit(PG_FUNCTION_ARGS)
 	if (allow_empty && skip_empty)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("--allow-empty and --skip-empty are incompatible")));
 	ensure_repository();
-	head = read_ref("heads/main");
-	staged = read_ref("staged/main");
-	working = read_ref("working/main");
+	head = read_ref(branch_ref("heads"));
+	staged = read_ref(branch_ref("staged"));
+	working = read_ref(branch_ref("working"));
 	parentdb = child(head.target, 1);
 	database = all ? capture(true).hash : staged.target;
 	if (!database)
 		database = parentdb;
-	if (same(database, parentdb) && !allow_empty)
+	if (same(database, parentdb) && !allow_empty && !merge_parent())
 	{
 		if (skip_empty)
 		{
@@ -660,11 +674,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 		}
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("nothing to commit")));
 	}
-	commit = commit_object(database, head.target, message, author, email, author_date);
-	move_ref("heads/main", head, commit);
-	move_ref("staged/main", staged, database);
+	commit = commit_object(database, head.target, merge_parent(), message, author, email, author_date);
+	move_ref(branch_ref("heads"), head, commit);
+	move_ref(branch_ref("staged"), staged, database);
 	if (all)
-		move_ref("working/main", working, database);
+		move_ref(branch_ref("working"), working, database);
+	finish_merge();
 	answer = hex(commit);
 	end_api(nest);
 	PG_RETURN_TEXT_P(cstring_to_text(answer));
@@ -812,14 +827,14 @@ dolt_log(PG_FUNCTION_ARGS)
 			revset = true;
 		}
 	}
-	if (!read_ref("heads/main").target && !strcmp(revision, "HEAD"))
+	if (!read_ref(branch_ref("heads")).target && !strcmp(revision, "HEAD"))
 	{
 		run("SELECT NULL::text WHERE false", 0, NULL, NULL, NULL, true);
 		return_rows(fcinfo, nest);
 		return (Datum) 0;
 	}
 	hash = resolve(revision);
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/main') THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
+	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -830,7 +845,7 @@ state_json(const char *revision)
 		return capture(false).json;
 	if (!pg_strcasecmp(revision, "STAGED"))
 	{
-		VersionRef	r = read_ref("staged/main");
+		VersionRef	r = read_ref(branch_ref("staged"));
 
 		if (!r.target)
 			return "{\"members\":[]}";
@@ -904,3 +919,5 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 {
 	return dolt_diff_summary(fcinfo);
 }
+
+#include "dg_merge.inc"

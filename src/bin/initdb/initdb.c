@@ -1838,6 +1838,8 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_log(text[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text, text) FROM PUBLIC;\n");
+ PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_checkout(text[]), pg_catalog.dolt_merge(text[]), pg_catalog.dolt_conflicts_resolve(text[]), pg_catalog.dolt_conflict_rows(text) FROM PUBLIC;\n");
+ PG_CMD_PUTS("REVOKE ALL ON pg_catalog.dolt_conflicts, pg_catalog.dolt_merge_status FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"

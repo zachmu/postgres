@@ -307,3 +307,15 @@ summary on these APIs. Checkout and live working-set publication on ordinary DML
 remain future work. The table writer lock remains unchanged.
 Physical backups include history; logical pg_dump currently omits it. This
 catalog revision requires fresh initdb.
+
+
+### Branch and merge milestone
+
+Native checkout now selects independent session data roots. Native `dolt_merge`
+handles fast-forward and unchanged-schema three-way data merges, returning
+non-aborting conflict status with durable resolution state. See
+`doc/doltgres/branch-merge.md` for the current contract, broad temporary schema
+freeze, whole-table unique-conflict fallback, and verification. Earlier milestone
+notes above describe their historical scope. This does not replace table writer
+serialization or complete branch-specific schema catalogs. Fresh initdb is needed
+for branch-tagged relation root records and the new built-in APIs/views.
