@@ -11,5 +11,6 @@ tests += {
     't/005_native.pl',
     't/006_manifest.pl',
     't/007_commands.pl',
+    't/008_publication.pl',
   ]},
 }
