@@ -125,3 +125,9 @@ unsupported inputs, old snapshots, stale publication, DML/DDL after capture,
 restart after dropping source storage, OID-independent reconstructed state,
 empty namespaces, comments, formatting GUCs and permissions. The other prolly
 TAP suites cover storage, crash recovery, concurrency and physical backups.
+
+Publication hardening adds `008_publication.pl`: stage and data savepoint rollback,
+prepared staging visibility and restart, cancellation/crash while blocked between
+HEAD and staged-ref updates, absence of partially visible objects/refs, capture
+error cleanup of snapshots/GUCs, and rejection of multi-statement implicit blocks.
+These boundaries passed without changing the existing publication protocol.
