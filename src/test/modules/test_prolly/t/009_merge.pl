@@ -20,13 +20,13 @@ is($other->query_safe('SELECT * FROM t'),'1|10|20','branch starts from retained 
 $other->query_safe('UPDATE t SET a=11 WHERE id=1');
 is(sql('SELECT a FROM t'),'10','branch update isolated');
 is($other->query_safe('SELECT a FROM t'),'11','own branch update visible');
-$other->query_safe(q{INSERT INTO bag VALUES('x')});
+$other->query_safe(q{INSERT INTO bag VALUES('y')});
 $other->query_safe(q{SELECT dolt_commit('-am','feature')});
 sql(q{UPDATE t SET b=21 WHERE id=1; INSERT INTO t VALUES(2,30,40); INSERT INTO bag VALUES('x')});
 sql(q{SELECT dolt_commit('-Am','main')});
 is(sql(q{SELECT fast_forward,conflicts,message FROM dolt_merge('feature')}),'0|0|merge successful','divergent clean merge');
 is(sql('SELECT * FROM t ORDER BY id'),"1|11|21\n2|30|40",'independent columns and insert combined');
-is(sql('SELECT count(*) FROM bag'),'3','keyless identical inserts add occurrences');
+is(sql('SELECT count(*) FROM bag'),'3','keyless changes to distinct row values combine');
 is($other->query_safe('SELECT * FROM t'),'1|11|20','merge does not change source branch');
 is(sql(q{SELECT array_length(string_to_array(parents,', '),1) FROM dolt_log('--parents','-n','1')}),'2','merge commit retains two parents');
 is(sql(q{SELECT conflicts,message FROM dolt_merge('feature')}),'0|Already up to date.','repeat merge no-op');
@@ -92,6 +92,34 @@ is(sql(q{SELECT conflicts FROM dolt_merge('unique_case')}),'1','unique conflict 
 is(sql(q{SELECT whole_table FROM dolt_conflict_rows('u')}),'t','unique conflict explicitly records whole-table granularity');
 sql(q{SELECT dolt_conflicts_resolve('--ours','.')});sql(q{SELECT dolt_commit('-Am','unique resolved')});
 is(sql('SELECT * FROM u ORDER BY id'),"1|10\n3|20",'ours unique table preserved');
+# Keyless duplicate cardinality edits follow Dolt's conflict classification.
+sql(q{SELECT dolt_branch('bag_conflict')});
+$other->query_safe(q{SELECT dolt_checkout('bag_conflict')});
+$other->query_safe(q{INSERT INTO bag VALUES('x')});
+$other->query_safe(q{SELECT dolt_commit('-Am','bag theirs')});
+sql(q{INSERT INTO bag VALUES('x')});sql(q{SELECT dolt_commit('-Am','bag ours')});
+is(sql(q{SELECT conflicts FROM dolt_merge('bag_conflict')}),'1','both branches changing same keyless count conflicts even if counts match');
+sql(q{SELECT dolt_conflicts_resolve('--theirs','bag')});
+is(sql(q{SELECT count(*) FROM bag WHERE v='x'}),'3','resolution selects cardinality rather than double-counting');
+sql(q{SELECT dolt_commit('-Am','bag resolved')});
+# Delayed commit retains parents even with no row conflicts.
+sql(q{SELECT dolt_branch('delayed')});
+$other->query_safe(q{SELECT dolt_checkout('delayed')});
+$other->query_safe('INSERT INTO t VALUES(5,90,100)');
+$other->query_safe(q{SELECT dolt_commit('-Am','delayed')});
+is(sql(q{SELECT conflicts,message FROM dolt_merge('delayed','--no-commit')}),'0|merge staged','no-commit installs and stages without moving HEAD');
+is(sql('SELECT is_merging FROM dolt_merge_status'),'t','clean pending merge retained');
+sql(q{SELECT dolt_commit('-m','finish delayed')});
+is(sql(q{SELECT array_length(string_to_array(parents,', '),1) FROM dolt_log('--parents','-n','1')}),'2','delayed commit retains merge parent');
+# Squash installs data but leaves ordinary single-parent commit semantics.
+sql(q{SELECT dolt_branch('squashed')});
+$other->query_safe(q{SELECT dolt_checkout('squashed')});
+$other->query_safe('INSERT INTO t VALUES(6,110,120)');
+$other->query_safe(q{SELECT dolt_commit('-Am','squashed')});
+is(sql(q{SELECT conflicts FROM dolt_merge('squashed','--squash')}),'0','clean squash stages data');
+is(sql('SELECT is_merging FROM dolt_merge_status'),'f','clean squash has no pending second parent');
+sql(q{SELECT dolt_commit('-m','squash commit')});
+is(sql(q{SELECT array_length(string_to_array(parents,', '),1) FROM dolt_log('--parents','-n','1')}),'1','squash commit has one parent');
 $other->quit;
 $node->stop;
 done_testing();

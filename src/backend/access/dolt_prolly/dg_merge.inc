@@ -127,6 +127,8 @@ merge_parent(void)
 	run("SELECT jsonb_array_length($1::jsonb->'conflicts')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	if (DatumGetInt32(cell(0, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unresolved merge conflicts")));
+	if (!strcmp(json_value(json, "squash") ? json_value(json, "squash") : "false", "true"))
+		return NULL;
 	return child(pending.target, 2);
 }
 static void
@@ -283,7 +285,104 @@ record_conflict(StringInfo conflicts, const char *name, PLSlice key, PLValue bas
 	appendStringInfoChar(conflicts, '}');
 }
 
-/* Walk all keys, including identical keyless changes: duplicate counts add. */
+/* JSON objects merge recursively by member. Arrays/scalars are atomic values;
+ * SQL NULL (absent field) remains distinct from a JSON null document. */
+static bool
+json_equal(const char *a, const char *b)
+{
+	return a && b ? strcmp(a, b) == 0 : a == b;
+}
+static bool
+merge_json_object(const char *base, const char *ours, const char *theirs, char **result)
+{
+	char	  **keys,
+			  **b,
+			  **o,
+			  **t;
+	int			n,
+				i;
+	StringInfoData out;
+
+	check_stack_depth();
+	CHECK_FOR_INTERRUPTS();
+	if (json_equal(ours, theirs) || json_equal(base, theirs))
+	{
+		*result = (char *) ours;
+		return true;
+	}
+	if (json_equal(base, ours))
+	{
+		*result = (char *) theirs;
+		return true;
+	}
+	if (!base || !ours || !theirs || *base != '{' || *ours != '{' || *theirs != '{')
+		return false;
+	run("WITH keys AS (SELECT jsonb_object_keys($1::jsonb) k UNION SELECT jsonb_object_keys($2::jsonb) UNION SELECT jsonb_object_keys($3::jsonb)) SELECT k,($1::jsonb->k)::text,($2::jsonb->k)::text,($3::jsonb->k)::text FROM keys ORDER BY k COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(base), CStringGetTextDatum(ours), CStringGetTextDatum(theirs)), NULL, true);
+	n = SPI_processed;
+	keys = palloc(sizeof(char *) * Max(n, 1));
+	b = palloc(sizeof(char *) * Max(n, 1));
+	o = palloc(sizeof(char *) * Max(n, 1));
+	t = palloc(sizeof(char *) * Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		keys[i] = strcell(i, 1);
+		b[i] = strcell(i, 2);
+		o[i] = strcell(i, 3);
+		t[i] = strcell(i, 4);
+	}
+	initStringInfo(&out);
+	appendStringInfoChar(&out, '{');
+	for (i = 0; i < n; i++)
+	{
+		char	   *value;
+
+		if (!merge_json_object(b[i], o[i], t[i], &value))
+			return false;
+		if (!value)
+			continue;
+		if (out.len > 1)
+			appendStringInfoChar(&out, ',');
+		escape_json(&out, keys[i]);
+		appendStringInfoChar(&out, ':');
+		appendStringInfoString(&out, value);
+	}
+	appendStringInfoChar(&out, '}');
+	*result = out.data;
+	return true;
+}
+static bool
+merge_json_field(Oid type, PLValue * f, PLValue * result)
+{
+	char	   *text[3],
+			   *merged;
+	int			i;
+	Size		prefix = type == JSONBOID ? 5 : 4;
+	uint8	   *bytes;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (!f[i].present)
+			return false;
+		if (f[i].bytes.len < prefix || memcmp(f[i].bytes.data, "DGB1", 4))
+			elog(ERROR, "invalid JSON field encoding");
+		text[		i] = pnstrdup((const char *) f[i].bytes.data + prefix, f[i].bytes.len - prefix);
+	}
+	run("SELECT $1::jsonb::text,$2::jsonb::text,$3::jsonb::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(text[0]), CStringGetTextDatum(text[1]), CStringGetTextDatum(text[2])), NULL, true);
+	for (i = 0; i < 3; i++)
+		text[		i] = strcell(0, i + 1);
+
+	if (!merge_json_object(text[0], text[1], text[2], &merged))
+		return false;
+	bytes = palloc(prefix + strlen(merged));
+	memcpy(bytes, "DGB1", 4);
+	if (type == JSONBOID)
+		bytes[4] = 1;
+	memcpy(bytes + prefix, merged, strlen(merged));
+	*result = DG_VALUE(true, DG_SLICE(bytes, prefix + strlen(merged)));
+	return true;
+}
+
+/* Walk all keys, including identical keyless changes: those still conflict. */
 static PLTree
 merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *name, StringInfo conflicts)
 {
@@ -322,23 +421,17 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 			}
 		if (!keyed)
 		{
-			uint64		counts[3],
-						sum,
-						count;
-			int			source = v[1].present ? 1 : v[2].present ? 2 : 0;
-
-			for (j = 0; j < 3; j++)
-				counts[j] = v[j].present ? pl_read64(v[j].bytes.data) : 0;
-			if (UINT64_MAX - counts[1] < counts[2] || (sum = counts[1] + counts[2]) < counts[0])
+			/*
+			 * Dolt cannot infer identity between indistinguishable
+			 * occurrences. Both sides changing cardinality conflicts, even to
+			 * equal counts.
+			 */
+			if (equal_value(v[0], v[1]))
+				value = v[2];
+			else if (equal_value(v[0], v[2]))
+				value = v[1];
+			else
 				conflict = true;
-			else if ((count = sum - counts[0]) != 0)
-			{
-				uint8	   *bytes = palloc(v[source].bytes.len);
-
-				memcpy(bytes, v[source].bytes.data, v[source].bytes.len);
-				pl_write64(bytes, count);
-				value = DG_VALUE(true, DG_SLICE(bytes, v[source].bytes.len));
-			}
 		}
 		else if (equal_value(v[1], v[2]))
 			value = v[1];
@@ -362,6 +455,8 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 					fields[k] = f[1];
 				else if (equal_value(f[0], f[1]))
 					fields[k] = f[2];
+				else if ((TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONOID || TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONBOID) && merge_json_field(TupleDescAttr(RelationGetDescr(rel), k)->atttypid, f, &fields[k]))
+					continue;
 				else
 				{
 					conflict = true;
@@ -599,7 +694,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	if (conflicts.len || nocommit)
 	{
 		initStringInfo(&json);
-		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"conflicts\":[%s]}", conflicts.data);
+		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", squash ? "true" : "false", conflicts.data);
 		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
 		conflicted = conflicts.len ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge staged";
@@ -720,7 +815,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		}
 	}
 	initStringInfo(&updated);
-	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"conflicts\":[%s]}", remaining.data);
+	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", json_value(json, "squash") ? json_value(json, "squash") : "false", remaining.data);
 	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);

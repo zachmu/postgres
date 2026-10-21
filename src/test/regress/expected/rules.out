@@ -1286,6 +1286,13 @@ drop table cchild;
 SELECT viewname, definition FROM pg_views
 WHERE schemaname = 'pg_catalog'
 ORDER BY viewname;
+dolt_conflicts| SELECT (v.value ->> 'table'::text) AS "table",
+    count(*) AS num_conflicts
+   FROM (pg_dolt_ref r
+     JOIN pg_dolt_object o ON ((o.objhash = r.reftarget))),
+    LATERAL jsonb_array_elements(((convert_from(o.objpayload, 'UTF8'::name))::jsonb -> 'conflicts'::text)) v(value)
+  WHERE (r.refname = ('merge/'::text || active_branch()))
+  GROUP BY (v.value ->> 'table'::text);
 dolt_log| SELECT commit_hash,
     committer,
     email,
@@ -1299,6 +1306,9 @@ dolt_log| SELECT commit_hash,
     author_email,
     author_date
    FROM dolt_log() dolt_log(commit_hash, committer, email, date, message, commit_order, parents, refs, signature, author, author_email, author_date);
+dolt_merge_status| SELECT (EXISTS ( SELECT 1
+           FROM pg_dolt_ref
+          WHERE (pg_dolt_ref.refname = ('merge/'::text || active_branch())))) AS is_merging;
 dolt_tags| SELECT substr(r.refname, 6) AS tag_name,
     encode(o.objchildren[1], 'hex'::text) AS tag_hash,
     ((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'tagger'::text) AS tagger,
