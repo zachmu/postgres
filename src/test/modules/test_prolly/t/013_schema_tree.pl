@@ -10,7 +10,8 @@ $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 sub schema_hash
 {
- return sql(q{SELECT encode(s.objhash,'hex') FROM pg_dolt_ref r JOIN pg_dolt_object c ON c.objhash=r.reftarget JOIN pg_dolt_object db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch JOIN pg_dolt_object s ON s.objhash=t.objchildren[1] WHERE r.refname='heads/main' AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'='public.t'});
+ my $server = shift // $node;
+ return $server->safe_psql('postgres', q{SELECT encode(s.objhash,'hex') FROM pg_dolt_ref r JOIN pg_dolt_object c ON c.objhash=r.reftarget JOIN pg_dolt_object db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch JOIN pg_dolt_object s ON s.objhash=t.objchildren[1] WHERE r.refname='heads/main' AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'='public.t'});
 }
 sql(q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'first'); GRANT SELECT ON t TO reader});
 my $first = sql(q{SELECT dolt_commit('-Am','first')});
@@ -51,6 +52,14 @@ is(sql("SET ROLE reader; SELECT v FROM t AS OF '$legacy_commit'"), 'second', 'le
 my ($status, $out, $err) = $node->psql('postgres', "SELECT dolt_manifest_put('schema','invalid'::bytea,ARRAY[(SELECT objchildren[1] FROM pg_dolt_object WHERE objhash=decode('$schema','hex'))])");
 isnt($status, 0, 'invalid tree envelope rejected');
 like($err, qr/invalid schema tree envelope/, 'invalid envelope diagnostic');
+sql(q{COMMENT ON COLUMN t.v IS U&'caf\00e9'; SELECT dolt_commit('-Am','unicode schema')});
+my $utf8_schema = schema_hash();
+my $latin = PostgreSQL::Test::Cluster->new('schema_latin1');
+$latin->init(extra => ['--encoding=LATIN1', '--locale=C']);
+$latin->start;
+$latin->safe_psql('postgres', q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; GRANT SELECT ON t TO reader; COMMENT ON COLUMN t.v IS U&'caf\00e9'; SELECT dolt_commit('-Am','latin1 schema')});
+is(schema_hash($latin), $utf8_schema, 'schema properties have canonical UTF8 bytes across database encodings');
+$latin->stop;
 sql('DROP TABLE t');
 $node->stop('immediate');
 $node->start;

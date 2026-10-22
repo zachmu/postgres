@@ -489,7 +489,7 @@ capture_mode(bool persist, bool all_catalogs)
 	Capture		result;
 	int			nest = NewGUCNestLevel();
 
-	set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("quote_all_identifiers", "off", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	PG_TRY();
 	{

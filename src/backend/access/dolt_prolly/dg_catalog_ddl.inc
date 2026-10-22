@@ -63,7 +63,6 @@ dg_catalog_drop(Node *statement)
 	PG_TRY();
 	{
 		nest = begin_api();
-		LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
 		if (read_ref("views/enabled").target)
 		{
 			ListCell   *lc;
