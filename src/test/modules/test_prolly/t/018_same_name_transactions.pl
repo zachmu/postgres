@@ -1,0 +1,58 @@
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node=PostgreSQL::Test::Cluster->new('same_name_transactions');
+$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->start;
+sub sql { return $node->safe_psql('postgres',$_[0]); }
+sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$pattern,"$label diagnostic"); }
+sql(q{CREATE ROLE maker; CREATE ROLE reader; CREATE ROLE othermaker;
+ CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO reader;
+ GRANT USAGE,CREATE ON SCHEMA app TO maker,othermaker;
+ ALTER DEFAULT PRIVILEGES FOR ROLE maker IN SCHEMA app GRANT SELECT ON TABLES TO reader;
+ CREATE TABLE seed(id int) USING dolt_prolly_table;
+ SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
+sql(q{SET ROLE maker; SET search_path=app; CREATE TABLE t(id int PRIMARY KEY,v text); INSERT INTO t VALUES(1,'main')});
+is(sql(q{SET ROLE reader; SELECT * FROM app.t}),'1|main','logical namespace default privileges apply to private table');
+my $other=$node->background_psql('postgres');
+$other->query_safe(q{SELECT dolt_checkout('other'); SET ROLE othermaker; CREATE TABLE app.t(id int PRIMARY KEY,v int); INSERT INTO app.t VALUES(2,20)});
+is(sql(q{SELECT id,v FROM "postgres/other".app.t}),'2|20','qualified lookup selects incompatible schema outside public');
+fails(q{SET ROLE reader; SELECT * FROM "postgres/other".app.t},qr/permission denied/,'grant on main does not grant access to same-name object on other');
+fails(q{SET ROLE reader; INSERT INTO app.t VALUES(3,'denied')},qr/permission denied/,'table ACL is enforced for ordinary writes');
+my $physical=sql(q{SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid='app.t'::regclass});
+fails("SET ROLE maker; SELECT * FROM $physical.t",qr/private runtime/,'even object owner cannot bypass binding through runtime name');
+is(sql(q{SET ROLE reader; SELECT current_user FROM app.t}),'reader','provider restores caller role');
+my $prepared=$node->background_psql('postgres');
+$prepared->query_safe(q{SET search_path=app; PREPARE p AS SELECT id FROM t; PREPARE w(int) AS INSERT INTO t(id) VALUES($1)});
+is($prepared->query_safe('EXECUTE p'),'1','prepared query initially uses main');
+$prepared->query_safe(q{SELECT dolt_checkout('other')});
+is($prepared->query_safe('EXECUTE p'),'2','prepared query rebinds after checkout to different runtime OID');
+$prepared->query_safe('EXECUTE w(3)');
+is(sql(q{SELECT id FROM "postgres/other".app.t ORDER BY id}),"2\n3",'prepared write rebinds to selected branch');
+is(sql(q{SELECT id FROM app.t}),'1','prepared write does not leak onto main');
+$prepared->quit;
+$other->query_safe('RESET ROLE');
+# A legacy physical name retained on another branch must not prevent CREATE.
+is($other->query_safe('SELECT id FROM app.t ORDER BY id'),"2\n3",'other members exist before DROP');
+$other->query_safe(q{DROP TABLE seed});
+is($other->query_safe('SELECT id FROM app.t ORDER BY id'),"2\n3",'DROP preserves unrelated members');
+$other->query_safe(q{CREATE TABLE seed(value text); INSERT INTO seed VALUES('new')});
+is(sql('SELECT count(*) FROM seed'),'0','replacing legacy same-name table preserves main');
+is(sql(q{SELECT * FROM "postgres/other".public.seed}),'new','legacy name collision uses new runtime generation');
+is(sql(q{SELECT id FROM "postgres/other".app.t ORDER BY id}),"2\n3",'unrelated same-name DROP recreate preserves other members');
+$other->quit;
+my $old=$node->background_psql('postgres');
+$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class');
+sql(q{DROP TABLE app.t; SET ROLE maker; CREATE TABLE app.t(id int PRIMARY KEY,v text); INSERT INTO app.t VALUES(4,'recreated')});
+is($old->query_safe('SELECT * FROM app.t'),'1|main','old SQL snapshot retains old same-name binding and data');
+$old->query_safe('COMMIT');$old->quit;
+is(sql('SELECT * FROM app.t'),'4|recreated','new SQL snapshot sees recreated binding');
+my $pending=$node->background_psql('postgres');
+$pending->query_safe(q{BEGIN; DROP TABLE app.t; CREATE TABLE app.t(wrong int); INSERT INTO app.t VALUES(99)});
+# Do not open the old relation here: the DDL transaction holds its writer lock.
+$node->stop('immediate');$pending->quit;$node->start;
+is(sql('SELECT * FROM app.t'),'4|recreated','crash abort restores previous committed same-name binding');
+is(sql(q{SELECT id,v FROM "postgres/other".app.t ORDER BY id}),"2|20\n3|",'crash preserves independent other schema and rows');
+$node->stop;done_testing();

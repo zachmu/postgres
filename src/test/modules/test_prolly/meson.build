@@ -20,5 +20,7 @@ tests += {
     't/014_branch_drop.pl',
     't/015_branch_create.pl',
     't/016_runtime_binding.pl',
+    't/017_same_name.pl',
+    't/018_same_name_transactions.pl',
   ]},
 }

@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -4252,6 +4253,8 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 	Acl		   *schema_acl;
 	Acl		   *def_acl;
 	char		defaclobjtype;
+
+	nsp_oid = dg_catalog_namespace(nsp_oid);
 
 	/*
 	 * Use NULL during bootstrap, since pg_default_acl probably isn't there
