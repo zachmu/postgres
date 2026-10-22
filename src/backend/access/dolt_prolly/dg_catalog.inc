@@ -178,6 +178,12 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 				 */
 				currentns = get_namespace_oid(ns, true);
 				currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
+				if (working)
+				{
+					currentrel = binding_relation(revision, logical, child(descriptor, 1));
+					if (!OidIsValid(currentrel))
+						ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
+				}
 				live = currentrel;
 				if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
 					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);

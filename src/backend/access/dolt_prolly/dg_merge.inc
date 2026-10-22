@@ -109,6 +109,12 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			unsupported("schema checkout: incompatible runtime definitions");
 	}
 
+	{
+		bytea	   *target = read_ref(psprintf("working/%s", name)).target;
+
+		binding_prepare(name, target ? target : child(commit, 1), true);
+	}
+
 	/*
 	 * A persistent marker freezes shared schemas after branch views are
 	 * enabled.

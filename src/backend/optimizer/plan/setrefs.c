@@ -16,6 +16,8 @@
 #include "postgres.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/pg_dolt_binding.h"
+#include "utils/lsyscache.h"
 
 #include "access/transam.h"
 #include "catalog/pg_type.h"
@@ -3732,6 +3734,7 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 				(rte->rtekind == RTE_RELATION && get_rel_relam(rte->relid) == DOLT_PROLLY_TABLE_AM_OID))
 			{
 				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
+				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltBindingRelationId);
 				if (OidIsValid(rte->dolt_relid))
 					context->glob->relationOids = lappend_oid(context->glob->relationOids, rte->dolt_relid);
 				context->glob->dependsOnRole = true;

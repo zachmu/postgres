@@ -73,6 +73,17 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 		db = catalog_database(branch);
 		if (!catalog_contains(db, name))
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, branch)));
+		if (db)
+		{
+			Oid			bound;
+			bytea	   *schema;
+
+			run("SELECT t.objchildren[1] FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+			schema = DatumGetByteaPCopy(cell(0, 1));
+			bound = binding_relation(branch, name, schema);
+			if (bound != RelationGetRelid(rel))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding mismatch for %s on branch %s", name, branch)));
+		}
 		end_api(nest);
 	}
 	PG_FINALLY();
