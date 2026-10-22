@@ -18,7 +18,7 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 	 * Serialize this prototype's local mapping writers. Readers keep MVCC
 	 * views.
 	 */
-	rel = table_open(DoltBindingRelationId, ShareRowExclusiveLock);
+	rel = table_open(DoltBindingRelationId, RowExclusiveLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber,
 				F_TEXTEQ, CStringGetTextDatum(branch));
 	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber,
@@ -72,7 +72,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 	char	  **names;
 	bytea	  **schemas;
 
-	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1] FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	names = palloc(sizeof(char *) * Max(n, 1));
 	schemas = palloc(sizeof(bytea *) * Max(n, 1));

@@ -48,7 +48,10 @@ lock_workspace(void)
 	for (i = 0; i < n; i++)
 		ids[i] = DatumGetObjectId(cell(i, 1));
 	for (i = 0; i < n; i++)
-		LockRelationOid(ids[i], canonical ? ExclusiveLock : AccessExclusiveLock);
+		if (canonical)
+			dg_storage_lock_branch(ids[i], dg_current_branch());
+		else
+			LockRelationOid(ids[i], AccessExclusiveLock);
 	PopActiveSnapshot();
 	PushCopiedSnapshot(GetLatestSnapshot());
 }
@@ -154,7 +157,7 @@ merge_base(bytea *ours, bytea *theirs)
 	 * Common ancestors that are ancestors of another common candidate are not
 	 * bases.
 	 */
-	run("WITH RECURSIVE a(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM a JOIN pg_dolt_object o ON o.objhash=a.h), b(h) AS (SELECT $2::bytea UNION SELECT unnest(o.objchildren[2:]) FROM b JOIN pg_dolt_object o ON o.objhash=b.h), common AS (SELECT h FROM a INTERSECT SELECT h FROM b), ancestors(origin,h) AS (SELECT c.h,unnest(o.objchildren[2:]) FROM common c JOIN pg_dolt_object o ON o.objhash=c.h UNION SELECT x.origin,unnest(o.objchildren[2:]) FROM ancestors x JOIN pg_dolt_object o ON o.objhash=x.h) SELECT h FROM common WHERE h NOT IN (SELECT h FROM ancestors)", 2, VC_TYPES(BYTEAOID, BYTEAOID), VC_ARGS(PointerGetDatum(ours), PointerGetDatum(theirs)), NULL, true);
+	run("WITH RECURSIVE a(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM a JOIN pg_dolt_object_visible o ON o.objhash=a.h), b(h) AS (SELECT $2::bytea UNION SELECT unnest(o.objchildren[2:]) FROM b JOIN pg_dolt_object_visible o ON o.objhash=b.h), common AS (SELECT h FROM a INTERSECT SELECT h FROM b), ancestors(origin,h) AS (SELECT c.h,unnest(o.objchildren[2:]) FROM common c JOIN pg_dolt_object_visible o ON o.objhash=c.h UNION SELECT x.origin,unnest(o.objchildren[2:]) FROM ancestors x JOIN pg_dolt_object_visible o ON o.objhash=x.h) SELECT h FROM common WHERE h NOT IN (SELECT h FROM ancestors)", 2, VC_TYPES(BYTEAOID, BYTEAOID), VC_ARGS(PointerGetDatum(ours), PointerGetDatum(theirs)), NULL, true);
 	if (SPI_processed != 1)
 		unsupported("merge requires a unique common ancestor (recursive criss-cross merge is not implemented)");
 	return (bytea *) DatumGetPointer(cell(0, 1));
@@ -163,7 +166,7 @@ merge_base(bytea *ours, bytea *theirs)
 static bytea *
 table_chunk(bytea *db, const char *name)
 {
-	run("SELECT o.objchildren[2] FROM pg_dolt_object db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE db.objhash=$1 AND o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT o.objchildren[2] FROM pg_dolt_object_visible db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE db.objhash=$1 AND o.objkind='table' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	if (SPI_processed != 1)
 		elog(ERROR, "missing retained table: %s", name);
 	return (bytea *) DatumGetPointer(cell(0, 1));

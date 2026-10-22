@@ -591,6 +591,14 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
 
+	if (dg_catalog_alter(parsetree))
+	{
+		if (qc)
+			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
 	if (dg_catalog_drop(parsetree))
 	{
 		if (qc)

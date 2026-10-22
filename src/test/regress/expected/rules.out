@@ -1289,7 +1289,7 @@ ORDER BY viewname;
 dolt_conflicts| SELECT (v.value ->> 'table'::text) AS "table",
     count(*) AS num_conflicts
    FROM (pg_dolt_ref r
-     JOIN pg_dolt_object o ON ((o.objhash = r.reftarget))),
+     JOIN pg_dolt_object_visible o ON ((o.objhash = r.reftarget))),
     LATERAL jsonb_array_elements(((convert_from(o.objpayload, 'UTF8'::name))::jsonb -> 'conflicts'::text)) v(value)
   WHERE (r.refname = ('merge/'::text || active_branch()))
   GROUP BY (v.value ->> 'table'::text);
@@ -1316,7 +1316,7 @@ dolt_tags| SELECT substr(r.refname, 6) AS tag_name,
     ('Sat Jan 01 00:00:00 2000'::timestamp without time zone + (((((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'date_us'::text))::bigint)::double precision * '@ 0.000001 secs'::interval)) AS date,
     ((convert_from(o.objpayload, 'UTF8'::name))::jsonb ->> 'message'::text) AS message
    FROM (pg_dolt_ref r
-     JOIN pg_dolt_object o ON ((o.objhash = r.reftarget)))
+     JOIN pg_dolt_object_visible o ON ((o.objhash = r.reftarget)))
   WHERE ((r.refname ~~ 'tags/%'::text) AND (o.objkind = 'tag'::text));
 pg_aios| SELECT pid,
     io_id,
@@ -1372,6 +1372,11 @@ pg_cursors| SELECT name,
     is_scrollable,
     creation_time
    FROM pg_cursor() c(name, statement, is_holdable, is_binary, is_scrollable, creation_time);
+pg_dolt_object_visible| SELECT DISTINCT objhash,
+    objkind,
+    objpayload,
+    objchildren
+   FROM pg_dolt_object;
 pg_file_settings| SELECT sourcefile,
     sourceline,
     seqno,

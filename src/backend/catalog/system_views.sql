@@ -1409,6 +1409,11 @@ REVOKE EXECUTE ON FUNCTION pg_get_aios() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;
 
 -- First version-control slice. History remains privileged until branch ACLs exist.
+-- Immutable manifest objects may have concurrent, byte-identical physical copies.
+CREATE VIEW pg_dolt_object_visible AS
+ SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;
+REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;
+
 CREATE VIEW dolt_log WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_log();
 CREATE VIEW dolt_tags WITH (security_invoker=true) AS
@@ -1418,13 +1423,13 @@ CREATE VIEW dolt_tags WITH (security_invoker=true) AS
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'email' AS email,
            timestamp '2000-01-01' + ((convert_from(o.objpayload,'UTF8')::jsonb)->>'date_us')::bigint * interval '1 microsecond' AS date,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'message' AS message
-    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object o ON o.objhash=r.reftarget
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget
     WHERE r.refname LIKE 'tags/%' AND o.objkind='tag';
 REVOKE ALL ON dolt_log, dolt_tags FROM PUBLIC;
 
 CREATE VIEW dolt_conflicts AS
  SELECT v->>'table' AS "table", count(*)::bigint AS num_conflicts
- FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget,
+ FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget,
  LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
  WHERE r.refname='merge/' || active_branch()
  GROUP BY v->>'table';

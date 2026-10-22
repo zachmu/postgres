@@ -69,7 +69,7 @@ dg_storage_record(Relation source)
 	if (CatalogViewObjectContext(id) || source->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
 		source->rd_locator.dbOid != MyDatabaseId || !RelFileNumberIsValid(source->rd_locator.relNumber))
 		elog(ERROR, "invalid physical source for prolly storage registration");
-	catalog = table_open(DoltStorageRelationId, ShareRowExclusiveLock);
+	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
 	ScanKeyInit(&key, Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(id));
 	scan = systable_beginscan(catalog, DoltStorageKeyIndexId, true, snapshot, 1, &key);
@@ -128,7 +128,7 @@ dg_storage_allocate(Relation definition, const char *branch)
 		!((definition->rd_rel->relkind == RELKIND_RELATION && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
 		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
 		elog(ERROR, "storage allocation requires a canonical prolly definition");
-	catalog = table_open(DoltStorageRelationId, ShareRowExclusiveLock);
+	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
 	do
 	{
 		id = GetNewOidWithIndex(catalog, DoltStorageKeyIndexId, Anum_pg_dolt_storage_storageid);
@@ -240,25 +240,16 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	if (form.storageimported)
 	{
 		Relation	source = try_relation_open(resource, NoLock);
-		TupleDesc	a,
-					b = RelationGetDescr(storage->definition);
 		RelFileLocator locator = {form.storagespc, form.storagedb, form.storagefile};
 		bool		compatible;
 
 		if (!source)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
-		a = RelationGetDescr(source);
-		compatible = a->natts == b->natts && RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
-		for (int i = 0; compatible && i < a->natts; i++)
-		{
-			Form_pg_attribute x = TupleDescAttr(a, i),
-						y = TupleDescAttr(b, i);
-
-			compatible = !x->attisdropped && x->atttypid == y->atttypid && x->atttypmod == y->atttypmod && x->attcollation == y->attcollation && !strcmp(NameStr(x->attname), NameStr(y->attname));
-		}
+		/* The physical bridge validates the allocation, never the schema. */
+		compatible = RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
 		relation_close(source, NoLock);
 		if (!compatible)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("imported resource allocation changed")));
 	}
 
 	/*
@@ -350,6 +341,18 @@ dg_storage_lock_working(const char *branch, Snapshot snapshot)
 	table_close(catalog, NoLock);
 }
 
+void
+dg_storage_lock_branch(Oid resource, const char *branch)
+{
+	PLHash		hash;
+	PLSlice		bytes = {(const uint8 *) branch, strlen(branch)};
+
+	if (!pl_hash_bytes(bytes, &hash))
+		elog(ERROR, "branch hash failed");
+	/* Hash collisions conservatively serialize unrelated branches. */
+	LockDatabaseObject(DoltBindingRelationId, resource, pl_read32(hash.bytes), ExclusiveLock);
+}
+
 Relation
 dg_storage_enable_write(DGStorage *storage, bytea *base)
 {
@@ -369,7 +372,8 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	 * Acquire the shared resource lock, never the backend-local definition
 	 * OID.
 	 */
-	LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
+	LockRelationId(&rel->rd_lockInfo.lockRelId, RowExclusiveLock);
+	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch);
 	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	catalog = table_open(DoltBindingRelationId, RowShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
