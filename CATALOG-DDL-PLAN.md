@@ -33,7 +33,41 @@ can be handled by table descriptors alone or by unchanged cache keys.
 - Active bindings retain required metadata/chunks. Initially retaining objects
   without reclaiming them is acceptable; adding GC requires explicit pins.
 
-## Implementation sequence
+## Current next steps — runtime binding revision, 2026-10-22
+
+The audit and restricted DROP/CREATE checkpoints below are implemented. Their
+historical descriptions are retained. The remaining implementation order is now
+specified by [Versioned catalog runtime bindings](CATALOG-RUNTIME-BINDING-PLAN.md),
+which refines the original sequence and takes precedence for the next work:
+
+1. **Mapping and same-name CREATE.** Separate logical names/object identity and
+   canonical schemas from local physical relation names/OIDs. Resolve each read
+   and write target through a branch/schema binding; route DML, COPY, indexes,
+   capture, DROP and checkout through it. Allocate runtime resources during DDL
+   and publish them atomically with canonical membership. Prove independent
+   same-name tables with incompatible definitions on two branches and a query
+   spanning both. This is the immediate milestone.
+2. **Successor generations and ALTER.** Add bounded ADD/DROP COLUMN with required
+   data/index transformation. Publish a successor binding without mutating another
+   branch's or active reader's descriptor. Prove rollback/recovery and explicit
+   stale-write outcomes before expanding operation coverage.
+3. **Logical catalogs and dependency closure.** Complete supported introspection,
+   OID/name conversions, caches, whole-row/type identities and versioned function/
+   type dependencies. Implement prerequisites in the earlier milestones wherever
+   necessary for correctness. Do not treat a distinct relation OID as a complete
+   solution for all catalog caches.
+4. **Review the full gate.** Validate against matching Doltgres tests and native
+   multi-session/recovery tests, then decide how far to expand DDL, concurrency and
+   retention. General catalog viability requires more than the same-name test.
+
+There will be no permanent physical catalog copy/OID per commit and no historical
+query-time materializer. Historical reads continue using canonical descriptors;
+local mappings support writable runtime generations. Logical identity encoding,
+reuse/reclamation, mapping persistence and catalog-query context need explicit
+choices during implementation, not accidental assumptions. Preserve history
+independence: physical names and allocation IDs must not enter canonical hashes.
+
+## Original implementation sequence (planning record)
 
 ### 1. Audit and publication contract
 

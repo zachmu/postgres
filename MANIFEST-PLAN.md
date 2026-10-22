@@ -315,3 +315,18 @@ Rollback and crash rollback leave neither a physical table nor partial membershi
 This retains broad workspace locking and Read Committed mutation; it does not
 implement concurrent schema publication or generation-aware writable bindings.
 See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
+
+## Runtime mapping publication revision — 2026-10-22
+
+[The runtime binding plan](CATALOG-RUNTIME-BINDING-PLAN.md) adds local mappings from
+logical object/schema identities to writable runtime resources. Publish mapping,
+physical table/index resources, canonical schema/data roots and working membership
+under the same PostgreSQL transaction/WAL decision. Keep internal names/OIDs out
+of canonical descriptors and deparsed definitions; capture must enumerate logical
+membership rather than infer authority from physical catalog names. Staged/HEAD
+publication retains existing explicit semantics.
+
+Specify initialization for retained writable schemas without local mappings during
+branch administration. This is not permission for a historical SELECT to create
+persistent catalog projections. Format, identity encoding and recovery/migration
+choices must be recorded and tested before expanding CREATE/ALTER around them.

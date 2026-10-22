@@ -352,3 +352,19 @@ Rollback and crash rollback leave neither a physical table nor partial membershi
 This retains broad workspace locking and Read Committed mutation; it does not
 implement concurrent schema publication or generation-aware writable bindings.
 See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
+
+## Writable schema-generation bindings — 2026-10-22
+
+[The runtime binding plan](CATALOG-RUNTIME-BINDING-PLAN.md) requires DML/COPY/index
+paths to carry an authoritative logical table, branch and schema generation, rather
+than relying solely on the session branch or physical Relation pointer. Validate
+that authority against schema publication; stale-generation writes must block,
+rebind or fail explicitly. Successor-generation ALTER must retain old reader and
+portal bindings while publishing schema, transformed data/indexes and mapping
+atomically.
+
+Broad serialization can remain for the first proof, with lock keys/order documented;
+it does not replace the planned row-level conflict tracking and three-way working-set
+publication. Retain generations initially, and specify pins/reclamation before
+claiming scalable runtime OID/storage lifetime. See the new plan for same-name,
+concurrent-reader, rollback and crash-recovery acceptance gates.

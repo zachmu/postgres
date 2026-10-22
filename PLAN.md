@@ -824,3 +824,23 @@ physical bridge. The next boundary is an explicit mapping from logical identity
 and schema generation to writable runtime relations; same-name divergent CREATE
 and layout-changing ALTER must be tested through it rather than mutating shared
 descriptors. See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
+
+## Next implementation order — runtime catalog bindings, 2026-10-22
+
+The restricted CREATE milestone confirms that shared physical names now limit
+versioned DDL. Follow [CATALOG-RUNTIME-BINDING-PLAN.md](CATALOG-RUNTIME-BINDING-PLAN.md)
+and the revised current sequence in [CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md):
+
+1. Logical-to-runtime mapping and authoritative per-reference bindings, proving
+   same-name CREATE with incompatible schemas and independent writes on branches.
+2. Successor-generation ADD/DROP COLUMN with atomic schema/data/index publication
+   and stable old readers, rather than mutation of shared descriptors.
+3. Logical catalog interfaces, caches, whole-row identities and versioned type/
+   function dependencies, with necessary prerequisites integrated into steps 1–2.
+4. Review complete acceptance evidence before expanding DDL and concurrency.
+
+This retains option 1, canonical schemas alongside data in prolly storage. Physical
+OIDs/internal names remain local, and runtime resources are not allocated per
+commit. Historical reads stay automatic, read-only-capable and independent of
+persistent query-time catalog preparation. These are planned changes, not claims
+that the remaining mapping or generalized catalog work is already implemented.
