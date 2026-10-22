@@ -176,7 +176,9 @@ dg_catalog_alter(Node *statement)
 	{
 		List	   *parts;
 
-		comment = (CommentStmt *) statement;
+		comment = copyObject((CommentStmt *) statement);
+		if (comment->comment && !comment->comment[0])
+			comment->comment = NULL;
 		if (comment->objtype != OBJECT_TABLE && comment->objtype != OBJECT_COLUMN)
 			return false;
 		parts = copyObject((List *) comment->object);

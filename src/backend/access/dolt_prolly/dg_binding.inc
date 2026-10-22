@@ -15,8 +15,8 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 	bool		changed = true;
 
 	/*
-	 * Serialize this prototype's local mapping writers. Readers keep MVCC
-	 * views.
+	 * Mapping mutations are protected by their tuple/unique-index locks.
+	 * Different branches must not hold a conflicting catalog-wide lock.
 	 */
 	rel = table_open(DoltBindingRelationId, RowExclusiveLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber,

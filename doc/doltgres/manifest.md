@@ -157,3 +157,11 @@ The former targets a pending merge object; the latter targets a commit used as
 an activation marker for shared-schema branch views. Existing object kind IDs
 and hash encodings are unchanged. These are trusted internal APIs, not a general
 user-facing ref editing interface.
+
+## Parallel canonical ALTER checkpoint (2026-10-22)
+
+[Branch-local ALTER](canonical-alter.md) records the next gate: COMMENT, nullable
+ADD COLUMN and unindexed DROP COLUMN, automatic legacy activation, and parallel
+DDL on branches sharing storage. It supersedes the earlier resource-wide writer
+serialization and physical hash-uniqueness descriptions. Logical hashes and
+PostgreSQL transaction publication remain authoritative.

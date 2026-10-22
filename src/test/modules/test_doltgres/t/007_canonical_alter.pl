@@ -8,7 +8,7 @@ $node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sub fails {my($q,$re,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$re,"$label diagnostic");}
 sql(q{CREATE ROLE denied; CREATE TABLE t(id int PRIMARY KEY,discard text,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,'old',10),(2,'two',20); CREATE TABLE bag(a int,b text) USING dolt_prolly_table; INSERT INTO bag VALUES(1,'a'),(1,'b'),(1,'b'); SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
-sql(q{CREATE TABLE shifted(trash text,id int PRIMARY KEY,v int UNIQUE); INSERT INTO shifted VALUES('remove',1,10); SELECT dolt_commit('-Am','shift fixture'); SELECT dolt_branch('shiftcopy')});
+sql(q{CREATE TABLE shifted(trash text NOT NULL,id int PRIMARY KEY,v int UNIQUE); INSERT INTO shifted VALUES('remove',1,10); SELECT dolt_commit('-Am','shift fixture'); SELECT dolt_branch('shiftcopy')});
 my $old=sql(q{SELECT commit_hash FROM dolt_log('-n','1')});
 my $resources=sql(q{SELECT count(*) FROM pg_dolt_storage});
 my $a=$node->background_psql('postgres');my $b=$node->background_psql('postgres');
@@ -58,7 +58,9 @@ fails(q{SET ROLE denied; COMMENT ON TABLE t IS 'bad'},qr/must be owner/,'COMMENT
 fails(q{SET ROLE denied; ALTER TABLE t DROP COLUMN extra},qr/must be owner/,'ALTER checks original caller ownership');
 is(sql(q{SELECT description FROM pg_description WHERE objoid='t'::regclass AND objsubid=0}),'main','table COMMENT belongs to selected branch');
 is($b->query_safe(q{SELECT description FROM pg_description WHERE objoid='t'::regclass AND objsubid=0}),'other','other branch retains its own COMMENT');
-sql(q{BEGIN; COMMENT ON TABLE t IS NULL; ROLLBACK});
+sql(q{BEGIN; COMMENT ON TABLE t IS ''; COMMIT});
+is(sql(q{SELECT count(*) FROM pg_description WHERE objoid='t'::regclass AND objsubid=0}),'0','empty COMMENT removes metadata like PostgreSQL');
+sql(q{COMMENT ON TABLE t IS 'main'; BEGIN; COMMENT ON TABLE t IS NULL; ROLLBACK});
 is(sql(q{SELECT description FROM pg_description WHERE objoid='t'::regclass AND objsubid=0}),'main','metadata-only revision rolls back');
 $a->query_safe(q{BEGIN; ALTER TABLE bag ADD COLUMN aborted text});
 $b->query_safe(q{BEGIN; ALTER TABLE bag DROP COLUMN b; COMMIT});

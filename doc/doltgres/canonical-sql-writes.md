@@ -108,3 +108,11 @@ Next gates: broaden canonical DDL and namespace/schema changes; complete context
 stored catalog views and remaining utility lookups; then remove the bootstrap/import
 bridge. Row-level concurrency and index execution/maintenance performance remain
 separate substantial work. Root planning documents were left unchanged per AGENTS.md.
+
+## Parallel canonical ALTER checkpoint (2026-10-22)
+
+[Branch-local ALTER](canonical-alter.md) records the next gate: COMMENT, nullable
+ADD COLUMN and unindexed DROP COLUMN, automatic legacy activation, and parallel
+DDL on branches sharing storage. It supersedes the earlier resource-wide writer
+serialization and physical hash-uniqueness descriptions. Logical hashes and
+PostgreSQL transaction publication remain authoritative.

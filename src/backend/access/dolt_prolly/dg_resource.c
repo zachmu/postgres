@@ -3,8 +3,8 @@
  * Resource records contain locators and access-method properties, never columns,
  * names, types or constraints. The transaction snapshot selects the binding.
  *
- * For now native capture registers existing permanent relation files. A future
- * canonical CREATE can allocate the same resource without a physical schema row.
+ * Native capture registers existing permanent relation files. Canonical CREATE
+ * allocates resources without a physical schema row.
  */
 #include "dg.h"
 #include "access/heapam.h"
@@ -232,10 +232,10 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource properties do not match canonical definition")));
 
 	/*
-	 * Imported resources still follow native physical DDL until that DDL is
-	 * routed through canonical publication. Validate this bridge, never adopt
-	 * its definition. Independently allocated resources have no physical
-	 * schema row.
+	 * Imported resources retain a physical allocation bridge. Only validate its
+	 * locator and AM: canonical ALTER can legitimately change the tuple layout
+	 * on one branch without changing that old physical schema. Independently
+	 * allocated resources have no physical schema row.
 	 */
 	if (form.storageimported)
 	{
