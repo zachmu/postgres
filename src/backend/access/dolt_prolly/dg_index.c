@@ -24,7 +24,7 @@ typedef struct DGIndexEntry
 	PLEntry		entry;
 	size_t		prefix;
 	bool		nullkey;
-} DGIndexEntry;
+}			DGIndexEntry;
 typedef struct DGIndexScan
 {
 	MemoryContext context;
@@ -33,7 +33,7 @@ typedef struct DGIndexScan
 	size_t		count;
 	int64		position,
 				mark;
-} DGIndexScan;
+}			DGIndexScan;
 static int
 compare_entries(const void *a, const void *b)
 {
@@ -163,8 +163,16 @@ dg_index_rebuild(Relation table, Relation index)
 void
 dg_rebuild_indexes(Relation rel)
 {
-	List	   *indexes = RelationGetIndexList(rel);
+	List	   *indexes;
 	ListCell   *cell;
+
+	if (rel->rd_catalogview)
+	{
+		foreach(cell, dg_storage_indexes(rel))
+			dg_index_rebuild(rel, (Relation) lfirst(cell));
+		return;
+	}
+	indexes = RelationGetIndexList(rel);
 
 	foreach(cell, indexes)
 	{

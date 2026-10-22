@@ -38,6 +38,7 @@ struct DGStorage
 	Relation	definition;
 	char	   *branch;
 	Snapshot	snapshot;
+	List	   *indexes;
 	bytea	   *base;
 	bool		writable;
 	MemoryContextCallback cleanup;
@@ -259,6 +260,13 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 		if (!compatible)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 	}
+
+	/*
+	 * Cache canonical index identities on their owning definition, not on a
+	 * disposable shallow copy of that descriptor.
+	 */
+	if (storage->definition->rd_rel->relhasindex)
+		list_free(RelationGetIndexList(storage->definition));
 	storage->relation = *storage->definition;
 	storage->form = *storage->definition->rd_rel;
 	storage->relation.rd_rel = &storage->form;
@@ -289,6 +297,10 @@ dg_storage_load(DGStorage *storage)
 void
 dg_storage_close(DGStorage *storage)
 {
+	ListCell   *lc;
+
+	foreach(lc, storage->indexes)
+		dg_storage_close_relation((Relation) lfirst(lc));
 	RelationCloseSmgr(&storage->relation);
 	UnregisterSnapshot(storage->snapshot);
 	relation_close(storage->definition, NoLock);
@@ -301,17 +313,17 @@ dg_storage_close(DGStorage *storage)
 static void
 lock_catalog_tuple(Relation catalog, HeapTuple tuple)
 {
- Buffer buffer = InvalidBuffer;
- TM_FailureData failure;
- TM_Result result;
+	Buffer		buffer = InvalidBuffer;
+	TM_FailureData failure;
+	TM_Result	result;
 
- result = heap_lock_tuple(catalog, tuple, GetCurrentCommandId(false),
-                          LockTupleShare, LockWaitBlock, false, &buffer, &failure);
- if (BufferIsValid(buffer))
-  ReleaseBuffer(buffer);
- if (result != TM_Ok)
-  ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-                  errmsg("canonical write binding changed; retry transaction")));
+	result = heap_lock_tuple(catalog, tuple, GetCurrentCommandId(false),
+							 LockTupleShare, LockWaitBlock, false, &buffer, &failure);
+	if (BufferIsValid(buffer))
+		ReleaseBuffer(buffer);
+	if (result != TM_Ok)
+		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						errmsg("canonical write binding changed; retry transaction")));
 }
 
 /* Pin working membership against concurrent DROP/ref publication. This lock is
@@ -319,116 +331,141 @@ lock_catalog_tuple(Relation catalog, HeapTuple tuple)
 void
 dg_storage_lock_working(const char *branch, Snapshot snapshot)
 {
- Relation catalog;
- SysScanDesc scan;
- ScanKeyData key;
- HeapTuple tuple;
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
 
- if (XactReadOnly)
-  ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot write canonical storage in a read-only transaction")));
- catalog = table_open(DoltRefRelationId, RowShareLock);
- ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ,
-             CStringGetTextDatum(psprintf("working/%s", branch)));
- scan = systable_beginscan(catalog, DoltRefKeyIndexId, true, snapshot, 1, &key);
- tuple = systable_getnext(scan);
- if (!HeapTupleIsValid(tuple))
-  ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch working set is unavailable: %s", branch)));
- lock_catalog_tuple(catalog, tuple);
- systable_endscan(scan);
- table_close(catalog, NoLock);
+	if (XactReadOnly)
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot write canonical storage in a read-only transaction")));
+	catalog = table_open(DoltRefRelationId, RowShareLock);
+	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ,
+				CStringGetTextDatum(psprintf("working/%s", branch)));
+	scan = systable_beginscan(catalog, DoltRefKeyIndexId, true, snapshot, 1, &key);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch working set is unavailable: %s", branch)));
+	lock_catalog_tuple(catalog, tuple);
+	systable_endscan(scan);
+	table_close(catalog, NoLock);
 }
 
 Relation
 dg_storage_enable_write(DGStorage *storage, bytea *base)
 {
- Relation rel = &storage->relation;
- Relation catalog;
- SysScanDesc scan;
- ScanKeyData keys[2];
- HeapTuple tuple;
- char *name;
+	Relation	rel = &storage->relation;
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData keys[2];
+	HeapTuple	tuple;
+	char	   *name;
 
- if (XactReadOnly)
-  ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot write canonical storage in a read-only transaction")));
- if (rel->rd_rel->relkind != RELKIND_RELATION || rel->rd_rel->relhasindex)
-  dg_unsupported("canonical resource writes with indexes");
- /* Acquire the shared resource lock, never the backend-local definition OID. */
- LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
- name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
- catalog = table_open(DoltBindingRelationId, RowShareLock);
- ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
- ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
- scan = systable_beginscan(catalog, DoltBindingKeyIndexId, true, storage->snapshot, 2, keys);
- tuple = systable_getnext(scan);
- if (!HeapTupleIsValid(tuple))
-  elog(ERROR, "canonical write binding disappeared");
- lock_catalog_tuple(catalog, tuple);
- systable_endscan(scan);
- table_close(catalog, NoLock);
- storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
- storage->writable = true;
- return rel;
+	if (XactReadOnly)
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot write canonical storage in a read-only transaction")));
+	if (rel->rd_rel->relkind != RELKIND_RELATION && rel->rd_rel->relkind != RELKIND_INDEX)
+		dg_unsupported("canonical resource write kind");
+
+	/*
+	 * Acquire the shared resource lock, never the backend-local definition
+	 * OID.
+	 */
+	LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
+	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	catalog = table_open(DoltBindingRelationId, RowShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltBindingKeyIndexId, true, storage->snapshot, 2, keys);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "canonical write binding disappeared");
+	lock_catalog_tuple(catalog, tuple);
+	systable_endscan(scan);
+	table_close(catalog, NoLock);
+	storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
+	storage->writable = true;
+	return rel;
 }
 
 static DGStorage *
 bound_storage(Relation rel)
 {
- DGStorage *storage = rel->rd_amcache;
+	DGStorage  *storage = rel->rd_amcache;
 
- if (!rel->rd_catalogview || !storage || &storage->relation != rel || !storage->definition)
-  ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
- return storage;
+	if (!rel->rd_catalogview || !storage || &storage->relation != rel || !storage->definition)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+	return storage;
 }
 
 const char *
 dg_storage_branch(Relation rel)
 {
- return bound_storage(rel)->branch;
+	return bound_storage(rel)->branch;
 }
 
 void
 dg_storage_require_write(Relation rel)
 {
- DGStorage *storage = bound_storage(rel);
+	DGStorage  *storage = bound_storage(rel);
 
- if (!storage->writable || XactReadOnly)
-  ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("canonical storage binding has no write authority")));
+	if (!storage->writable || XactReadOnly)
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("canonical storage binding has no write authority")));
 }
 
 DGState *
 dg_storage_am_load(Relation rel, Snapshot snapshot)
 {
- DGStorage *storage = bound_storage(rel);
- DGState *state;
+	DGStorage  *storage = bound_storage(rel);
+	DGState    *state;
 
- if (snapshot == SnapshotSelf)
-  dg_storage_require_write(rel);
- state = dg_load_bound(rel, snapshot, storage->branch);
- if (!state->has_root && storage->base)
- {
-  Oid user;
-  int security;
+	if (snapshot == SnapshotSelf)
+		dg_storage_require_write(rel);
+	state = dg_load_bound(rel, snapshot, storage->branch);
+	if (!state->has_root && storage->base)
+	{
+		Oid			user;
+		int			security;
 
-  GetUserIdAndSecContext(&user, &security);
-  SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-  PushActiveSnapshot(storage->snapshot);
-  PG_TRY();
-  {
-   state->content = dg_history_import(state->store, storage->base);
-   dg_history_handles(state);
-  }
-  PG_FINALLY();
-  {
-   PopActiveSnapshot();
-   SetUserIdAndSecContext(user, security);
-  }
-  PG_END_TRY();
- }
- return state;
+		GetUserIdAndSecContext(&user, &security);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+		PushActiveSnapshot(storage->snapshot);
+		PG_TRY();
+		{
+			state->content = dg_history_import(state->store, storage->base);
+			if (rel->rd_rel->relkind == RELKIND_RELATION)
+				dg_history_handles(state);
+		}
+		PG_FINALLY();
+		{
+			PopActiveSnapshot();
+			SetUserIdAndSecContext(user, security);
+		}
+		PG_END_TRY();
+	}
+	return state;
 }
 
 void
 dg_storage_close_relation(Relation rel)
 {
- dg_storage_close(bound_storage(rel));
+	dg_storage_close(bound_storage(rel));
+}
+
+void
+dg_storage_set_indexes(Relation rel, List *indexes)
+{
+	DGStorage  *storage = bound_storage(rel);
+
+	Assert(storage->indexes == NIL);
+	storage->indexes = indexes;
+}
+
+List *
+dg_storage_indexes(Relation rel)
+{
+	DGStorage  *storage = bound_storage(rel);
+
+	dg_storage_require_write(rel);
+	if (rel->rd_rel->relhasindex && storage->indexes == NIL)
+		elog(ERROR, "canonical indexed write has no bound indexes");
+	return storage->indexes;
 }

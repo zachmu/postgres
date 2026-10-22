@@ -245,55 +245,94 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 Relation
 dg_catalog_write_table(const char *branch, const char *name, AclMode permission)
 {
- Oid user;
- int security, nest;
- Relation result = NULL;
- List *parts = stringToQualifiedNameList(name, NULL);
- const char *privilege;
+	Oid			user;
+	int			security,
+				nest;
+	Relation	result = NULL;
+	List	   *parts = stringToQualifiedNameList(name, NULL);
+	const char *privilege;
 
- if (!ActiveSnapshotSet() || list_length(parts) != 2)
-  elog(ERROR, "canonical write requires a snapshot and qualified logical name");
- switch (permission)
- {
-  case ACL_INSERT: privilege = "INSERT"; break;
-  case ACL_UPDATE: privilege = "UPDATE"; break;
-  case ACL_DELETE: privilege = "DELETE"; break;
-  default: elog(ERROR, "invalid canonical write permission");
- }
- dg_storage_lock_working(branch, GetActiveSnapshot());
- GetUserIdAndSecContext(&user, &security);
- SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
- PG_TRY();
- {
-  bytea *db, *descriptor, *schema;
-  char *definition;
-  Oid resource, handle;
-  DGStorage *storage;
+	if (!ActiveSnapshotSet() || list_length(parts) != 2)
+		elog(ERROR, "canonical write requires a snapshot and qualified logical name");
+	switch (permission)
+	{
+		case ACL_INSERT:
+			privilege = "INSERT";
+			break;
+		case ACL_UPDATE:
+			privilege = "UPDATE";
+			break;
+		case ACL_DELETE:
+			privilege = "DELETE";
+			break;
+		default:
+			elog(ERROR, "invalid canonical write permission");
+	}
+	dg_storage_lock_working(branch, GetActiveSnapshot());
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bytea	   *db,
+				   *descriptor,
+				   *schema;
+		char	   *definition;
+		Oid			resource,
+					handle;
+		DGStorage  *storage;
 
-  nest = begin_api();
-  db = read_ref(psprintf("working/%s", branch)).target;
-  if (!db)
-   elog(ERROR, "canonical working set disappeared");
-  run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-  if (SPI_processed != 1)
-   ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, branch)));
-  descriptor = DatumGetByteaPCopy(cell(0, 1));
-  schema = child(descriptor, 1);
-  definition = metadata(schema, "schema");
-  catalog_acl(catalog_namespace(db, strVal(linitial(parts))), "USAGE", user);
-  catalog_acl(definition, privilege, user);
-  resource = binding_relation(branch, name, schema);
-  if (!OidIsValid(resource))
-   ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
-  handle = CatalogViewLookupObject(provider_view(db), RelationRelationId, name);
-  storage = dg_storage_open(handle, branch, name, schema, resource, GetActiveSnapshot());
-  result = dg_storage_enable_write(storage, child(descriptor, 2));
-  end_api(nest);
- }
- PG_FINALLY();
- {
-  SetUserIdAndSecContext(user, security);
- }
- PG_END_TRY();
- return result;
+		nest = begin_api();
+		db = read_ref(psprintf("working/%s", branch)).target;
+		if (!db)
+			elog(ERROR, "canonical working set disappeared");
+		run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+		if (SPI_processed != 1)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, branch)));
+		descriptor = DatumGetByteaPCopy(cell(0, 1));
+		schema = child(descriptor, 1);
+		definition = metadata(schema, "schema");
+		catalog_acl(catalog_namespace(db, strVal(linitial(parts))), "USAGE", user);
+		catalog_acl(definition, privilege, user);
+		resource = binding_relation(branch, name, schema);
+		if (!OidIsValid(resource))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
+		handle = CatalogViewLookupObject(provider_view(db), RelationRelationId, name);
+		storage = dg_storage_open(handle, branch, name, schema, resource, GetActiveSnapshot());
+		result = dg_storage_enable_write(storage, child(descriptor, 2));
+		{
+			List	   *ids = RelationGetIndexList(result);
+			List	   *indexes = NIL;
+			ListCell   *lc;
+
+			foreach(lc, ids)
+			{
+				Oid			indexid = lfirst_oid(lc);
+				char	   *indexname = quote_qualified_identifier(get_namespace_name(get_rel_namespace(indexid)), get_rel_name(indexid));
+				bytea	   *indexdesc,
+						   *indexschema;
+				Oid			indexresource;
+				DGStorage  *indexstorage;
+
+				run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='index' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(indexname)), NULL, true);
+				if (SPI_processed != 1)
+					elog(ERROR, "canonical index membership is unavailable");
+				indexdesc = DatumGetByteaPCopy(cell(0, 1));
+				indexschema = child(indexdesc, 1);
+				indexresource = binding_relation(branch, indexname, indexschema);
+				if (!OidIsValid(indexresource))
+					elog(ERROR, "canonical index storage binding is unavailable");
+				indexstorage = dg_storage_open(indexid, branch, indexname, indexschema, indexresource, GetActiveSnapshot());
+				indexes = lappend(indexes, dg_storage_enable_write(indexstorage, child(indexdesc, 2)));
+			}
+			dg_storage_set_indexes(result, indexes);
+			list_free(ids);
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return result;
 }

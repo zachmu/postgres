@@ -248,6 +248,8 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	dg_release(s);
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
+	if (rel->rd_catalogview)
+		dg_rebuild_indexes(rel);
 }
 static void
 multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int opts, BulkInsertState state)

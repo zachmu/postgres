@@ -11,13 +11,23 @@ sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);is
 sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT;
 CREATE FUNCTION pg_catalog.test_storage_write(text,text,text,text[],bigint) RETURNS bigint AS 'storage_resource','test_storage_write' LANGUAGE C STRICT;
 CREATE ROLE writer; CREATE ROLE outsider;
-CREATE TABLE t(id int NOT NULL,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,7)});
+CREATE TABLE t(id int PRIMARY KEY,v int UNIQUE) USING dolt_prolly_table; INSERT INTO t VALUES(1,7)});
 my $legacy=sql(q{SELECT dolt_commit('-Am','integer definition')});
 my $schema=sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'});
-sql(q{DROP TABLE t; CREATE TABLE t(id int NOT NULL,v text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'main'); GRANT SELECT,INSERT ON t TO writer; SELECT dolt_commit('-Am','text definition'); SELECT dolt_branch('other')});
+my %index_schemas;
+for my $index ('t_pkey','t_v_key')
+{
+ $index_schemas{$index}=sql("SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.$index'");
+}
+sql(q{DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v text UNIQUE) USING dolt_prolly_table; INSERT INTO t VALUES(1,'main'); GRANT SELECT,INSERT ON t TO writer; SELECT dolt_commit('-Am','text definition'); SELECT dolt_branch('other')});
 sql("SELECT dolt_branch('legacy','$legacy')");
 my $resource=sql(q{SELECT test_storage_allocate(c.oid,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c WHERE c.relname='t'});
 sql("UPDATE pg_dolt_binding SET bindrelid=$resource WHERE bindbranch='other' AND bindname='public.t'; DELETE FROM pg_dolt_binding WHERE bindbranch='legacy' AND bindname='public.t'; INSERT INTO pg_dolt_binding VALUES($resource,'legacy','public.t',decode('$schema','hex'))");
+for my $index ('t_pkey','t_v_key')
+{
+ my $id=sql("SELECT test_storage_allocate(c.oid,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c WHERE c.relname='$index'");
+ sql("BEGIN; UPDATE pg_dolt_binding SET bindrelid=$id WHERE bindbranch='other' AND bindname='public.$index'; DELETE FROM pg_dolt_binding WHERE bindbranch='legacy' AND bindname='public.$index'; INSERT INTO pg_dolt_binding VALUES($id,'legacy','public.$index',decode('$index_schemas{$index}','hex')); COMMIT");
+}
 my $resources=sql(q{SELECT count(*) FROM pg_dolt_storage});
 is(sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['2','8'],0)}),'2','native insert imports old branch contents and allocates occurrence handle');
 is(sql(q{SET ROLE writer; SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'1','authorized non-owner writes through canonical definition');
@@ -28,6 +38,10 @@ is(sql(q{SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],1
 is(sql(q{SELECT test_storage_write('legacy','public.t','delete',ARRAY[]::text[],2)}),'0','native delete uses bound branch');
 is(sql(q{SELECT * FROM "postgres/legacy".public.t}),'1|9','updated branch has correct rows');
 is(sql(q{SELECT * FROM "postgres/other".public.t}),'2|text','other schema remains unchanged after update and delete');
+fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','different'],0)},qr/duplicate key violates unique constraint "t_pkey"/,'bound primary index rejects duplicate key');
+fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['3','text'],0)},qr/duplicate key violates unique constraint "t_v_key"/,'bound secondary unique index rejects duplicate value');
+is(sql(q{SELECT * FROM "postgres/other".public.t}),'2|text','failed index updates roll back table root too');
+
 fails(q{SET ROLE outsider; SELECT test_storage_write('other','public.t','insert',ARRAY['3','denied'],0)},qr/permission denied/,'canonical grants reject unauthorized write');
 fails(q{SET ROLE writer; SELECT test_storage_write('other','public.t','delete',ARRAY[]::text[],1)},qr/permission denied/,'INSERT grant does not grant DELETE authority');
 fails(q{BEGIN READ ONLY; SELECT test_storage_write('other','public.t','insert',ARRAY['3','denied'],0)},qr/read-only/,'read-only transaction rejects write before page changes');
