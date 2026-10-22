@@ -10,6 +10,7 @@
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
+extern bool dg_catalog_alter(Node *statement);
 extern bool dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait);
 extern bool dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result);
 extern Relation dg_catalog_target(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);

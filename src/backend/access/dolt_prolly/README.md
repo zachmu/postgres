@@ -110,9 +110,13 @@ versioned schema resolution and historical SQL reads remain later work.
 
 ### Concurrency and retention
 
-Writes take a transaction-duration ExclusiveLock on the table. Readers may
-continue with immutable snapshot roots. This deliberately serializes writers;
-concurrent lock upgrades can deadlock and PostgreSQL detects those deadlocks.
+Canonical writes serialize per branch/resource for the transaction; different
+branches can write shared files concurrently. A short file lock keeps each append
+contiguous and is released before transaction end. Legacy unbound writes retain
+table-wide serialization. Readers use immutable snapshot roots. Lock upgrades
+can deadlock and PostgreSQL detects those deadlocks. See
+[parallel canonical ALTER](../../../../doc/doltgres/canonical-alter.md) for the
+metadata and immutable-object publication changes.
 A writer encountering a committed root newer than its active snapshot raises a
 serialization error instead of merging whole roots or exposing snapshot phantoms.
 This is conservative rejection, not full PostgreSQL row-level conflict behavior.

@@ -450,7 +450,7 @@ provider_view(bytea *database)
 					rows.rows[i] = lappend(rows.rows[i], heap_copytuple(tuple));
 			table_endscan(scan);
 		}
-		run("SELECT o.objhash,o.objkind FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+		run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 		n = SPI_processed;
 		addresses = palloc_array(bytea *, Max(n, 1));
 		kinds = palloc_array(char *, Max(n, 1));

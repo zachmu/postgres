@@ -79,7 +79,7 @@ dg_branch_base(Relation rel, DGState *state)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect branch SPI");
 	MemoryContextSwitchTo(caller);
-	SPI_execute_with_args("SELECT d.objchildren[2] FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object c ON c.objhash=r.reftarget JOIN pg_catalog.pg_dolt_object db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_catalog.pg_dolt_object d ON d.objhash=ch WHERE r.refname=$1 AND d.objkind IN ('table','index') AND (pg_catalog.convert_from(d.objpayload,'UTF8')::jsonb->>'name')=pg_catalog.format('%I.%I',$2,$3)", 3, types, args, NULL, true, 1);
+	SPI_execute_with_args("SELECT d.objchildren[2] FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible c ON c.objhash=r.reftarget JOIN pg_catalog.pg_dolt_object_visible db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_catalog.pg_dolt_object_visible d ON d.objhash=ch WHERE r.refname=$1 AND d.objkind IN ('table','index') AND (pg_catalog.convert_from(d.objpayload,'UTF8')::jsonb->>'name')=pg_catalog.format('%I.%I',$2,$3)", 3, types, args, NULL, true, 1);
 	MemoryContextSwitchTo(caller);
 	if (SPI_processed)
 		address = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));

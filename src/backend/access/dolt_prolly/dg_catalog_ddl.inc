@@ -78,7 +78,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 			Oid			bound;
 			bytea	   *schema;
 
-			run("SELECT t.objchildren[1] FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+			run("SELECT t.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 			schema = DatumGetByteaPCopy(cell(0, 1));
 			bound = binding_relation(branch, name, schema);
 			if (bound != RelationGetRelid(rel))
@@ -207,7 +207,7 @@ dg_catalog_drop(Node *statement)
 
 				run("SELECT jsonb_set($1::jsonb,'{members}',coalesce((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",coalesce(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (coalesce(v->>'name','')=ANY($2))),'[]'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTARRAYOID), VC_ARGS(CStringGetTextDatum(current.json), PointerGetDatum(array)), NULL, true);
 				json = strcell(0, 1);
-				run("SELECT ch FROM pg_dolt_object db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE db.objhash=$1 AND CASE WHEN o.objkind IN ('table','index') THEN NOT (convert_from(o.objpayload,'UTF8')::jsonb->>'name'=ANY($2)) ELSE true END ORDER BY ch", 2, VC_TYPES(BYTEAOID, TEXTARRAYOID), VC_ARGS(PointerGetDatum(current.hash), PointerGetDatum(array)), NULL, true);
+				run("SELECT ch FROM pg_dolt_object_visible db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE db.objhash=$1 AND CASE WHEN o.objkind IN ('table','index') THEN NOT (convert_from(o.objpayload,'UTF8')::jsonb->>'name'=ANY($2)) ELSE true END ORDER BY ch", 2, VC_TYPES(BYTEAOID, TEXTARRAYOID), VC_ARGS(PointerGetDatum(current.hash), PointerGetDatum(array)), NULL, true);
 			}
 			nchildren = SPI_processed;
 			children = palloc(sizeof(Datum) * Max(nchildren, 1));

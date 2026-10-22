@@ -347,7 +347,7 @@ metadata(bytea *hash, const char *kind)
 	if (!strcmp(kind, "schema") || !strcmp(kind, "namespace"))
 		return dg_schema_read(hash, kind);
 
-	run("SELECT convert_from(objpayload,'UTF8') FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true);
+	run("SELECT convert_from(objpayload,'UTF8') FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true);
 	if (!SPI_processed)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
 	return strcell(0, 1);
@@ -358,7 +358,7 @@ child(bytea *hash, int index)
 	Oid			types[] = {BYTEAOID, INT4OID};
 	Datum		args[] = {PointerGetDatum(hash), Int32GetDatum(index)};
 
-	run("SELECT objchildren[$2] FROM pg_catalog.pg_dolt_object WHERE objhash=$1", 2, types, args, NULL, true);
+	run("SELECT objchildren[$2] FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 2, types, args, NULL, true);
 	if (!SPI_processed || !cell(0, 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision has no requested ancestor or state")));
 	return (bytea *) DatumGetPointer(cell(0, 1));
@@ -392,7 +392,7 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	return SPI_processed != 0;
 }
 
@@ -430,7 +430,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 				i;
 	StringInfoData json;
 
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	objects = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
@@ -775,7 +775,7 @@ resolve(const char *revision)
 			hash = ref.target;
 			if (hash)
 			{
-				run("SELECT objkind FROM pg_dolt_object WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(hash)), NULL, true);
+				run("SELECT objkind FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(hash)), NULL, true);
 				if (SPI_processed && !strcmp(strcell(0, 1), "tag"))
 					hash = child(hash, 1);
 			}
@@ -785,7 +785,7 @@ resolve(const char *revision)
 		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&
 				 strspn(base, "0123456789abcdef") == strlen(base))
 		{
-			run("SELECT objhash FROM pg_dolt_object WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
+			run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
 			if (SPI_processed > 1)
 				ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
 			if (SPI_processed)
@@ -1091,7 +1091,7 @@ dolt_log(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	hash = resolve(revision);
-	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
+	run("WITH RECURSIVE walk(h) AS (SELECT $1::bytea UNION SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h), commits AS (SELECT o.*,convert_from(o.objpayload,'UTF8')::jsonb m FROM walk w JOIN pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit'), refs AS (SELECT r.refname,CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END target FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%') SELECT encode(c.objhash,'hex'),m->>'committer',m->>'email',timestamp '2000-01-01' + (m->>'date_us')::bigint * interval '1 microsecond',m->>'message',(m->>'height')::bigint,CASE WHEN $2 THEN COALESCE((SELECT string_agg(encode(h,'hex'),', ' ORDER BY ord) FROM unnest(c.objchildren[2:]) WITH ORDINALITY u(h,ord)),'') ELSE NULL END,COALESCE((SELECT CASE WHEN c.objhash=(SELECT reftarget FROM pg_dolt_ref WHERE refname='heads/' || pg_catalog.active_branch()) THEN 'HEAD -> ' ELSE '' END || string_agg(CASE WHEN r.refname LIKE 'tags/%' THEN 'tag: '||substr(r.refname,6) ELSE substr(r.refname,7) END,', ' ORDER BY r.refname COLLATE \"C\") FROM refs r WHERE r.target=c.objhash),''),CASE WHEN $3 THEN ''::text ELSE NULL END,m->>'author',m->>'author_email',timestamp '2000-01-01' + (m->>'author_date_us')::bigint * interval '1 microsecond' FROM commits c ORDER BY (m->>'height')::bigint DESC,(m->>'date_us')::bigint DESC,c.objhash LIMIT NULLIF($4,-1)", 4, VC_TYPES(BYTEAOID, BOOLOID, BOOLOID, INT4OID), VC_ARGS(PointerGetDatum(hash), BoolGetDatum(parents), BoolGetDatum(signature), Int32GetDatum(limit)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -1188,3 +1188,5 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
+
+#include "dg_alter.inc"

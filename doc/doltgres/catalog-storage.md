@@ -169,3 +169,11 @@ routine per-revision allocation.
 status for activated branch catalogs. Same-name CREATE, native DML, COPY and data
 merge now operate without physical table schema rows. The document records the
 remaining bootstrap bridge, concurrency restrictions and validation evidence.
+
+## Parallel canonical ALTER checkpoint (2026-10-22)
+
+[Branch-local ALTER](canonical-alter.md) records the next gate: COMMENT, nullable
+ADD COLUMN and unindexed DROP COLUMN, automatic legacy activation, and parallel
+DDL on branches sharing storage. It supersedes the earlier resource-wide writer
+serialization and physical hash-uniqueness descriptions. Logical hashes and
+PostgreSQL transaction publication remain authoritative.

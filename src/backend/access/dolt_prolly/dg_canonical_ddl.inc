@@ -245,7 +245,7 @@ dg_catalog_create(Node *statement, const char *query)
 		for (int i = 0; i < k; i++)
 			newmembers[i + 1] = canonical_empty_member("index", index_names[i], canonical_definition(index_names[i], user, acldefault(OBJECT_TABLE, user), index_columns[i], "[]", "[]", index_defs[i]), &empty->content);
 		dg_release(empty);
-		run("SELECT unnest(objchildren) FROM pg_dolt_object WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
+		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;
 		total = oldcount + k + 1;
 		members = palloc_array(Datum, total);

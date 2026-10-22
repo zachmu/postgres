@@ -33,7 +33,7 @@ is(sql(q{SELECT conflicts,message FROM dolt_merge('feature')}),'0|Already up to 
 # Index paths carry the selected branch just like sequential scans.
 $other->query_safe('SET enable_seqscan=off');
 is($other->query_safe('SELECT a,b FROM t WHERE id=1'),'11|20','branch index fetch selects matching table state');
-fails('ALTER TABLE t ADD COLUMN c int',qr/schema changes/,'shared schema changes rejected after checkout');
+fails('ALTER TABLE t ALTER COLUMN a TYPE bigint',qr/schema changes/,'shared schema changes rejected after checkout');
 fails(q{BEGIN; SELECT dolt_merge('feature')},qr/transaction block/,'merge outside explicit transaction');
 # Clean fast-forward and forced merge.
 sql(q{SELECT dolt_branch('ff')});

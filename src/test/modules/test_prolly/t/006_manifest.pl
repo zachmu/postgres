@@ -110,19 +110,18 @@ $a->quit; $b->quit;
 is(readref('heads/main'), $c2, 'waiting writer succeeds after competitor aborts');
 
 
-# Concurrent creators deduplicate only after the first transaction commits.
+# Independent transactions may store the same immutable bytes without waiting.
 $a = $node->background_psql('postgres');
 $b = $node->background_psql('postgres');
-$pid = $b->query_safe('SELECT pg_backend_pid()');
 $a->query_safe('BEGIN');
 my $shared_sql = q{SELECT encode(dolt_manifest_put('schema','shared-concurrent'::bytea,ARRAY[]::bytea[]),'hex')};
 my $shared = $a->query_safe($shared_sql);
-$b->query_until(qr/object_wait/, "\\echo object_wait\n$shared_sql;\n");
-ok($node->poll_query_until('postgres', "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$pid"), 'same new immutable object waits for creator');
+$b->query_safe("SET statement_timeout='2s'");
+is($b->query_safe($shared_sql),$shared,'same new immutable object publishes without waiting for creator');
 $a->query_safe('COMMIT');
-like($b->query_safe('SELECT 1'), qr/$shared/, 'waiting creator returns identical object hash');
 $a->quit; $b->quit;
-is(sql("SELECT count(*) FROM pg_dolt_object WHERE objhash=".hasharg($shared)), '1', 'concurrent insertion deduplicated');
+is(sql("SELECT count(*) FROM pg_dolt_object_visible WHERE objhash=".hasharg($shared)), '1', 'logical object reads deduplicate concurrent copies');
+is(sql("SELECT count(*) FROM pg_dolt_object WHERE objhash=".hasharg($shared)), '2', 'physical immutable copies retain independent transaction visibility');
 
 # An old RR snapshot cannot adopt an object committed after its snapshot.
 $a = $node->background_psql('postgres', on_error_stop => 0);
@@ -130,7 +129,7 @@ $a->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_d
 my $late = put('schema', 'created-after-snapshot');
 is($a->query_safe("SELECT kind IS NULL FROM dolt_manifest_get(".hasharg($late).")"), 't', 'object lookup respects old snapshot');
 ($out, $error) = $a->query(q{SELECT dolt_manifest_put('schema','created-after-snapshot'::bytea,ARRAY[]::bytea[])});
-is($error, 1, 'RR object insertion requires retry if matching object is outside snapshot');
+is($error, 0, 'RR may publish its own identical object without adopting an invisible row');
 $a->query('ROLLBACK'); $a->quit;
 
 # Copy real multi-node table and index content into relation-independent objects.

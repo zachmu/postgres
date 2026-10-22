@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "storage/lmgr.h"
 #include "catalog/catalogview.h"
 #include "access/doltbranch.h"
 #include "access/doltcatalog.h"
@@ -267,6 +268,8 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 	if (!pl_hash_bytes(branchbytes, &binding))
 		elog(ERROR, "branch hash failed");
 
+/* Keep chunk fragments contiguous, without holding a file writer lock until COMMIT. */
+	LockRelationId(&rel->rd_lockInfo.lockRelId, ShareUpdateExclusiveLock);
 	for (i = 0; i < s->store->capacity; i++)
 	{
 		PLNode	   *node;
@@ -304,6 +307,7 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 	pl_write64(data + DG_HEADER + 72, s->nextid);
 	memcpy(data + DG_HEADER + 80, binding.bytes, 32);
 	append(rel, data, DG_HEADER + 112);
+	UnlockRelationId(&rel->rd_lockInfo.lockRelId, ShareUpdateExclusiveLock);
 }
 void
 dg_save(Relation rel, DGState *s, CommandId cid)

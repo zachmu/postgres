@@ -82,7 +82,7 @@ object_kind(bytea *hash, bool readonly)
 	char	   *kind;
 
 	check_hash(hash);
-	manifest_execute("SELECT objkind FROM pg_catalog.pg_dolt_object WHERE objhash=$1", 1, types, args, NULL, readonly, 1);
+	manifest_execute("SELECT objkind FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 1, types, args, NULL, readonly, 1);
 	if (SPI_processed != 1)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest target object is not visible")));
 	kind = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
@@ -163,15 +163,11 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	args[3] = PointerGetDatum(children);
 
 	/*
-	 * Lock only on cache miss. Colliding lock keys merely serialize
-	 * insertions.
+	 * Identical immutable objects can be inserted by independent
+	 * transactions. Their snapshot-visible logical representation is
+	 * deduplicated by the view.
 	 */
-	manifest_execute("SELECT objkind=$2 AND objpayload=$3 AND objchildren=$4 AS same FROM pg_catalog.pg_dolt_object WHERE objhash=$1", 4, types, args, NULL, false, 1);
-	if (!SPI_processed)
-	{
-		LockDatabaseObject(DoltObjectRelationId, pl_read32(hash.bytes), pl_read32(hash.bytes + 4), ExclusiveLock);
-		manifest_execute("SELECT objkind=$2 AND objpayload=$3 AND objchildren=$4 AS same FROM pg_catalog.pg_dolt_object WHERE objhash=$1", 4, types, args, NULL, false, 1);
-	}
+	manifest_execute("SELECT objkind=$2 AND objpayload=$3 AND objchildren=$4 AS same FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 4, types, args, NULL, false, 1);
 	if (SPI_processed)
 	{
 		bool		isnull;
@@ -181,7 +177,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 			elog(ERROR, "manifest object hash collision");
 	}
 	else
-		manifest_execute("INSERT INTO pg_catalog.pg_dolt_object VALUES($1,$2,$3,$4)", 4, types, args, NULL, false, 0);
+		manifest_execute("INSERT INTO pg_catalog.pg_dolt_object(objhash,objkind,objpayload,objchildren,objid) VALUES($1,$2,$3,$4,gen_random_uuid())", 4, types, args, NULL, false, 0);
 	pfree(encoding);
 	return address;
 }
@@ -232,7 +228,7 @@ dolt_manifest_get(PG_FUNCTION_ARGS)
 
 	manifest_begin();
 	check_hash(PG_GETARG_BYTEA_PP(0));
-	manifest_execute("SELECT objkind,objpayload,objchildren FROM pg_catalog.pg_dolt_object WHERE objhash=$1", 1, types, args, NULL, true, 1);
+	manifest_execute("SELECT objkind,objpayload,objchildren FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 1, types, args, NULL, true, 1);
 	return record_result(fcinfo, 3);
 }
 
@@ -335,13 +331,14 @@ export_node(PLStore *store, PLHash hash, int depth)
 }
 
 bytea *
-dg_history_export_tree(const PLTree *tree)
+dg_history_export_tree(const PLTree * tree)
 {
- bytea *result;
- manifest_begin();
- result = export_node(tree->store, tree->root, 0);
- SPI_finish();
- return result;
+	bytea	   *result;
+
+	manifest_begin();
+	result = export_node(tree->store, tree->root, 0);
+	SPI_finish();
+	return result;
 }
 
 Datum
@@ -383,7 +380,7 @@ import_node(PLStore *store, bytea *address, int depth)
 	check_stack_depth();
 	if (depth >= PL_MAX_DEPTH)
 		elog(ERROR, "history chunk tree too deep");
-	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind='chunk'", 1, types, args, NULL, true, 1);
+	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind='chunk'", 1, types, args, NULL, true, 1);
 	if (SPI_processed != 1)
 		elog(ERROR, "missing history chunk");
 	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
@@ -488,7 +485,7 @@ dg_schema_read(bytea *address, const char *kind)
 	int			n;
 
 	manifest_begin();
-	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true, 1);
+	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true, 1);
 	if (SPI_processed != 1)
 		elog(ERROR, "missing retained schema object");
 	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
