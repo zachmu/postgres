@@ -28,9 +28,9 @@ typedef struct DGRows
 	size_t		capacity;
 }			DGRows;
 typedef struct DGStorage DGStorage;
-extern Oid	dg_storage_allocate(Relation definition, bytea *schema, const char *branch);
+extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern void dg_initialize_resource(Relation rel, const char *branch);
-extern void dg_storage_record(Relation source, bytea *schema);
+extern void dg_storage_record(Relation source);
 extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);
 extern DGState *dg_storage_load(DGStorage *storage);
 extern void dg_storage_close(DGStorage *storage);

@@ -56,7 +56,7 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 static Oid
 binding_relation(const char *branch, const char *name, bytea *schema)
 {
-	run("SELECT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid AND s.storageschema=b.bindschema WHERE b.bindbranch=$1 AND b.bindname=$2 AND b.bindschema=$3", 3, VC_TYPES(TEXTOID, TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
+	run("SELECT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindbranch=$1 AND b.bindname=$2 AND b.bindschema=$3", 3, VC_TYPES(TEXTOID, TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
 	return SPI_processed ? DatumGetObjectId(cell(0, 1)) : InvalidOid;
 }
 
@@ -87,7 +87,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 
 		if (OidIsValid(relid))
 			continue;
-		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid AND s.storageschema=b.bindschema WHERE b.bindname=$1 AND b.bindschema=$2", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i])), NULL, true);
+		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND b.bindschema=$2", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i])), NULL, true);
 		if (SPI_processed == 1)
 			binding_record(branch, names[i], schemas[i], DatumGetObjectId(cell(0, 1)));
 		else if (required)

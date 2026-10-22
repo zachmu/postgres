@@ -11,7 +11,7 @@ Datum
 test_storage_allocate(PG_FUNCTION_ARGS)
 {
 	Relation	definition = relation_open(PG_GETARG_OID(0), AccessShareLock);
-	Oid			resource = dg_storage_allocate(definition, PG_GETARG_BYTEA_P(1), text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	Oid			resource = dg_storage_allocate(definition, text_to_cstring(PG_GETARG_TEXT_PP(1)));
 
 	relation_close(definition, AccessShareLock);
 	PG_RETURN_OID(resource);

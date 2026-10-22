@@ -12,12 +12,8 @@ CATALOG(pg_dolt_storage,9114,DoltStorageRelationId)
 	Oid			storageam BKI_FORCE_NOT_NULL;
 	char		storagekind BKI_FORCE_NOT_NULL;
 	bool		storageimported BKI_FORCE_NOT_NULL;
-#ifdef CATALOG_VARLEN
-	bytea		storageschema BKI_FORCE_NOT_NULL;
-#endif
 } FormData_pg_dolt_storage;
 typedef FormData_pg_dolt_storage *Form_pg_dolt_storage;
 
-DECLARE_TOAST(pg_dolt_storage, 9115, 9116);
 DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_storage_key_index, 9117, DoltStorageKeyIndexId, pg_dolt_storage, btree(storageid oid_ops));
 #endif
