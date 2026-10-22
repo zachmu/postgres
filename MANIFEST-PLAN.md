@@ -302,3 +302,16 @@ PostgreSQL transaction as captured data roots/chunks. Ref CAS and native transac
 outcome provide one commit decision, with no independently published filesystem
 manifest. Staged and HEAD are unchanged until requested. Retained physical objects
 are not garbage-collected. See [schema-provider details](doc/doltgres/catalog-schema-provider.md).
+
+## CREATE publication checkpoint — 2026-10-22
+
+Branch-local CREATE now publishes table/index physical objects, initialized roots,
+canonical schema chunks and working membership in one PostgreSQL transaction.
+Staged/HEAD remain unchanged until add/commit. Initialization on a non-main branch
+explicitly starts from empty content rather than importing a missing HEAD member.
+Capture includes only the new table/indexes plus existing branch membership.
+Rollback and crash rollback leave neither a physical table nor partial membership.
+
+This retains broad workspace locking and Read Committed mutation; it does not
+implement concurrent schema publication or generation-aware writable bindings.
+See [the CREATE checkpoint](doc/doltgres/catalog-create.md).

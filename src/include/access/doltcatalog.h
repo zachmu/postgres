@@ -8,6 +8,12 @@
 #include "nodes/pathnodes.h"
 #include "nodes/extensible.h"
 struct ParseState;
+extern bool dg_catalog_creating_relation(Relation rel);
+extern void dg_catalog_create_scope(bool enter);
+extern void dg_catalog_created(Oid id);
+extern bool dg_catalog_create_index(Node *statement);
+extern bool dg_catalog_create_begin(Node *statement);
+extern void dg_catalog_create_finish(CreateStmt *stmt);
 extern bool dg_catalog_drop(Node *statement);
 extern void dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot);
 extern TupleDesc dg_catalog_bind(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);

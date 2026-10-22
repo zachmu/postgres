@@ -598,7 +598,27 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		free_parsestate(pstate);
 		return;
 	}
-	dg_guard_branch_ddl(parsetree);
+	if (dg_catalog_create_begin(parsetree))
+	{
+		dg_catalog_create_scope(true);
+		PG_TRY();
+		{
+			ProcessUtilitySlow(pstate, pstmt, queryString, context, params,
+							   queryEnv, dest, qc);
+			CommandCounterIncrement();
+			dg_catalog_create_finish((CreateStmt *) parsetree);
+		}
+		PG_FINALLY();
+		{
+			dg_catalog_create_scope(false);
+		}
+		PG_END_TRY();
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
+	if (context != PROCESS_UTILITY_SUBCOMMAND || !dg_catalog_create_index(parsetree))
+		dg_guard_branch_ddl(parsetree);
 
 	switch (nodeTag(parsetree))
 	{
@@ -1179,6 +1199,7 @@ ProcessUtilitySlow(ParseState *pstate,
 													 RELKIND_RELATION,
 													 InvalidOid, NULL,
 													 queryString);
+							dg_catalog_created(address.objectId);
 							EventTriggerCollectSimpleCommand(address,
 															 secondaryObject,
 															 stmt);

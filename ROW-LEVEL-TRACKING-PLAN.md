@@ -339,3 +339,16 @@ lock, and writes still use the current session branch. General writable bindings
 schema-generation conflict checks and three-way working-set publication remain
 required. Do not extrapolate this membership-only experiment to layout-changing
 ALTER or OID-only type/function caches. See [the current boundary](doc/doltgres/catalog-schema-provider.md).
+
+## CREATE publication checkpoint — 2026-10-22
+
+Branch-local CREATE now publishes table/index physical objects, initialized roots,
+canonical schema chunks and working membership in one PostgreSQL transaction.
+Staged/HEAD remain unchanged until add/commit. Initialization on a non-main branch
+explicitly starts from empty content rather than importing a missing HEAD member.
+Capture includes only the new table/indexes plus existing branch membership.
+Rollback and crash rollback leave neither a physical table nor partial membership.
+
+This retains broad workspace locking and Read Committed mutation; it does not
+implement concurrent schema publication or generation-aware writable bindings.
+See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
