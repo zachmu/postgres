@@ -44,6 +44,7 @@
  */
 
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/parallel.h"
 #include "access/table.h"
@@ -839,7 +840,13 @@ ExecGetRangeTableRelation(EState *estate, Index rti, bool isResultRel)
 
 		Assert(rte->rtekind == RTE_RELATION);
 
-		if (!IsParallelWorker())
+		if (rte->dolt_branch)
+		{
+			if (IsParallelWorker())
+				elog(ERROR, "parallel canonical write target is not supported");
+			rel = dg_catalog_executor_target(rte, estate->es_plannedstmt->commandType);
+		}
+		else if (!IsParallelWorker())
 		{
 			/*
 			 * In a normal query, we should already have the appropriate lock,

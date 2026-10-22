@@ -56,6 +56,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 #include "catalog/pg_dolt_ref.h"
 
 #include <limits.h>
@@ -1935,6 +1936,9 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 				  (rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid))))
 				continue;
 
+			if (CatalogViewObjectContext(rte->relid))
+				continue;
+
 			/*
 			 * Acquire the appropriate type of lock on each relation OID. Note
 			 * that we don't actually try to open the rel, and hence will not
@@ -2000,6 +2004,8 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
+				if (CatalogViewObjectContext(rte->relid))
+					break;
 				/* Acquire or release the appropriate type of lock */
 				if (acquire)
 					LockRelationOid(rte->relid, rte->rellockmode);

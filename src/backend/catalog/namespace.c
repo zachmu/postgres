@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -450,6 +451,13 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	Oid			oldRelId = InvalidOid;
 	bool		retry = false;
 	bool		missing_ok = (flags & RVR_MISSING_OK) != 0;
+
+	if (dg_catalog_lookup_relation(relation, missing_ok, &relId))
+	{
+		if (callback)
+			callback(relation, relId, InvalidOid, callback_arg);
+		return relId;
+	}
 
 	/* Project names before lookup; retain the normal permission/lock path. */
 	if (rangevar_projection_hook)

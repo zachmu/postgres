@@ -36,6 +36,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -1643,7 +1644,12 @@ ExecCloseRangeTableRelations(EState *estate)
 	for (i = 0; i < estate->es_range_table_size; i++)
 	{
 		if (estate->es_relations[i])
-			table_close(estate->es_relations[i], NoLock);
+		{
+			if (estate->es_relations[i]->rd_catalogview)
+				dg_storage_close_relation(estate->es_relations[i]);
+			else
+				table_close(estate->es_relations[i], NoLock);
+		}
 	}
 }
 

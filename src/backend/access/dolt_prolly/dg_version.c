@@ -46,6 +46,15 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_namespace.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_statistic_ext_data.h"
+#include "commands/tablecmds.h"
+#include "parser/parse_utilcmd.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_collation.h"
@@ -124,6 +133,30 @@ strcell(int row, int col)
 
 	return s ? pstrdup(s) : NULL;
 }
+
+/* Suppress branch interception only for explicitly scoped internal catalog SQL.
+ * Track subtransactions so a caught ERROR cannot disable ordinary binding. */
+static int	catalog_api_depth;
+static SubTransactionId catalog_api_subids[64];
+static bool catalog_api_registered;
+static void
+catalog_api_xact(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
+		catalog_api_depth = 0;
+}
+static void
+catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		while (catalog_api_depth && catalog_api_subids[catalog_api_depth - 1] == id)
+			catalog_api_depth--;
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		for (int i = 0; i < catalog_api_depth; i++)
+			if (catalog_api_subids[i] == id)
+				catalog_api_subids[i] = parent;
+}
+
 static int
 begin_api(void)
 {
@@ -135,6 +168,15 @@ begin_api(void)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect version-control SPI");
 	MemoryContextSwitchTo(c);
+	if (!catalog_api_registered)
+	{
+		RegisterXactCallback(catalog_api_xact, NULL);
+		RegisterSubXactCallback(catalog_api_subxact, NULL);
+		catalog_api_registered = true;
+	}
+	if (catalog_api_depth == lengthof(catalog_api_subids))
+		elog(ERROR, "canonical catalog API nesting limit");
+	catalog_api_subids[catalog_api_depth++] = GetCurrentSubTransactionId();
 	PushCopiedSnapshot(GetActiveSnapshot());
 	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
@@ -142,6 +184,8 @@ begin_api(void)
 static void
 end_api(int nest)
 {
+	Assert(catalog_api_depth > 0);
+	catalog_api_depth--;
 	PopActiveSnapshot();
 	SPI_finish();
 	AtEOXact_GUC(true, nest);
@@ -281,11 +325,18 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 	Oid			types[] = {TEXTOID, TEXTOID, BYTEAARRAYOID};
 	Datum		args[] = {CStringGetTextDatum(kind), CStringGetTextDatum(json), PointerGetDatum(links(hashes, count))};
 
-	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
-		return dg_schema_store(kind, json);
+	bytea	   *result;
 
-	run("SELECT pg_catalog.dolt_manifest_put($1,convert_to(($2::jsonb)::text,'UTF8'),$3)", 3, types, args, NULL, false);
-	return (bytea *) DatumGetPointer(cell(0, 1));
+	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
+		result = dg_schema_store(kind, json);
+	else
+	{
+		run("SELECT pg_catalog.dolt_manifest_put($1,convert_to(($2::jsonb)::text,'UTF8'),$3)", 3, types, args, NULL, false);
+		result = (bytea *) DatumGetPointer(cell(0, 1));
+	}
+	CommandCounterIncrement();
+	UpdateActiveSnapshotCommandId();
+	return result;
 }
 static char *
 metadata(bytea *hash, const char *kind)
@@ -345,6 +396,101 @@ catalog_contains(bytea *db, const char *name)
 	return SPI_processed != 0;
 }
 
+static CatalogView *provider_view(bytea *database);
+static char *json_value(const char *json, const char *key);
+
+static bytea *
+canonical_database(const char *json, Datum *members, int count)
+{
+	char	   *normalized;
+	ArrayType  *array;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	normalized = strcell(0, 1);
+	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
+	array = DatumGetArrayTypeP(cell(0, 1));
+	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	return put("database", normalized, values, n);
+}
+
+/* Capture canonical membership and schema, selecting only data from local roots.
+ * Physical pg_class enumeration cannot describe branch-only objects. */
+static Capture
+capture_canonical(bytea *database, bool persist, bool definitions_only)
+{
+	Capture		result = {0};
+	CatalogView *view = provider_view(database);
+	bytea	  **objects;
+	char	  **kinds;
+	Datum	   *members;
+	int			n,
+				i;
+	StringInfoData json;
+
+	run("SELECT o.objhash,o.objkind FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	n = SPI_processed;
+	objects = palloc_array(bytea *, Max(n, 1));
+	kinds = palloc_array(char *, Max(n, 1));
+	members = palloc_array(Datum, Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		objects[i] = DatumGetByteaPCopy(cell(i, 1));
+		kinds[i] = strcell(i, 2);
+	}
+	initStringInfo(&json);
+	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+	for (i = 0; i < n; i++)
+	{
+		char	   *payload = metadata(objects[i], kinds[i]);
+
+		members[i] = PointerGetDatum(objects[i]);
+		if (i)
+			appendStringInfoChar(&json, ',');
+		if (!strcmp(kinds[i], "namespace"))
+			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
+		else
+		{
+			char	   *name = json_value(payload, "name");
+			bytea	   *schema = child(objects[i], 1);
+			Oid			resource = binding_relation(dg_current_branch(), name, schema);
+
+			if (!definitions_only)
+			{
+				DGStorage  *storage;
+				DGState    *state;
+
+				if (!OidIsValid(resource))
+					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
+				storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+				state = dg_storage_load(storage);
+				dg_storage_close(storage);
+				if (state->has_root)
+				{
+					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+
+					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
+					memcpy(VARDATA(raw), state->content.root.bytes, PL_HASH_SIZE);
+					run("SELECT jsonb_set($1::jsonb,'{content}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(hex(raw))), NULL, true);
+					payload = strcell(0, 1);
+					if (persist)
+						members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+				}
+				dg_release(state);
+			}
+			appendStringInfoString(&json, payload);
+		}
+	}
+	appendStringInfoString(&json, "]}");
+	run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
+	result.json = strcell(0, 1);
+	if (persist)
+		result.hash = canonical_database(result.json, members, n);
+	return result;
+}
+
 /* Fixed schema locks make ordinary relcache descriptors safe for this capture.
  * AccessShare relation locks keep DDL out without stopping row writers. */
 static Capture
@@ -361,6 +507,9 @@ capture_inner(bool persist, bool all_catalogs)
 	Datum	   *members;
 	int			used = 0;
 	StringInfoData json;
+
+	if (!catalog_creating && read_ref("views/enabled").target)
+		return capture_canonical(read_ref(branch_ref("working")).target, persist, all_catalogs);
 
 	for (i = 0; i < lengthof(catalogs); i++)
 		LockRelationOid(catalogs[i], ShareLock);
@@ -1038,3 +1187,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_catalog.inc"
 
 #include "dg_catalog_ddl.inc"
+#include "dg_canonical_ddl.inc"

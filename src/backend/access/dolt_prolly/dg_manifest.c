@@ -334,6 +334,16 @@ export_node(PLStore *store, PLHash hash, int depth)
 	return put_object("chunk", bytes(node->data, node->size), children_array(children, count));
 }
 
+bytea *
+dg_history_export_tree(const PLTree *tree)
+{
+ bytea *result;
+ manifest_begin();
+ result = export_node(tree->store, tree->root, 0);
+ SPI_finish();
+ return result;
+}
+
 Datum
 dolt_manifest_export(PG_FUNCTION_ARGS)
 {

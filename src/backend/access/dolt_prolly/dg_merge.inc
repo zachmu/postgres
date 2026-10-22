@@ -34,17 +34,21 @@ static void
 lock_workspace(void)
 {
 	Oid		   *ids;
+	bool		canonical = read_ref("views/enabled").target != NULL;
 	int			n,
 				i;
 
 	LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
-	run("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	if (canonical)
+		run("SELECT DISTINCT bindrelid FROM pg_dolt_binding WHERE bindbranch=$1 ORDER BY bindrelid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
+	else
+		run("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
 	n = SPI_processed;
 	ids = palloc(sizeof(Oid) * Max(n, 1));
 	for (i = 0; i < n; i++)
 		ids[i] = DatumGetObjectId(cell(i, 1));
 	for (i = 0; i < n; i++)
-		LockRelationOid(ids[i], AccessExclusiveLock);
+		LockRelationOid(ids[i], canonical ? ExclusiveLock : AccessExclusiveLock);
 	PopActiveSnapshot();
 	PushCopiedSnapshot(GetLatestSnapshot());
 }
@@ -64,7 +68,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			   *name;
 	bytea	   *commit;
 	VersionRef	ref;
-	Capture		live;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
 
@@ -97,16 +100,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		unsupported("checkout supports branch or -b branch [start-point]");
 		return 0;
-	}
-	live = capture_mode(false, true);
-	{
-		bytea	   *target = read_ref(psprintf("working/%s", name)).target;
-		char	   *definition = metadata(target ? target : child(commit, 1), "database");
-
-		/* Retained physical objects may outlive membership on one branch. */
-		run("SELECT NOT EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb->'members') wanted WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements($2::jsonb->'members') live WHERE wanted-'content'=live-'content'))", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(live.json)), NULL, true);
-		if (!DatumGetBool(cell(0, 1)))
-			unsupported("schema checkout: incompatible runtime definitions");
 	}
 
 	{
@@ -218,7 +211,7 @@ logical_rows(Relation rel, const PLTree * content, bool *keyed)
 	*keyed = OidIsValid(pk);
 	if (!*keyed)
 		return *content;
-	index = index_open(pk, AccessShareLock);
+	index = rel->rd_catalogview ? dg_storage_index(rel, pk) : index_open(pk, AccessShareLock);
 	nkeys = index->rd_index->indnkeyatts;
 	rows = dg_rows(content);
 	items = palloc(sizeof(*items) * Max(rows.count, 1));
@@ -236,7 +229,8 @@ logical_rows(Relation rel, const PLTree * content, bool *keyed)
 	}
 	qsort(items, rows.count, sizeof(*items), entry_compare);
 	dg_check(pl_build(content->store, items, rows.count, &result));
-	index_close(index, AccessShareLock);
+	if (!rel->rd_catalogview)
+		index_close(index, AccessShareLock);
 	return result;
 }
 static PLTree
@@ -505,14 +499,15 @@ unique_contents(Relation rel, const PLTree * contents)
 
 	foreach(lc, indexes)
 	{
-		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
+		Relation	idx = rel->rd_catalogview ? dg_storage_index(rel, lfirst_oid(lc)) : index_open(lfirst_oid(lc), AccessShareLock);
 		size_t		i,
 					used = 0;
 		PLEntry    *keys;
 
 		if (!idx->rd_index->indisunique)
 		{
-			index_close(idx, AccessShareLock);
+			if (!rel->rd_catalogview)
+				index_close(idx, AccessShareLock);
 			continue;
 		}
 		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
@@ -534,7 +529,8 @@ unique_contents(Relation rel, const PLTree * contents)
 				continue;
 			if (pl_read64(rows.items[i].value.data) > 1)
 			{
-				index_close(idx, AccessShareLock);
+				if (!rel->rd_catalogview)
+					index_close(idx, AccessShareLock);
 				return false;
 			}
 			keys[used++].key = pack_merge_fields(fields, n);
@@ -543,10 +539,12 @@ unique_contents(Relation rel, const PLTree * contents)
 		for (i = 1; i < used; i++)
 			if (!pl_compare(keys[i - 1].key, keys[i].key))
 			{
-				index_close(idx, AccessShareLock);
+				if (!rel->rd_catalogview)
+					index_close(idx, AccessShareLock);
 				return false;
 			}
-		index_close(idx, AccessShareLock);
+		if (!rel->rd_catalogview)
+			index_close(idx, AccessShareLock);
 	}
 	return true;
 }
@@ -555,22 +553,26 @@ static void
 install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 {
 	char	  **names;
+	bool		canonical = (read_ref("views/enabled").target != NULL);
 	Oid		   *ids;
 	int			n,
 				i;
 
-	run("SELECT c.oid,format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	if (canonical)
+		run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(metadata(theirs, "database"))), NULL, true);
+	else
+		run("SELECT c.oid,format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
 	n = SPI_processed;
-	ids = palloc(sizeof(*ids) * Max(n, 1));
+	ids = palloc(sizeof(Oid) * Max(n, 1));
 	names = palloc(sizeof(*names) * Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		ids[i] = DatumGetObjectId(cell(i, 1));
-		names[i] = strcell(i, 2);
+		ids[i] = canonical ? InvalidOid : DatumGetObjectId(cell(i, 1));
+		names[i] = strcell(i, canonical ? 1 : 2);
 	}
 	for (i = 0; i < n; i++)
 	{
-		Relation	rel = relation_open(ids[i], NoLock);
+		Relation	rel = canonical ? dg_catalog_write_table(dg_current_branch(), names[i], ACL_UPDATE) : relation_open(ids[i], NoLock);
 		DGState    *state = dg_load(rel, SnapshotSelf);
 		PLTree		right = dg_history_import(state->store, table_chunk(theirs, names[i])),
 					result = right;
@@ -604,13 +606,18 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 		}
 		dg_history_install(rel, state, result);
 		dg_release(state);
-		relation_close(rel, NoLock);
+		if (canonical)
+			dg_storage_close_relation(rel);
+		else
+			relation_close(rel, NoLock);
+		UpdateActiveSnapshotCommandId();
 	}
 }
 
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
 {
+	Capture		live;
 	int			n,
 				i,
 				nest;
@@ -630,7 +637,6 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *their_db,
 			   *database,
 			   *commit = NULL;
-	Capture		live;
 	StringInfoData conflicts,
 				json;
 	Datum		values[4];
@@ -813,7 +819,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		oid = DatumGetObjectId(cell(0, 1));
 		for (j = 1; j < n; j++)
 		{
-			if (!strcmp(args[j], ".") || !strcmp(args[j], name) || !strcmp(args[j], get_rel_name(oid)))
+			if (!strcmp(args[j], ".") || !strcmp(args[j], name) || !strcmp(args[j], strVal(llast(stringToQualifiedNameList(name, NULL)))))
 				selected = true;
 		}
 		if (!selected)
@@ -824,7 +830,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			continue;
 		}
 		{
-			Relation	rel = relation_open(oid, NoLock);
+			Relation	rel = (read_ref("views/enabled").target != NULL) ? dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE) : relation_open(oid, NoLock);
 			DGState    *state = dg_load(rel, SnapshotSelf);
 			PLTree		result;
 
@@ -851,7 +857,11 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			}
 			dg_history_install(rel, state, result);
 			dg_release(state);
-			relation_close(rel, NoLock);
+			if (rel->rd_catalogview)
+				dg_storage_close_relation(rel);
+			else
+				relation_close(rel, NoLock);
+			UpdateActiveSnapshotCommandId();
 		}
 	}
 	initStringInfo(&updated);

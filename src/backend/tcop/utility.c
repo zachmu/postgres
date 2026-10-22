@@ -598,6 +598,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		free_parsestate(pstate);
 		return;
 	}
+	if (dg_catalog_create(parsetree, queryString))
+	{
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
 	if (dg_catalog_create_begin(parsetree))
 	{
 		dg_catalog_create_scope(true);

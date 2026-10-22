@@ -915,6 +915,9 @@ CopyFrom(CopyFromState cstate)
 	 */
 	ExecInitRangeTable(estate, cstate->range_table, cstate->rteperminfos,
 					   bms_make_singleton(1));
+	/* COPY owns the already-bound descriptor through DoCopy. */
+	if (cstate->rel->rd_catalogview)
+		estate->es_relations[0] = cstate->rel;
 	resultRelInfo = target_resultRelInfo = makeNode(ResultRelInfo);
 	ExecInitResultRelation(estate, resultRelInfo, 1);
 
@@ -1505,6 +1508,8 @@ CopyFrom(CopyFromState cstate)
 
 	/* Close the result relations, including any trigger target relations */
 	ExecCloseResultRelations(estate);
+	if (cstate->rel->rd_catalogview)
+		estate->es_relations[0] = NULL;
 	ExecCloseRangeTableRelations(estate);
 
 	FreeExecutorState(estate);

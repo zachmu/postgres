@@ -191,7 +191,9 @@ writer(Relation rel)
 {
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
-	LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
+	if (rel->rd_catalogview)
+		dg_storage_require_write(rel);
+	LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
 }
 static void
 multiplicity(DGState *s, PLSlice row, int delta)
@@ -246,6 +248,8 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	dg_release(s);
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
+	if (rel->rd_catalogview)
+		dg_rebuild_indexes(rel);
 }
 static void
 multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int opts, BulkInsertState state)
@@ -371,7 +375,7 @@ toast(Relation rel)
 static void
 estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double *allvis)
 {
-	*pages = RelationGetNumberOfBlocks(rel);
+	*pages = rel->rd_catalogview ? 1 : RelationGetNumberOfBlocks(rel);
 	*tuples = Max(1000, *pages);
 	*allvis = 0;
 }
@@ -516,6 +520,9 @@ dg_history_handles(DGState *state)
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
+	/* Bound resources retain their original snapshot during root publication. */
+	if (rel->rd_catalogview)
+		PushCopiedSnapshot(GetActiveSnapshot());
 	state->content = contents;
 	dg_history_handles(state);
 	dg_save(rel, state, GetCurrentCommandId(true));
@@ -524,4 +531,6 @@ dg_history_install(Relation rel, DGState *state, PLTree contents)
 	dg_rebuild_indexes(rel);
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
+	if (rel->rd_catalogview)
+		PopActiveSnapshot();
 }

@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -179,6 +180,7 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 			   bool inh, bool alsoSource, AclMode requiredPerms)
 {
 	ParseNamespaceItem *nsitem;
+	RangeTblEntry *binding = makeNode(RangeTblEntry);
 
 	/*
 	 * ENRs hide tables of the same name, so we need to check for them first.
@@ -202,8 +204,9 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	 * free_parsestate() will eventually do the corresponding table_close(),
 	 * but *not* release the lock.
 	 */
-	pstate->p_target_relation = parserOpenTable(pstate, relation,
-												RowExclusiveLock);
+	pstate->p_target_relation = dg_catalog_target(pstate, relation, binding);
+	if (!pstate->p_target_relation)
+		pstate->p_target_relation = parserOpenTable(pstate, relation, RowExclusiveLock);
 
 	/*
 	 * Now build an RTE and a ParseNamespaceItem.
@@ -211,6 +214,15 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	nsitem = addRangeTableEntryForRelation(pstate, pstate->p_target_relation,
 										   RowExclusiveLock,
 										   relation->alias, inh, false);
+
+	if (binding->dolt_branch)
+	{
+		nsitem->p_rte->dolt_branch = binding->dolt_branch;
+		nsitem->p_rte->dolt_table = binding->dolt_table;
+		nsitem->p_rte->dolt_database = binding->dolt_database;
+		nsitem->p_rte->dolt_relid = binding->dolt_relid;
+		nsitem->p_rte->inh = false;
+	}
 
 	/* remember the RTE/nsitem as being the query target */
 	pstate->p_target_nsitem = nsitem;

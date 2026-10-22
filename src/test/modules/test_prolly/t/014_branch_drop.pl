@@ -10,7 +10,7 @@ sub sql { return $node->safe_psql('postgres',$_[0]); }
 sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$pattern,"$label diagnostic"); }
 sql(q{CREATE ROLE owner; CREATE ROLE denied; CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'old'); ALTER TABLE t OWNER TO owner});
 my $old=sql(q{SELECT dolt_commit('-Am','base')});
-my $oid=sql(q{SELECT 't'::regclass::oid});
+
 my $owner=$node->background_psql('postgres');
 $owner->query_safe('SET ROLE owner; CREATE TEMP TABLE pg_class(fake int); CREATE TEMP TABLE pg_dolt_object(fake int)');
 sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
@@ -33,10 +33,10 @@ my($out,$err)=$plan->query('EXECUTE p');is($err,1,'prepared empty-result query r
 fails('SELECT * FROM t',qr/does not exist on branch/,'unqualified read respects dropped membership');
 fails('INSERT INTO t VALUES(2,\'new\')',qr/does not exist on branch/,'write cannot target retained physical object');
 fails('COPY t TO STDOUT',qr/does not exist on branch/,'COPY storage path respects branch membership');
-fails('SELECT * FROM "postgres/main".public.t',qr/does not exist in revision/,'qualified working read respects DROP');
+fails('SELECT * FROM "postgres/main".public.t',qr/does not exist on branch/,'qualified working read respects DROP');
 is(sql('SELECT * FROM "postgres/other".public.t'),'1|old','other branch still reads same physical table');
 is(sql("SELECT * FROM t AS OF '$old'"),'1|old','committed history survives branch DROP');
-is(sql(q{SELECT 't'::regclass::oid}),$oid,'physical OID retained for surviving branches (catalog introspection limitation)');
+is(sql(q{SELECT to_regclass('t') IS NULL}),'t','regclass respects dropped branch membership');
 sql('DROP TABLE IF EXISTS t');
 sql(q{SELECT dolt_commit('-am','drop on main')});
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING')}),'0','capture does not resurrect retained physical table');

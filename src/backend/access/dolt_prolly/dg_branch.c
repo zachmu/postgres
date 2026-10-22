@@ -29,7 +29,7 @@ dg_current_branch(void)
 const char *
 dg_relation_branch(Relation rel)
 {
-	return dg_current_branch();
+	return rel->rd_catalogview ? dg_storage_branch(rel) : dg_current_branch();
 }
 
 static void
