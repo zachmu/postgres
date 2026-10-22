@@ -36,7 +36,7 @@ sql('DROP TABLE catalog_control');
 sql('CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,10)');
 my $old = sql(q{SELECT dolt_commit('-Am','base')});
 my $before = sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/main'});
-rejected('ALTER TABLE t ADD COLUMN extra int', qr/schema versioning is not implemented/,
+rejected('ALTER TABLE t ALTER COLUMN v TYPE bigint', qr/schema versioning is not implemented/,
  'layout changes guarded even before branch activation');
 is(sql('SELECT * FROM t'), '1|10', 'rejected ALTER preserves existing tuple decoding');
 

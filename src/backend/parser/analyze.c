@@ -3513,6 +3513,9 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 						perminfo->requiredPerms |= ACL_SELECT_FOR_UPDATE;
 					}
 					break;
+				case RTE_DOLT:
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("row locking on versioned relations is not supported")));
+					break;
 				case RTE_SUBQUERY:
 					applyLockingClause(qry, i, lc->strength, lc->waitPolicy,
 									   pushedDown);

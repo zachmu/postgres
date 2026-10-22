@@ -8,12 +8,14 @@ $node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sub fails {my($q,$re,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$re,"$label diagnostic");}
 sql(q{CREATE ROLE denied; CREATE TABLE t(id int PRIMARY KEY,discard text,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,'old',10),(2,'two',20); CREATE TABLE bag(a int,b text) USING dolt_prolly_table; INSERT INTO bag VALUES(1,'a'),(1,'b'),(1,'b'); SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
+sql(q{CREATE TABLE shifted(trash text,id int PRIMARY KEY,v int UNIQUE); INSERT INTO shifted VALUES('remove',1,10); SELECT dolt_commit('-Am','shift fixture'); SELECT dolt_branch('shiftcopy')});
 my $old=sql(q{SELECT commit_hash FROM dolt_log('-n','1')});
 my $resources=sql(q{SELECT count(*) FROM pg_dolt_storage});
 my $a=$node->background_psql('postgres');my $b=$node->background_psql('postgres');
 $b->query_safe(q{SELECT dolt_checkout('other')});
 $a->query_safe(q{BEGIN; COMMENT ON TABLE t IS 'main'; COMMENT ON COLUMN t.v IS 'main value'; ALTER TABLE t ADD COLUMN extra text; INSERT INTO t VALUES(3,'third',30,'new')});
 $b->query_safe(q{SET statement_timeout='3s'; BEGIN; COMMENT ON TABLE t IS 'other'; ALTER TABLE t ADD COLUMN extra text; INSERT INTO t VALUES(4,'four',40,'other'); COMMIT});
+$b->query_safe(q{SELECT dolt_commit('-Am','other schema while main is open')});
 is($b->query_safe(q{SELECT count(*),max(extra) FROM t}),'3|other','other branch commits identical schema rewrite while main transaction stays open');
 is($a->query_safe(q{SELECT count(*),max(extra) FROM t}),'3|new','main retains own uncommitted schema and rows');
 is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid='t'::regclass AND attname='extra'}),'0','uncommitted schema hidden from another main session');
@@ -43,8 +45,15 @@ sql(q{BEGIN; ALTER TABLE t DROP COLUMN extra; ROLLBACK});
 is(sql(q{SELECT extra FROM t WHERE id=5}),'five','rollback restores schema and row payload');
 sql(q{BEGIN; SAVEPOINT s; ALTER TABLE t ADD COLUMN gone int; ROLLBACK TO s; INSERT INTO t VALUES(6,60,'six'); COMMIT});
 is(sql(q{SELECT extra FROM t WHERE id=6}),'six','savepoint rollback restores writable schema');
+fails(q{SELECT * FROM t FOR UPDATE},qr/row locking/,'versioned read cannot silently ignore row locking');
 fails(q{ALTER TABLE t DROP COLUMN id},qr/indexed column/,'indexed DROP rejected before publication');
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),$resources,'ADD and DROP reuse the original allocations');
+# Overlapping large writes exercise contiguous chunk framing in a shared file.
+$a->query_until(qr/large_main/, "\\echo large_main\nBEGIN; UPDATE t SET extra=repeat('x',50000) WHERE id=1;\n");
+$b->query_until(qr/large_other/, "\\echo large_other\nBEGIN; UPDATE t SET discard=repeat('y',50000) WHERE id=1;\n");
+like($a->query_safe(q{SELECT length(extra) FROM t WHERE id=1}),qr/50000/,'large main write completes with other branch transaction open');
+like($b->query_safe(q{SELECT length(discard) FROM t WHERE id=1}),qr/50000/,'large other write keeps its own schema and fragmented chunks');
+$a->query_safe('ROLLBACK');$b->query_safe('ROLLBACK');
 fails(q{SET ROLE denied; COMMENT ON TABLE t IS 'bad'},qr/must be owner/,'COMMENT checks original caller ownership');
 fails(q{SET ROLE denied; ALTER TABLE t DROP COLUMN extra},qr/must be owner/,'ALTER checks original caller ownership');
 is(sql(q{SELECT description FROM pg_description WHERE objoid='t'::regclass AND objsubid=0}),'main','table COMMENT belongs to selected branch');
@@ -55,6 +64,17 @@ $a->query_safe(q{BEGIN; ALTER TABLE bag ADD COLUMN aborted text});
 $b->query_safe(q{BEGIN; ALTER TABLE bag DROP COLUMN b; COMMIT});
 $a->query_safe('ROLLBACK');
 is($b->query_safe(q{SELECT count(*) FROM bag}),'3','other DROP survives concurrent rewrite rollback');
+sql(q{ALTER TABLE shifted DROP COLUMN trash; UPDATE shifted SET v=11 WHERE id=1; INSERT INTO shifted VALUES(2,20)});
+is(sql(q{SELECT * FROM shifted ORDER BY id}),"1|11\n2|20",'DROP before indexed columns remaps keys and rebuilds indexes');
+fails(q{INSERT INTO shifted VALUES(3,20)},qr/duplicate key/,'shifted unique index still enforces values');
+my $schema_before=sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.shifted'});
+my $content_before=sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'});
+# Capture the preceding DML before comparing the canonical content root.
+sql(q{SELECT dolt_add('.')});
+$content_before=sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'});
+sql(q{ALTER TABLE shifted ADD COLUMN roundtrip text; ALTER TABLE shifted DROP COLUMN roundtrip});
+is(sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.shifted'}),$schema_before,'ADD then DROP restores byte-identical schema');
+is(sql(q{SELECT v->>'content' FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget CROSS JOIN LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'members') v WHERE refname='working/main' AND v->>'name'='public.shifted'}),$content_before,'ADD then DROP restores byte-identical content root');
 $a->quit;$b->quit;
 sql(q{SELECT dolt_commit('-Am','main altered')});
 $node->stop('immediate');$node->start;

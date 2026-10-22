@@ -75,6 +75,53 @@ alter_database(Capture current, const char *name, bytea *member)
 	return canonical_database(json, children, n);
 }
 
+/* One-time transition of legacy native schema capture. No user commit is made. */
+static bool
+alter_activate(const RangeVar *rv, bool missing)
+{
+	Oid			id = RangeVarGetRelid(rv, AccessShareLock, missing);
+	Relation	rel;
+	Oid			user;
+	int			security,
+				nest;
+
+	if (!OidIsValid(id))
+		return false;
+	rel = relation_open(id, NoLock);
+	if (rel->rd_tableam != dg_table_routine())
+	{
+		relation_close(rel, NoLock);
+		return false;
+	}
+	GetUserIdAndSecContext(&user, &security);
+	if (!object_ownercheck(RelationRelationId, id, user))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, rv->relname);
+	relation_close(rel, NoLock);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		Capture		current;
+
+		nest = begin_api();
+		lock_workspace();
+		ensure_repository();
+		if (!read_ref("views/enabled").target)
+		{
+			current = capture(true);
+			move_ref(branch_ref("working"), read_ref(branch_ref("working")), current.hash);
+			move_ref("views/enabled", empty_ref, read_ref(branch_ref("heads")).target);
+			advance_snapshot();
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+	} PG_END_TRY();
+	UpdateActiveSnapshotCommandId();
+	return true;
+}
+
 bool
 dg_catalog_alter(Node *statement)
 {
@@ -91,9 +138,11 @@ dg_catalog_alter(Node *statement)
 			   *name;
 	Relation	definition;
 
+	if (rangevar_projection_hook || catalog_api_depth)
+		return false;
 	if (!IsA(statement, AlterTableStmt) && !IsA(statement, CommentStmt))
 		return false;
-	if (!dg_catalog_active())
+	if (!dg_catalog_active() && (!IsA(statement, AlterTableStmt) || ((AlterTableStmt *) statement)->objtype != OBJECT_TABLE || list_length(((AlterTableStmt *) statement)->cmds) != 1))
 		return false;
 	if (IsA(statement, AlterTableStmt))
 	{
@@ -104,6 +153,20 @@ dg_catalog_alter(Node *statement)
 		cmd = linitial_node(AlterTableCmd, stmt->cmds);
 		if (cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
 			return false;
+		if (!dg_catalog_active())
+		{
+			Oid			nativeid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
+			Relation	native;
+			bool		prolly;
+
+			if (!OidIsValid(nativeid))
+				return false;
+			native = relation_open(nativeid, NoLock);
+			prolly = native->rd_tableam == dg_table_routine();
+			relation_close(native, AccessShareLock);
+			if (!prolly)
+				return false;
+		}
 		if (cmd->behavior != DROP_RESTRICT)
 			unsupported("canonical column DROP CASCADE");
 		rv = stmt->relation;
@@ -132,6 +195,12 @@ dg_catalog_alter(Node *statement)
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
+	}
+	if (!dg_catalog_active() && !alter_activate(rv, missing))
+	{
+		if (pushed)
+			PopActiveSnapshot();
+		return false;
 	}
 	id = RangeVarGetRelid(rv, NoLock, missing);
 	if (!OidIsValid(id))
@@ -245,6 +314,8 @@ dg_catalog_alter(Node *statement)
 
 				if (col->constraints || col->raw_default || col->cooked_default || col->identity || col->generated || col->collClause || col->storage || col->compression)
 					unsupported("canonical ADD COLUMN requires a plain nullable column");
+				if (oldcount >= MaxHeapAttributeNumber)
+					ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS), errmsg("tables can have at most %d columns", MaxHeapAttributeNumber)));
 				desc = BuildDescForRelation(list_make1(col));
 				dg_validate_descriptor(desc);
 				a = TupleDescAttr(desc, 0);
