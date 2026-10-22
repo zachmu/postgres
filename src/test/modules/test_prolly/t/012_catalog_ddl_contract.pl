@@ -50,7 +50,6 @@ is(sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/ma
 
 sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
 for my $case (
- ['CREATE TABLE branch_only(id int) USING dolt_prolly_table', 'CREATE'],
  ['ALTER TABLE t ADD COLUMN extra int', 'ALTER'],
  ['TRUNCATE t', 'TRUNCATE'])
 {
@@ -58,7 +57,6 @@ for my $case (
 }
 is(sql(q{SELECT * FROM "postgres/other".public.t}), '1|10', 'failed branch DDL leaves selected branch data intact');
 is(sql(q{SELECT * FROM "postgres/main".public.t}), '1|10', 'failed branch DDL leaves other branch intact');
-is(sql(q{SELECT to_regclass('branch_only') IS NULL}), 't', 'failed CREATE leaves no shared catalog object');
 
 # A failing DDL statement must release only its subtransaction work, not erase
 # earlier writes; publication still uses the existing transaction outcome.

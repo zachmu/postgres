@@ -598,6 +598,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		free_parsestate(pstate);
 		return;
 	}
+	if (dg_catalog_create_begin(parsetree))
+	{
+		ProcessUtilitySlow(pstate, pstmt, queryString, context, params,
+						   queryEnv, dest, qc);
+		CommandCounterIncrement();
+		dg_catalog_create_finish((CreateStmt *) parsetree);
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
 	dg_guard_branch_ddl(parsetree);
 
 	switch (nodeTag(parsetree))

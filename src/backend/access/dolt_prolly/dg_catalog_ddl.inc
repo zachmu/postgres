@@ -8,7 +8,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 				nest;
 	bool		pushed = false;
 
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster || RelationGetRelid(rel) == catalog_new_relation)
 		return;
 	GetUserIdAndSecContext(&user, &security);
 	if (!ActiveSnapshotSet() || (snapshot && IsMVCCSnapshot(snapshot)))
@@ -146,4 +146,143 @@ dg_catalog_drop(Node *statement)
 	}
 	PG_END_TRY();
 	return handled;
+}
+
+/* Validate and serialize before running ordinary CREATE as the caller. */
+bool
+dg_catalog_create_begin(Node *statement)
+{
+	CreateStmt *stmt;
+	Oid			user;
+	int			security,
+				nest;
+	bool		active = false;
+	bool		pushed = false;
+	ListCell   *lc;
+
+	if (!IsUnderPostmaster || !IsA(statement, CreateStmt))
+		return false;
+	stmt = (CreateStmt *) statement;
+	GetUserIdAndSecContext(&user, &security);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		active = read_ref("views/enabled").target != NULL;
+		if (active)
+		{
+			lock_workspace();
+			if (IsolationUsesXactSnapshot())
+				unsupported("branch CREATE under Repeatable Read or Serializable");
+			run("SELECT 1 FROM pg_event_trigger WHERE evtenabled <> 'D'", 0, NULL, NULL, NULL, true);
+			if (SPI_processed)
+				unsupported("branch CREATE with event triggers");
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	if (!active)
+		return false;
+	if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT ||
+		stmt->inhRelations || stmt->partbound || stmt->partspec ||
+		stmt->ofTypename || stmt->options || stmt->tablespacename ||
+		(stmt->accessMethod && strcmp(stmt->accessMethod, "dolt_prolly_table")))
+		unsupported("branch CREATE requires a plain permanent prolly table");
+	foreach(lc, stmt->tableElts)
+	{
+		ColumnDef  *col = lfirst(lc);
+		ListCell   *cc;
+
+		if (!IsA(col, ColumnDef))
+			unsupported("branch CREATE table constraints or LIKE");
+		foreach(cc, col->constraints)
+		{
+			Constraint *con = lfirst(cc);
+
+			if (con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL)
+				unsupported("branch CREATE currently supports only NOT NULL constraints");
+		}
+	}
+	/* IF NOT EXISTS must not silently accept a retained object absent here. */
+	{
+		Oid			existing = RangeVarGetRelid(stmt->relation, NoLock, true);
+
+		if (OidIsValid(existing))
+		{
+			Relation	rel = table_open(existing, AccessShareLock);
+
+			dg_catalog_check_relation(rel, dg_current_branch(), GetTransactionSnapshot());
+			table_close(rel, AccessShareLock);
+		}
+	}
+	stmt->accessMethod = pstrdup("dolt_prolly_table");
+	return true;
+}
+
+/* The relation has been created as the caller; capture and ref publication are
+ * privileged, fixed-query operations in that very same SQL transaction. */
+void
+dg_catalog_create_finish(CreateStmt *stmt)
+{
+	Oid			id = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, false);
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+
+	GetUserIdAndSecContext(&user, &security);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		VersionRef	working;
+		Capture		current;
+		Relation	rel;
+		DGState    *state;
+
+		nest = begin_api();
+		working = read_ref(branch_ref("working"));
+		rel = table_open(id, NoLock);
+		if (catalog_contains(working.target, quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel))))
+		{
+			/* Existing member with IF NOT EXISTS: do not reset its content. */
+			table_close(rel, NoLock);
+		}
+		else
+		{
+			catalog_new_relation = id;
+			/* A new table has no HEAD entry, even on a non-main branch. */
+			state = dg_load_branch(rel, GetActiveSnapshot(), dg_current_branch());
+			dg_save(rel, state, GetCurrentCommandId(true));
+			dg_release(state);
+			table_close(rel, NoLock);
+			CommandCounterIncrement();
+			current = capture(true);
+			move_ref(branch_ref("working"), working, current.hash);
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		catalog_new_relation = InvalidOid;
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
 }

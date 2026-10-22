@@ -59,6 +59,9 @@ typedef struct Capture
 	char	   *json;
 	bytea	   *hash;
 } Capture;
+/* Only set while publishing a freshly created physical relation. */
+static Oid catalog_new_relation = InvalidOid;
+
 static const VersionRef empty_ref = {NULL, NULL};
 
 /* Typed argument vectors live for the enclosing block and are consumed synchronously. */
@@ -355,7 +358,7 @@ capture_inner(bool persist, bool all_catalogs)
 			Oid			id = relations[i];
 			char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(id)), get_rel_name(id));
 
-			if (catalog_contains(membership, name))
+			if (id == catalog_new_relation || catalog_contains(membership, name))
 				relations[kept++] = id;
 		}
 		nrel = kept;

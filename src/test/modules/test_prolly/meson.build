@@ -18,5 +18,6 @@ tests += {
     't/012_catalog_ddl_contract.pl',
     't/013_schema_tree.pl',
     't/014_branch_drop.pl',
+    't/015_branch_create.pl',
   ]},
 }
