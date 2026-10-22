@@ -162,3 +162,10 @@ revisions, but need bounded cache lifetimes rather than persisted identities for
 all history. Table/index resources may still need distinct files, and genuinely
 new storage or explicit rewrites may allocate resources. This does not authorize
 routine per-revision allocation.
+
+## Writable canonical SQL checkpoint (2026-10-22)
+
+[Canonical SQL writes](canonical-sql-writes.md) supersedes the read-only/allocator
+status for activated branch catalogs. Same-name CREATE, native DML, COPY and data
+merge now operate without physical table schema rows. The document records the
+remaining bootstrap bridge, concurrency restrictions and validation evidence.
