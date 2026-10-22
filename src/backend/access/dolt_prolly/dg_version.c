@@ -6,10 +6,6 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
-#include "catalog/pg_dolt_namespace.h"
-#include "catalog/pg_dolt_generation.h"
-#include "catalog/pg_am_d.h"
-#include "access/transam.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
@@ -88,13 +84,9 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
-static void generation_record(const char *name, bytea *schema, Oid relid);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
-static void binding_prepare(const char *branch, bytea *database, bool required, bool fresh);
-static List *binding_members(bytea *database, const char *branch);
-static Oid	binding_create_namespace(Oid logical, Oid owner);
-static char *binding_name(Oid id);
+static void binding_prepare(const char *branch, bytea *database, bool required);
 
 static void
 run(const char *sql, int n, Oid *types, Datum *args, const char *nulls, bool ro)
@@ -364,43 +356,37 @@ capture_inner(bool persist, bool all_catalogs)
 	if (IsolationUsesXactSnapshot())
 		unsupported("live capture under Repeatable Read or Serializable (historical schema binding is not implemented)");
 	PushActiveSnapshot(GetLatestSnapshot());
-	run("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	run("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
 	nrel = SPI_processed;
 	relations = palloc(sizeof(Oid) * Max(nrel, 1));
 	for (i = 0; i < nrel; i++)
 		relations[i] = DatumGetObjectId(cell(i, 1));
 	if (membership)
 	{
-		List	   *ids = binding_members(membership, dg_current_branch());
-		ListCell   *lc;
+		int			kept = 0;
 
-		if (OidIsValid(catalog_new_relation))
+		for (i = 0; i < nrel; i++)
 		{
-			Relation	created = relation_open(catalog_new_relation, NoLock);
+			Oid			id = relations[i];
+			char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(id)), get_rel_name(id));
 
-			ids = list_append_unique_oid(ids, catalog_new_relation);
-			foreach(lc, RelationGetIndexList(created))
-				ids = list_append_unique_oid(ids, lfirst_oid(lc));
-			relation_close(created, NoLock);
+			if (catalog_new_member(id) || catalog_contains(membership, name))
+				relations[kept++] = id;
 		}
-		nrel = list_length(ids);
-		relations = palloc(sizeof(Oid) * Max(nrel, 1));
-		i = 0;
-		foreach(lc, ids)
-			relations[i++] = lfirst_oid(lc);
+		nrel = kept;
 	}
 	for (i = 0; i < nrel; i++)
 		LockRelationOid(relations[i], AccessShareLock);
 	PopActiveSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 	/* Reject unsupported definitions instead of producing incomplete commits. */
-	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
+	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("database capture containing non-prolly relations, routines, custom types or unsupported relation properties");
 	run("SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE " USER_NAMESPACE, 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("capture of custom collations or operators");
-	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attoptions IS NOT NULL OR a.atthasdef OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=x.connamespace),x.connamespace) WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n')", 0, NULL, NULL, NULL, true);
+	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attoptions IS NOT NULL OR a.atthasdef OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n')", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("capture of defaults, generated/dropped columns, user types, triggers or non-unique constraints");
 	run("SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\"", 0, NULL, NULL, NULL, true);
@@ -436,10 +422,10 @@ capture_inner(bool persist, bool all_catalogs)
 		DGState    *state;
 		Relation	rel;
 
-		run("SELECT format('%I.%I',n.nspname,c.relname),CASE WHEN c.relkind='r' THEN 'table' ELSE 'index' END FROM pg_class c JOIN pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE c.oid=$1", 1, types, args, NULL, true);
+		run("SELECT format('%I.%I',n.nspname,c.relname),CASE WHEN c.relkind='r' THEN 'table' ELSE 'index' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 		name = strcell(0, 1);
 		kind = strcell(0, 2);
-		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE c.oid=$1", 1, types, args, NULL, true);
+		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 		schema = strcell(0, 1);
 		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 		schemahash = strcell(0, 1);
@@ -470,7 +456,6 @@ capture_inner(bool persist, bool all_catalogs)
 		if (persist)
 		{
 			shash = put("schema", schema, NULL, 0);
-			generation_record(name, shash, relations[i]);
 			binding_record(dg_current_branch(), name, shash, relations[i]);
 			chunk = DatumGetByteaP(DirectFunctionCall1(dolt_manifest_export, ObjectIdGetDatum(relations[i])));
 			desc = put(kind, member.data, VC_ARGS(PointerGetDatum(shash), PointerGetDatum(chunk)), 2);
@@ -814,7 +799,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	move_ref(psprintf("heads/%s", args[0]), ref, commit);
 	move_ref(psprintf("working/%s", args[0]), empty_ref, child(commit, 1));
 	move_ref(psprintf("staged/%s", args[0]), empty_ref, child(commit, 1));
-	binding_prepare(args[0], child(commit, 1), false, true);
+	binding_prepare(args[0], child(commit, 1), false);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }

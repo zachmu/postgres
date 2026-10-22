@@ -184,27 +184,6 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 					if (!OidIsValid(currentrel))
 						ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
 				}
-				else
-				{
-					/*
-					 * Same logical name can denote an independent runtime
-					 * object. Prefer the retained schema's resource for
-					 * current ACL checks.
-					 */
-					run("SELECT g.genrelid FROM pg_dolt_generation g JOIN pg_class c ON c.oid=g.genrelid WHERE g.genname=$1 AND g.genschema=$2 ORDER BY g.genrelid LIMIT 1", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(logical), PointerGetDatum(child(descriptor, 1))), NULL, true);
-					if (SPI_processed)
-					{
-						Oid			candidate = DatumGetObjectId(cell(0, 1));
-
-						/*
-						 * An old SQL snapshot can still see a physically
-						 * dropped registry/class row. History does not
-						 * require that resource.
-						 */
-						if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(candidate)))
-							currentrel = candidate;
-					}
-				}
 				live = currentrel;
 				if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
 					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);

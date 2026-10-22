@@ -1,8 +1,5 @@
 # Transactional runtime mapping foundation
 
-**Later checkpoint:** [same-name CREATE is now implemented](catalog-same-name.md).
-The historical restrictions and test counts below describe this earlier milestone.
-
 2026-10-22. First implementation checkpoint for
 [the runtime binding plan](../../CATALOG-RUNTIME-BINDING-PLAN.md).
 This implements the local mapping/publication foundation, not the full same-name

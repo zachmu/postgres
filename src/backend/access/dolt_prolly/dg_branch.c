@@ -69,7 +69,7 @@ dg_branch_base(Relation rel, DGState *state)
 	MemoryContext caller = CurrentMemoryContext;
 	Oid			types[] = {TEXTOID, TEXTOID, TEXTOID};
 	Datum		args[] = {CStringGetTextDatum(psprintf("heads/%s", dg_relation_branch(rel))),
-		CStringGetTextDatum(get_namespace_name(dg_catalog_namespace(RelationGetNamespace(rel)))),
+		CStringGetTextDatum(get_namespace_name(RelationGetNamespace(rel))),
 	CStringGetTextDatum(RelationGetRelationName(rel))};
 	bytea	   *address = NULL;
 	bool		isnull;

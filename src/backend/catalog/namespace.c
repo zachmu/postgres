@@ -18,7 +18,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -509,10 +508,7 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		 * operation, which must be careful to find the temp table, even when
 		 * pg_temp is not first in the search path.
 		 */
-		if (dg_catalog_resolve(relation, missing_ok, &relId))
-			;					/* Logical provider supplied the OID; normal
-								 * locking follows. */
-		else if (relation->relpersistence == RELPERSISTENCE_TEMP)
+		if (relation->relpersistence == RELPERSISTENCE_TEMP)
 		{
 			if (!OidIsValid(myTempNamespace))
 				relId = InvalidOid; /* this probably can't happen? */

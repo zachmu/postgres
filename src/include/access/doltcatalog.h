@@ -8,9 +8,6 @@
 #include "nodes/pathnodes.h"
 #include "nodes/extensible.h"
 struct ParseState;
-extern Oid	dg_catalog_namespace(Oid physical);
-extern bool dg_catalog_name_exists(Oid physical, const char *name);
-extern bool dg_catalog_resolve(const RangeVar *rv, bool missing_ok, Oid *id);
 extern bool dg_catalog_creating_relation(Relation rel);
 extern void dg_catalog_create_scope(bool enter);
 extern void dg_catalog_created(Oid id);

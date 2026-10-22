@@ -1,8 +1,5 @@
 # Branch-local CREATE checkpoint
 
-**Later checkpoint:** [same-name CREATE is now implemented](catalog-same-name.md).
-The historical restrictions and test counts below describe this earlier milestone.
-
 2026-10-22. Builds on [canonical schemas and DROP](catalog-schema-provider.md).
 This is a bounded continuation of option 1, not the full DDL viability gate.
 
