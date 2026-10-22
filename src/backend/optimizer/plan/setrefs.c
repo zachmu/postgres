@@ -17,6 +17,7 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_dolt_ref.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_storage.h"
 #include "utils/lsyscache.h"
 
 #include "access/transam.h"
@@ -3735,6 +3736,7 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 			{
 				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
 				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltBindingRelationId);
+				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltStorageRelationId);
 				if (OidIsValid(rte->dolt_relid))
 					context->glob->relationOids = lappend_oid(context->glob->relationOids, rte->dolt_relid);
 				context->glob->dependsOnRole = true;

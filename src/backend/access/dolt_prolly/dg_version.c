@@ -467,6 +467,9 @@ capture_inner(bool persist, bool all_catalogs)
 		if (persist)
 		{
 			shash = put("schema", schema, NULL, 0);
+			rel = relation_open(relations[i], NoLock);
+			dg_storage_record(rel, shash);
+			relation_close(rel, NoLock);
 			binding_record(dg_current_branch(), name, shash, relations[i]);
 			chunk = DatumGetByteaP(DirectFunctionCall1(dolt_manifest_export, ObjectIdGetDatum(relations[i])));
 			desc = put(kind, member.data, VC_ARGS(PointerGetDatum(shash), PointerGetDatum(chunk)), 2);

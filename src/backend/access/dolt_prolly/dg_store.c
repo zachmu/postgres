@@ -55,21 +55,23 @@ visible(TransactionId xid, CommandId cid, Snapshot snap)
 	return !XidInMVCCSnapshot(xid, snap);
 }
 static DGState *
-load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch, bool use_base)
+load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch, bool use_base, bool bound)
 {
 	DGState    *s = palloc0(sizeof(*s));
 	bool		found_root = false;
 	PLHash		binding;
 	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
 	HASHCTL		ctl = {0};
-	BlockNumber n = RelationGetNumberOfBlocks(rel),
+	BlockNumber n,
 				b;
 	uint8	   *assembly = NULL;
 	uint32		assembled = 0,
 				total = 0;
 	PLHash		assembling = {{0}};
 
-	dg_catalog_check_relation(rel, branch, snap);
+	if (!bound)
+		dg_catalog_check_relation(rel, branch, snap);
+	n = RelationGetNumberOfBlocks(rel);
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	if (!pl_hash_bytes(branchbytes, &binding))
@@ -202,7 +204,7 @@ dg_load(Relation rel, Snapshot snap)
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
-	return load_state(rel, snap, NULL, dg_relation_branch(rel), true);
+	return load_state(rel, snap, NULL, dg_relation_branch(rel), true, false);
 }
 DGState *
 dg_load_branch(Relation rel, Snapshot snap, const char *branch)
@@ -210,7 +212,7 @@ dg_load_branch(Relation rel, Snapshot snap, const char *branch)
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
-	return load_state(rel, snap, NULL, branch, false);
+	return load_state(rel, snap, NULL, branch, false, false);
 }
 DGState *
 dg_load_tid(Relation rel, uint64 id)
@@ -218,8 +220,19 @@ dg_load_tid(Relation rel, uint64 id)
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
-	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true);
+	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false);
 }
+
+/* Internal page-reader entrypoint; only dg_resource.c supplies this descriptor. */
+DGState *
+dg_load_bound(Relation rel, Snapshot snap, const char *branch)
+{
+	Assert(CatalogViewObjectContext(RelationGetRelid(rel)));
+	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
+	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
+	return load_state(rel, snap, NULL, branch, false, true);
+}
+
 static void
 append(Relation rel, const uint8 *data, Size length)
 {
@@ -236,18 +249,14 @@ append(Relation rel, const uint8 *data, Size length)
 	GenericXLogFinish(wal);
 	UnlockReleaseBuffer(buf);
 }
-void
-dg_save(Relation rel, DGState *s, CommandId cid)
+static void
+save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 {
 
 	size_t		i;
 	uint8		data[DG_HEADER + DG_PART];
 	PLHash		binding;
-	const char *branch = dg_relation_branch(rel);
 	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
-
-	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
 	if (!pl_hash_bytes(branchbytes, &binding))
 		elog(ERROR, "branch hash failed");
@@ -290,6 +299,28 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 	memcpy(data + DG_HEADER + 80, binding.bytes, 32);
 	append(rel, data, DG_HEADER + 112);
 }
+void
+dg_save(Relation rel, DGState *s, CommandId cid)
+{
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+	save_state(rel, s, cid, dg_relation_branch(rel));
+}
+
+/* Only the transactional resource allocator calls this, before publishing any
+ * branch binding. WAL contains an empty, branch-tagged root under the caller XID. */
+void
+dg_initialize_resource(Relation rel, const char *branch)
+{
+	DGState    *state;
+
+	Assert(CatalogViewObjectContext(RelationGetRelid(rel)));
+	Assert(RelationGetNumberOfBlocks(rel) == 0);
+	state = dg_load_bound(rel, SnapshotSelf, branch);
+	save_state(rel, state, GetCurrentCommandId(true), branch);
+	dg_release(state);
+}
+
 static PLStatus
 collect(void *arg, PLSlice key, PLSlice value)
 {

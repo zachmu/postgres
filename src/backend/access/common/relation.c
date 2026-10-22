@@ -23,6 +23,7 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/catalogview.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "utils/inval.h"
@@ -47,11 +48,12 @@ Relation
 relation_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
+	bool		canonical = CatalogViewObjectContext(relationId) != NULL;
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* Get the lock before trying to open the relcache entry */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock && !canonical)
 		LockRelationOid(relationId, lockmode);
 
 	/* The relcache does all the real work... */
@@ -64,7 +66,7 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	 * If we didn't get the lock ourselves, assert that caller holds one,
 	 * except in bootstrap mode where no locks are used.
 	 */
-	Assert(lockmode != NoLock ||
+	Assert(canonical || lockmode != NoLock ||
 		   IsBootstrapProcessingMode() ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
@@ -72,7 +74,9 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
-	pgstat_init_relation(r);
+	/* Immutable metadata handles have no shared lock or statistics identity. */
+	if (!canonical)
+		pgstat_init_relation(r);
 
 	return r;
 }
@@ -88,11 +92,12 @@ Relation
 try_relation_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
+	bool		canonical = CatalogViewObjectContext(relationId) != NULL;
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* Get the lock first */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock && !canonical)
 		LockRelationOid(relationId, lockmode);
 
 	/*
@@ -102,7 +107,7 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relationId)))
 	{
 		/* Release useless lock */
-		if (lockmode != NoLock)
+		if (lockmode != NoLock && !canonical)
 			UnlockRelationOid(relationId, lockmode);
 
 		return NULL;
@@ -115,14 +120,16 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 		elog(ERROR, "could not open relation with OID %u", relationId);
 
 	/* If we didn't get the lock ourselves, assert that caller holds one */
-	Assert(lockmode != NoLock ||
+	Assert(canonical || lockmode != NoLock ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
-	pgstat_init_relation(r);
+	/* Immutable metadata handles have no shared lock or statistics identity. */
+	if (!canonical)
+		pgstat_init_relation(r);
 
 	return r;
 }
@@ -205,12 +212,13 @@ void
 relation_close(Relation relation, LOCKMODE lockmode)
 {
 	LockRelId	relid = relation->rd_lockInfo.lockRelId;
+	bool		canonical = relation->rd_catalogview != NULL;
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* The relcache does the real work... */
 	RelationClose(relation);
 
-	if (lockmode != NoLock)
+	if (lockmode != NoLock && !canonical)
 		UnlockRelationId(&relid, lockmode);
 }

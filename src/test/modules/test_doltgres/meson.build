@@ -10,10 +10,15 @@ test_doltgres = shared_module('test_doltgres', test_doltgres_sources,
   kwargs: pg_test_mod_args)
 test_install_libs += test_doltgres
 
+# Keep allocation tests separate from the old projection fixture's _PG_init hook.
+test_storage_resource = shared_module('storage_resource', files('storage_resource.c'),
+  kwargs: pg_test_mod_args)
+test_install_libs += test_storage_resource
+
 tests += {
   'name': 'test_doltgres',
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'regress': {'sql': ['branch_catalog'], 'dbname': 'contrib_regression'},
-  'tap': {'tests': ['t/001_branch_catalog.pl', 't/002_catalog_views.pl']},
+  'tap': {'tests': ['t/001_branch_catalog.pl', 't/002_catalog_views.pl', 't/003_storage_allocation.pl']},
 }

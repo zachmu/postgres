@@ -89,8 +89,7 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 	ListCell   *lc;
 	Oid			user;
 	int			security,
-				nest,
-				i;
+				nest;
 	bytea	   *db,
 			   *descriptor = NULL;
 
@@ -196,11 +195,12 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 					currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
 					if (working)
 					{
-						currentrel = binding_relation(revision, logical, child(descriptor, 1));
-						if (!OidIsValid(currentrel))
+						live = binding_relation(revision, logical, child(descriptor, 1));
+						if (!OidIsValid(live))
 							ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
 					}
-					live = currentrel;
+					if (!working)
+						live = currentrel;
 					if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
 						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
 					if (OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
@@ -223,26 +223,10 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 
 			if (working && OidIsValid(live))
 			{
-				Relation	rel = table_open(live, AccessShareLock);
-				TupleDesc	current = RelationGetDescr(rel);
-				bool		compatible = current->natts == result->natts;
-
-				for (i = 0; compatible && i < current->natts; i++)
-				{
-					Form_pg_attribute a = TupleDescAttr(current, i),
-								b = TupleDescAttr(result, i);
-
-					compatible = !a->attisdropped && a->atttypid == b->atttypid && a->atttypmod == b->atttypmod && a->attcollation == b->attcollation && !strcmp(NameStr(a->attname), NameStr(b->attname));
-				}
-				if (compatible && rel->rd_tableam == dg_table_routine())
-				{
-					rte->dolt_branch = pstrdup(revision);
-					rte->dolt_relid = live;
-				}
-				else
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
-				table_close(rel, NoLock);
+				rte->dolt_branch = pstrdup(revision);
+				rte->dolt_relid = live;
 			}
+
 			if (working && !OidIsValid(live))
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 		}
