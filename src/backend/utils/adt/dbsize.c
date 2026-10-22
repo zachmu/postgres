@@ -11,6 +11,8 @@
 
 #include "postgres.h"
 
+#include "catalog/catalogview.h"
+
 #include <sys/stat.h>
 
 #include "access/htup_details.h"
@@ -368,6 +370,12 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	Relation	rel;
 	int64		size;
 
+	/* A canonical descriptor is not a physical file locator. */
+	if (CatalogViewObjectContext(relOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("physical size is not defined for a revision-bound relation")));
+
 	rel = try_relation_open(relOid, AccessShareLock);
 
 	/*
@@ -507,6 +515,12 @@ pg_table_size(PG_FUNCTION_ARGS)
 	Relation	rel;
 	int64		size;
 
+	/* A canonical descriptor is not a physical file locator. */
+	if (CatalogViewObjectContext(relOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("physical size is not defined for a revision-bound relation")));
+
 	rel = try_relation_open(relOid, AccessShareLock);
 
 	if (rel == NULL)
@@ -525,6 +539,12 @@ pg_indexes_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	Relation	rel;
 	int64		size;
+
+	/* A canonical descriptor is not a physical file locator. */
+	if (CatalogViewObjectContext(relOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("physical size is not defined for a revision-bound relation")));
 
 	rel = try_relation_open(relOid, AccessShareLock);
 
@@ -567,6 +587,12 @@ pg_total_relation_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	Relation	rel;
 	int64		size;
+
+	/* A canonical descriptor is not a physical file locator. */
+	if (CatalogViewObjectContext(relOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("physical size is not defined for a revision-bound relation")));
 
 	rel = try_relation_open(relOid, AccessShareLock);
 

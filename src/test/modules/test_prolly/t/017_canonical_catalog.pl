@@ -5,7 +5,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('canonical_catalog');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);
 $node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sql(q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v int NOT NULL) USING dolt_prolly_table; INSERT INTO t VALUES(1,7); GRANT SELECT ON t TO reader; COMMENT ON COLUMN t.v IS 'integer revision'});
@@ -38,11 +38,25 @@ is(sql("PREPARE retained AS SELECT row_to_json(x) FROM t AS OF '$a' x; EXECUTE r
 is(sql("BEGIN; DECLARE old_cursor CURSOR FOR SELECT row_to_json(x) FROM t AS OF '$a' x; SELECT row_to_json(x) FROM t AS OF '$b' x; FETCH ALL old_cursor; COMMIT"),"{\"id\":1,\"v\":\"seven\",\"note\":\"new\"}\n{\"id\":1,\"v\":7}",'cursor remains bound while another revision executes');
 is(sql("SELECT c.relname,i.indisprimary,i.indisunique,i.indkey FROM pg_catalog.pg_index AS OF '$a' i JOIN pg_catalog.pg_class AS OF '$a' c ON c.oid=i.indexrelid JOIN pg_catalog.pg_class AS OF '$a' t ON t.oid=i.indrelid WHERE t.relname='t'"),'t_pkey|t|t|1','canonical index ownership and keys use the bound table');
 is(sql("SELECT con.conname,pg_get_constraintdef(con.oid) FROM pg_catalog.pg_constraint AS OF '$a' con JOIN pg_catalog.pg_class AS OF '$a' c ON c.oid=con.conrelid WHERE c.relname='t' ORDER BY con.conname"),"t_id_not_null|NOT NULL id\nt_pkey|PRIMARY KEY (id)\nt_v_not_null|NOT NULL v",'native constraint deparser follows canonical bound metadata');
+for my $function (qw(pg_relation_size pg_table_size pg_indexes_size pg_total_relation_size))
+{
+ my ($status,$out,$err)=$node->psql('postgres',"SELECT $function(c.oid) FROM pg_catalog.pg_class AS OF '$a' c WHERE c.relname='t'");
+ isnt($status,0,"$function rejects an unbound physical locator");
+ like($err,qr/physical size is not defined for a revision-bound relation/,"$function fails explicitly");
+}
 my ($status,$out,$err)=$node->psql('postgres',"SELECT * FROM pg_catalog.pg_proc AS OF '$a'");
 isnt($status,0,'unimplemented revision catalog rejects');
 like($err,qr/revision-qualified catalog .* is not supported/,'unsupported catalog does not expose live rows');
 $node->stop('immediate');
 $node->start;
 is(sql("BEGIN READ ONLY; SELECT row_to_json(x) FROM t AS OF '$a' x; SELECT col_description(c.oid,2) FROM pg_catalog.pg_class AS OF '$b' c WHERE c.relname='t'; COMMIT"),"{\"id\":1,\"v\":7}\ntext revision",'canonical native descriptors reconstruct after restart without materialization');
+# Historical reads also honor current revocations on a same-named live object.
+sql(q{GRANT SELECT ON t TO reader});
+$node->backup('canonical');
+my $standby=PostgreSQL::Test::Cluster->new('canonical_standby');
+$standby->init_from_backup($node,'canonical',has_streaming=>1);
+$standby->start;
+is($standby->safe_psql('postgres',"SET ROLE reader; SELECT row_to_json(x) FROM t AS OF '$a' x; SELECT col_description(c.oid,2) FROM pg_catalog.pg_class AS OF '$b' c WHERE c.relname='t'; SELECT pg_current_xact_id_if_assigned() IS NULL"),"{\"id\":1,\"v\":7}\ntext revision\nt",'cold standby reconstructs native canonical types and catalogs without writes');
+$standby->stop;
 $node->stop;
 done_testing();
