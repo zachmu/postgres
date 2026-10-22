@@ -156,3 +156,22 @@ Native tests cover 15 schema-tree and 28 branch-DROP assertions. A new shared
 Doltgres branch-DROP scenario passes all 17 assertions on both engines. The prior
 safety test now has 25 assertions because DROP rejection moved to positive tests.
 See [details and next experiments](doc/doltgres/catalog-schema-provider.md).
+
+## Branch-local CREATE checkpoint — 2026-10-22
+
+Native CREATE TABLE now publishes a new table and its NOT NULL / immediate PRIMARY
+KEY / UNIQUE constraints into only the selected branch's canonical working set.
+Physical table/index creation runs under the caller's privileges; canonical schema,
+empty roots and ref publication share the SQL transaction. Non-main branches do
+not require a preexisting HEAD entry for a newly created relation. Abort, savepoint
+rollback, crash rollback and native index-build failure are tested.
+
+This advances the option 1 implementation without resolving runtime identity:
+a qualified physical name already retained on another branch cannot be reused.
+CREATE after activation chooses the prolly AM when omitted and rejects explicit
+non-prolly AMs. General CREATE forms, event triggers, deferred constraints and
+layout-changing ALTER remain guarded. Raw catalog introspection still exposes the
+physical bridge. The next boundary is an explicit mapping from logical identity
+and schema generation to writable runtime relations; same-name divergent CREATE
+and layout-changing ALTER must be tested through it rather than mutating shared
+descriptors. See [the CREATE checkpoint](doc/doltgres/catalog-create.md).

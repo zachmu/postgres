@@ -98,3 +98,11 @@ versions in one statement. Stable logical identity is desirable; reusing a physi
 OID without version context through every relevant cache remains unsafe. This
 checkpoint found no fundamental obstacle to option 1, but it does not settle those
 remaining identity/cache questions.
+
+## Subsequent implementation — branch CREATE, 2026-10-22
+
+The DROP checkpoint above is preserved. A restricted branch-local CREATE TABLE
+path, including immediate PRIMARY KEY/UNIQUE indexes, is now implemented and
+verified. See [the CREATE checkpoint](catalog-create.md) for its publication scope,
+tests and remaining physical-name restriction. Layout-changing ALTER and general
+branch-aware catalog infrastructure remain incomplete.
