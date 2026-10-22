@@ -261,3 +261,20 @@ materializer and projection mapping were removed. Branch-qualified reads select
 snapshot-visible working roots; AS OF resolves committed revisions. No query-time
 catalog publication is required. Writable branch-local schema publication and
 its dependencies remain open work, coordinated with manifest CAS and SQL MVCC.
+
+## Catalog DDL publication coordination — 2026-10-22
+
+The native provider direction and [DDL gate](CATALOG-DDL-PLAN.md) supersede earlier
+projection-based assumptions. No SELECT publishes catalog objects. Branch-local
+DDL must publish its canonical schema, table/index roots and dependency changes
+as one transactionally visible working state, coordinated with PostgreSQL commit
+and WAL recovery. Other branches must retain their own definitions and roots.
+
+Design the state transition with the row-level plan before implementation:
+transaction-start schema identity, private DDL/DML changes, validation against the
+current publication state, then atomic publication or an explicit conflict.
+Dolt-style three-way working-set reconciliation remains appropriate where valid;
+it does not authorize automatic schema merging or replace SQL locking/validation.
+Concurrent DDL/DML must not attach rows or indexes to an incompatible definition.
+Savepoint/full rollback and crash recovery must preserve this invariant. Avoid
+turning a shared manifest update into a permanent database-wide writer lock.

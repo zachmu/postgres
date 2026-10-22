@@ -18,6 +18,20 @@ for future detailed planning work.
   heap-backed refs, immutable database states, transaction visibility and an
   early version-control slice coordinated with the row-level publication design.
 
+### Planning record — 2026-10-22
+
+The plans and original DESIGN.md were copied unchanged from the workspace into
+this repository and committed before this revision. These repository-root files
+are now the authoritative, version-controlled plans. Earlier dated notes and
+superseded proposals remain as historical evidence; later decisions take
+precedence. Historical `reports/...` links originally refer to the workspace
+reports directory, not a tracked directory in this repository.
+
+- [Native catalog binding](CATALOG-BINDING-PLAN.md) records the selected provider
+  direction and completed read experiment.
+- [Branch-local DDL viability gate](CATALOG-DDL-PLAN.md) defines the next experiment,
+  implementation sequence, risks and acceptance tests.
+
 ## Part I — Amended design and requirements
 
 ### 1. Project goals and compatibility
@@ -383,6 +397,30 @@ Canonical expression serialization needs a symbolic/reference-aware format.
 Raw PostgreSQL catalog or parse-tree bytes may contain runtime OIDs and are not
 an acceptable general canonical schema format.
 
+#### Decision update — 2026-10-22: native versioned catalog provider
+
+Proceed with explicit per-reference version contexts and native metadata
+providers, extending core catalog infrastructure where evidence requires it.
+The persistent materializer/projection approach is withdrawn: requiring user
+preparation violates the query contract, and hidden persistent reconstruction
+would also violate cold read-only/standby behavior. Do not restore it as a
+prerequisite or assume unchanged OID/cache infrastructure is sufficient.
+
+The completed read milestone demonstrates automatic incompatible historical
+schemas and independent branch working roots in one query, without persistent
+catalog projection. It does not prove branch-local DDL or generalized versioned
+types/functions. Ordinary PostgreSQL catalogs and access methods remain intact;
+runtime identities may still be necessary for objects whose engine interfaces
+require them, but are not portable canonical identity.
+
+The next decision gate is [transactional branch-local DDL](CATALOG-DDL-PLAN.md),
+including dependency-consistent binding and concurrent readers. The serious risks
+are OID-based type/function resolution, atomic schema/data publication, cache and
+prepared-plan isolation, authorization/introspection consistency, and retention.
+Avoid accumulating independent lookup exceptions: establish one explicit binding
+context and a documented provider boundary. Unsupported combinations must fail
+explicitly, never silently bind a current object from another version.
+
 ### 12. Canonicalization, row identity, and indexes
 
 Use the storage serialization contract in section 2 as the tree-hash correctness
@@ -588,6 +626,17 @@ Prepared transactions survive restart and resolve correctly.
 **Gate:** different schemas coexist in one query; concurrent branch edits work;
 DDL rollback is correct; recovery and readers never observe partial multi-ref
 publication.
+
+##### Next gate update — 2026-10-22
+
+Begin the branch-local DDL portion now, coordinated with the unfinished Phase 3
+publication work. Start with branch-local CREATE/ALTER/DROP TABLE and transactional
+rollback, then test dependencies and incompatible branch-local types/functions.
+The read milestone alone does not satisfy this phase's gate. Keep the existing
+DDL guard for unsupported paths and remove it only for operations with validated
+branch isolation, publication and recovery. Schema merges and general multi-branch
+writes are not implied by this first DDL milestone. Detailed stages and decisive
+cross-branch/concurrent-DDL tests are in [CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md).
 
 #### Phase 5 — Version-control behavior
 

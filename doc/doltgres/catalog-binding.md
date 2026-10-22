@@ -86,3 +86,12 @@ Only the current database can be revision-qualified.
 Continue with a native provider boundary, not persistent physical projection.
 Table reads demonstrate that canonical descriptors can bypass physical OIDs;
 they do not establish that general types/functions can avoid all OID infrastructure.
+
+## Next architecture gate — 2026-10-22
+
+The repository-root [plans](../../PLAN.md) are now version controlled. The
+[branch-local DDL plan](../../CATALOG-DDL-PLAN.md) specifies the next viability
+experiment: transactional schema isolation, dependency-consistent bindings,
+versioned types/functions, concurrent readers and recovery. This extends the
+native provider direction; it does not restore persistent materialization or
+claim that the existing table-read milestone already solves generalized catalogs.
