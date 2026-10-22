@@ -20,7 +20,7 @@ $reader->query_safe("PREPARE old_plan AS SELECT v FROM t AS OF '$old'");
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 is($reader->query_safe('EXECUTE old_plan'),'10','retained descriptor and root bound');
 sql(q{SET lock_timeout='1s'; DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C",note text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'ten','new schema'); GRANT SELECT ON t TO reader});
-fails(q{SELECT * FROM "postgres/main".public.t},qr/unpublished branch schema changes/,'working schema mismatch never silently reads committed HEAD');
+fails(q{SELECT * FROM "postgres/main".public.t},qr/runtime catalog binding unavailable/,'working schema mismatch never silently reads committed HEAD');
 my $new=sql(q{SELECT dolt_commit('-Am','text schema')});
 is($reader->query_safe('EXECUTE old_plan'),'10','live DDL does not invalidate old descriptor');$reader->query_safe('COMMIT');$reader->quit;
 is(sql("SELECT a.v,b.v,b.note,pg_typeof(a.v),pg_typeof(b.v) FROM t AS OF '$old' a JOIN t AS OF '$new' b USING(id)"),'10|ten|new schema|integer|text','incompatible schemas in one query');

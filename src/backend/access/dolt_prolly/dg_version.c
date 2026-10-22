@@ -4,6 +4,11 @@
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_dolt_binding.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "utils/fmgroids.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
 #include "utils/syscache.h"
@@ -79,6 +84,9 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
+static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
+static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
+static void binding_prepare(const char *branch, bytea *database, bool required);
 
 static void
 run(const char *sql, int n, Oid *types, Datum *args, const char *nulls, bool ro)
@@ -448,6 +456,7 @@ capture_inner(bool persist, bool all_catalogs)
 		if (persist)
 		{
 			shash = put("schema", schema, NULL, 0);
+			binding_record(dg_current_branch(), name, shash, relations[i]);
 			chunk = DatumGetByteaP(DirectFunctionCall1(dolt_manifest_export, ObjectIdGetDatum(relations[i])));
 			desc = put(kind, member.data, VC_ARGS(PointerGetDatum(shash), PointerGetDatum(chunk)), 2);
 			members[used] = PointerGetDatum(desc);
@@ -790,6 +799,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	move_ref(psprintf("heads/%s", args[0]), ref, commit);
 	move_ref(psprintf("working/%s", args[0]), empty_ref, child(commit, 1));
 	move_ref(psprintf("staged/%s", args[0]), empty_ref, child(commit, 1));
+	binding_prepare(args[0], child(commit, 1), false);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
@@ -1003,6 +1013,8 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 {
 	return dolt_diff_summary(fcinfo);
 }
+
+#include "dg_binding.inc"
 
 #include "dg_merge.inc"
 
