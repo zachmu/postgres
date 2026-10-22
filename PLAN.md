@@ -1,5 +1,9 @@
 # PostgreSQL Prolly Storage and Version Control Plan
 
+> Current direction: see [the latest clarification](#current-catalog-direction-and-ddl-requirement-clarification--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 This document captures requirements and a partial plan to create a fork of Postgres with Dolt's
 prolly tree storage and version control capabilities.
 
@@ -844,3 +848,34 @@ OIDs/internal names remain local, and runtime resources are not allocated per
 commit. Historical reads stay automatic, read-only-capable and independent of
 persistent query-time catalog preparation. These are planned changes, not claims
 that the remaining mapping or generalized catalog work is already implemented.
+
+## Current catalog direction and DDL requirement clarification — 2026-10-22
+
+The private-namespace approach was rejected and rolled back. Earlier instructions
+to allocate distinct internal catalog names as the solution to same-name CREATE
+are superseded. Option 1 remains the direction: canonical versioned schemas are
+authoritative, and every versioned reference carries context through native
+catalog/cache/type/dependency interfaces and planning/execution. SQL introspection
+must agree; unsupported paths reject rather than silently use physical definitions.
+
+The hard DDL requirement is branch isolation: sessions on another branch retain
+their definitions and usable bindings while schema changes occur elsewhere. Follow
+PostgreSQL's native transaction rules for each DDL command; adopting Dolt's DDL
+transaction semantics is not required. Ordinary PostgreSQL table DDL can share a
+SQL transaction with DML, so preserve native commit/abort/savepoint behavior where
+supported. Atomic internal publication remains necessary for coherent schema,
+data/index and dependency state; it does not impose Dolt-style transaction behavior.
+
+The [current catalog execution plan](CATALOG-DDL-PLAN.md#current-execution-plan-and-ddl-semantics-clarification--2026-10-22)
+owns the implementation order and gates: canonical provider, automatic per-reference
+binding and introspection, storage-resource binding, native DDL provider state,
+then lifecycle/compatibility closure. Test a narrow CREATE/rollback path early.
+The first integrated read gate is two incompatible canonical revisions in one
+query with correct row types and catalog introspection; the writable gate includes
+same-name CREATE and multi-session branch isolation during/after DDL. No manual
+preparation or persisted schema projection is permitted.
+
+The native catalog-view infrastructure is on an unmerged feature branch; its
+fixtures do not establish production catalog/DDL completeness. The preserved
+same-name Doltgres suite still fails. See also the updated
+[runtime identity contract](CATALOG-RUNTIME-BINDING-PLAN.md#current-runtime-contract--2026-10-22).

@@ -1,5 +1,9 @@
 # Branch-local DDL viability gate
 
+> Current direction: see [the latest clarification](#current-execution-plan-and-ddl-semantics-clarification--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 ## Decision and scope — 2026-10-22
 
 Continue the native versioned catalog-provider direction documented in
@@ -209,3 +213,102 @@ physical bridge. The next boundary is an explicit mapping from logical identity
 and schema generation to writable runtime relations; same-name divergent CREATE
 and layout-changing ALTER must be tested through it rather than mutating shared
 descriptors. See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
+
+## Current execution plan and DDL semantics clarification — 2026-10-22
+
+This decision supersedes the earlier runtime-name/mapping-first sequence and the
+withdrawn private-namespace implementation. Preserve those sections as history,
+not as instructions to allocate persisted catalog definitions per branch. Follow
+option 1: canonical schemas live alongside table data in prolly storage and are
+vended through branch-aware native catalog interfaces.
+
+### DDL contract: branch isolation, PostgreSQL transaction rules
+
+The hard requirement is branch isolation: a schema change on branch A must not
+change the definitions, name resolution, dependencies, permissions, rows, indexes,
+or valid execution bindings seen by sessions using branch B. Isolation must hold
+while A's DDL is running, after commit, and after rollback. A change on A must not
+require B to switch views, stop using its schema, or have its user reprepare a
+statement because A's schema changed. Scope schema-conflict locks by branch/object as appropriate; a
+transaction-duration database-wide DDL freeze is not the target architecture.
+Ordinary shared server resources can still contend; logical isolation does not
+promise zero shared-resource contention.
+
+Do not import Dolt's DDL transaction semantics or introduce a new requirement to
+combine schema and data edits into a Dolt-style transaction. Follow PostgreSQL's
+rules for each supported command, including commands prohibited in transaction
+blocks. PostgreSQL ordinary table DDL is itself transactional and can share a SQL
+transaction with DML; preserve that native behavior, including command visibility,
+abort and savepoints where supported. This is not an instruction to add implicit
+DDL commits or split a native PostgreSQL transaction. A SQL transaction commit
+and a version-control commit remain separate operations.
+
+Earlier requirements for coordinated publication mean internal consistency under
+the applicable PostgreSQL command/transaction boundary: no observer may see a
+schema with incompatible data/index roots or a half-published dependency change.
+They do not require adopting Dolt's transaction model. Existing standalone-command
+rules for version-control functions are a separate concern.
+
+### Ordered implementation work
+
+1. **Canonical schema provider.** Decode canonical namespaces, tables, columns,
+   row types, indexes, constraints and dependencies into native catalog views.
+   Extend canonical formats where necessary, using portable object references.
+   Hide physical definitions for versioned objects; missing required metadata or
+   unsupported paths must reject instead of falling back. Keep PostgreSQL-owned
+   bootstrap/system objects on their existing implementation.
+2. **Automatic per-reference binding.** Ordinary names select the session branch
+   and applicable SQL snapshot; qualified names and AS OF select their own
+   contexts. Carry bindings through planning, execution, prepared statements and
+   cursors. Syscache, relcache, type and dependency lookups must honor context or
+   use handles explicitly bound to it. SQL pg_catalog/information_schema access
+   must see the same definitions, including supported revision-qualified catalog
+   references. No user preparation or persisted historical projections.
+3. **Storage integration.** Resolve bound definitions to stable storage resources
+   for locks, buffers and WAL, independently selecting the branch/historical data
+   root. Runtime OIDs cannot stand in for cross-session lock/resource identity.
+   Validate write authority and schema layout at every supported mutation path.
+4. **Native DDL through provider state.** Construct provisional definitions in
+   transactional provider state and publish supported canonical schema, dependency,
+   storage and membership changes according to PostgreSQL's native rules above.
+   Remove reliance on physical catalog name uniqueness for versioned objects.
+   Exercise a narrow CREATE/index/rollback path early while building steps 1–3;
+   do not defer discovering DDL integration problems until all reads are polished.
+   Then pass independent same-name CREATE and extend to bounded ALTER/DROP forms.
+5. **Lifecycle and compatibility closure.** Complete plan/portal pins, snapshot
+   selection, invalidation/rebinding, context reclamation and dependency traversal.
+   Implement parallel context transport or reject unsupported parallel paths.
+   Validate recovery, read-only and standby reads, and matching Doltgres suites
+   alongside native regression/isolation tests. Required correctness mechanisms
+   belong in each earlier step; this step is not permission to postpone them.
+
+### Acceptance gates
+
+The first integrated read gate is a real query reading two incompatible canonical
+revisions of the same table, with correct row types and matching catalog
+introspection. It must work cold and without a preparation call or persisted
+schema projection. Synthetic provider fixtures alone do not meet this gate.
+
+The writable gate adds independent same-name CREATE on two branches, primary and
+unique indexes, DML on each, cross-revision reads, and branch-scoped dependency and
+permission checks. Keep the preserved Doltgres same-name tests. Add two-session
+checks showing B remains usable and sees its own schema during A's open DDL
+transaction, after A commits, and after A aborts or rolls back a savepoint. Include
+B's existing cursor/prepared plan, and native same-branch conflict handling. Test
+schema/index failures and restart/crash boundaries for complete old/new states.
+
+Doltgres tests are the oracle for version selection and branch isolation;
+PostgreSQL tests/rules govern native DDL transaction behavior when the engines
+differ. Record intentional transaction differences explicitly rather than weakening
+branch-isolation expectations. Report selected suites, counts, failures, unsupported
+paths and untested cases; passing ordinary reads does not establish completeness.
+
+### Implementation status at this revision
+
+The unmerged `zachmu/branch-aware-catalog` branch implements native immutable-view
+lookup/scan infrastructure and synthetic-provider tests. Production canonical
+schema decoding, automatic binding and DDL publication are not connected. Existing
+selected compatibility tests pass, but the preserved same-name CREATE suite fails.
+No completed writable architecture or fundamental impossibility has been proved.
+The next work is production integration through the gates above, not another
+private-namespace workaround or an isolated cache-only milestone.
