@@ -90,14 +90,10 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 	Oid			user;
 	int			security,
 				nest,
-				i,
-				n;
+				i;
 	bytea	   *db,
 			   *descriptor = NULL;
-	char	  **names,
-			  **types,
-			  **collations;
-	int		   *mods;
+
 	TupleDesc	result = NULL;
 	bool		pushed = false;
 	bool		working = false;
@@ -152,98 +148,104 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 		db = working ? read_ref(psprintf("working/%s", revision)).target : NULL;
 		if (!db)
 			db = child(resolve(revision), 1);
-		foreach(lc, path)
+		rte->dolt_database = hex(db);
+		if (rv->schemaname && !strcmp(rv->schemaname, "pg_catalog"))
 		{
-			char	   *ns = (char *) lfirst(lc);
+			Relation	catalog;
+			Oid			id = get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE);
 
-			if (!strcmp(ns, "$user"))
-				ns = GetUserNameFromId(user, false);
-			logical = quote_qualified_identifier(ns, rv->relname);
-			run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
-			if (SPI_processed)
+			provider_catalog_index(id); /* reject unsupported catalogs
+										 * explicitly */
+			(void) provider_view(db);
+			if (pg_class_aclcheck(id, user, ACL_SELECT) != ACLCHECK_OK)
+				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
+			catalog = table_open(id, AccessShareLock);
+			result = CreateTupleDescCopy(RelationGetDescr(catalog));
+			rte->dolt_catalog = id;
+			rte->dolt_table = pstrdup("");
+			rte->dolt_rowtype = get_rel_type_id(id);
+			table_close(catalog, AccessShareLock);
+		}
+		else
+		{
+			foreach(lc, path)
 			{
-				char	   *nsdef;
-				Oid			currentns,
-							currentrel;
+				char	   *ns = (char *) lfirst(lc);
 
-				descriptor = DatumGetByteaPCopy(cell(0, 1));
-				schema = metadata(child(descriptor, 1), "schema");
-				nsdef = catalog_namespace(db, ns);
-				catalog_acl(nsdef, "USAGE", user);
-				catalog_acl(schema, "SELECT", user);
-
-				/*
-				 * Do not let historical grants bypass current revocations on
-				 * a live object.
-				 */
-				currentns = get_namespace_oid(ns, true);
-				currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
-				if (working)
+				if (!strcmp(ns, "$user"))
+					ns = GetUserNameFromId(user, false);
+				logical = quote_qualified_identifier(ns, rv->relname);
+				run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
+				if (SPI_processed)
 				{
-					currentrel = binding_relation(revision, logical, child(descriptor, 1));
-					if (!OidIsValid(currentrel))
-						ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
+					char	   *nsdef;
+					Oid			currentns,
+								currentrel;
+
+					descriptor = DatumGetByteaPCopy(cell(0, 1));
+					schema = metadata(child(descriptor, 1), "schema");
+					nsdef = catalog_namespace(db, ns);
+					catalog_acl(nsdef, "USAGE", user);
+					catalog_acl(schema, "SELECT", user);
+
+					/*
+					 * Do not let historical grants bypass current revocations
+					 * on a live object.
+					 */
+					currentns = get_namespace_oid(ns, true);
+					currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
+					if (working)
+					{
+						currentrel = binding_relation(revision, logical, child(descriptor, 1));
+						if (!OidIsValid(currentrel))
+							ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
+					}
+					live = currentrel;
+					if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
+						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
+					if (OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
+						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
+					break;
 				}
-				live = currentrel;
-				if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
-					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
-				if (OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
-					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
-				break;
 			}
-		}
-		if (!descriptor)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in revision %s", rv->relname, revision)));
-		rte->dolt_table = hex(descriptor);
-		run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
-		n = SPI_processed;
-		names = palloc(n * sizeof(char *));
-		types = palloc(n * sizeof(char *));
-		collations = palloc(n * sizeof(char *));
-		mods = palloc(n * sizeof(int));
-		for (i = 0; i < n; i++)
-		{
-			names[i] = strcell(i, 1);
-			types[i] = strcell(i, 2);
-			mods[i] = DatumGetInt32(cell(i, 3));
-			collations[i] = strcell(i, 4);
-		}
-		result = CreateTemplateTupleDesc(n);
-		for (i = 0; i < n; i++)
-		{
-			Oid			type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(types[i]), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
-
-			if (!OidIsValid(type))
-				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("unknown retained built-in type %s", types[i])));
-			TupleDescInitEntry(result, i + 1, names[i], type, mods[i], 0);
-			if (collations[i])
-				TupleDescInitEntryCollation(result, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
-		}
-		dg_validate_descriptor(result);
-		if (working && OidIsValid(live))
-		{
-			Relation	rel = table_open(live, AccessShareLock);
-			TupleDesc	current = RelationGetDescr(rel);
-			bool		compatible = current->natts == result->natts;
-
-			for (i = 0; compatible && i < current->natts; i++)
+			if (!descriptor)
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in revision %s", rv->relname, revision)));
+			rte->dolt_table = hex(descriptor);
 			{
-				Form_pg_attribute a = TupleDescAttr(current, i),
-							b = TupleDescAttr(result, i);
+				CatalogView *view = provider_view(db);
+				Oid			handle = CatalogViewLookupObject(view, RelationRelationId, logical);
+				Relation	rel = relation_open(handle, AccessShareLock);
 
-				compatible = !a->attisdropped && a->atttypid == b->atttypid && a->atttypmod == b->atttypmod && a->attcollation == b->attcollation && !strcmp(NameStr(a->attname), NameStr(b->attname));
+				result = CreateTupleDescCopy(RelationGetDescr(rel));
+				rte->dolt_rowtype = rel->rd_rel->reltype;
+				relation_close(rel, AccessShareLock);
 			}
-			if (compatible && rel->rd_tableam == dg_table_routine())
+
+			if (working && OidIsValid(live))
 			{
-				rte->dolt_branch = pstrdup(revision);
-				rte->dolt_relid = live;
+				Relation	rel = table_open(live, AccessShareLock);
+				TupleDesc	current = RelationGetDescr(rel);
+				bool		compatible = current->natts == result->natts;
+
+				for (i = 0; compatible && i < current->natts; i++)
+				{
+					Form_pg_attribute a = TupleDescAttr(current, i),
+								b = TupleDescAttr(result, i);
+
+					compatible = !a->attisdropped && a->atttypid == b->atttypid && a->atttypmod == b->atttypmod && a->attcollation == b->attcollation && !strcmp(NameStr(a->attname), NameStr(b->attname));
+				}
+				if (compatible && rel->rd_tableam == dg_table_routine())
+				{
+					rte->dolt_branch = pstrdup(revision);
+					rte->dolt_relid = live;
+				}
+				else
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
+				table_close(rel, NoLock);
 			}
-			else
+			if (working && !OidIsValid(live))
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
-			table_close(rel, NoLock);
 		}
-		if (working && !OidIsValid(live))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 		end_api(nest);
 	} PG_FINALLY();
 	{

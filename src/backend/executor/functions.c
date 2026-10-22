@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -588,6 +589,8 @@ init_sql_fcache(FunctionCallInfo fcinfo, bool lazyEvalOK)
 	if (fcache->eslist != NULL)
 	{
 		Assert(fcache->func != NULL);
+		if (!fcache->func->cfunc.fn_hashkey || fcache->func->cfunc.fn_hashkey->catalogContext != CatalogViewCacheId(CatalogViewCurrent()))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot change catalog context during an active SQL function")));
 		return fcache;
 	}
 
@@ -1572,8 +1575,57 @@ postquel_get_single_result(TupleTableSlot *slot,
 /*
  * fmgr_sql: function call manager for SQL functions
  */
+static Datum fmgr_sql_in_context(FunctionCallInfo fcinfo);
+
+/* OID arguments can identify immutable catalog objects in another revision.
+ * Keep nested SQL catalog scans in that scope, and restore it on every exit. */
 Datum
 fmgr_sql(PG_FUNCTION_ARGS)
+{
+	CatalogView *view = NULL,
+			   *previous;
+	Datum		result;
+	bool		candidate = false;
+	int			i;
+
+	for (i = 0; i < fcinfo->nargs; i++)
+		if (!fcinfo->args[i].isnull && DatumGetObjectId(fcinfo->args[i].value) >= FirstCatalogViewObjectId && (fcinfo->args[i].value <= PG_UINT32_MAX || (int64) fcinfo->args[i].value < 0))
+			candidate = true;
+	if (candidate)
+	{
+		Oid		   *types;
+		int			nargs;
+
+		(void) get_func_signature(fcinfo->flinfo->fn_oid, &types, &nargs);
+		for (i = 0; i < Min(nargs, fcinfo->nargs); i++)
+			if (types[i] == OIDOID && !fcinfo->args[i].isnull)
+			{
+				CatalogView *bound = CatalogViewObjectContext(DatumGetObjectId(fcinfo->args[i].value));
+
+				if (bound && view && view != bound)
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("SQL function arguments span incompatible catalog contexts")));
+				if (bound)
+					view = bound;
+			}
+		pfree(types);
+	}
+	if (!view)
+		view = CatalogViewCurrent();
+	previous = CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		result = fmgr_sql_in_context(fcinfo);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Datum
+fmgr_sql_in_context(FunctionCallInfo fcinfo)
 {
 	SQLFunctionCachePtr fcache;
 	ErrorContextCallback sqlerrcontext;

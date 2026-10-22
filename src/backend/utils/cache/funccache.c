@@ -22,6 +22,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "catalog/pg_proc.h"
 #include "commands/event_trigger.h"
@@ -285,6 +286,7 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 
 	/* get input collation, if known */
 	hashkey->inputCollation = fcinfo->fncollation;
+	hashkey->catalogContext = CatalogViewCacheId(CatalogViewCurrent());
 
 	/*
 	 * We include only input arguments in the hash key, since output argument
@@ -520,6 +522,8 @@ cached_function_compile(FunctionCallInfo fcinfo,
 	 * to find one in the hash table.
 	 */
 recheck:
+	if (function && (!function->fn_hashkey || function->fn_hashkey->catalogContext != CatalogViewCacheId(CatalogViewCurrent())))
+		function = NULL;
 	if (!function)
 	{
 		/* Compute hashkey using function signature and actual arg types */

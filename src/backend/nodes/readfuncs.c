@@ -418,6 +418,9 @@ _readRangeTblEntry(void)
 			break;
 		case RTE_DOLT:
 			READ_STRING_FIELD(dolt_table);
+			READ_STRING_FIELD(dolt_database);
+			READ_OID_FIELD(dolt_catalog);
+			READ_OID_FIELD(dolt_rowtype);
 			READ_STRING_FIELD(dolt_branch);
 			READ_OID_FIELD(dolt_relid);
 			READ_NODE_FIELD(coltypes);

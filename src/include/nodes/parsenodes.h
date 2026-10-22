@@ -1259,6 +1259,11 @@ typedef struct RangeTblEntry
 	 */
 	/* RTE_DOLT: retained table descriptor address (hex), not a runtime OID. */
 	char	   *dolt_table;
+	char	   *dolt_database;	/* canonical schema context, also for catalog
+								 * scans */
+	Oid			dolt_catalog;	/* native catalog scanned through that
+								 * context, or zero */
+	Oid			dolt_rowtype;	/* backend-local bound row type */
 	char	   *dolt_branch;
 	Oid			dolt_relid;
 

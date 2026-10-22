@@ -1346,6 +1346,16 @@ RelationInitPhysicalAddr(Relation relation)
 {
 	RelFileNumber oldnumber = relation->rd_locator.relNumber;
 
+	/*
+	 * Canonical definitions are not mapped physical relations. Storage access
+	 * must use an explicitly bound resource; retained metadata has no file.
+	 */
+	if (CatalogViewObjectContext(RelationGetRelid(relation)))
+	{
+		MemSet(&relation->rd_locator, 0, sizeof(relation->rd_locator));
+		return;
+	}
+
 	/* these relations kinds never have storage */
 	if (!RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 		return;

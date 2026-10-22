@@ -3,6 +3,15 @@
 #include "nodes/makefuncs.h"
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
+#include "catalog/catalogview.h"
+#include "catalog/heap.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_cast.h"
+#include "catalog/dependency.h"
+#include "catalog/pg_type.h"
+#include "access/heapam.h"
+#include "access/sysattr.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
@@ -15,6 +24,8 @@
 #include "utils/regproc.h"
 #include "utils/varlena.h"
 #include "parser/parse_expr.h"
+#include "parser/parser.h"
+#include "commands/defrem.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "optimizer/optimizer.h"
@@ -1020,6 +1031,7 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 
 
+#include "dg_provider.inc"
 #include "dg_catalog.inc"
 
 #include "dg_catalog_ddl.inc"

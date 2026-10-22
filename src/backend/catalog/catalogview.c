@@ -25,6 +25,7 @@ struct CatalogView
 {
 	MemoryContext memory;
 	char	   *identity;
+	uint64		serial;
 	uint64		references;
 	bool		sealed;
 	List	   *catalogs;
@@ -61,6 +62,7 @@ typedef struct CatalogViewObject
 static HTAB *objects;
 static Oid	next_handle = FirstCatalogViewObjectId;
 
+static uint64 next_view_serial = 1;
 static CatalogView *current_view;
 static dlist_head views = DLIST_STATIC_INIT(views);
 
@@ -73,6 +75,9 @@ CatalogViewCreate(const char *identity)
 
 	view->memory = memory;
 	view->identity = pstrdup(identity);
+	if (!next_view_serial)
+		elog(ERROR, "catalog context identifier space exhausted");
+	view->serial = next_view_serial++;
 	view->references = 1;
 	dlist_push_tail(&views, &view->link);
 	MemoryContextSwitchTo(previous);
@@ -238,6 +243,7 @@ CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys)
 	bool		has_bound_key = false;
 	int			i;
 
+
 	for (i = 0; i < nkeys; i++)
 	{
 		int			attr = keys[i].sk_attno;
@@ -257,7 +263,7 @@ CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys)
 	if (!CatalogViewContains(view, RelationGetRelid(relation)))
 	{
 		if (has_bound_key)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog scan cannot follow this revision-bound handle")));
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog scan of %u cannot follow this revision-bound handle", RelationGetRelid(relation))));
 		return NULL;
 	}
 	scan = palloc0(sizeof(*scan));
@@ -443,7 +449,7 @@ CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const in
 
 	for (i = 0; i < nkeys; i++)
 	{
-		if (values[i] <= UINT32_MAX && attributes[i] > 0 && TupleDescAttr(desc, attributes[i] - 1)->atttypid == OIDOID)
+		if (attributes[i] > 0 && TupleDescAttr(desc, attributes[i] - 1)->atttypid == OIDOID)
 		{
 			CatalogView *view = CatalogViewObjectContext(DatumGetObjectId(values[i]));
 
@@ -530,4 +536,27 @@ CatalogViewRejectPhysicalAccess(Relation relation)
 	if (CatalogViewContains(CatalogViewCurrent(), RelationGetRelid(relation)))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("physical access to revision-bound catalog %s is not supported", RelationGetRelationName(relation))));
+}
+
+Oid
+CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity)
+{
+	ListCell   *lc;
+
+	foreach(lc, view->handles)
+	{
+		Oid			handle = lfirst_oid(lc);
+		CatalogViewObject *object = hash_search(objects, &handle, HASH_FIND, NULL);
+
+		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
+			return handle;
+	}
+	ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("object %s does not exist in catalog context", identity)));
+	return InvalidOid;
+}
+
+uint64
+CatalogViewCacheId(CatalogView *view)
+{
+	return view ? view->serial : 0;
 }

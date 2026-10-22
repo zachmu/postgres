@@ -561,6 +561,9 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			break;
 		case RTE_DOLT:
 			WRITE_STRING_FIELD(dolt_table);
+			WRITE_STRING_FIELD(dolt_database);
+			WRITE_OID_FIELD(dolt_catalog);
+			WRITE_OID_FIELD(dolt_rowtype);
 			WRITE_STRING_FIELD(dolt_branch);
 			WRITE_OID_FIELD(dolt_relid);
 			WRITE_NODE_FIELD(coltypes);

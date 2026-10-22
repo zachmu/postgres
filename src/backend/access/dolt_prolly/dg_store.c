@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "catalog/catalogview.h"
 #include "access/doltbranch.h"
 #include "access/doltcatalog.h"
 #include "access/generic_xlog.h"
@@ -198,16 +199,25 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 DGState *
 dg_load(Relation rel, Snapshot snap)
 {
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+
 	return load_state(rel, snap, NULL, dg_relation_branch(rel), true);
 }
 DGState *
 dg_load_branch(Relation rel, Snapshot snap, const char *branch)
 {
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+
 	return load_state(rel, snap, NULL, branch, false);
 }
 DGState *
 dg_load_tid(Relation rel, uint64 id)
 {
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+
 	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true);
 }
 static void
@@ -229,11 +239,15 @@ append(Relation rel, const uint8 *data, Size length)
 void
 dg_save(Relation rel, DGState *s, CommandId cid)
 {
+
 	size_t		i;
 	uint8		data[DG_HEADER + DG_PART];
 	PLHash		binding;
 	const char *branch = dg_relation_branch(rel);
 	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
+
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
 	if (!pl_hash_bytes(branchbytes, &binding))
 		elog(ERROR, "branch hash failed");

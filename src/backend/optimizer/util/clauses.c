@@ -18,6 +18,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "catalog/pg_language.h"
@@ -4546,6 +4547,19 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 						 result_collid);
 }
 
+/* Identify calls whose argument OIDs can belong to a canonical revision. */
+static bool
+has_catalog_context(Node *node, void *unused)
+{
+	if (!node)
+		return false;
+	if (IsA(node, RangeTblEntry))
+		return ((RangeTblEntry *) node)->rtekind == RTE_DOLT;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, has_catalog_context, NULL, QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, has_catalog_context, NULL);
+}
+
 /*
  * inline_function: try to expand a function call inline
  *
@@ -4616,6 +4630,22 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		!heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL) ||
 		funcform->pronargs != list_length(args))
 		return NULL;
+
+	/*
+	 * Inlining must not erase the call boundary that recovers a bound OID's
+	 * catalog scope. Preserve ordinary context-free SQL-function
+	 * optimization.
+	 */
+	for (i = 0; i < funcform->pronargs; i++)
+		if (funcform->proargtypes.values[i] == OIDOID)
+		{
+			Node	   *value = list_nth(args, i);
+
+			if (CatalogViewCurrent() || IsA(value, Param) ||
+				(context->root && has_catalog_context((Node *) context->root->parse, NULL)) ||
+				(IsA(value, Const) && !((Const *) value)->constisnull && CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))
+				return NULL;
+		}
 
 	/* Check for recursive function, and give up trying to expand if so */
 	if (list_member_oid(context->active_fns, funcid))
@@ -5197,6 +5227,22 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		ReleaseSysCache(func_tuple);
 		return NULL;
 	}
+
+	/* A bound OID must retain the fmgr_sql context-selection boundary. */
+	for (int i = 0; i < funcform->pronargs; i++)
+		if (funcform->proargtypes.values[i] == OIDOID)
+		{
+			Node	   *value = list_nth(fexpr->args, i);
+
+			if (CatalogViewCurrent() || IsA(value, Param) ||
+				has_catalog_context((Node *) root->parse, NULL) ||
+				(IsA(value, Const) && !((Const *) value)->constisnull &&
+				 CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))
+			{
+				ReleaseSysCache(func_tuple);
+				return NULL;
+			}
+		}
 
 	/*
 	 * Make a temporary memory context, so that we don't leak all the stuff
