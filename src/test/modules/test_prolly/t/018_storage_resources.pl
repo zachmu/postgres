@@ -13,9 +13,25 @@ sql(q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_p
 my $head=sql(q{SELECT dolt_commit('-Am','base')});
 my $resource=sql(q{SELECT bindrelid FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'});
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),'2','capture registers table and index resources');
-is(sql(q{SELECT bool_and(s.storageid=c.oid AND s.storagefile=pg_relation_filenode(c.oid) AND s.storageam=c.relam AND s.storagekind=c.relkind AND s.storageschema=b.bindschema) FROM pg_dolt_storage s JOIN pg_class c ON c.oid=s.storageid JOIN pg_dolt_binding b ON b.bindrelid=s.storageid}),'t','imported resource records describe files and exact canonical schemas');
+is(sql(q{SELECT bool_and(s.storageid=c.oid AND s.storagefile=pg_relation_filenode(c.oid) AND s.storageam=c.relam AND s.storagekind=c.relkind) FROM pg_dolt_storage s JOIN pg_class c ON c.oid=s.storageid JOIN pg_dolt_binding b ON b.bindrelid=s.storageid}),'t','imported resource records describe files independently of canonical schemas');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING')}),'0','resource registration does not change canonical content');
 fails(q{SET ROLE reader; SELECT * FROM pg_dolt_storage},qr/permission denied/,'resource records are internal');
+# A schema revision changes the branch binding, not the resource identity or row.
+# Branch creation alone does not activate the temporary shared-DDL freeze.
+sql(q{SELECT dolt_branch('before_comment')});
+my $registration=sql("SELECT xmin::text||':'||ctid::text FROM pg_dolt_storage WHERE storageid=$resource");
+sql(q{COMMENT ON COLUMN t.v IS 'revised definition'; SELECT dolt_commit('-Am','schema revision')});
+is(sql(q{SELECT count(DISTINCT bindrelid),count(DISTINCT bindschema) FROM pg_dolt_binding WHERE bindname='public.t' AND bindbranch IN ('main','before_comment')}),'1|2','two canonical schemas bind to one storage resource');
+is(sql("SELECT xmin::text||':'||ctid::text FROM pg_dolt_storage WHERE storageid=$resource"),$registration,'schema capture does not rewrite resource registration');
+is(sql(q{SELECT a.v,b.v FROM "postgres/main".public.t a JOIN "postgres/before_comment".public.t b USING(id)}),'base|base','working reads bind distinct schema revisions to the same file');
+is(sql(q{SELECT count(*) FROM "postgres/before_comment".pg_catalog.pg_description WHERE objsubid=2}),'0','old branch catalog excludes the new column comment');
+is(sql(q{SELECT description FROM "postgres/main".pg_catalog.pg_description WHERE objsubid=2}),'revised definition','new branch catalog supplies its own definition');
+for my $revision (1..3)
+{
+ sql("COMMENT ON COLUMN t.v IS 'revision $revision'; SELECT dolt_commit('-Am','schema revision $revision')");
+}
+is(sql(q{SELECT count(*) FROM pg_dolt_storage}),'2','repeated schema commits allocate no additional resource identifiers');
+is(sql("SELECT xmin::text||':'||ctid::text FROM pg_dolt_storage WHERE storageid=$resource"),$registration,'repeated schema capture leaves the resource tuple unchanged');
 sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other'); UPDATE t SET v='other'});
 is(sql(q{SELECT a.v,b.v FROM "postgres/main".public.t a JOIN "postgres/other".public.t b USING(id)}),'base|other','one resource supplies independently selected branch roots');
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),'2','branch creation shares resources without schema copies');
@@ -27,7 +43,7 @@ is($locked->query_safe(q{SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid(
 $locked->query_safe('ROLLBACK');$locked->quit;
 # A stale plan must not silently adopt a resource with a different schema.
 sql(q{PREPARE held AS SELECT * FROM "postgres/other".public.t; EXECUTE held; DISCARD PLANS; EXECUTE held});
-fails("BEGIN; UPDATE pg_dolt_storage SET storageschema=decode(repeat('00',32),'hex') WHERE storageid=$resource; SELECT * FROM \"postgres/other\".public.t",qr/runtime catalog binding unavailable/,'incompatible resource schema fails closed');
+fails("BEGIN; UPDATE pg_dolt_binding SET bindschema=decode(repeat('00',32),'hex') WHERE bindrelid=$resource AND bindbranch='other'; SELECT * FROM \"postgres/other\".public.t",qr/runtime catalog binding unavailable/,'incompatible branch schema binding fails closed');
 fails("BEGIN; UPDATE pg_dolt_storage SET storageam=0 WHERE storageid=$resource; SELECT * FROM \"postgres/other\".public.t",qr/storage resource properties do not match/,'incompatible resource AM fails before page access');
 is(sql(q{SELECT * FROM "postgres/other".public.t}),'1|other','failed resource change rolls back');
 # The statement snapshot applies to both mapping and resource rows.

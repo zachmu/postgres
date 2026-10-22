@@ -1,6 +1,6 @@
 /*
  * A canonical definition and a storage resource are different objects.
- * Resource records contain locators and compatibility evidence, never columns,
+ * Resource records contain locators and access-method properties, never columns,
  * names, types or constraints. The transaction snapshot selects the binding.
  *
  * For now native capture registers existing permanent relation files. A future
@@ -46,7 +46,7 @@ same_schema(bytea *a, bytea *b)
 
 /* Called while capture holds the source relation lock. */
 void
-dg_storage_record(Relation source, bytea *schema)
+dg_storage_record(Relation source)
 {
 	Relation	catalog;
 	SysScanDesc scan;
@@ -55,8 +55,7 @@ dg_storage_record(Relation source, bytea *schema)
 				tuple;
 	Datum		values[Natts_pg_dolt_storage];
 	bool		nulls[Natts_pg_dolt_storage] = {false};
-	bool		changed = true,
-				isnull;
+	bool		changed = true;
 	Snapshot	snapshot;
 	Oid			id = RelationGetRelid(source);
 
@@ -71,14 +70,13 @@ dg_storage_record(Relation source, bytea *schema)
 	if (HeapTupleIsValid(old))
 	{
 		Form_pg_dolt_storage form = (Form_pg_dolt_storage) GETSTRUCT(old);
-		bytea	   *stored = DatumGetByteaPP(heap_getattr(old, Anum_pg_dolt_storage_storageschema, RelationGetDescr(catalog), &isnull));
 
 		if (!form->storageimported)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource identity belongs to an independent allocation")));
 
 		changed = form->storagespc != source->rd_locator.spcOid || form->storagedb != source->rd_locator.dbOid ||
 			form->storagefile != source->rd_locator.relNumber || form->storageam != source->rd_rel->relam ||
-			form->storagekind != source->rd_rel->relkind || !same_schema(stored, schema);
+			form->storagekind != source->rd_rel->relkind;
 	}
 	if (changed)
 	{
@@ -88,7 +86,6 @@ dg_storage_record(Relation source, bytea *schema)
 		values[Anum_pg_dolt_storage_storagefile - 1] = ObjectIdGetDatum(source->rd_locator.relNumber);
 		values[Anum_pg_dolt_storage_storageam - 1] = ObjectIdGetDatum(source->rd_rel->relam);
 		values[Anum_pg_dolt_storage_storagekind - 1] = CharGetDatum(source->rd_rel->relkind);
-		values[Anum_pg_dolt_storage_storageschema - 1] = PointerGetDatum(schema);
 		values[Anum_pg_dolt_storage_storageimported - 1] = BoolGetDatum(true);
 		tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 		if (HeapTupleIsValid(old))
@@ -108,7 +105,7 @@ dg_storage_record(Relation source, bytea *schema)
  * The caller must publish canonical membership and a branch binding in the same
  * transaction. Native pending-delete machinery owns file cleanup on abort. */
 Oid
-dg_storage_allocate(Relation definition, bytea *schema, const char *branch)
+dg_storage_allocate(Relation definition, const char *branch)
 {
 	Relation	catalog;
 	Relation	resource = palloc0(sizeof(RelationData));
@@ -147,7 +144,6 @@ dg_storage_allocate(Relation definition, bytea *schema, const char *branch)
 	values[Anum_pg_dolt_storage_storageam - 1] = ObjectIdGetDatum(form.relam);
 	values[Anum_pg_dolt_storage_storagekind - 1] = CharGetDatum(form.relkind);
 	values[Anum_pg_dolt_storage_storageimported - 1] = BoolGetDatum(false);
-	values[Anum_pg_dolt_storage_storageschema - 1] = PointerGetDatum(schema);
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	CatalogTupleInsert(catalog, tuple);
 	heap_freetuple(tuple);
@@ -221,9 +217,6 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is unavailable", resource)));
 	form = *(Form_pg_dolt_storage) GETSTRUCT(tuple);
-	stored = DatumGetByteaPP(heap_getattr(tuple, Anum_pg_dolt_storage_storageschema, RelationGetDescr(catalog), &isnull));
-	if (!same_schema(stored, schema))
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource schema does not match canonical definition")));
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
 	storage->definition = relation_open(definition, NoLock);

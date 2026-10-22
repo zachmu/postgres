@@ -7,10 +7,10 @@ use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('storage_allocation');
 $node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
-sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,bytea,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT});
+sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT});
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'main')});
 sql(q{SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
-my $allocate=q{SELECT test_storage_allocate(c.oid,b.bindschema,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c JOIN pg_dolt_binding b ON b.bindname='public.'||c.relname AND b.bindbranch='other' WHERE c.relname='t'};
+my $allocate=q{SELECT test_storage_allocate(c.oid,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c JOIN pg_dolt_binding b ON b.bindname='public.'||c.relname AND b.bindbranch='other' WHERE c.relname='t'};
 my $pending=$node->background_psql('postgres');
 $pending->query_safe('BEGIN');
 my $aborted=$pending->query_safe($allocate);
@@ -56,7 +56,7 @@ is($plan->query_safe('EXECUTE current_binding'),'0','read-committed prepared pla
 $old->query_safe('ROLLBACK');$old->quit;$plan->quit;
 is(sql(q{SELECT * FROM "postgres/main".public.t}),'1|main','other branch retains its original resource and rows');
 is(sql(q{SELECT * FROM t AS OF 'HEAD'}),'1|main','retained query still reads canonical commit content');
-my $index=sql(q{SELECT test_storage_allocate(c.oid,b.bindschema,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c JOIN pg_dolt_binding b ON b.bindname='public.'||c.relname AND b.bindbranch='other' WHERE c.relname='t_pkey'});
+my $index=sql(q{SELECT test_storage_allocate(c.oid,'other') FROM pg_catalog.pg_class AS OF 'HEAD' c JOIN pg_dolt_binding b ON b.bindname='public.'||c.relname AND b.bindbranch='other' WHERE c.relname='t_pkey'});
 is(sql("SELECT storagekind FROM pg_dolt_storage WHERE storageid=$index"),'i','native index definition can allocate an independent index file');
 is(sql("SELECT count(*) FROM pg_class WHERE oid=$index"),'0','index allocation also has no physical schema row');
 $node->stop('immediate');$node->start;
