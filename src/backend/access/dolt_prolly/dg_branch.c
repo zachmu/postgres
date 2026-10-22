@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
@@ -73,7 +74,7 @@ dg_branch_base(Relation rel, DGState *state)
 	bytea	   *address = NULL;
 	bool		isnull;
 
-	if (!strcmp(dg_relation_branch(rel), "main"))
+	if (dg_catalog_creating_relation(rel) || !strcmp(dg_relation_branch(rel), "main"))
 		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect branch SPI");

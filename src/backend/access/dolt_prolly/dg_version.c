@@ -3,6 +3,7 @@
 #include "nodes/makefuncs.h"
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
+#include "catalog/index.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
 #include "utils/syscache.h"
@@ -59,8 +60,11 @@ typedef struct Capture
 	char	   *json;
 	bytea	   *hash;
 } Capture;
+
 /* Only set while publishing a freshly created physical relation. */
-static Oid catalog_new_relation = InvalidOid;
+static Oid	catalog_new_relation = InvalidOid;
+static bool catalog_creating;
+static bool catalog_new_member(Oid id);
 
 static const VersionRef empty_ref = {NULL, NULL};
 
@@ -358,7 +362,7 @@ capture_inner(bool persist, bool all_catalogs)
 			Oid			id = relations[i];
 			char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(id)), get_rel_name(id));
 
-			if (id == catalog_new_relation || catalog_contains(membership, name))
+			if (catalog_new_member(id) || catalog_contains(membership, name))
 				relations[kept++] = id;
 		}
 		nrel = kept;

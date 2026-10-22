@@ -1,3 +1,50 @@
+/* CREATE scope only admits the newly allocated table and its own indexes. */
+static bool
+catalog_new_member(Oid id)
+{
+	if (!OidIsValid(catalog_new_relation))
+		return false;
+	return id == catalog_new_relation ||
+		(get_rel_relkind(id) == RELKIND_INDEX && IndexGetRelation(id, false) == catalog_new_relation);
+}
+
+bool
+dg_catalog_creating_relation(Relation rel)
+{
+	return catalog_new_member(RelationGetRelid(rel));
+}
+
+void
+dg_catalog_create_scope(bool enter)
+{
+	Assert(!enter || !catalog_creating);
+	catalog_creating = enter;
+	catalog_new_relation = InvalidOid;
+}
+
+void
+dg_catalog_created(Oid id)
+{
+	if (catalog_creating)
+	{
+		Assert(!OidIsValid(catalog_new_relation));
+		catalog_new_relation = id;
+	}
+}
+
+/* Only the native index subcommands emitted by this CREATE may pass the guard. */
+bool
+dg_catalog_create_index(Node *statement)
+{
+	IndexStmt  *stmt;
+
+	if (!catalog_creating || !OidIsValid(catalog_new_relation) || !IsA(statement, IndexStmt))
+		return false;
+	stmt = (IndexStmt *) statement;
+	return stmt->isconstraint && !stmt->concurrent &&
+		RangeVarGetRelid(stmt->relation, NoLock, false) == catalog_new_relation;
+}
+
 /* First writable provider operation: remove branch membership, not storage.
  * The physical catalog remains a runtime bridge for surviving definitions. */
 void
@@ -8,7 +55,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 				nest;
 	bool		pushed = false;
 
-	if (!IsUnderPostmaster || RelationGetRelid(rel) == catalog_new_relation)
+	if (!IsUnderPostmaster || catalog_new_member(RelationGetRelid(rel)))
 		return;
 	GetUserIdAndSecContext(&user, &security);
 	if (!ActiveSnapshotSet() || (snapshot && IsMVCCSnapshot(snapshot)))
@@ -204,19 +251,31 @@ dg_catalog_create_begin(Node *statement)
 		ColumnDef  *col = lfirst(lc);
 		ListCell   *cc;
 
+		if (IsA(col, Constraint))
+		{
+			Constraint *con = (Constraint *) col;
+
+			if (con->deferrable || (con->contype != CONSTR_PRIMARY && con->contype != CONSTR_UNIQUE))
+				unsupported("branch CREATE table constraint");
+			continue;
+		}
 		if (!IsA(col, ColumnDef))
-			unsupported("branch CREATE table constraints or LIKE");
+			unsupported("branch CREATE LIKE");
 		foreach(cc, col->constraints)
 		{
 			Constraint *con = lfirst(cc);
 
-			if (con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL)
-				unsupported("branch CREATE currently supports only NOT NULL constraints");
+			if (con->deferrable || (con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL &&
+									con->contype != CONSTR_PRIMARY && con->contype != CONSTR_UNIQUE))
+				unsupported("branch CREATE supports only NOT NULL, PRIMARY KEY and UNIQUE constraints");
 		}
 	}
 	/* IF NOT EXISTS must not silently accept a retained object absent here. */
 	{
-		Oid			existing = RangeVarGetRelid(stmt->relation, NoLock, true);
+		Oid			existing;
+		Oid			namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing);
+
+		stmt->relation->schemaname = get_namespace_name(namespaceid);
 
 		if (OidIsValid(existing))
 		{

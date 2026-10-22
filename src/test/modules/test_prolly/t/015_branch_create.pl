@@ -8,7 +8,7 @@ $node->init(extra=>['--encoding=UTF8','--locale=C']);
 $node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$pattern,"$label diagnostic"); }
-sql(q{CREATE ROLE creator; GRANT CREATE ON SCHEMA public TO creator; CREATE TABLE seed(id int) USING dolt_prolly_table; SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
+sql(q{CREATE SCHEMA first; CREATE SCHEMA second; CREATE ROLE creator; GRANT CREATE ON SCHEMA public TO creator; CREATE TABLE seed(id int) USING dolt_prolly_table; SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
 sql(q{SET ROLE creator; CREATE TABLE owned(id int); INSERT INTO owned VALUES(7)});
 is(sql(q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='owned'::regclass}), 'creator', 'physical owner remains the caller');
 fails(q{SET ROLE creator; CREATE TABLE pg_catalog.forbidden(id int)},qr/permission denied/, 'native namespace permissions retained');
@@ -21,14 +21,27 @@ sql(q{BEGIN; CREATE TABLE aborted(id int); INSERT INTO aborted VALUES(1); ROLLBA
 is(sql(q{SELECT to_regclass('aborted') IS NULL}),'t','abort removes physical table and canonical membership');
 sql(q{BEGIN; SAVEPOINT s; CREATE TABLE rolled(id int); ROLLBACK TO s; COMMIT});
 is(sql(q{SELECT to_regclass('rolled') IS NULL}),'t','savepoint rolls back CREATE');
-fails(q{CREATE TABLE unsupported(id int DEFAULT 1)},qr/only NOT NULL/,'unsupported defaults remain guarded');
+fails(q{CREATE TABLE unsupported(id int DEFAULT 1)},qr/NOT NULL, PRIMARY KEY/,'unsupported defaults remain guarded');
 is(sql(q{SELECT to_regclass('unsupported') IS NULL}),'t','rejected CREATE leaves no physical object');
+sql(q{CREATE TABLE composite(a int,b int,PRIMARY KEY(a,b)); INSERT INTO composite VALUES(1,2)});
+is(sql('SELECT * FROM composite'),'1|2','table-level composite primary key supported');
+fails(q{CREATE INDEX forbidden_index ON new_table(id)},qr/schema changes/, 'standalone index DDL remains guarded');
+fails(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)},qr/NOT NULL, PRIMARY KEY/, 'deferred constraint remains rejected');
+fails(q{CREATE TABLE bad_index(id json PRIMARY KEY)},qr/default operator class/, 'native index creation failure aborts entire CREATE');
+is(sql(q{SELECT to_regclass('bad_index') IS NULL}),'t','failed index leaves no physical table');
+sql(q{CREATE TABLE after_failure(id int PRIMARY KEY); INSERT INTO after_failure VALUES(4)});
+is(sql(q{SELECT * FROM after_failure}),'4','CREATE scope restored after native failure');
+sql(q{CREATE TABLE second.shadow(id int); SET search_path=first,second; CREATE TABLE shadow(id int); INSERT INTO shadow VALUES(8)});
+is(sql('SELECT * FROM first.shadow'),'8','CREATE uses creation namespace rather than later search path match');
+is(sql('SELECT count(*) FROM second.shadow'),'0','same name in later namespace is untouched');
 my $commit=sql(q{SELECT dolt_commit('-Am','main adds table')});
 is(sql("SELECT * FROM new_table AS OF '$commit'"),'1|main','new schema and rows readable through retained provider');
 my $other=$node->background_psql('postgres',on_error_stop=>0);
 $other->query_safe(q{SELECT dolt_checkout('other')});
-$other->query_safe(q{CREATE TABLE other_table(id int, v text); INSERT INTO other_table VALUES(2,'other')});
+$other->query_safe(q{CREATE TABLE other_table(id int PRIMARY KEY, v text UNIQUE); INSERT INTO other_table VALUES(2,'other')});
 is($other->query_safe('SELECT * FROM other_table'),'2|other','CREATE initializes empty root on non-main branch');
+is($other->query_safe(q{DO $$ BEGIN INSERT INTO other_table VALUES(2,'duplicate'); RAISE EXCEPTION 'duplicate accepted'; EXCEPTION WHEN unique_violation THEN NULL; END $$}), '', 'new branch primary key enforces uniqueness');
+is($other->query_safe(q{DO $$ BEGIN INSERT INTO other_table VALUES(3,'other'); RAISE EXCEPTION 'duplicate accepted'; EXCEPTION WHEN unique_violation THEN NULL; END $$}), '', 'new branch unique index enforces uniqueness');
 $other->query_safe(q{SELECT dolt_commit('-Am','other adds table')});
 is(sql('SELECT * FROM "postgres/other".public.other_table'),'2|other','qualified read sees independently created branch table');
 fails('SELECT * FROM other_table',qr/does not exist on branch/,'ordinary read cannot leak another branch table');
