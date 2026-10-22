@@ -17,7 +17,11 @@ my $aborted=$pending->query_safe($allocate);
 my $path=$pending->query_safe("SELECT 'base/'||storagedb||'/'||storagefile FROM pg_dolt_storage WHERE storageid=$aborted");
 ok(-f $node->data_dir.'/'.$path,'allocation creates a real relation file before commit');
 is(sql("SELECT count(*) FROM pg_dolt_storage WHERE storageid=$aborted"),'0','uncommitted resource is invisible to other sessions');
+$pending->query_safe("UPDATE pg_dolt_binding SET bindrelid=$aborted WHERE bindbranch='other' AND bindname='public.t'");
+is($pending->query_safe(q{SELECT count(*) FROM "postgres/other".public.t}),'0','allocating transaction sees its own provisional binding');
+is(sql(q{SELECT count(*) FROM "postgres/other".public.t}),'1','concurrent session cannot see provisional resource publication');
 $pending->query_safe('ROLLBACK');
+is(sql(q{SELECT count(*) FROM "postgres/other".public.t}),'1','abort restores the prior binding along with storage cleanup');
 sql('CHECKPOINT');
 ok(!-e $node->data_dir.'/'.$path,'abort removes allocated file through native pending-delete machinery');
 is(sql("SELECT count(*) FROM pg_dolt_storage WHERE storageid=$aborted"),'0','abort also removes resource metadata');
@@ -29,18 +33,23 @@ sql('CHECKPOINT');
 ok(!-e $node->data_dir.'/'.$path,'savepoint rollback removes file');
 is(sql("SELECT count(*) FROM pg_dolt_storage WHERE storageid=$rolled"),'0','savepoint rollback removes resource row');
 $pending->quit;
-my $id=sql($allocate);
-is(sql("SELECT count(*) FROM pg_class WHERE oid=$id"),'0','committed allocation has no physical pg_class row');
-is(sql("SELECT count(*) FROM pg_attribute WHERE attrelid=$id"),'0','committed allocation has no physical column definitions');
-is(sql("SELECT count(*) FROM pg_type WHERE typrelid=$id"),'0','committed allocation has no persisted runtime row type');
-is(sql("SELECT storageimported FROM pg_dolt_storage WHERE storageid=$id"),'f','resource owns its file independently of native schema catalogs');
 # Fixture publishes a binding to the existing canonical definition. Full SQL
 # CREATE must publish a new definition and membership as well in one transaction.
 my $old=$node->background_psql('postgres');
 $old->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; PREPARE retained_binding AS SELECT count(*) FROM "postgres/other".public.t; EXECUTE retained_binding});
 my $plan=$node->background_psql('postgres');
 $plan->query_safe(q{PREPARE current_binding AS SELECT count(*) FROM "postgres/other".public.t; EXECUTE current_binding});
-sql("UPDATE pg_dolt_binding SET bindrelid=$id WHERE bindbranch='other' AND bindname='public.t'");
+my $publisher=$node->background_psql('postgres');
+$publisher->query_safe('BEGIN');
+my $id=$publisher->query_safe($allocate);
+$publisher->query_safe("UPDATE pg_dolt_binding SET bindrelid=$id WHERE bindbranch='other' AND bindname='public.t'");
+is(sql(q{SELECT count(*) FROM "postgres/other".public.t}),'1','publication remains invisible until its SQL transaction commits');
+$publisher->query_safe('COMMIT');$publisher->quit;
+is(sql("SELECT count(*) FROM pg_class WHERE oid=$id"),'0','committed allocation has no physical pg_class row');
+is(sql("SELECT count(*) FROM pg_attribute WHERE attrelid=$id"),'0','committed allocation has no physical column definitions');
+is(sql("SELECT count(*) FROM pg_type WHERE typrelid=$id"),'0','committed allocation has no persisted runtime row type');
+is(sql("SELECT storageimported FROM pg_dolt_storage WHERE storageid=$id"),'f','resource owns its file independently of native schema catalogs');
+
 is(sql(q{SELECT count(*) FROM "postgres/other".public.t}),'0','normal qualified SQL reads initialized empty resource with canonical schema');
 is($old->query_safe('EXECUTE retained_binding'),'1','old snapshot and prepared binding retain the prior resource');
 is($plan->query_safe('EXECUTE current_binding'),'0','read-committed prepared plan rebinds after resource publication');
@@ -56,7 +65,7 @@ $node->backup('allocated');
 my $standby=PostgreSQL::Test::Cluster->new('allocated_standby');$standby->init_from_backup($node,'allocated',has_streaming=>1);$standby->start;
 is($standby->safe_psql('postgres',q{SELECT count(*) FROM "postgres/other".public.t}),'0','standby reads allocation without any persisted schema copy');
 $standby->stop;
-# Crash before commit must clean both metadata and newly allocated storage.
+# Crash before commit must not publish resource metadata or replace a binding.
 my $crash=$node->background_psql('postgres');$crash->query_safe('BEGIN');
 my $crashed=$crash->query_safe($allocate);
 $path=$crash->query_safe("SELECT 'base/'||storagedb||'/'||storagefile FROM pg_dolt_storage WHERE storageid=$crashed");

@@ -157,3 +157,13 @@ and current revocations on same-named live objects.
 The report `reports/canonical-catalog-provider.html` in the workspace records the
 exact verification selection and known failure. The first read gate is evidence
 for continuing this architecture, not a claim that branch-aware DDL is complete.
+
+## Storage boundary integration — 2026-10-22
+
+Qualified working reads now bind canonical definitions to separate MVCC-visible
+resource records, with stable storage locks and one retained selection snapshot.
+An internal allocation primitive creates table/index files and empty WAL-backed
+roots without physical schema rows; abort/savepoint, recovery and standby tests
+exercise it. Full SQL CREATE publication and native writable binding remain open.
+See [catalog-storage.md](catalog-storage.md) for the implemented contract, test
+scope, imported-resource bridge, crash-orphan finding and immediate continuation.
