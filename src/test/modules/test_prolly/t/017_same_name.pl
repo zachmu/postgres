@@ -34,7 +34,9 @@ my $internal=sql(q{SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid
 fails("SELECT * FROM $internal.t",qr/private runtime/,'direct internal namespace access rejected');
 is(sql(q{SELECT count(*) FROM pg_dolt_object WHERE objkind IN ('schema','namespace','table','index','database') AND position('pg_dolt_runtime_'::bytea in objpayload)>0}),'0','manifest envelopes and descriptors exclude internal namespace names');
 my $schema=sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'});
-sql(q{DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v int UNIQUE); INSERT INTO t VALUES(1,10); SELECT dolt_commit('--allow-empty','-Am','recreated')});
+sql(q{DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v int UNIQUE); INSERT INTO t VALUES(1,10)});
+is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING')}),'0','identical schema and rows produce identical canonical table and index contents');
+sql(q{SELECT dolt_commit('--allow-empty','-Am','recreated')});
 isnt(sql(q{SELECT 't'::regclass::oid}),$mainoid,'DROP recreate allocates a fresh runtime generation');
 is(sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'}),$schema,'canonical schema identity excludes runtime allocation and namespace');
 is($other->query_safe('SELECT v FROM t WHERE id=1'),'ten','DROP recreate on main preserves other branch');
@@ -64,6 +66,17 @@ fails(q{CREATE TABLE identical_pkey(id int)},qr/already exists/,'table name cann
 # Explicit transactions and savepoints publish all local catalog resources atomically.
 sql(q{BEGIN; SAVEPOINT s; DROP TABLE identical; CREATE TABLE identical(wrong text); ROLLBACK TO s; INSERT INTO identical VALUES(5,'saved'); COMMIT});
 is(sql('SELECT * FROM identical ORDER BY id'),"1|main\n5|saved",'savepoint restores prior binding for later writes');
+
+# A retained resource is still discoverable after its last branch binding moves.
+sql(q{CREATE TABLE archived(id int PRIMARY KEY,v int); INSERT INTO archived VALUES(7,70)});
+my $archive = sql(q{SELECT dolt_commit('-Am','old generation')});
+sql(q{DROP TABLE archived; CREATE TABLE archived(id int PRIMARY KEY,v text); INSERT INTO archived VALUES(8,'new'); SELECT dolt_commit('-Am','new generation')});
+my $history=$node->background_psql('postgres');
+$history->query_safe("SELECT dolt_checkout('-b','archive','$archive')");
+is($history->query_safe('SELECT * FROM archived'),'7|70','branch from retained commit finds runtime generation no longer bound by any branch');
+$history->query_safe(q{INSERT INTO archived VALUES(9,90); SELECT dolt_commit('-Am','historical branch writes')});
+is(sql('SELECT * FROM archived'),'8|new','historical branch writes preserve replacement generation');
+$history->quit;
 $other->quit;
 $node->stop('immediate');$node->start;
 is(sql('SELECT * FROM t'),'1|10','main generation survives recovery');

@@ -95,7 +95,7 @@ binding_prepare(const char *branch, bytea *database, bool required, bool fresh)
 		 * SPI takes a current command snapshot to see parent mappings just
 		 * inserted.
 		 */
-		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_class c ON c.oid=b.bindrelid WHERE b.bindname=$1 AND b.bindschema=$2 AND (c.relkind='r' OR EXISTS (SELECT 1 FROM pg_index x JOIN pg_dolt_binding parent ON parent.bindrelid=x.indrelid WHERE x.indexrelid=c.oid AND parent.bindbranch=$3)) ORDER BY b.bindrelid", 3, VC_TYPES(TEXTOID, BYTEAOID, TEXTOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i]), CStringGetTextDatum(branch)), NULL, false);
+		run("SELECT DISTINCT b.genrelid FROM pg_dolt_generation b JOIN pg_class c ON c.oid=b.genrelid WHERE b.genname=$1 AND b.genschema=$2 AND (c.relkind='r' OR EXISTS (SELECT 1 FROM pg_index x JOIN pg_dolt_binding parent ON parent.bindrelid=x.indrelid WHERE x.indexrelid=c.oid AND parent.bindbranch=$3)) ORDER BY b.genrelid", 3, VC_TYPES(TEXTOID, BYTEAOID, TEXTOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i]), CStringGetTextDatum(branch)), NULL, false);
 		if (SPI_processed == 1 || (fresh && SPI_processed > 0))
 			binding_record(branch, names[i], schemas[i], DatumGetObjectId(cell(0, 1)));
 		else if (required)
@@ -304,4 +304,49 @@ dg_catalog_name_exists(Oid physical, const char *name)
 		return false;
 	rv = makeRangeVar(get_namespace_name(logical), pstrdup(name), -1);
 	return dg_catalog_resolve(rv, true, &id) && OidIsValid(id);
+}
+
+/* Remember available resources after a branch moves to a replacement schema.
+ * This is one row per runtime relation, never one row per commit. */
+static void
+generation_record(const char *name, bytea *schema, Oid relid)
+{
+	Relation	rel = table_open(DoltGenerationRelationId, ShareRowExclusiveLock);
+	ScanKeyData key;
+	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	SysScanDesc scan;
+	HeapTuple	old,
+				tuple;
+	Datum		values[Natts_pg_dolt_generation];
+	bool		nulls[Natts_pg_dolt_generation] = {false};
+	bool		isnull;
+	bool		changed = true;
+
+	ScanKeyInit(&key, Anum_pg_dolt_generation_genrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, DoltGenerationKeyIndexId, true, snapshot, 1, &key);
+	old = systable_getnext(scan);
+	if (HeapTupleIsValid(old))
+	{
+		Datum		oldname = heap_getattr(old, Anum_pg_dolt_generation_genname, RelationGetDescr(rel), &isnull);
+		Datum		oldschema = heap_getattr(old, Anum_pg_dolt_generation_genschema, RelationGetDescr(rel), &isnull);
+
+		changed = strcmp(TextDatumGetCString(oldname), name) || !same(DatumGetByteaPP(oldschema), schema);
+	}
+	if (changed)
+	{
+		values[Anum_pg_dolt_generation_genrelid - 1] = ObjectIdGetDatum(relid);
+		values[Anum_pg_dolt_generation_genname - 1] = CStringGetTextDatum(name);
+		values[Anum_pg_dolt_generation_genschema - 1] = PointerGetDatum(schema);
+		tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+		if (HeapTupleIsValid(old))
+			CatalogTupleUpdate(rel, &old->t_self, tuple);
+		else
+			CatalogTupleInsert(rel, tuple);
+		heap_freetuple(tuple);
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snapshot);
+	table_close(rel, NoLock);
+	if (changed)
+		CommandCounterIncrement();
 }

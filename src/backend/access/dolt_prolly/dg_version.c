@@ -7,6 +7,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
 #include "catalog/pg_dolt_namespace.h"
+#include "catalog/pg_dolt_generation.h"
 #include "catalog/pg_am_d.h"
 #include "access/transam.h"
 #include "access/genam.h"
@@ -87,6 +88,7 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
+static void generation_record(const char *name, bytea *schema, Oid relid);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
 static void binding_prepare(const char *branch, bytea *database, bool required, bool fresh);
@@ -468,6 +470,7 @@ capture_inner(bool persist, bool all_catalogs)
 		if (persist)
 		{
 			shash = put("schema", schema, NULL, 0);
+			generation_record(name, shash, relations[i]);
 			binding_record(dg_current_branch(), name, shash, relations[i]);
 			chunk = DatumGetByteaP(DirectFunctionCall1(dolt_manifest_export, ObjectIdGetDatum(relations[i])));
 			desc = put(kind, member.data, VC_ARGS(PointerGetDatum(shash), PointerGetDatum(chunk)), 2);

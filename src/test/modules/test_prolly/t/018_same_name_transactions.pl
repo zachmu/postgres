@@ -16,6 +16,8 @@ sql(q{CREATE ROLE maker; CREATE ROLE reader; CREATE ROLE othermaker;
  SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
 sql(q{SET ROLE maker; SET search_path=app; CREATE TABLE t(id int PRIMARY KEY,v text); INSERT INTO t VALUES(1,'main')});
 is(sql(q{SET ROLE reader; SELECT * FROM app.t}),'1|main','logical namespace default privileges apply to private table');
+my $main = sql(q{SELECT dolt_commit('-Am','granted table')});
+is(sql(qq{SET ROLE reader; SELECT * FROM app.t AS OF '$main'}),'1|main','historical access checks retained runtime object privileges');
 my $other=$node->background_psql('postgres');
 $other->query_safe(q{SELECT dolt_checkout('other'); SET ROLE othermaker; CREATE TABLE app.t(id int PRIMARY KEY,v int); INSERT INTO app.t VALUES(2,20)});
 is(sql(q{SELECT id,v FROM "postgres/other".app.t}),'2|20','qualified lookup selects incompatible schema outside public');

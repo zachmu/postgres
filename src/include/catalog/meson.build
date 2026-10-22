@@ -73,6 +73,7 @@ catalog_headers = [
   'pg_dolt_ref.h',
   'pg_dolt_binding.h',
   'pg_dolt_namespace.h',
+  'pg_dolt_generation.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.
