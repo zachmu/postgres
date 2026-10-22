@@ -21,5 +21,6 @@ tests += {
     't/015_branch_create.pl',
     't/016_runtime_binding.pl',
     't/017_canonical_catalog.pl',
+      't/018_storage_resources.pl',
   ]},
 }

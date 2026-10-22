@@ -27,6 +27,12 @@ typedef struct DGRows
 	size_t		count;
 	size_t		capacity;
 }			DGRows;
+typedef struct DGStorage DGStorage;
+extern void dg_storage_record(Relation source, bytea *schema);
+extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);
+extern DGState *dg_storage_load(DGStorage *storage, Snapshot snapshot);
+extern void dg_storage_close(DGStorage *storage);
+extern DGState *dg_load_bound(Relation rel, Snapshot snapshot, const char *branch);
 extern void dg_check(PLStatus status);
 extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);

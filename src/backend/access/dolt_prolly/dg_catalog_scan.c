@@ -21,6 +21,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 
 #define CAT_ARGS(...) ((Datum[]){__VA_ARGS__})
@@ -45,6 +46,7 @@ typedef struct DGCatalogScan
 	Relation	objects;
 	Snapshot	snapshot;
 	DGState    *live;
+	DGStorage  *storage;
 	CatalogViewScan *catalog_scan;
 	PLCursor	cursor;
 	MemoryContextCallback cleanup;
@@ -99,6 +101,7 @@ create_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist, L
 	scan->custom_private = list_make3(makeString(pstrdup(rte->dolt_table)), makeString(pstrdup(rte->dolt_branch ? rte->dolt_branch : "")), makeInteger(rte->dolt_relid));
 	scan->custom_private = lappend(scan->custom_private, makeString(pstrdup(rte->dolt_database)));
 	scan->custom_private = lappend(scan->custom_private, makeInteger(rte->dolt_catalog));
+	scan->custom_private = lappend(scan->custom_private, makeInteger(rte->dolt_catalog ? InvalidOid : get_typ_typrelid(rte->dolt_rowtype)));
 	scan->methods = &scan_methods;
 	return &scan->scan.plan;
 }
@@ -262,10 +265,12 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 	s->repeats = 0;
 	if (intVal(lthird(plan->custom_private)))
 	{
-		Relation	rel = table_open((Oid) intVal(lthird(plan->custom_private)), AccessShareLock);
+		Oid			definition = (Oid) intVal(list_nth(plan->custom_private, 5));
+		char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(definition)), get_rel_name(definition));
 
-		s->live = dg_load_branch(rel, s->snapshot, strVal(lsecond(plan->custom_private)));
-		table_close(rel, NoLock);
+		s->storage = dg_storage_open(definition, strVal(lsecond(plan->custom_private)), name,
+									 DatumGetByteaP(children[0]), (Oid) intVal(lthird(plan->custom_private)), s->snapshot);
+		s->live = dg_storage_load(s->storage, s->snapshot);
 		if (s->live->has_root)
 		{
 			dg_check(pl_cursor_init(&s->cursor, &s->live->content, NULL));
@@ -382,7 +387,13 @@ end_scan(CustomScanState *css)
 	{
 		dg_release(s->live);
 		s->live = NULL;
-	} if (s->objects)
+	}
+	if (s->storage)
+	{
+		dg_storage_close(s->storage);
+		s->storage = NULL;
+	}
+	if (s->objects)
 	{
 		table_close(s->objects, AccessShareLock);
 		s->objects = NULL;
