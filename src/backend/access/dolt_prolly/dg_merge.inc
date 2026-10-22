@@ -98,8 +98,16 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		unsupported("checkout supports branch or -b branch [start-point]");
 		return 0;
 	}
-	live = capture(false);
-	same_schema(live.json, metadata(child(commit, 1), "database"));
+	live = capture_mode(false, true);
+	{
+		bytea	   *target = read_ref(psprintf("working/%s", name)).target;
+		char	   *definition = metadata(target ? target : child(commit, 1), "database");
+
+		/* Retained physical objects may outlive membership on one branch. */
+		run("SELECT NOT EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb->'members') wanted WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements($2::jsonb->'members') live WHERE wanted-'content'=live-'content'))", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(live.json)), NULL, true);
+		if (!DatumGetBool(cell(0, 1)))
+			unsupported("schema checkout: incompatible runtime definitions");
+	}
 
 	/*
 	 * A persistent marker freezes shared schemas after branch views are

@@ -52,7 +52,6 @@ sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
 for my $case (
  ['CREATE TABLE branch_only(id int) USING dolt_prolly_table', 'CREATE'],
  ['ALTER TABLE t ADD COLUMN extra int', 'ALTER'],
- ['DROP TABLE t', 'DROP'],
  ['TRUNCATE t', 'TRUNCATE'])
 {
  rejected(q{SELECT dolt_checkout('other'); } . $case->[0], qr/schema changes with multiple branches/, "$case->[1] remains guarded on activated branches");
@@ -78,7 +77,7 @@ is(sql(q{SELECT v FROM "postgres/other".public.t}), '20', 'committed working roo
 is(sql(q{SELECT v FROM "postgres/main".public.t}), '10', 'other branch root remains unchanged');
 $node->stop('immediate');
 $node->start;
-rejected('DROP TABLE t', qr/schema changes with multiple branches/, 'DDL activation guard survives restart');
+rejected('ALTER TABLE t ADD COLUMN extra int', qr/schema changes with multiple branches/, 'DDL activation guard survives restart');
 is(sql("SELECT * FROM t AS OF '$old'"), '1|10', 'retained schema survives restart');
 $node->stop;
 done_testing();

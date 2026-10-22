@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_dolt_ref.h"
 
 #include "access/transam.h"
@@ -3727,7 +3728,8 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 
-			if (rte->rtekind == RTE_DOLT)
+			if (rte->rtekind == RTE_DOLT ||
+				(rte->rtekind == RTE_RELATION && get_rel_relam(rte->relid) == DOLT_PROLLY_TABLE_AM_OID))
 			{
 				context->glob->relationOids = lappend_oid(context->glob->relationOids, DoltRefRelationId);
 				if (OidIsValid(rte->dolt_relid))

@@ -45,7 +45,7 @@ failure(cas('heads/main', undef, $c1), qr/duplicate key/, 'concurrent-style dupl
 failure(cas('heads/bad', undef, $empty), qr/requires commit/, 'HEAD requires commit object');
 failure(q{SELECT dolt_manifest_put('commit',''::bytea,ARRAY[]::bytea[])}, qr/child count/, 'commit needs database child');
 failure(q{SELECT dolt_manifest_put('table',''::bytea,ARRAY[decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex')])}, qr/not visible/, 'dangling children rejected');
-failure(q{SELECT dolt_manifest_put('schema',''::bytea,ARRAY[NULL]::bytea[])}, qr/child count/, 'schema child count validated');
+failure(q{SELECT dolt_manifest_put('schema',''::bytea,ARRAY[NULL,NULL]::bytea[])}, qr/child count/, 'schema child count validated');
 failure(q{SELECT dolt_manifest_put('chunk',''::bytea,ARRAY[NULL]::bytea[])}, qr/cannot be null/, 'null children rejected');
 failure(q{SELECT dolt_manifest_get('\x00'::bytea)}, qr/32 bytes/, 'invalid hash size rejected');
 failure(cas('main', undef, $c1), qr/heads\//, 'ref namespace checked');

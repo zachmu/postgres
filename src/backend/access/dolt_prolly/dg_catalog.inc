@@ -52,6 +52,31 @@ dg_catalog_permission(const char *descriptor, Oid user)
 	} PG_END_TRY();
 }
 
+/* Namespace descriptions are decoded through the same canonical provider. */
+static char *
+catalog_namespace(bytea *db, const char *name)
+{
+	bytea	  **addresses;
+	int			n,
+				i;
+
+	run("SELECT o.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind='namespace'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(db)), NULL, true);
+	n = SPI_processed;
+	addresses = palloc(sizeof(bytea *) * Max(n, 1));
+	for (i = 0; i < n; i++)
+		addresses[i] = DatumGetByteaPCopy(cell(i, 1));
+	for (i = 0; i < n; i++)
+	{
+		char	   *definition = metadata(addresses[i], "namespace");
+		char	   *candidate = json_value(definition, "name");
+
+		if (candidate && !strcmp(candidate, name))
+			return definition;
+	}
+	elog(ERROR, "missing retained namespace");
+	return NULL;
+}
+
 TupleDesc
 dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 {
@@ -124,7 +149,9 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 	{
 		nest = begin_api();
 		working = !rv->dolt_revision && read_ref(psprintf("heads/%s", revision)).target != NULL;
-		db = child(resolve(revision), 1);
+		db = working ? read_ref(psprintf("working/%s", revision)).target : NULL;
+		if (!db)
+			db = child(resolve(revision), 1);
 		foreach(lc, path)
 		{
 			char	   *ns = (char *) lfirst(lc);
@@ -132,7 +159,7 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 			if (!strcmp(ns, "$user"))
 				ns = GetUserNameFromId(user, false);
 			logical = quote_qualified_identifier(ns, rv->relname);
-			run("SELECT t.objhash,convert_from(s.objpayload,'UTF8') FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch JOIN pg_dolt_object s ON s.objhash=t.objchildren[1] WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
+			run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
 			if (SPI_processed)
 			{
 				char	   *nsdef;
@@ -140,11 +167,8 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 							currentrel;
 
 				descriptor = DatumGetByteaPCopy(cell(0, 1));
-				schema = strcell(0, 2);
-				run("SELECT (v->'definition')::text FROM pg_dolt_object d,jsonb_array_elements(convert_from(d.objpayload,'UTF8')::jsonb->'members') v WHERE d.objhash=$1 AND v->>'kind'='namespace' AND v->'definition'->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(ns)), NULL, true);
-				if (SPI_processed != 1)
-					elog(ERROR, "missing retained namespace");
-				nsdef = strcell(0, 1);
+				schema = metadata(child(descriptor, 1), "schema");
+				nsdef = catalog_namespace(db, ns);
 				catalog_acl(nsdef, "USAGE", user);
 				catalog_acl(schema, "SELECT", user);
 

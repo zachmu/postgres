@@ -1,5 +1,6 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
+#include "nodes/makefuncs.h"
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
@@ -254,6 +255,9 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 	Oid			types[] = {TEXTOID, TEXTOID, BYTEAARRAYOID};
 	Datum		args[] = {CStringGetTextDatum(kind), CStringGetTextDatum(json), PointerGetDatum(links(hashes, count))};
 
+	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
+		return dg_schema_store(kind, json);
+
 	run("SELECT pg_catalog.dolt_manifest_put($1,convert_to(($2::jsonb)::text,'UTF8'),$3)", 3, types, args, NULL, false);
 	return (bytea *) DatumGetPointer(cell(0, 1));
 }
@@ -262,6 +266,9 @@ metadata(bytea *hash, const char *kind)
 {
 	Oid			types[] = {BYTEAOID, TEXTOID};
 	Datum		args[] = {PointerGetDatum(hash), CStringGetTextDatum(kind)};
+
+	if (!strcmp(kind, "schema") || !strcmp(kind, "namespace"))
+		return dg_schema_read(hash, kind);
 
 	run("SELECT convert_from(objpayload,'UTF8') FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true);
 	if (!SPI_processed)
@@ -289,13 +296,37 @@ json_field(StringInfo b, const char *key, const char *value, bool comma)
 	escape_json(b, value);
 }
 
+/* Canonical branch membership is authoritative once branch views are active. */
+static bytea *
+catalog_database(const char *branch)
+{
+	VersionRef	ref;
+
+	if (!read_ref("views/enabled").target)
+		return NULL;
+	ref = read_ref(psprintf("working/%s", branch));
+	if (ref.target)
+		return ref.target;
+	ref = read_ref(psprintf("heads/%s", branch));
+	return ref.target ? child(ref.target, 1) : NULL;
+}
+static bool
+catalog_contains(bytea *db, const char *name)
+{
+	if (!db)
+		return true;
+	run("SELECT 1 FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	return SPI_processed != 0;
+}
+
 /* Fixed schema locks make ordinary relcache descriptors safe for this capture.
  * AccessShare relation locks keep DDL out without stopping row writers. */
 static Capture
-capture_inner(bool persist)
+capture_inner(bool persist, bool all_catalogs)
 {
 	Oid			catalogs[] = {RelationRelationId, AttributeRelationId, IndexRelationId, NamespaceRelationId, TypeRelationId, ProcedureRelationId, ConstraintRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, CollationRelationId, AuthIdRelationId, DescriptionRelationId, OperatorRelationId};
 	Capture		result = {0};
+	bytea	   *membership = all_catalogs ? NULL : catalog_database(dg_current_branch());
 	Oid		   *relations;
 	char	  **namespaces;
 	int			nrel,
@@ -315,6 +346,20 @@ capture_inner(bool persist)
 	relations = palloc(sizeof(Oid) * Max(nrel, 1));
 	for (i = 0; i < nrel; i++)
 		relations[i] = DatumGetObjectId(cell(i, 1));
+	if (membership)
+	{
+		int			kept = 0;
+
+		for (i = 0; i < nrel; i++)
+		{
+			Oid			id = relations[i];
+			char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(id)), get_rel_name(id));
+
+			if (catalog_contains(membership, name))
+				relations[kept++] = id;
+		}
+		nrel = kept;
+	}
 	for (i = 0; i < nrel; i++)
 		LockRelationOid(relations[i], AccessShareLock);
 	PopActiveSnapshot();
@@ -370,15 +415,21 @@ capture_inner(bool persist)
 		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 		schemahash = strcell(0, 1);
 		rel = relation_open(relations[i], NoLock);
-		state = dg_load(rel, GetActiveSnapshot());
+		if (all_catalogs)
+			content = pstrdup("");	/* Definition validation never reads
+									 * another branch's rows. */
+		else
 		{
-			bytea	   *raw = palloc(VARHDRSZ + 32);
+			state = dg_load(rel, GetActiveSnapshot());
+			{
+				bytea	   *raw = palloc(VARHDRSZ + 32);
 
-			SET_VARSIZE(raw, VARHDRSZ + 32);
-			memcpy(VARDATA(raw), state->content.root.bytes, 32);
-			content = hex(raw);
+				SET_VARSIZE(raw, VARHDRSZ + 32);
+				memcpy(VARDATA(raw), state->content.root.bytes, 32);
+				content = hex(raw);
+			}
+			dg_release(state);
 		}
-		dg_release(state);
 		relation_close(rel, NoLock);
 		initStringInfo(&member);
 		appendStringInfoChar(&member, '{');
@@ -433,16 +484,16 @@ capture_inner(bool persist)
 	return result;
 }
 static Capture
-capture(bool persist)
+capture_mode(bool persist, bool all_catalogs)
 {
 	Capture		result;
 	int			nest = NewGUCNestLevel();
 
-	set_config_option("search_path", "pg_catalog", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("quote_all_identifiers", "off", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	PG_TRY();
 	{
-		result = capture_inner(persist);
+		result = capture_inner(persist, all_catalogs);
 	}
 	PG_FINALLY();
 	{
@@ -450,6 +501,12 @@ capture(bool persist)
 	}
 	PG_END_TRY();
 	return result;
+}
+
+static Capture
+capture(bool persist)
+{
+	return capture_mode(persist, false);
 }
 
 static char *
@@ -945,3 +1002,5 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 
 #include "dg_catalog.inc"
+
+#include "dg_catalog_ddl.inc"

@@ -1,5 +1,6 @@
 #include "dg.h"
 #include "access/doltbranch.h"
+#include "access/doltcatalog.h"
 #include "access/generic_xlog.h"
 #include "access/relation.h"
 #include "access/transam.h"
@@ -67,6 +68,7 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 				total = 0;
 	PLHash		assembling = {{0}};
 
+	dg_catalog_check_relation(rel, branch, snap);
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	if (!pl_hash_bytes(branchbytes, &binding))

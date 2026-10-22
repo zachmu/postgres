@@ -783,3 +783,25 @@ Continue with explicit writable branch/schema bindings and transaction-local
 schema deltas before lifting DDL guards. Branch-local DDL and versioned routines
 remain unimplemented; the baseline Doltgres failures are documented rather than
 reclassified as passes.
+
+## Canonical schema provider implementation — 2026-10-22
+
+Option 1 is the selected direction: immutable canonical schema descriptions live
+in prolly trees alongside retained data, and native providers resolve a bound
+branch/revision. Shared physical catalogs are a temporary runtime bridge, not the
+canonical cross-branch definition store. No materializer or explicit preparation
+is required for reads.
+
+The first writable subset is implemented: branch-local `DROP TABLE ... RESTRICT`
+updates only canonical working-set membership, atomically under PostgreSQL MVCC
+and WAL. Other branches and historical reads retain their table/index storage.
+Table and namespace descriptions now use the existing prolly encoding/chunk
+retention machinery. See [implementation details](doc/doltgres/catalog-schema-provider.md).
+
+This is a partial implementation gate, not general branch-aware catalogs. Capture
+still obtains definitions from shared catalogs; CREATE, layout-changing ALTER,
+versioned type/function identities, dependencies and logical catalog introspection
+remain to be implemented. Physical catalog scans still expose retained dropped
+objects. The next gate must address these limitations explicitly; removing the
+remaining guards would be incorrect. Existing table-wide writer serialization
+also remains. No fundamental obstacle to option 1 was found in this subset.

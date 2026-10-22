@@ -35,6 +35,8 @@ extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
 extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
+extern bytea *dg_schema_store(const char *kind, const char *json);
+extern char *dg_schema_read(bytea *address, const char *kind);
 extern void dg_history_handles(DGState *state);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
