@@ -38,7 +38,7 @@ lock_workspace(void)
 				i;
 
 	LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
-	run("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	run("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=coalesce((SELECT logicalnsp FROM pg_catalog.pg_dolt_namespace WHERE runtimensp=c.relnamespace),c.relnamespace) WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
 	n = SPI_processed;
 	ids = palloc(sizeof(Oid) * Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -112,7 +112,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		bytea	   *target = read_ref(psprintf("working/%s", name)).target;
 
-		binding_prepare(name, target ? target : child(commit, 1), true);
+		binding_prepare(name, target ? target : child(commit, 1), true, n >= 2);
 	}
 
 	/*
@@ -559,7 +559,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 	int			n,
 				i;
 
-	run("SELECT c.oid,format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	run("SELECT c.oid,b.bindname FROM pg_dolt_binding b JOIN pg_class c ON c.oid=b.bindrelid WHERE b.bindbranch=$1 AND c.relkind='r' AND EXISTS (SELECT 1 FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$2 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=b.bindname AND t.objchildren[1]=b.bindschema) ORDER BY c.oid", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(dg_current_branch()), PointerGetDatum(theirs)), NULL, true);
 	n = SPI_processed;
 	ids = palloc(sizeof(*ids) * Max(n, 1));
 	names = palloc(sizeof(*names) * Max(n, 1));

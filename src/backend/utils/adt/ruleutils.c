@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include <ctype.h>
 #include <unistd.h>
@@ -13226,7 +13227,7 @@ generate_relation_name(Oid relid, List *namespaces)
 		need_qual = !RelationIsVisible(relid);
 
 	if (need_qual)
-		nspname = get_namespace_name_or_temp(reltup->relnamespace);
+		nspname = get_namespace_name_or_temp(dg_catalog_namespace(reltup->relnamespace));
 	else
 		nspname = NULL;
 
@@ -13258,7 +13259,7 @@ generate_qualified_relation_name(Oid relid)
 	reltup = (Form_pg_class) GETSTRUCT(tp);
 	relname = NameStr(reltup->relname);
 
-	nspname = get_namespace_name_or_temp(reltup->relnamespace);
+	nspname = get_namespace_name_or_temp(dg_catalog_namespace(reltup->relnamespace));
 	if (!nspname)
 		elog(ERROR, "cache lookup failed for namespace %u",
 			 reltup->relnamespace);

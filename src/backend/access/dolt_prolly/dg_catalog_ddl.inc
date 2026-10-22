@@ -67,7 +67,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 	PG_TRY();
 	{
 		bytea	   *db;
-		char	   *name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+		char	   *name = binding_name(RelationGetRelid(rel));
 
 		nest = begin_api();
 		db = catalog_database(branch);
@@ -155,7 +155,7 @@ dg_catalog_drop(Node *statement)
 				if (!OidIsValid(id))
 					continue;
 				rel = table_open(id, NoLock);
-				name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+				name = binding_name(RelationGetRelid(rel));
 				if (!catalog_contains(working.target, name))
 				{
 					table_close(rel, NoLock);
@@ -165,18 +165,20 @@ dg_catalog_drop(Node *statement)
 				}
 				if (rel->rd_tableam != dg_table_routine())
 					unsupported("branch DROP of non-prolly tables");
-				if (!object_ownercheck(RelationRelationId, id, user) && !object_ownercheck(NamespaceRelationId, RelationGetNamespace(rel), user))
+				if (!object_ownercheck(RelationRelationId, id, user) && !object_ownercheck(NamespaceRelationId, dg_catalog_namespace(RelationGetNamespace(rel)), user))
 					aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
 				removed = lappend(removed, name);
 				foreach(index, RelationGetIndexList(rel))
 				{
 					Oid			indexid = lfirst_oid(index);
 
-					removed = lappend(removed, quote_qualified_identifier(get_namespace_name(get_rel_namespace(indexid)), get_rel_name(indexid)));
+					removed = lappend(removed, binding_name(indexid));
 				}
 				table_close(rel, NoLock);
 			}
 			current = capture(true);
+			/* Read the new capture through this API scope's copied snapshot. */
+			advance_snapshot();
 			names = palloc(sizeof(Datum) * Max(list_length(removed), 1));
 			foreach(lc, removed)
 				names[i++] = CStringGetTextDatum((char *) lfirst(lc));
@@ -281,20 +283,24 @@ dg_catalog_create_begin(Node *statement)
 				unsupported("branch CREATE supports only NOT NULL, PRIMARY KEY and UNIQUE constraints");
 		}
 	}
-	/* IF NOT EXISTS must not silently accept a retained object absent here. */
+	/* Resolve duplicates in the logical branch namespace before allocation. */
 	{
+		Oid			physical;
+		Oid			logical = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &physical);
 		Oid			existing;
-		Oid			namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing);
 
-		stmt->relation->schemaname = get_namespace_name(namespaceid);
-
+		stmt->relation->schemaname = get_namespace_name(logical);
+		if (dg_catalog_namespace(logical) != logical)
+			unsupported("CREATE in a private runtime namespace");
+		existing = RangeVarGetRelid(stmt->relation, NoLock, true);
 		if (OidIsValid(existing))
 		{
-			Relation	rel = table_open(existing, AccessShareLock);
-
-			dg_catalog_check_relation(rel, dg_current_branch(), GetTransactionSnapshot());
-			table_close(rel, AccessShareLock);
+			if (!stmt->if_not_exists)
+				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", stmt->relation->relname)));
+			stmt->relation->schemaname = get_namespace_name(get_rel_namespace(existing));
 		}
+		else
+			stmt->relation->schemaname = get_namespace_name(binding_create_namespace(logical, user));
 	}
 	stmt->accessMethod = pstrdup("dolt_prolly_table");
 	return true;
@@ -328,7 +334,7 @@ dg_catalog_create_finish(CreateStmt *stmt)
 		nest = begin_api();
 		working = read_ref(branch_ref("working"));
 		rel = table_open(id, NoLock);
-		if (catalog_contains(working.target, quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel))))
+		if (catalog_contains(working.target, binding_name(RelationGetRelid(rel))))
 		{
 			/* Existing member with IF NOT EXISTS: do not reset its content. */
 			table_close(rel, NoLock);

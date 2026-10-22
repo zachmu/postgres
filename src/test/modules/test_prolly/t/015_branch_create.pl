@@ -44,9 +44,10 @@ is($other->query_safe(q{DO $$ BEGIN INSERT INTO other_table VALUES(2,'duplicate'
 is($other->query_safe(q{DO $$ BEGIN INSERT INTO other_table VALUES(3,'other'); RAISE EXCEPTION 'duplicate accepted'; EXCEPTION WHEN unique_violation THEN NULL; END $$}), '', 'new branch unique index enforces uniqueness');
 $other->query_safe(q{SELECT dolt_commit('-Am','other adds table')});
 is(sql('SELECT * FROM "postgres/other".public.other_table'),'2|other','qualified read sees independently created branch table');
-fails('SELECT * FROM other_table',qr/does not exist on branch/,'ordinary read cannot leak another branch table');
+fails('SELECT * FROM other_table',qr/does not exist/,'ordinary read cannot leak another branch table');
 my($out,$err)=$other->query('CREATE TABLE IF NOT EXISTS new_table(id int)');
-is($err,1,'IF NOT EXISTS cannot hide cross-branch physical name collision');
+is($err,0,'IF NOT EXISTS creates independent same-name branch table');
+is($other->query_safe('SELECT count(*) FROM new_table'),'0','independent same-name table starts empty');
 $other->quit;
 $node->stop('immediate');$node->start;
 is(sql('SELECT * FROM new_table'),'1|main','CREATE publication survives restart');

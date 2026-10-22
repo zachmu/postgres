@@ -15,6 +15,7 @@
 
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/amapi.h"
 #include "access/gist.h"
 #include "access/heapam.h"
@@ -833,6 +834,9 @@ DefineIndex(Oid tableId,
 											stmt->excludeOpNames,
 											stmt->primary,
 											stmt->isconstraint);
+
+	if (dg_catalog_name_exists(namespaceId, indexRelationName))
+		ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", indexRelationName)));
 
 	/*
 	 * look up the access method, verify it can handle the requested features
@@ -2664,7 +2668,8 @@ ChooseRelationName(const char *name1, const char *name2,
 								  &SnapshotDirty,
 								  2, key);
 
-		collides = HeapTupleIsValid(systable_getnext(scan));
+		collides = HeapTupleIsValid(systable_getnext(scan)) ||
+			dg_catalog_name_exists(namespaceid, relname);
 
 		systable_endscan(scan);
 
