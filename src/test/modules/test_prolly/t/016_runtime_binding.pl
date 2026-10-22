@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('runtime_binding');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);
 $node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$pattern,"$label diagnostic"); }
@@ -19,11 +19,15 @@ is(sql(q{SELECT count(*) FROM pg_dolt_binding a JOIN pg_dolt_binding b USING(bin
 is(sql(q{SET ROLE reader; BEGIN READ ONLY; SELECT * FROM "postgres/other".public.t; SELECT pg_current_xact_id_if_assigned() IS NULL; COMMIT}),"1|base\nt",'ordinary read-only binding needs no writes or caller elevation');
 fails(q{SET ROLE reader; SELECT * FROM pg_dolt_binding},qr/permission denied/,'runtime mappings are not public SQL data');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING')}),'0','local binding publication does not change canonical database content');
+my $plan=$node->background_psql('postgres',on_error_stop=>0);
+$plan->query_safe('PREPARE binding_plan AS SELECT * FROM t WHERE false');
 my $old=$node->background_psql('postgres');
 $old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class');
 # Superuser fault injection into local metadata: prove MVCC and fail-closed reads.
 # This is test-only; no public mapping mutation API is introduced.
 sql(q{UPDATE pg_dolt_binding SET bindschema=decode(repeat('00',32),'hex') WHERE bindbranch='main' AND bindname='public.t'});
+my($planout,$planerr)=$plan->query('EXECUTE binding_plan');
+is($planerr,1,'prepared zero-row plan revalidates the runtime binding');$plan->quit;
 is($old->query_safe('SELECT * FROM t'),'1|base','old snapshot retains its binding generation');
 $old->query_safe('COMMIT');$old->quit;
 fails('SELECT * FROM t',qr/runtime catalog binding mismatch/,'fresh ordinary read rejects stale schema binding');
@@ -47,6 +51,11 @@ $node->stop('immediate');$node->start;
 is(sql('SELECT * FROM "postgres/other".public.t'),'1|base','branch binding survives recovery');
 is(sql(q{SELECT bindrelid FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'}),$oid,'runtime OID mapping survives restart');
 is(sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='main' AND bindname='public.t'}),$schema,'schema binding survives restart');
+$node->backup('bound');
+my $standby=PostgreSQL::Test::Cluster->new('bound_standby');
+$standby->init_from_backup($node,'bound',has_streaming=>1);$standby->start;
+is($standby->safe_psql('postgres',q{SET ROLE reader; SELECT * FROM "postgres/other".public.t; SELECT pg_current_xact_id_if_assigned() IS NULL}),"1|base\nt",'cold standby working query uses WAL-recovered binding without writes');
+$standby->stop;
 my $pending=$node->background_psql('postgres');
 $pending->query_safe(q{BEGIN; CREATE TABLE pending(id int PRIMARY KEY); INSERT INTO pending VALUES(9)});
 is(sql(q{SELECT count(*) FROM pg_dolt_binding WHERE bindname IN ('public.pending','public.pending_pkey')}),'0','uncommitted bindings invisible to another session');
