@@ -1,5 +1,9 @@
 # Native versioned catalog provider
 
+> Current direction: see [the latest clarification](#current-provider-integration-direction--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 ## Hard requirements
 
 A valid versioned query must work on first access without user preparation,
@@ -137,3 +141,26 @@ closure. Required cache/permission/introspection prerequisites belong in each ga
 not only at the end. No per-commit physical catalog copies or persistent historical
 query-time materialization. Exact identity encoding and runtime reuse/lifetime rules
 remain explicit implementation decisions; the new sub-plan records their tests.
+
+## Current provider integration direction — 2026-10-22
+
+The runtime-name approach described in the previous revision is superseded by the
+[complete native catalog execution plan](CATALOG-DDL-PLAN.md#current-execution-plan-and-ddl-semantics-clarification--2026-10-22).
+The private-namespace implementation was rolled back. Context-aware lookup is
+required throughout catalog, syscache, relcache, type and dependency interfaces;
+context-bound runtime handles can support native OID consumers but physical
+catalog definitions must not override canonical versioned schemas.
+
+Connect the canonical provider first, then automatic per-reference selection,
+including SQL catalog introspection, plans and execution. The first integrated
+read gate must use actual canonical schemas: two incompatible revisions in one
+query, correct row types and matching catalog results, without preparation or
+persisted projections. Complete storage binding and native DDL publication to
+reach independent same-name writes. Probe CREATE/rollback early during this work.
+
+DDL isolation means another branch's sessions retain their own definitions and
+usable bindings during and after schema changes. Follow PostgreSQL's native DDL
+transaction rules; Dolt's DDL transaction behavior is not a requirement. Native
+abort/savepoint behavior where supported and consistent internal publication still
+apply. The unmerged CatalogView fixtures establish only lookup infrastructure;
+production provider/binding/DDL integration and same-name acceptance remain open.

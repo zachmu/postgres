@@ -1,5 +1,9 @@
 # Versioned catalog runtime bindings
 
+> Current direction: see [the latest clarification](#current-runtime-contract--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 ## Decision — 2026-10-22
 
 This is the current next implementation plan for the
@@ -160,3 +164,33 @@ Coordinate these details with [manifest publication](MANIFEST-PLAN.md) and
 [row-level tracking](ROW-LEVEL-TRACKING-PLAN.md). General multi-branch writes,
 schema merge, all PostgreSQL DDL forms and removal of table-wide writer locks
 remain outside this bounded gate.
+
+## Current runtime contract — 2026-10-22
+
+The earlier internal-name/generation mapping implementation was rejected and
+rolled back. In particular, gate A's instruction to allocate distinct internal
+names and the claim that incompatible definitions require persisted differently
+named relations are withdrawn. Keep that text only as the decision history.
+
+Canonical schema definitions are authoritative. Every versioned reference carries
+schema/revision context through planning and execution. All catalog, syscache,
+relcache, type and dependency lookups honor that context or use an explicitly
+context-bound runtime handle. SQL introspection uses the same branch semantics;
+unsupported paths reject. Physical catalog rows cannot silently supply a different
+definition. A global/session view switch cannot disambiguate two incompatible
+revisions in one statement.
+
+Keep logical identity, canonical schema identity, runtime definition handles and
+stable storage-resource identity distinct. Runtime handles may use backend-local
+OIDs, with explicit pins and lifetime/rebinding rules; they are not permanent
+per-branch/per-commit schema copies. Storage allocation metadata supplies resources
+for locking, buffers and WAL, not schema authority. Plan/portal/type lifetimes and
+cross-backend transport must be addressed; current backend-lifetime typcache pins
+are a prototype limitation, not the final reclamation policy.
+
+Use the [current execution plan](CATALOG-DDL-PLAN.md#current-execution-plan-and-ddl-semantics-clarification--2026-10-22)
+in place of gates A–D's old ordering. Provider and automatic binding/introspection
+precede enabling same-name writes; prove a narrow native CREATE/rollback path early.
+Branch isolation is the hard DDL requirement. Follow PostgreSQL command-specific
+transaction semantics, not Dolt's DDL semantics. Do not replace another branch's
+schema or impose a transaction-duration database-wide DDL freeze to achieve this.

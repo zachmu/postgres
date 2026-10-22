@@ -1,5 +1,9 @@
 # Row-level tracking and concurrent publication plan
 
+> Current direction: see [the latest clarification](#catalog-isolation-and-native-ddl-semantics--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 This sub-plan expands [PLAN.md §13–15](PLAN.md#13-mvcc-locking-and-isolation-integration).
 It records the agreed first-pass direction for Phase 3. It is a design and set of
 implementation gates, not a claim that these mechanisms already exist. Detailed
@@ -368,3 +372,26 @@ it does not replace the planned row-level conflict tracking and three-way workin
 publication. Retain generations initially, and specify pins/reclamation before
 claiming scalable runtime OID/storage lifetime. See the new plan for same-name,
 concurrent-reader, rollback and crash-recovery acceptance gates.
+
+## Catalog isolation and native DDL semantics — 2026-10-22
+
+Use the [current catalog execution plan](CATALOG-DDL-PLAN.md#current-execution-plan-and-ddl-semantics-clarification--2026-10-22)
+and [runtime contract](CATALOG-RUNTIME-BINDING-PLAN.md#current-runtime-contract--2026-10-22)
+in place of the rejected private-namespace/runtime-name workaround. Bound schema
+context supplies definitions; stable storage resources supply shared lock and WAL
+identity. Never substitute backend-local definition OIDs for cross-session resource
+keys or infer branch authority from a physical Relation pointer alone.
+
+The hard DDL requirement is isolation between branches. Preserve PostgreSQL's
+command-specific transaction behavior, including rollback/savepoints for ordinary
+table DDL; adopting Dolt's DDL transaction model is not required. Coordinate schema
+and data/index publication as necessary for native consistency, without adding a
+separate Dolt-style transaction requirement. This does not change the row-level
+concurrency milestones or the working-set three-way publication design.
+
+Add multi-session tests in which A changes schema while B continues reading and
+writing its own definition and using valid cursor/prepared-plan bindings. Test A's
+commit, abort and savepoint rollback. Same-branch stale layouts must block, rebind
+or fail explicitly; another branch's schema must not be replaced or its workload
+held behind a transaction-duration global DDL freeze. Document actual shared
+resource contention separately from logical branch/schema conflict handling.

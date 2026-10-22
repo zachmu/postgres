@@ -1,5 +1,9 @@
 # Database manifest and version-control publication plan
 
+> Current direction: see [the latest clarification](#catalog-publication-scope-clarification--2026-10-22).
+> Earlier runtime-name/private-namespace proposals are historical and superseded
+> where they conflict with that clarification.
+
 This sub-plan accompanies [PLAN.md](PLAN.md) and the
 [row-level tracking plan](ROW-LEVEL-TRACKING-PLAN.md). It records the next
 implementation direction; the foundation status is recorded below.
@@ -330,3 +334,26 @@ Specify initialization for retained writable schemas without local mappings duri
 branch administration. This is not permission for a historical SELECT to create
 persistent catalog projections. Format, identity encoding and recovery/migration
 choices must be recorded and tested before expanding CREATE/ALTER around them.
+
+## Catalog publication scope clarification — 2026-10-22
+
+Follow the [current catalog execution plan](CATALOG-DDL-PLAN.md#current-execution-plan-and-ddl-semantics-clarification--2026-10-22),
+which supersedes the withdrawn private-namespace/runtime-name implementation.
+Canonical schemas supply definitions; local storage locators and runtime handles
+must not become a second schema authority or independently published manifest.
+
+The hard DDL requirement is branch isolation, not Dolt-compatible DDL transaction
+semantics. Use PostgreSQL's native boundary for each supported command, including
+transaction-block restrictions. Ordinary PostgreSQL table DDL remains transactional
+and can share a transaction with DML. Prior atomic publication requirements mean
+coherent schema/dependency/data/index membership under that boundary, including
+native rollback where supported; they do not require a new Dolt-style transaction
+contract or implicit DDL commits. SQL commit, staging and version-control commits
+retain their separate meanings.
+
+Publishing a schema on A must not change B's schema, refs, dependency bindings or
+execution authority. Test B during A's open DDL transaction and after commit/abort,
+as well as recovery before/after publication. Branch-scoped schema conflicts must
+not be implemented as a transaction-duration database-wide freeze. General
+multi-ref atomicity remains a separate existing manifest requirement, not a reason
+to delay proving this catalog isolation gate.
