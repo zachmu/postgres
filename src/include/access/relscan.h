@@ -204,8 +204,10 @@ typedef struct ParallelIndexScanDescData
 struct TupleTableSlot;
 
 /* Struct for storage-or-index scans of system tables */
+struct CatalogViewScan;
 typedef struct SysScanDescData
 {
+	struct CatalogViewScan *catalog_view;
 	Relation	heap_rel;		/* catalog being scanned */
 	Relation	irel;			/* NULL if doing heap scan */
 	struct TableScanDescData *scan; /* only valid in storage-scan case */

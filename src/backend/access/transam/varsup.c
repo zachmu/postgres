@@ -12,6 +12,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
@@ -594,6 +595,13 @@ GetNewObjectId(void)
 				TransamVariables->oidCount = 0;
 			}
 		}
+	}
+
+	/* Keep backend-local catalog handles disjoint from persisted object IDs. */
+	if (TransamVariables->nextOid >= FirstCatalogViewObjectId)
+	{
+		TransamVariables->nextOid = FirstNormalObjectId;
+		TransamVariables->oidCount = 0;
 	}
 
 	/* If we run out of logged for use oids then we must log more */

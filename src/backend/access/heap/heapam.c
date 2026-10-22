@@ -30,6 +30,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/heapam.h"
 #include "access/heaptoast.h"
@@ -1141,6 +1142,15 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	scan->rs_strategy = NULL;	/* set in initscan */
 	scan->rs_cbuf = InvalidBuffer;
 
+	scan->rs_catalogview = CatalogViewBeginScan(relation, nkeys, key);
+	if (scan->rs_catalogview)
+	{
+		if (parallel_scan || (flags & (SO_TYPE_BITMAPSCAN | SO_TYPE_TIDSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_SAMPLESCAN)))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported physical access to a versioned catalog")));
+		scan->rs_base.rs_key = NULL;
+		return (TableScanDesc) scan;
+	}
+
 	/*
 	 * Disable page-at-a-time mode if it's not a MVCC-safe snapshot.
 	 */
@@ -1268,6 +1278,12 @@ heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 			scan->rs_base.rs_flags &= ~SO_ALLOW_PAGEMODE;
 	}
 
+	if (scan->rs_catalogview)
+	{
+		CatalogViewRescan(scan->rs_catalogview, key);
+		return;
+	}
+
 	/*
 	 * unpin scan buffers
 	 */
@@ -1300,6 +1316,16 @@ void
 heap_endscan(TableScanDesc sscan)
 {
 	HeapScanDesc scan = (HeapScanDesc) sscan;
+
+	if (scan->rs_catalogview)
+	{
+		CatalogViewEndScan(scan->rs_catalogview);
+		RelationDecrementReferenceCount(sscan->rs_rd);
+		if (sscan->rs_flags & SO_TEMP_SNAPSHOT)
+			UnregisterSnapshot(sscan->rs_snapshot);
+		pfree(scan);
+		return;
+	}
 
 	/* Note: no locking manipulations needed */
 
@@ -1339,6 +1365,9 @@ HeapTuple
 heap_getnext(TableScanDesc sscan, ScanDirection direction)
 {
 	HeapScanDesc scan = (HeapScanDesc) sscan;
+
+	if (scan->rs_catalogview)
+		return CatalogViewNext(scan->rs_catalogview, direction);
 
 	/*
 	 * This is still widely used directly, without going through table AM, so
@@ -1388,6 +1417,19 @@ bool
 heap_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
 	HeapScanDesc scan = (HeapScanDesc) sscan;
+
+	if (scan->rs_catalogview)
+	{
+		HeapTuple	tuple = CatalogViewNext(scan->rs_catalogview, direction);
+
+		if (!tuple)
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		ExecForceStoreHeapTuple(tuple, slot, false);
+		return true;
+	}
 
 	/* Note: no locking manipulations needed */
 
@@ -1607,6 +1649,8 @@ heap_fetch(Relation relation,
 	Page		page;
 	OffsetNumber offnum;
 	bool		valid;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	/*
 	 * Fetch and pin the appropriate page of the relation.
@@ -2089,6 +2133,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		clear_all_visible = false;
 	bool		vmbuffer_modified = false;
 
+	CatalogViewRejectPhysicalAccess(relation);
+
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
 		   RelationGetNumberOfAttributes(relation));
@@ -2392,6 +2438,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2846,6 +2894,8 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		clear_all_visible = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -3367,6 +3417,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				infomask2_old_tuple,
 				infomask_new_tuple,
 				infomask2_new_tuple;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	Assert(ItemPointerIsValid(otid));
 
@@ -4795,6 +4847,8 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	bool		skip_tuple_lock = false;
 	bool		have_tuple_lock = false;
 	bool		cleared_all_frozen = false;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	*buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
 	block = ItemPointerGetBlockNumber(tid);
@@ -6765,6 +6819,8 @@ heap_inplace_update_and_unlock(Relation relation,
 	int			nmsgs = 0;
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
+
+	CatalogViewRejectPhysicalAccess(relation);
 
 	Assert(ItemPointerEquals(&oldtup->t_self, &tuple->t_self));
 	oldlen = oldtup->t_len - htup->t_hoff;

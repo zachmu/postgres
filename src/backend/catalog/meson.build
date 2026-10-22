@@ -3,6 +3,7 @@
 backend_sources += files(
   'aclchk.c',
   'catalog.c',
+  'catalogview.c',
   'dependency.c',
   'heap.c',
   'index.c',

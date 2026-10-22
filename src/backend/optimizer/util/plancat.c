@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include <math.h>
 
@@ -216,7 +217,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 * whether they're unique indexes or not.
 	 */
 	if ((inhparent && relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		|| (IgnoreSystemIndexes && IsSystemRelation(relation)))
+		|| (IgnoreSystemIndexes && IsSystemRelation(relation))
+		|| CatalogViewContains(CatalogViewCurrent(), relationObjectId))
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;

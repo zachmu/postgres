@@ -20,6 +20,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/catalogview.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
 #include "utils/rel.h"
@@ -234,6 +235,7 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 
+	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -256,6 +258,7 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
+	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_insert(heapRel, tup);
@@ -273,6 +276,7 @@ void
 CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 								 int ntuples, CatalogIndexState indstate)
 {
+	CatalogViewRejectPhysicalAccess(heapRel);
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
@@ -315,6 +319,7 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -339,6 +344,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
@@ -364,5 +370,6 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 void
 CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 {
+	CatalogViewRejectPhysicalAccess(heapRel);
 	simple_heap_delete(heapRel, tid);
 }

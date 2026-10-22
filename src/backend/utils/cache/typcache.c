@@ -40,6 +40,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include <limits.h>
 
@@ -382,8 +383,32 @@ type_cache_syshash(const void *key, Size keysize)
  * TypeCacheEntry items for TYPTYPE_COMPOSITE.  So, tupdesc can't get
  * invalidated during the lookup_type_cache() call.
  */
+static TypeCacheEntry *lookup_type_cacheInContext(Oid type_id, int flags);
+
 TypeCacheEntry *
 lookup_type_cache(Oid type_id, int flags)
+{
+	CatalogView *view = CatalogViewObjectContext(type_id);
+	CatalogView *previous;
+	TypeCacheEntry *result;
+
+	if (!view)
+		return lookup_type_cacheInContext(type_id, flags);
+	previous = CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		result = lookup_type_cacheInContext(type_id, flags);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static TypeCacheEntry *
+lookup_type_cacheInContext(Oid type_id, int flags)
 {
 	TypeCacheEntry *typentry;
 	bool		found;
@@ -488,6 +513,15 @@ lookup_type_cache(Oid type_id, int flags)
 
 		/* These fields can never change, by definition */
 		typentry->type_id = type_id;
+
+		/*
+		 * Native type entries have backend lifetime; keep their immutable
+		 * definitions alive as long as their OID and tuple descriptors can be
+		 * reused.
+		 */
+		typentry->catalogview = CatalogViewObjectContext(type_id);
+		if (typentry->catalogview)
+			CatalogViewRetain(typentry->catalogview);
 		typentry->type_id_hash = get_hash_value(TypeCacheHash, &type_id);
 
 		/* Keep this part in sync with the code below */

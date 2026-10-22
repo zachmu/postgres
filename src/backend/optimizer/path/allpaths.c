@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 #include "access/doltcatalog.h"
 
 #include <limits.h>
@@ -603,6 +604,8 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 	 * return if it becomes clear that we can't safely set it.
 	 */
 	Assert(!rel->consider_parallel);
+	if (rte->rtekind == RTE_RELATION && CatalogViewContains(CatalogViewCurrent(), rte->relid))
+		return;
 
 	/* Don't call this if parallelism is disallowed for the entire query. */
 	Assert(root->glob->parallelModeOK);
