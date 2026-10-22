@@ -34,6 +34,8 @@ typedef struct TypeCacheEntry
 	Oid			type_id;		/* OID of the data type */
 
 	uint32		type_id_hash;	/* hashed value of the OID */
+	struct CatalogView *catalogview;	/* pinned for native typcache entry
+										 * lifetime */
 
 	/* some subsidiary information copied from the pg_type row */
 	int16		typlen;

@@ -43,6 +43,7 @@ typedef bool (*CCFastEqualFN) (Datum a, Datum b);
 
 typedef struct catcache
 {
+	struct CatalogView *cc_catalogview; /* owner of revision-specific tuples */
 	int			id;				/* cache identifier --- see syscache.h */
 	int			cc_nbuckets;	/* # of hash buckets in this cache */
 	TupleDesc	cc_tupdesc;		/* tuple descriptor (copied from reldesc) */
@@ -196,6 +197,7 @@ extern void CreateCacheMemoryContext(void);
 extern CatCache *InitCatCache(int id, Oid reloid, Oid indexoid,
 							  int nkeys, const int *key,
 							  int nbuckets);
+extern void DestroyCatCache(CatCache *cache);
 extern void InitCatCachePhase2(CatCache *cache, bool touch_index);
 
 extern HeapTuple SearchCatCache(CatCache *cache,

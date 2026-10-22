@@ -18,6 +18,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -393,6 +394,15 @@ systable_beginscan(Relation heapRelation,
 {
 	SysScanDesc sysscan;
 	Relation	irel;
+	CatalogViewScan *viewscan = CatalogViewBeginScan(heapRelation, nkeys, key);
+
+	if (viewscan)
+	{
+		sysscan = palloc0(sizeof(SysScanDescData));
+		sysscan->heap_rel = heapRelation;
+		sysscan->catalog_view = viewscan;
+		return sysscan;
+	}
 
 	if (indexOK &&
 		!IgnoreSystemIndexes &&
@@ -401,7 +411,7 @@ systable_beginscan(Relation heapRelation,
 	else
 		irel = NULL;
 
-	sysscan = (SysScanDesc) palloc(sizeof(SysScanDescData));
+	sysscan = (SysScanDesc) palloc0(sizeof(SysScanDescData));
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = irel;
@@ -515,6 +525,9 @@ systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup = NULL;
 
+	if (sysscan->catalog_view)
+		return CatalogViewNext(sysscan->catalog_view, ForwardScanDirection);
+
 	if (sysscan->irel)
 	{
 		if (index_getnext_slot(sysscan->iscan, ForwardScanDirection, sysscan->slot))
@@ -602,6 +615,12 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
+	if (sysscan->catalog_view)
+	{
+		CatalogViewEndScan(sysscan->catalog_view);
+		pfree(sysscan);
+		return;
+	}
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -656,6 +675,18 @@ systable_beginscan_ordered(Relation heapRelation,
 	int			i;
 	ScanKey		idxkey;
 
+	CatalogViewScan *viewscan = CatalogViewBeginScan(heapRelation, nkeys, key);
+
+	if (viewscan)
+	{
+		CatalogViewOrderScan(viewscan, indexRelation);
+		sysscan = palloc0(sizeof(SysScanDescData));
+		sysscan->heap_rel = heapRelation;
+		sysscan->irel = indexRelation;
+		sysscan->catalog_view = viewscan;
+		return sysscan;
+	}
+
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
 		ereport(ERROR,
@@ -667,7 +698,7 @@ systable_beginscan_ordered(Relation heapRelation,
 		elog(WARNING, "using index \"%s\" despite IgnoreSystemIndexes",
 			 RelationGetRelationName(indexRelation));
 
-	sysscan = (SysScanDesc) palloc(sizeof(SysScanDescData));
+	sysscan = (SysScanDesc) palloc0(sizeof(SysScanDescData));
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = indexRelation;
@@ -733,6 +764,9 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 {
 	HeapTuple	htup = NULL;
 
+	if (sysscan->catalog_view)
+		return CatalogViewNext(sysscan->catalog_view, direction);
+
 	Assert(sysscan->irel);
 	if (index_getnext_slot(sysscan->iscan, direction, sysscan->slot))
 		htup = ExecFetchSlotHeapTuple(sysscan->slot, false, NULL);
@@ -756,6 +790,12 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 void
 systable_endscan_ordered(SysScanDesc sysscan)
 {
+	if (sysscan->catalog_view)
+	{
+		CatalogViewEndScan(sysscan->catalog_view);
+		pfree(sysscan);
+		return;
+	}
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);

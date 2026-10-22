@@ -8,6 +8,8 @@
 #include "nodes/pathnodes.h"
 #include "nodes/extensible.h"
 struct ParseState;
+struct CatalogView;
+extern struct CatalogView *dg_catalog_view(const char *database);
 extern bool dg_catalog_creating_relation(Relation rel);
 extern void dg_catalog_create_scope(bool enter);
 extern void dg_catalog_created(Oid id);

@@ -42,6 +42,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/amapi.h"
 #include "access/relation.h"
@@ -319,6 +320,9 @@ index_beginscan_internal(Relation indexRelation,
 
 	RELATION_CHECKS;
 	CHECK_REL_PROCEDURE(ambeginscan);
+	if (CatalogViewContains(CatalogViewCurrent(), indexRelation->rd_index->indrelid))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("physical index access cannot bypass a versioned catalog")));
+
 
 	if (!(indexRelation->rd_indam->ampredlocks))
 		PredicateLockRelation(indexRelation, snapshot);
@@ -359,6 +363,7 @@ index_rescan(IndexScanDesc scan,
 {
 	SCAN_CHECKS;
 	CHECK_SCAN_PROCEDURE(amrescan);
+
 
 	Assert(nkeys == scan->numberOfKeys);
 	Assert(norderbys == scan->numberOfOrderBys);

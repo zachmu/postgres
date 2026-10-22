@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/genam.h"
 #include "access/heaptoast.h"
@@ -1473,6 +1474,8 @@ SearchCatCacheInternal(CatCache *cache,
 			ResourceOwnerEnlarge(CurrentResourceOwner);
 			ct->refcount++;
 			ResourceOwnerRememberCatCacheRef(CurrentResourceOwner, &ct->tuple);
+			if (cache->cc_catalogview)
+				CatalogViewRetain(cache->cc_catalogview);
 
 			CACHE_elog(DEBUG2, "SearchCatCache(%s): found in bucket %d",
 					   cache->cc_relname, hashIndex);
@@ -1589,6 +1592,8 @@ SearchCatCacheMiss(CatCache *cache,
 			ResourceOwnerEnlarge(CurrentResourceOwner);
 			ct->refcount++;
 			ResourceOwnerRememberCatCacheRef(CurrentResourceOwner, &ct->tuple);
+			if (cache->cc_catalogview)
+				CatalogViewRetain(cache->cc_catalogview);
 			break;				/* assume only one match */
 		}
 
@@ -1665,6 +1670,7 @@ ReleaseCatCacheWithOwner(HeapTuple tuple, ResourceOwner resowner)
 {
 	CatCTup    *ct = (CatCTup *) (((char *) tuple) -
 								  offsetof(CatCTup, tuple));
+	CatalogView *view = ct->my_cache->cc_catalogview;
 
 	/* Safety checks to ensure we were handed a cache entry */
 	Assert(ct->ct_magic == CT_MAGIC);
@@ -1681,6 +1687,8 @@ ReleaseCatCacheWithOwner(HeapTuple tuple, ResourceOwner resowner)
 		ct->refcount == 0 &&
 		(ct->c_list == NULL || ct->c_list->refcount == 0))
 		CatCacheRemoveCTup(ct->my_cache, ct);
+	if (view)
+		CatalogViewRelease(view);
 }
 
 
@@ -1839,6 +1847,8 @@ SearchCatCacheList(CatCache *cache,
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 		cl->refcount++;
 		ResourceOwnerRememberCatCacheListRef(CurrentResourceOwner, cl);
+		if (cache->cc_catalogview)
+			CatalogViewRetain(cache->cc_catalogview);
 
 		CACHE_elog(DEBUG2, "SearchCatCacheList(%s): found list",
 				   cache->cc_relname);
@@ -2088,6 +2098,8 @@ SearchCatCacheList(CatCache *cache,
 	/* Finally, bump the list's refcount and return it */
 	cl->refcount++;
 	ResourceOwnerRememberCatCacheListRef(CurrentResourceOwner, cl);
+	if (cache->cc_catalogview)
+		CatalogViewRetain(cache->cc_catalogview);
 
 	CACHE_elog(DEBUG2, "SearchCatCacheList(%s): made list of %d members",
 			   cache->cc_relname, nmembers);
@@ -2109,6 +2121,8 @@ ReleaseCatCacheList(CatCList *list)
 static void
 ReleaseCatCacheListWithOwner(CatCList *list, ResourceOwner resowner)
 {
+	CatalogView *view = list->my_cache->cc_catalogview;
+
 	/* Safety checks to ensure we were handed a cache entry */
 	Assert(list->cl_magic == CL_MAGIC);
 	Assert(list->refcount > 0);
@@ -2122,6 +2136,8 @@ ReleaseCatCacheListWithOwner(CatCList *list, ResourceOwner resowner)
 #endif
 		list->refcount == 0)
 		CatCacheRemoveCList(list->my_cache, list);
+	if (view)
+		CatalogViewRelease(view);
 }
 
 
@@ -2481,4 +2497,24 @@ ResOwnerPrintCatCacheList(Datum res)
 	return psprintf("cache %s (%d), list %p has count %d",
 					list->my_cache->cc_relname, list->my_cache->id,
 					list, list->refcount);
+}
+
+/* A catalog view may retire its caches only after consumers release them. */
+void
+DestroyCatCache(CatCache *cache)
+{
+	ResetCatalogCache(cache, false);
+	if (cache->cc_ntup || cache->cc_nlist)
+		elog(ERROR, "catalog view still has referenced cache entries");
+	slist_delete(&CacheHdr->ch_caches, &cache->cc_next);
+	if (cache->cc_tupdesc)
+	{
+		pfree(unconstify(char *, cache->cc_relname));
+		FreeTupleDesc(cache->cc_tupdesc);
+	}
+	if (cache->cc_lbucket)
+		pfree(cache->cc_lbucket);
+	pfree(cache->cc_bucket);
+
+	pfree(cache);
 }

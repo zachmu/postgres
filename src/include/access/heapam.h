@@ -51,9 +51,12 @@ struct VacuumCutoffs;
 /*
  * Descriptor for heap table scans.
  */
+struct CatalogViewScan;
 typedef struct HeapScanDescData
 {
 	TableScanDescData rs_base;	/* AM independent part of the descriptor */
+
+	struct CatalogViewScan *rs_catalogview;
 
 	/* state set up at initscan time */
 	BlockNumber rs_nblocks;		/* total number of blocks in rel */

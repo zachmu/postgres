@@ -25,6 +25,7 @@
  *		careful....
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include <sys/file.h>
 #include <fcntl.h>
@@ -1312,6 +1313,9 @@ retry:
 	 * zero (else somebody forgot to close it); in the event that it doesn't,
 	 * we'll elog a WARNING and leak the already-present entry.
 	 */
+	relation->rd_catalogview = CatalogViewObjectContext(targetRelId);
+	if (relation->rd_catalogview)
+		CatalogViewRetain(relation->rd_catalogview);
 	if (insertIt)
 		RelationCacheInsert(relation, true);
 
@@ -1341,6 +1345,16 @@ static void
 RelationInitPhysicalAddr(Relation relation)
 {
 	RelFileNumber oldnumber = relation->rd_locator.relNumber;
+
+	/*
+	 * Canonical definitions are not mapped physical relations. Storage access
+	 * must use an explicitly bound resource; retained metadata has no file.
+	 */
+	if (CatalogViewObjectContext(RelationGetRelid(relation)))
+	{
+		MemSet(&relation->rd_locator, 0, sizeof(relation->rd_locator));
+		return;
+	}
 
 	/* these relations kinds never have storage */
 	if (!RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
@@ -2097,8 +2111,32 @@ AssertCouldGetRelation(void)
  *		Caller should eventually decrement count.  (Usually,
  *		that happens by calling RelationClose().)
  */
+static Relation RelationIdGetRelationInContext(Oid relationId);
+
 Relation
 RelationIdGetRelation(Oid relationId)
+{
+	CatalogView *view = CatalogViewObjectContext(relationId);
+	CatalogView *previous;
+	Relation	result;
+
+	if (!view)
+		return RelationIdGetRelationInContext(relationId);
+	previous = CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		result = RelationIdGetRelationInContext(relationId);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Relation
+RelationIdGetRelationInContext(Oid relationId)
 {
 	Relation	rd;
 
@@ -2508,6 +2546,8 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 		MemoryContextDelete(relation->rd_pddcxt);
 	if (relation->rd_partcheckcxt)
 		MemoryContextDelete(relation->rd_partcheckcxt);
+	if (relation->rd_catalogview)
+		CatalogViewRelease(relation->rd_catalogview);
 	pfree(relation);
 }
 

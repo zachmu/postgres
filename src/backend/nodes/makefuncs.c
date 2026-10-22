@@ -145,6 +145,9 @@ makeWholeRowVar(RangeTblEntry *rte,
 
 	switch (rte->rtekind)
 	{
+		case RTE_DOLT:
+			result = makeVar(varno, InvalidAttrNumber, rte->dolt_rowtype ? rte->dolt_rowtype : RECORDOID, -1, InvalidOid, varlevelsup);
+			break;
 		case RTE_RELATION:
 			/* relation: the rowtype is a named composite type */
 			toid = get_rel_type_id(rte->relid);

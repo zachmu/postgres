@@ -10,6 +10,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "catalog/indexing.h"
+#include "catalog/catalogview.h"
 #include "catalog/pg_dolt_object.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
@@ -44,6 +45,7 @@ typedef struct DGCatalogScan
 	Relation	objects;
 	Snapshot	snapshot;
 	DGState    *live;
+	CatalogViewScan *catalog_scan;
 	PLCursor	cursor;
 	MemoryContextCallback cleanup;
 } DGCatalogScan;
@@ -95,6 +97,8 @@ create_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist, L
 	scan->custom_scan_tlist = build_physical_tlist(root, rel);
 	scan->custom_relids = bms_copy(rel->relids);
 	scan->custom_private = list_make3(makeString(pstrdup(rte->dolt_table)), makeString(pstrdup(rte->dolt_branch ? rte->dolt_branch : "")), makeInteger(rte->dolt_relid));
+	scan->custom_private = lappend(scan->custom_private, makeString(pstrdup(rte->dolt_database)));
+	scan->custom_private = lappend(scan->custom_private, makeInteger(rte->dolt_catalog));
 	scan->methods = &scan_methods;
 	return &scan->scan.plan;
 }
@@ -217,6 +221,27 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 	int			count;
 	char	   *table = strVal(linitial(plan->custom_private));
 
+	if (intVal(list_nth(plan->custom_private, 4)))
+	{
+		CatalogView *view = dg_catalog_view(strVal(list_nth(plan->custom_private, 3)));
+		CatalogView *previous;
+
+		s->objects = table_open((Oid) intVal(list_nth(plan->custom_private, 4)), AccessShareLock);
+		previous = CatalogViewSwitch(view);
+		PG_TRY();
+		{
+			s->catalog_scan = CatalogViewBeginScan(s->objects, 0, NULL);
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(previous);
+		}
+		PG_END_TRY();
+		if (!s->catalog_scan)
+			elog(ERROR, "canonical catalog scan has no provider");
+		return;
+	}
+
 	dg_catalog_permission(table, GetUserId());
 	s->snapshot = estate->es_snapshot;
 	s->objects = table_open(DoltObjectRelationId, AccessShareLock);
@@ -260,6 +285,13 @@ next_row(ScanState *ss)
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
 	ExecClearTuple(slot);
+	if (s->catalog_scan)
+	{
+		HeapTuple	tuple = CatalogViewNext(s->catalog_scan, ForwardScanDirection);
+
+		return tuple ? ExecStoreHeapTuple(tuple, slot, false) : slot;
+	}
+
 	if (s->live)
 	{
 		PLEntry		entry;
@@ -338,6 +370,12 @@ end_scan(CustomScanState *css)
 {
 	DGCatalogScan *s = (DGCatalogScan *) css;
 
+	if (s->catalog_scan)
+	{
+		CatalogViewEndScan(s->catalog_scan);
+		s->catalog_scan = NULL;
+	}
+
 	while (s->depth)
 		pop(s);
 	if (s->live)
@@ -354,6 +392,13 @@ static void
 rescan(CustomScanState *css)
 {
 	DGCatalogScan *s = (DGCatalogScan *) css;
+
+	if (s->catalog_scan)
+	{
+		CatalogViewRescan(s->catalog_scan, NULL);
+		ExecScanReScan(&css->ss);
+		return;
+	}
 
 	while (s->depth)
 		pop(s);

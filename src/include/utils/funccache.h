@@ -80,6 +80,7 @@ typedef struct CachedFunctionHashKey
 	 * collations) for different collation settings.
 	 */
 	Oid			inputCollation;
+	uint64		catalogContext; /* revision scope of compiled catalog queries */
 
 	/* Number of arguments (counting input arguments only, ie pronargs) */
 	int			nargs;
