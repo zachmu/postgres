@@ -1634,7 +1634,7 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	Assert(lockmode == AccessShareLock ||
 		   lockmode == RowShareLock ||
 		   lockmode == RowExclusiveLock);
-	Assert(CheckRelationLockedByMe(rel, lockmode, true));
+	Assert(rel->rd_catalogview || CheckRelationLockedByMe(rel, lockmode, true));
 
 	rte->rtekind = RTE_RELATION;
 	rte->alias = alias;

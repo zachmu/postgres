@@ -105,6 +105,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/genam.h"
 #include "access/relscan.h"
@@ -209,7 +210,7 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		Relation	indexDesc;
 		IndexInfo  *ii;
 
-		indexDesc = index_open(indexOid, RowExclusiveLock);
+		indexDesc = resultRelation->rd_catalogview ? dg_storage_index(resultRelation, indexOid) : index_open(indexOid, RowExclusiveLock);
 
 		/* extract index key information from the index's pg_index info */
 		ii = BuildIndexInfo(indexDesc);
@@ -256,7 +257,8 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
-		index_close(indexDescs[i], RowExclusiveLock);
+		if (!resultRelInfo->ri_RelationDesc->rd_catalogview)
+			index_close(indexDescs[i], RowExclusiveLock);
 
 		/* Mark the index as closed */
 		indexDescs[i] = NULL;

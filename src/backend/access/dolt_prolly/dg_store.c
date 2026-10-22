@@ -218,7 +218,7 @@ DGState *
 dg_load_tid(Relation rel, uint64 id)
 {
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+		return dg_storage_am_load_tid(rel, id);
 
 	return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false);
 }
@@ -231,6 +231,12 @@ dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
 	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
 	return load_state(rel, snap, NULL, branch, false, true);
+}
+
+DGState *
+dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
+{
+ return load_state(rel, SnapshotSelf, &id, branch, false, true);
 }
 
 static void

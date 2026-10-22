@@ -411,15 +411,10 @@ dg_storage_require_write(Relation rel)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("canonical storage binding has no write authority")));
 }
 
-DGState *
-dg_storage_am_load(Relation rel, Snapshot snapshot)
+static void
+storage_base(DGStorage *storage, DGState *state)
 {
-	DGStorage  *storage = bound_storage(rel);
-	DGState    *state;
-
-	if (snapshot == SnapshotSelf)
-		dg_storage_require_write(rel);
-	state = dg_load_bound(rel, snapshot, storage->branch);
+ Relation rel = &storage->relation;
 	if (!state->has_root && storage->base)
 	{
 		Oid			user;
@@ -441,6 +436,18 @@ dg_storage_am_load(Relation rel, Snapshot snapshot)
 		}
 		PG_END_TRY();
 	}
+}
+
+DGState *
+dg_storage_am_load(Relation rel, Snapshot snapshot)
+{
+	DGStorage  *storage = bound_storage(rel);
+	DGState    *state;
+
+	if (snapshot == SnapshotSelf)
+		dg_storage_require_write(rel);
+	state = dg_load_bound(rel, snapshot, storage->branch);
+	storage_base(storage, state);
 	return state;
 }
 
@@ -468,4 +475,29 @@ dg_storage_indexes(Relation rel)
 	if (rel->rd_rel->relhasindex && storage->indexes == NIL)
 		elog(ERROR, "canonical indexed write has no bound indexes");
 	return storage->indexes;
+}
+
+Relation
+dg_storage_index(Relation rel, Oid id)
+{
+ ListCell *lc;
+ foreach(lc, dg_storage_indexes(rel))
+ {
+  Relation index = lfirst(lc);
+  if (RelationGetRelid(index) == id)
+   return index;
+ }
+ elog(ERROR, "canonical index is not bound to target resource");
+ return NULL;
+}
+
+DGState *
+dg_storage_am_load_tid(Relation rel, uint64 id)
+{
+ DGStorage *storage=bound_storage(rel);
+ DGState *state;
+ dg_storage_require_write(rel);
+ state=dg_load_bound_tid(rel,id,storage->branch);
+ storage_base(storage,state);
+ return state;
 }

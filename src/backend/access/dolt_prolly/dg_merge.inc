@@ -64,7 +64,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			   *name;
 	bytea	   *commit;
 	VersionRef	ref;
-	Capture		live;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
 
@@ -97,16 +96,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		unsupported("checkout supports branch or -b branch [start-point]");
 		return 0;
-	}
-	live = capture_mode(false, true);
-	{
-		bytea	   *target = read_ref(psprintf("working/%s", name)).target;
-		char	   *definition = metadata(target ? target : child(commit, 1), "database");
-
-		/* Retained physical objects may outlive membership on one branch. */
-		run("SELECT NOT EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb->'members') wanted WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements($2::jsonb->'members') live WHERE wanted-'content'=live-'content'))", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(live.json)), NULL, true);
-		if (!DatumGetBool(cell(0, 1)))
-			unsupported("schema checkout: incompatible runtime definitions");
 	}
 
 	{
@@ -611,6 +600,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 Datum
 dolt_merge(PG_FUNCTION_ARGS)
 {
+	Capture live;
 	int			n,
 				i,
 				nest;
@@ -630,7 +620,6 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *their_db,
 			   *database,
 			   *commit = NULL;
-	Capture		live;
 	StringInfoData conflicts,
 				json;
 	Datum		values[4];

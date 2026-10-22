@@ -77,8 +77,28 @@ catalog_namespace(bytea *db, const char *name)
 	return NULL;
 }
 
-TupleDesc
-dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
+bool
+dg_catalog_active(void)
+{
+ Relation refs;
+ SysScanDesc scan;
+ ScanKeyData key;
+ bool active;
+
+ if (!IsUnderPostmaster || catalog_api_depth || rangevar_projection_hook)
+  return false;
+ refs = table_open(DoltRefRelationId, AccessShareLock);
+ ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum("views/enabled"));
+ scan = systable_beginscan(refs, DoltRefKeyIndexId, true,
+                           ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot(), 1, &key);
+ active = HeapTupleIsValid(systable_getnext(scan));
+ systable_endscan(scan);
+ table_close(refs, AccessShareLock);
+ return active;
+}
+
+static TupleDesc
+catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool target)
 {
 	const char *sep = NULL;
 	char	   *revision,
@@ -98,12 +118,33 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 	bool		working = false;
 	Oid			live = InvalidOid;
 
-	if (rangevar_projection_hook)
+	if (rangevar_projection_hook || catalog_api_depth)
 		return NULL;			/* isolated phase-1 fixture */
 	if (!rv->dolt_revision)
 	{
 		if (!rv->catalogname || !(sep = strpbrk(rv->catalogname, "@/")))
-			return NULL;
+		{
+			Oid systemid;
+			if (!dg_catalog_active())
+				return NULL;
+			if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
+				return NULL;
+			systemid = (!rv->schemaname || !strcmp(rv->schemaname, "pg_catalog")) ? get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE) : InvalidOid;
+			if (OidIsValid(systemid))
+			{
+				RangeVar *qualified;
+				if (systemid >= FirstNormalObjectId || !strncmp(rv->relname, "pg_dolt_", 8))
+					return NULL;
+				/* Only supported versioned catalog families are redirected. */
+				if (!list_member_oid(list_make5_oid(NamespaceRelationId, RelationRelationId, AttributeRelationId, TypeRelationId, IndexRelationId), systemid) && systemid != ConstraintRelationId && systemid != DescriptionRelationId && systemid != DependRelationId && systemid != CastRelationId)
+					return NULL;
+				qualified = (RangeVar *) copyObject(rv);
+				qualified->schemaname = pstrdup("pg_catalog");
+				rv = qualified;
+			}
+			revision = pstrdup(dg_current_branch());
+			goto revision_selected;
+		}
 		dbname = pnstrdup(rv->catalogname, sep - rv->catalogname);
 		if (strcmp(dbname, get_database_name(MyDatabaseId)))
 			return NULL;
@@ -124,6 +165,9 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 		if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
 	}
+revision_selected:
+	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
+		unsupported("revision-qualified write targets");
 	GetUserIdAndSecContext(&user, &security);
 	if (rv->schemaname)
 		path = list_make1(pstrdup(rv->schemaname));
@@ -185,7 +229,8 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 					schema = metadata(child(descriptor, 1), "schema");
 					nsdef = catalog_namespace(db, ns);
 					catalog_acl(nsdef, "USAGE", user);
-					catalog_acl(schema, "SELECT", user);
+					if (!target)
+						catalog_acl(schema, "SELECT", user);
 
 					/*
 					 * Do not let historical grants bypass current revocations
@@ -201,9 +246,9 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 					}
 					if (!working)
 						live = currentrel;
-					if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
+					if (!working && OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
 						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
-					if (OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
+					if (!working && !target && OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
 						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
 					break;
 				}
@@ -335,4 +380,37 @@ dg_catalog_write_table(const char *branch, const char *name, AclMode permission)
 	}
 	PG_END_TRY();
 	return result;
+}
+
+TupleDesc
+dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
+{
+ return catalog_bind(pstate, rv, rte, false);
+}
+
+Relation
+dg_catalog_target(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
+{
+ TupleDesc desc = catalog_bind(pstate, rv, rte, true);
+
+ if (!desc)
+  return NULL;
+ if (!rte->dolt_branch || rte->dolt_catalog)
+  unsupported("non-working canonical write target");
+ return table_open(get_typ_typrelid(rte->dolt_rowtype), NoLock);
+}
+
+Relation
+dg_catalog_executor_target(RangeTblEntry *rte, CmdType command)
+{
+ char *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(rte->relid)), get_rel_name(rte->relid));
+ AclMode permission = command == CMD_INSERT ? ACL_INSERT : command == CMD_UPDATE ? ACL_UPDATE : ACL_DELETE;
+ Relation rel;
+
+ if (command != CMD_INSERT && command != CMD_UPDATE && command != CMD_DELETE)
+  unsupported("canonical executor operation");
+ rel = dg_catalog_write_table(rte->dolt_branch, name, permission);
+ if (RelationGetRelid(rel) != rte->relid)
+  ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical target changed; replan statement")));
+ return rel;
 }

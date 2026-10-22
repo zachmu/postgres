@@ -375,7 +375,7 @@ toast(Relation rel)
 static void
 estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double *allvis)
 {
-	*pages = RelationGetNumberOfBlocks(rel);
+	*pages = rel->rd_catalogview ? 1 : RelationGetNumberOfBlocks(rel);
 	*tuples = Max(1000, *pages);
 	*allvis = 0;
 }

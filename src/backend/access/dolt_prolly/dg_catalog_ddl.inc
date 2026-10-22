@@ -137,7 +137,7 @@ dg_catalog_drop(Node *statement)
 			handled = true;
 			if (drop->behavior != DROP_RESTRICT || drop->concurrent)
 				unsupported("branch DROP supports RESTRICT only");
-			lock_workspace();
+			dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
 			working = read_ref(branch_ref("working"));
 			foreach(lc, drop->objects)
 			{
@@ -147,11 +147,30 @@ dg_catalog_drop(Node *statement)
 				char	   *name;
 				ListCell   *index;
 
-				SetUserIdAndSecContext(user, security);
-				set_config_option("search_path", search_path, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-				id = RangeVarGetRelid(rv, AccessExclusiveLock, drop->missing_ok);
-				SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-				set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+				List *path = NIL;
+				ListCell *part;
+				CatalogView *view = provider_view(working.target);
+				id = InvalidOid;
+				if (rv->catalogname || rv->dolt_revision)
+					unsupported("qualified revision DROP");
+				if (rv->schemaname)
+					path = list_make1(rv->schemaname);
+				else if (!SplitIdentifierString(pstrdup(search_path), ',', &path))
+					elog(ERROR, "invalid search_path");
+				foreach(part, path)
+				{
+					char *ns = (char *) lfirst(part);
+					if (!strcmp(ns, "$user")) ns = GetUserNameFromId(user, false);
+					name = quote_qualified_identifier(ns, rv->relname);
+					if (catalog_contains(working.target, name))
+					{
+						catalog_acl(catalog_namespace(working.target,ns),"USAGE",user);
+						id = CatalogViewLookupObject(view,RelationRelationId,name);
+						break;
+					}
+				}
+				if (!OidIsValid(id) && !drop->missing_ok)
+					ereport(ERROR,(errcode(ERRCODE_UNDEFINED_TABLE),errmsg("relation %s does not exist on branch %s",rv->relname,dg_current_branch())));
 				if (!OidIsValid(id))
 					continue;
 				rel = table_open(id, NoLock);
