@@ -388,7 +388,12 @@ CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, 
 	}
 	if (view->sealed)
 		elog(ERROR, "cannot bind a new object in a published catalog context");
-	if (next_handle < FirstCatalogViewObjectId)
+
+	/*
+	 * Keep the high-water mark representable so stale handles stay
+	 * detectable.
+	 */
+	if (next_handle == PG_UINT32_MAX)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("backend catalog handle space exhausted")));
 	object = hash_search(objects, &next_handle, HASH_ENTER, &found);
 	Assert(!found);
