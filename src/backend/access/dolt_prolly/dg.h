@@ -36,6 +36,7 @@ extern DGState *dg_storage_load(DGStorage *storage);
 extern void dg_storage_close(DGStorage *storage);
 extern void dg_storage_lock_working(const char *branch, Snapshot snapshot);
 extern Relation dg_catalog_write_table(const char *branch, const char *name, AclMode permission);
+extern Relation dg_storage_enable_read(DGStorage *storage, bytea *base);
 extern Relation dg_storage_enable_write(DGStorage *storage, bytea *base);
 extern void dg_storage_close_relation(Relation rel);
 extern void dg_storage_set_indexes(Relation rel, List *indexes);

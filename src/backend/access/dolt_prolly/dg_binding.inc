@@ -88,10 +88,14 @@ binding_prepare(const char *branch, bytea *database, bool required)
 		if (OidIsValid(relid))
 			continue;
 		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND b.bindschema=$2", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i])), NULL, true);
-		/* An independent resource can hold roots for several schemas. A new
-		 * branch starts from its retained descriptor, never another branch's root. */
+
+		/*
+		 * An independent resource can hold roots for several schemas. A new
+		 * branch starts from its retained descriptor, never another branch's
+		 * root.
+		 */
 		if (SPI_processed != 1)
-			run("SELECT min(s.storageid::bigint)::oid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND NOT s.storageimported HAVING count(*)>0",1,VC_TYPES(TEXTOID),VC_ARGS(CStringGetTextDatum(names[i])),NULL,true);
+			run("SELECT min(s.storageid::bigint)::oid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND NOT s.storageimported HAVING count(*)>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(names[i])), NULL, true);
 		if (SPI_processed == 1)
 			binding_record(branch, names[i], schemas[i], DatumGetObjectId(cell(0, 1)));
 		else if (required)

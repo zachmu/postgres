@@ -520,6 +520,9 @@ dg_history_handles(DGState *state)
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
+	/* Bound resources retain their original snapshot during root publication. */
+	if (rel->rd_catalogview)
+		PushCopiedSnapshot(GetActiveSnapshot());
 	state->content = contents;
 	dg_history_handles(state);
 	dg_save(rel, state, GetCurrentCommandId(true));
@@ -528,4 +531,6 @@ dg_history_install(Relation rel, DGState *state, PLTree contents)
 	dg_rebuild_indexes(rel);
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
+	if (rel->rd_catalogview)
+		PopActiveSnapshot();
 }

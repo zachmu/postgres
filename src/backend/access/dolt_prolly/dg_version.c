@@ -133,27 +133,28 @@ strcell(int row, int col)
 
 	return s ? pstrdup(s) : NULL;
 }
+
 /* Suppress branch interception only for explicitly scoped internal catalog SQL.
  * Track subtransactions so a caught ERROR cannot disable ordinary binding. */
-static int catalog_api_depth;
+static int	catalog_api_depth;
 static SubTransactionId catalog_api_subids[64];
 static bool catalog_api_registered;
 static void
 catalog_api_xact(XactEvent event, void *arg)
 {
- if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
-  catalog_api_depth = 0;
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
+		catalog_api_depth = 0;
 }
 static void
 catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
 {
- if (event == SUBXACT_EVENT_ABORT_SUB)
-  while (catalog_api_depth && catalog_api_subids[catalog_api_depth - 1] == id)
-   catalog_api_depth--;
- else if (event == SUBXACT_EVENT_COMMIT_SUB)
-  for (int i = 0; i < catalog_api_depth; i++)
-   if (catalog_api_subids[i] == id)
-    catalog_api_subids[i] = parent;
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		while (catalog_api_depth && catalog_api_subids[catalog_api_depth - 1] == id)
+			catalog_api_depth--;
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		for (int i = 0; i < catalog_api_depth; i++)
+			if (catalog_api_subids[i] == id)
+				catalog_api_subids[i] = parent;
 }
 
 static int
@@ -324,7 +325,8 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 	Oid			types[] = {TEXTOID, TEXTOID, BYTEAARRAYOID};
 	Datum		args[] = {CStringGetTextDatum(kind), CStringGetTextDatum(json), PointerGetDatum(links(hashes, count))};
 
-	bytea *result;
+	bytea	   *result;
+
 	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
 		result = dg_schema_store(kind, json);
 	else
@@ -400,18 +402,18 @@ static char *json_value(const char *json, const char *key);
 static bytea *
 canonical_database(const char *json, Datum *members, int count)
 {
- char *normalized;
- ArrayType *array;
- Datum *values;
- bool *nulls;
- int n;
+	char	   *normalized;
+	ArrayType  *array;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
 
- run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
- normalized = strcell(0, 1);
- run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
- array = DatumGetArrayTypeP(cell(0, 1));
- deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
- return put("database", normalized, values, n);
+	run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	normalized = strcell(0, 1);
+	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
+	array = DatumGetArrayTypeP(cell(0, 1));
+	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	return put("database", normalized, values, n);
 }
 
 /* Capture canonical membership and schema, selecting only data from local roots.
@@ -419,63 +421,74 @@ canonical_database(const char *json, Datum *members, int count)
 static Capture
 capture_canonical(bytea *database, bool persist, bool definitions_only)
 {
- Capture result = {0};
- CatalogView *view = provider_view(database);
- bytea **objects;
- char **kinds;
- Datum *members;
- int n, i;
- StringInfoData json;
+	Capture		result = {0};
+	CatalogView *view = provider_view(database);
+	bytea	  **objects;
+	char	  **kinds;
+	Datum	   *members;
+	int			n,
+				i;
+	StringInfoData json;
 
- run("SELECT o.objhash,o.objkind FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
- n = SPI_processed;
- objects = palloc_array(bytea *, Max(n,1));
- kinds = palloc_array(char *, Max(n,1));
- members = palloc_array(Datum, Max(n,1));
- for (i=0;i<n;i++) { objects[i]=DatumGetByteaPCopy(cell(i,1)); kinds[i]=strcell(i,2); }
- initStringInfo(&json);
- appendStringInfoString(&json,"{\"format\":\"DGDB1\",\"members\":[");
- for (i=0;i<n;i++)
- {
-  char *payload = metadata(objects[i], kinds[i]);
-  members[i] = PointerGetDatum(objects[i]);
-  if (i) appendStringInfoChar(&json, ',');
-  if (!strcmp(kinds[i],"namespace"))
-   appendStringInfo(&json,"{\"kind\":\"namespace\",\"definition\":%s}",payload);
-  else
-  {
-   char *name = json_value(payload,"name");
-   bytea *schema = child(objects[i],1);
-   Oid resource = binding_relation(dg_current_branch(),name,schema);
-   if (!definitions_only)
-   {
-    DGStorage *storage;
-    DGState *state;
-    if (!OidIsValid(resource))
-     ereport(ERROR,(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),errmsg("runtime catalog binding unavailable for %s on branch %s",name,dg_current_branch())));
-    storage = dg_storage_open(CatalogViewLookupObject(view,RelationRelationId,name),dg_current_branch(),name,schema,resource,GetActiveSnapshot());
-    state=dg_storage_load(storage);
-    dg_storage_close(storage);
-    if (state->has_root)
-    {
-     bytea *raw=palloc(VARHDRSZ+PL_HASH_SIZE);
-     SET_VARSIZE(raw,VARHDRSZ+PL_HASH_SIZE);
-     memcpy(VARDATA(raw),state->content.root.bytes,PL_HASH_SIZE);
-     run("SELECT jsonb_set($1::jsonb,'{content}',to_jsonb($2::text))::text",2,VC_TYPES(TEXTOID,TEXTOID),VC_ARGS(CStringGetTextDatum(payload),CStringGetTextDatum(hex(raw))),NULL,true);
-     payload=strcell(0,1);
-     if (persist)
-      members[i]=PointerGetDatum(put(kinds[i],payload,VC_ARGS(PointerGetDatum(schema),PointerGetDatum(dg_history_export_tree(&state->content))),2));
-    }
-    dg_release(state);
-   }
-   appendStringInfoString(&json,payload);
-  }
- }
- appendStringInfoString(&json,"]}");
- run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v",1,VC_TYPES(TEXTOID),VC_ARGS(CStringGetTextDatum(json.data)),NULL,true);
- result.json=strcell(0,1);
- if (persist) result.hash=canonical_database(result.json,members,n);
- return result;
+	run("SELECT o.objhash,o.objkind FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	n = SPI_processed;
+	objects = palloc_array(bytea *, Max(n, 1));
+	kinds = palloc_array(char *, Max(n, 1));
+	members = palloc_array(Datum, Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		objects[i] = DatumGetByteaPCopy(cell(i, 1));
+		kinds[i] = strcell(i, 2);
+	}
+	initStringInfo(&json);
+	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+	for (i = 0; i < n; i++)
+	{
+		char	   *payload = metadata(objects[i], kinds[i]);
+
+		members[i] = PointerGetDatum(objects[i]);
+		if (i)
+			appendStringInfoChar(&json, ',');
+		if (!strcmp(kinds[i], "namespace"))
+			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
+		else
+		{
+			char	   *name = json_value(payload, "name");
+			bytea	   *schema = child(objects[i], 1);
+			Oid			resource = binding_relation(dg_current_branch(), name, schema);
+
+			if (!definitions_only)
+			{
+				DGStorage  *storage;
+				DGState    *state;
+
+				if (!OidIsValid(resource))
+					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
+				storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+				state = dg_storage_load(storage);
+				dg_storage_close(storage);
+				if (state->has_root)
+				{
+					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+
+					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
+					memcpy(VARDATA(raw), state->content.root.bytes, PL_HASH_SIZE);
+					run("SELECT jsonb_set($1::jsonb,'{content}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(hex(raw))), NULL, true);
+					payload = strcell(0, 1);
+					if (persist)
+						members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+				}
+				dg_release(state);
+			}
+			appendStringInfoString(&json, payload);
+		}
+	}
+	appendStringInfoString(&json, "]}");
+	run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
+	result.json = strcell(0, 1);
+	if (persist)
+		result.hash = canonical_database(result.json, members, n);
+	return result;
 }
 
 /* Fixed schema locks make ordinary relcache descriptors safe for this capture.

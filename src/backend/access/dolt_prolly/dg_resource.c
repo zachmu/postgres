@@ -414,7 +414,8 @@ dg_storage_require_write(Relation rel)
 static void
 storage_base(DGStorage *storage, DGState *state)
 {
- Relation rel = &storage->relation;
+	Relation	rel = &storage->relation;
+
 	if (!state->has_root && storage->base)
 	{
 		Oid			user;
@@ -480,24 +481,34 @@ dg_storage_indexes(Relation rel)
 Relation
 dg_storage_index(Relation rel, Oid id)
 {
- ListCell *lc;
- foreach(lc, dg_storage_indexes(rel))
- {
-  Relation index = lfirst(lc);
-  if (RelationGetRelid(index) == id)
-   return index;
- }
- elog(ERROR, "canonical index is not bound to target resource");
- return NULL;
+	ListCell   *lc;
+
+	foreach(lc, dg_storage_indexes(rel))
+	{
+		Relation	index = lfirst(lc);
+
+		if (RelationGetRelid(index) == id)
+			return index;
+	}
+	elog(ERROR, "canonical index is not bound to target resource");
+	return NULL;
 }
 
 DGState *
 dg_storage_am_load_tid(Relation rel, uint64 id)
 {
- DGStorage *storage=bound_storage(rel);
- DGState *state;
- dg_storage_require_write(rel);
- state=dg_load_bound_tid(rel,id,storage->branch);
- storage_base(storage,state);
- return state;
+	DGStorage  *storage = bound_storage(rel);
+	DGState    *state;
+
+	dg_storage_require_write(rel);
+	state = dg_load_bound_tid(rel, id, storage->branch);
+	storage_base(storage, state);
+	return state;
+}
+
+Relation
+dg_storage_enable_read(DGStorage *storage, bytea *base)
+{
+	storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
+	return &storage->relation;
 }

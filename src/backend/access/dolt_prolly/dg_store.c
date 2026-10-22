@@ -236,7 +236,7 @@ dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 DGState *
 dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 {
- return load_state(rel, SnapshotSelf, &id, branch, false, true);
+	return load_state(rel, SnapshotSelf, &id, branch, false, true);
 }
 
 static void

@@ -147,9 +147,10 @@ dg_catalog_drop(Node *statement)
 				char	   *name;
 				ListCell   *index;
 
-				List *path = NIL;
-				ListCell *part;
+				List	   *path = NIL;
+				ListCell   *part;
 				CatalogView *view = provider_view(working.target);
+
 				id = InvalidOid;
 				if (rv->catalogname || rv->dolt_revision)
 					unsupported("qualified revision DROP");
@@ -159,18 +160,20 @@ dg_catalog_drop(Node *statement)
 					elog(ERROR, "invalid search_path");
 				foreach(part, path)
 				{
-					char *ns = (char *) lfirst(part);
-					if (!strcmp(ns, "$user")) ns = GetUserNameFromId(user, false);
+					char	   *ns = (char *) lfirst(part);
+
+					if (!strcmp(ns, "$user"))
+						ns = GetUserNameFromId(user, false);
 					name = quote_qualified_identifier(ns, rv->relname);
 					if (catalog_contains(working.target, name))
 					{
-						catalog_acl(catalog_namespace(working.target,ns),"USAGE",user);
-						id = CatalogViewLookupObject(view,RelationRelationId,name);
+						catalog_acl(catalog_namespace(working.target, ns), "USAGE", user);
+						id = CatalogViewLookupObject(view, RelationRelationId, name);
 						break;
 					}
 				}
 				if (!OidIsValid(id) && !drop->missing_ok)
-					ereport(ERROR,(errcode(ERRCODE_UNDEFINED_TABLE),errmsg("relation %s does not exist on branch %s",rv->relname,dg_current_branch())));
+					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", rv->relname, dg_current_branch())));
 				if (!OidIsValid(id))
 					continue;
 				rel = table_open(id, NoLock);

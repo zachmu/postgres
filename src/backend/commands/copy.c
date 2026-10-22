@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include <ctype.h>
 #include <unistd.h>
@@ -122,6 +123,13 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		/* Open and lock the relation, using the appropriate lock type. */
 		rel = table_openrv(stmt->relation, lockmode);
+		if (rel->rd_catalogview)
+		{
+			Relation	definition = rel;
+
+			rel = dg_catalog_copy_relation(definition, is_from);
+			table_close(definition, NoLock);
+		}
 
 		relid = RelationGetRelid(rel);
 
@@ -313,7 +321,10 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			 *
 			 * We'll reopen it later as part of the query-based COPY.
 			 */
-			table_close(rel, NoLock);
+			if (rel->rd_catalogview)
+				dg_storage_close_relation(rel);
+			else
+				table_close(rel, NoLock);
 			rel = NULL;
 		}
 	}
@@ -358,7 +369,12 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 	}
 
 	if (rel != NULL)
-		table_close(rel, NoLock);
+	{
+		if (rel->rd_catalogview)
+			dg_storage_close_relation(rel);
+		else
+			table_close(rel, NoLock);
+	}
 }
 
 /*

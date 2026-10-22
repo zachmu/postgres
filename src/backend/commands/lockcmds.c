@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/table.h"
 #include "access/xact.h"
@@ -55,6 +56,9 @@ LockTableCommand(LockStmt *lockstmt)
 										  lockstmt->nowait ? RVR_NOWAIT : 0,
 										  RangeVarCallbackForLockTable,
 										  &lockstmt->mode);
+
+		if (dg_catalog_lock_relation(reloid, lockstmt->mode, lockstmt->nowait))
+			continue;
 
 		if (get_rel_relkind(reloid) == RELKIND_VIEW)
 			LockViewRecurse(reloid, lockstmt->mode, lockstmt->nowait, NIL);

@@ -4,6 +4,15 @@
 #include "access/relation.h"
 #include "utils/builtins.h"
 #include "fmgr.h"
+#include "access/xact.h"
+#include "executor/executor.h"
+#include "utils/array.h"
+#include "utils/lsyscache.h"
+#include "utils/acl.h"
+#include "utils/snapmgr.h"
+#include "access/heapam.h"
+#include "catalog/pg_class.h"
+#include "miscadmin.h"
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_storage_allocate);
@@ -19,12 +28,6 @@ test_storage_allocate(PG_FUNCTION_ARGS)
 
 /* Exercise the native table-AM callbacks with an explicitly bound descriptor.
  * This fixture is not SQL INSERT/UPDATE/DELETE integration. */
-#include "access/xact.h"
-#include "executor/executor.h"
-#include "utils/array.h"
-#include "utils/lsyscache.h"
-#include "utils/acl.h"
-#include "utils/snapmgr.h"
 
 PG_FUNCTION_INFO_V1(test_storage_write);
 Datum
@@ -90,4 +93,27 @@ test_storage_write(PG_FUNCTION_ARGS)
 	ExecDropSingleTupleTableSlot(slot);
 	dg_storage_close_relation(rel);
 	PG_RETURN_INT64(result);
+}
+
+/* Test-only physical inspection proves SQL CREATE didn't persist schema rows. */
+PG_FUNCTION_INFO_V1(test_physical_class);
+Datum
+test_physical_class(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Relation	catalog;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	int			count = 0;
+
+	if (!superuser())
+		elog(ERROR, "physical test inspection requires superuser");
+	catalog = table_open(RelationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(catalog, 0, NULL);
+	while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
+		if (!strcmp(NameStr(((Form_pg_class) GETSTRUCT(tuple))->relname), name))
+			count++;
+	table_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	PG_RETURN_INT32(count);
 }
