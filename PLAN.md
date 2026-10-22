@@ -773,3 +773,13 @@ architecture; branch-local DDL and generalized versioned objects remain the next
 catalog gates. Details: [catalog plan](CATALOG-BINDING-PLAN.md) and
 [milestone report](reports/versioned-catalog.html). Earlier projection proposals
 are superseded, not optional prerequisites for query correctness.
+
+## Catalog DDL audit checkpoint — 2026-10-22
+
+Step 1 of the [DDL gate](CATALOG-DDL-PLAN.md) has a source-level contract and
+executable baseline. The [audit](doc/doltgres/catalog-ddl-contract.md) demonstrates
+why SQL catalog snapshots alone do not version relcache/type/function lookup.
+Continue with explicit writable branch/schema bindings and transaction-local
+schema deltas before lifting DDL guards. Branch-local DDL and versioned routines
+remain unimplemented; the baseline Doltgres failures are documented rather than
+reclassified as passes.
