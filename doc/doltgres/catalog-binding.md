@@ -95,3 +95,11 @@ experiment: transactional schema isolation, dependency-consistent bindings,
 versioned types/functions, concurrent readers and recovery. This extends the
 native provider direction; it does not restore persistent materialization or
 claim that the existing table-read milestone already solves generalized catalogs.
+
+## Implementation update — 2026-10-22
+
+The original audit above is preserved as a planning record. Canonical schema
+trees and branch-local DROP RESTRICT are now implemented; see
+[the schema-provider checkpoint](catalog-schema-provider.md) for exact coverage,
+publication behavior and remaining restrictions. General branch-local CREATE/ALTER,
+versioned dependencies and logical catalog introspection remain unimplemented.

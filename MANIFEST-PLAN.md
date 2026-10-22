@@ -287,3 +287,18 @@ catalogs and requires a new branch-membership source before divergent DDL can be
 published correctly. Existing working refs do not automatically represent every
 ordinary DML change. Schema/data/dependency publication must use one SQL outcome;
 this is a required new protocol, not a property established by the read milestone.
+
+## Canonical schema storage and transactional membership — 2026-10-22
+
+New schema/namespace objects use a `DGSCHEMA2` envelope with one retained prolly
+chunk-root child. Legacy JSON objects remain readable. Canonical bytes exclude
+runtime OIDs, XIDs and command IDs; transaction visibility remains in heap-backed
+refs and relation-root publication records. Database descriptors retain references
+to both table data and schema objects. This does not replace DGDB1 with a single
+global catalog tree, nor eliminate its duplicated definition metadata.
+
+Branch-local DROP publishes a successor working database descriptor in the same
+PostgreSQL transaction as captured data roots/chunks. Ref CAS and native transaction
+outcome provide one commit decision, with no independently published filesystem
+manifest. Staged and HEAD are unchanged until requested. Retained physical objects
+are not garbage-collected. See [schema-provider details](doc/doltgres/catalog-schema-provider.md).

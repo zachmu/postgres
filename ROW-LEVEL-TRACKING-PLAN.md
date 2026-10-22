@@ -325,3 +325,17 @@ returns the session branch, and roots do not carry a validated decoding-schema
 binding. Replacing these assumptions is prerequisite to branch-local DDL. The
 current writer serialization remains. The new safety test confirms savepoint
 failure preserves preceding DML without exposing it to other sessions or branches.
+
+## Schema membership publication checkpoint — 2026-10-22
+
+Canonical branch membership is now MVCC-visible through working refs. Branch-local
+DROP preserves membership and data for an older SQL snapshot, while new statements
+on that branch reject the retained physical relation. Full abort, savepoint rollback
+and crash-aborted DROP were tested against a running server. Canonical schema chunks
+contain no PostgreSQL transaction metadata.
+
+This does not solve concurrent writers: branch DDL uses the existing broad workspace
+lock, and writes still use the current session branch. General writable bindings,
+schema-generation conflict checks and three-way working-set publication remain
+required. Do not extrapolate this membership-only experiment to layout-changing
+ALTER or OID-only type/function caches. See [the current boundary](doc/doltgres/catalog-schema-provider.md).

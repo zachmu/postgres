@@ -83,3 +83,20 @@ extended by mutating ordinary shared catalogs. Explicit write bindings, staged
 schema membership and provider-aware dependencies are the next implementation
 boundary. Type/function runtime identities and introspection remain unproven;
 branch DDL is still guarded.
+
+## Canonical schema provider and membership — 2026-10-22
+
+The selected option 1 now has an implementation foothold. Retained table schemas
+and namespaces are canonical prolly trees, decoded through one schema-object
+provider. Working revision lookup uses the branch's working database descriptor,
+with HEAD fallback only when no working target exists. Native parser/AM membership
+checks prevent retained physical relations from leaking into ordinary reads,
+writes and COPY on a branch where the table was dropped. Prepared ordinary
+prolly queries depend on manifest refs and rebind after membership changes.
+
+This is not a general replacement of OID-only catalog lookup. Raw catalog SQL,
+regclass, type/function resolution and dependency infrastructure still use shared
+physical identities. Preserve stable logical object identity; do not allocate a
+permanent OID for every revision. The runtime identity/context bridge remains to
+be proven with incompatible custom types and functions in one statement.
+See [the implementation boundary](doc/doltgres/catalog-schema-provider.md).

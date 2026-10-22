@@ -134,3 +134,25 @@ Two original Doltgres revision-introspection scripts and its branch-function
 scenario pass on Doltgres and fail at the current fork restrictions. A new native
 27-assertion safety/visibility test passes. These are baseline evidence, not
 completion of steps 2–3. See the contract for exact coverage and limitations.
+
+## First writable subset — 2026-10-22
+
+Branch-local `DROP TABLE ... RESTRICT` now removes table/index membership from the
+selected working database descriptor. It leaves physical catalog rows and storage
+in place for other branches/history. Abort, savepoint rollback and crash rollback
+restore membership through ordinary PostgreSQL transaction outcome. Staged state
+and HEAD move only through the existing add/commit operations. Checkout tolerates
+extra retained physical objects while requiring matching definitions for target
+members. Schema merge remains excluded.
+
+This deliberately proves removal before creation/rewrite: it avoids mutating a
+shared TupleDesc while testing canonical publication and reader stability. It
+does not complete the explicit write-binding interface, scoped dependency graph,
+or CREATE/ALTER gates. DROP CASCADE remains rejected. Ordinary capture now filters
+membership through the working descriptor, but definitions still come from shared
+catalogs. Raw pg_catalog and information_schema remain an acknowledged gap.
+
+Native tests cover 15 schema-tree and 28 branch-DROP assertions. A new shared
+Doltgres branch-DROP scenario passes all 17 assertions on both engines. The prior
+safety test now has 25 assertions because DROP rejection moved to positive tests.
+See [details and next experiments](doc/doltgres/catalog-schema-provider.md).
