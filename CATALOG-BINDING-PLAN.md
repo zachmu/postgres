@@ -119,3 +119,21 @@ physical bridge. The next boundary is an explicit mapping from logical identity
 and schema generation to writable runtime relations; same-name divergent CREATE
 and layout-changing ALTER must be tested through it rather than mutating shared
 descriptors. See [the CREATE checkpoint](doc/doltgres/catalog-create.md).
+
+## Runtime binding design revision — 2026-10-22
+
+The next gate is now detailed in
+[CATALOG-RUNTIME-BINDING-PLAN.md](CATALOG-RUNTIME-BINDING-PLAN.md). Logical names and
+object identities resolve through canonical branch membership to schema versions;
+local mappings provide runtime relations where needed. Each reference carries its
+own branch/revision and schema context, including writable targets. Distinct
+internal names/OIDs permit incompatible same-name writable definitions without
+changing another branch's descriptor. Compatible generations may share resources
+only when data-root selection and dependencies remain correctly bound.
+
+Implement same-name CREATE and binding propagation first, successor-generation
+ALTER second, then complete logical catalog interfaces and type/function dependency
+closure. Required cache/permission/introspection prerequisites belong in each gate,
+not only at the end. No per-commit physical catalog copies or persistent historical
+query-time materialization. Exact identity encoding and runtime reuse/lifetime rules
+remain explicit implementation decisions; the new sub-plan records their tests.
