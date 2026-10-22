@@ -239,3 +239,61 @@ dg_catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 		PopActiveSnapshot();
 	return result;
 }
+
+/* Internal executor/DDL integration boundary. No SQL preparation API. Resolve
+ * authority from canonical membership before constructing a private AM relation. */
+Relation
+dg_catalog_write_table(const char *branch, const char *name, AclMode permission)
+{
+ Oid user;
+ int security, nest;
+ Relation result = NULL;
+ List *parts = stringToQualifiedNameList(name, NULL);
+ const char *privilege;
+
+ if (!ActiveSnapshotSet() || list_length(parts) != 2)
+  elog(ERROR, "canonical write requires a snapshot and qualified logical name");
+ switch (permission)
+ {
+  case ACL_INSERT: privilege = "INSERT"; break;
+  case ACL_UPDATE: privilege = "UPDATE"; break;
+  case ACL_DELETE: privilege = "DELETE"; break;
+  default: elog(ERROR, "invalid canonical write permission");
+ }
+ dg_storage_lock_working(branch, GetActiveSnapshot());
+ GetUserIdAndSecContext(&user, &security);
+ SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+ PG_TRY();
+ {
+  bytea *db, *descriptor, *schema;
+  char *definition;
+  Oid resource, handle;
+  DGStorage *storage;
+
+  nest = begin_api();
+  db = read_ref(psprintf("working/%s", branch)).target;
+  if (!db)
+   elog(ERROR, "canonical working set disappeared");
+  run("SELECT t.objhash FROM pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+  if (SPI_processed != 1)
+   ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, branch)));
+  descriptor = DatumGetByteaPCopy(cell(0, 1));
+  schema = child(descriptor, 1);
+  definition = metadata(schema, "schema");
+  catalog_acl(catalog_namespace(db, strVal(linitial(parts))), "USAGE", user);
+  catalog_acl(definition, privilege, user);
+  resource = binding_relation(branch, name, schema);
+  if (!OidIsValid(resource))
+   ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
+  handle = CatalogViewLookupObject(provider_view(db), RelationRelationId, name);
+  storage = dg_storage_open(handle, branch, name, schema, resource, GetActiveSnapshot());
+  result = dg_storage_enable_write(storage, child(descriptor, 2));
+  end_api(nest);
+ }
+ PG_FINALLY();
+ {
+  SetUserIdAndSecContext(user, security);
+ }
+ PG_END_TRY();
+ return result;
+}

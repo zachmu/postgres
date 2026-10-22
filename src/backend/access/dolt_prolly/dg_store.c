@@ -202,7 +202,7 @@ DGState *
 dg_load(Relation rel, Snapshot snap)
 {
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+		return dg_storage_am_load(rel, snap);
 
 	return load_state(rel, snap, NULL, dg_relation_branch(rel), true, false);
 }
@@ -303,7 +303,7 @@ void
 dg_save(Relation rel, DGState *s, CommandId cid)
 {
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+		dg_storage_require_write(rel);
 	save_state(rel, s, cid, dg_relation_branch(rel));
 }
 

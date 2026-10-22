@@ -191,7 +191,9 @@ writer(Relation rel)
 {
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
-	LockRelationOid(RelationGetRelid(rel), ExclusiveLock);
+	if (rel->rd_catalogview)
+		dg_storage_require_write(rel);
+	LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
 }
 static void
 multiplicity(DGState *s, PLSlice row, int delta)
