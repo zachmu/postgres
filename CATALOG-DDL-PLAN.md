@@ -114,3 +114,23 @@ this gate. Existing guards remain for unsupported cases. Function lookup syntax,
 versioned view ownership, catalog introspection context, runtime OID lifetimes and
 cache invalidation scope need explicit decisions during the audit. Keep these
 open questions visible rather than treating prototype choices as final contracts.
+
+## Step 1 audit checkpoint — 2026-10-22
+
+The [source audit and publication contract](doc/doltgres/catalog-ddl-contract.md)
+records implementation cut points and a live-server finding: SQL catalog scans
+and parser/relcache lookup can observe different schema generations within one
+REPEATABLE READ transaction. Native version context must cover catalog lookup;
+ordinary catalog MVCC and a selected session branch are insufficient.
+
+The first implementation prerequisite is explicit writable branch/schema binding
+and staged membership/dependency changes, coordinated with data roots. The current
+capture path still enumerates shared live catalogs, and the AM has a second ALTER
+guard independent of the branch activation guard. Both remain intact. No branch
+DDL was enabled by this audit checkpoint. The runtime OID bridge and introspection
+strategy are still open choices, not validated interfaces.
+
+Two original Doltgres revision-introspection scripts and its branch-function
+scenario pass on Doltgres and fail at the current fork restrictions. A new native
+27-assertion safety/visibility test passes. These are baseline evidence, not
+completion of steps 2–3. See the contract for exact coverage and limitations.

@@ -316,3 +316,12 @@ live-reader and transaction lifetime rules. These are requirements for the next
 experiment, not claims that row-level concurrency or retention GC is implemented.
 Native providers replace historical projection; the current writer serialization
 and unsupported-operation guards remain until their replacements pass tests.
+
+## Writable binding audit checkpoint — 2026-10-22
+
+The [DDL contract](doc/doltgres/catalog-ddl-contract.md) requires an explicit
+branch/schema/storage binding at each write consumer. `dg_relation_branch` still
+returns the session branch, and roots do not carry a validated decoding-schema
+binding. Replacing these assumptions is prerequisite to branch-local DDL. The
+current writer serialization remains. The new safety test confirms savepoint
+failure preserves preceding DML without exposing it to other sessions or branches.

@@ -73,3 +73,13 @@ session-wide catalog switch to implement a multi-version statement. Runtime
 mappings may be necessary; their exact representation is an experimental choice,
 not a commitment to per-commit physical catalogs. The shared-schema freeze stays
 in force outside the subset actually proven safe.
+
+## DDL audit checkpoint — 2026-10-22
+
+See [the audited contract](doc/doltgres/catalog-ddl-contract.md). A real-server
+probe demonstrates different schema visibility between SQL catalog scans and
+parser/relcache lookup under one old snapshot. Read descriptors cannot simply be
+extended by mutating ordinary shared catalogs. Explicit write bindings, staged
+schema membership and provider-aware dependencies are the next implementation
+boundary. Type/function runtime identities and introspection remain unproven;
+branch DDL is still guarded.

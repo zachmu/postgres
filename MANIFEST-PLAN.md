@@ -278,3 +278,12 @@ it does not authorize automatic schema merging or replace SQL locking/validation
 Concurrent DDL/DML must not attach rows or indexes to an incompatible definition.
 Savepoint/full rollback and crash recovery must preserve this invariant. Avoid
 turning a shared manifest update into a permanent database-wide writer lock.
+
+## DDL publication audit checkpoint — 2026-10-22
+
+The [DDL contract](doc/doltgres/catalog-ddl-contract.md) specifies bind, prepare,
+validate, publish and finish/abort stages. Current capture enumerates shared live
+catalogs and requires a new branch-membership source before divergent DDL can be
+published correctly. Existing working refs do not automatically represent every
+ordinary DML change. Schema/data/dependency publication must use one SQL outcome;
+this is a required new protocol, not a property established by the read milestone.
