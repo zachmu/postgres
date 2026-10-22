@@ -14,6 +14,10 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/snapmgr.h"
+#include "utils/json.h"
+#include "mb/pg_wchar.h"
+
+#define DG_SCHEMA_TREE "DGSCHEMA2"
 
 static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge"};
 
@@ -114,8 +118,12 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if (((id == 1 || id == 6) && n != 0) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3))
+	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
+	if ((id == 1 || id == 6) && n == 1 &&
+		(VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
+		 memcmp(VARDATA_ANY(payload), DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE))))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid schema tree envelope")));
 	for (i = 0; i < n; i++)
 	{
 		char	   *child;
@@ -124,7 +132,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("manifest child cannot be null")));
 		child = object_kind(DatumGetByteaPP(links[i]), false);
-		valid = id == 0 ? strcmp(child, "chunk") == 0 :
+		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
 			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
@@ -394,6 +402,133 @@ dg_history_import(PLStore *store, bytea *address)
 	manifest_begin();
 	hash = import_node(store, address, 0);
 	dg_check(pl_open(store, hash, &result));
+	SPI_finish();
+	return result;
+}
+
+/* Canonical schema properties use the same node encoding and retained chunk
+ * ownership as table contents. Runtime OIDs/transaction metadata never enter
+ * this tree. The outer object kind distinguishes table schemas/namespaces. */
+bytea *
+dg_schema_store(const char *kind, const char *json)
+{
+	PLStore    *volatile store = NULL;
+	bytea	   *result = NULL;
+	PLTree		tree;
+	PLEntry    *entries;
+	int			n,
+				i;
+	Oid			types[] = {TEXTOID};
+	Datum		args[] = {CStringGetTextDatum(json)};
+
+	manifest_begin();
+	PG_TRY();
+	{
+		manifest_execute("SELECT key,value::text FROM jsonb_each($1::jsonb) ORDER BY key COLLATE \"C\"", 1, types, args, NULL, true, 0);
+		n = SPI_processed;
+		entries = palloc(sizeof(*entries) * Max(n, 1));
+		for (i = 0; i < n; i++)
+		{
+			char	   *key = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+			char	   *value = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+
+			key = pg_server_to_any(key, strlen(key), PG_UTF8);
+			value = pg_server_to_any(value, strlen(value), PG_UTF8);
+			entries[i].key = (PLSlice)
+			{
+				(uint8 *) key, strlen(key)
+			};
+			entries[i].value = (PLSlice)
+			{
+				(uint8 *) value, strlen(value)
+			};
+		}
+		store = pl_store_create();
+		if (!store)
+			elog(ERROR, "cannot allocate schema tree");
+		dg_check(pl_build(store, entries, n, &tree));
+		{
+			Datum		root = PointerGetDatum(export_node(store, tree.root, 0));
+
+			result = put_object(kind, bytes(DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE)), children_array(&root, 1));
+		}
+	}
+	PG_FINALLY();
+	{
+		if (store)
+			pl_store_free(store);
+	}
+	PG_END_TRY();
+	SPI_finish();
+	return result;
+}
+
+char *
+dg_schema_read(bytea *address, const char *kind)
+{
+	PLStore    *volatile store = NULL;
+	char	   *result = NULL;
+	Oid			types[] = {BYTEAOID, TEXTOID};
+	Datum		args[] = {PointerGetDatum(address), CStringGetTextDatum(kind)};
+	bool		isnull;
+	bytea	   *payload;
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	manifest_begin();
+	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true, 1);
+	if (SPI_processed != 1)
+		elog(ERROR, "missing retained schema object");
+	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	children = DatumGetArrayTypePCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	if (n == 0)
+	{
+		/* Existing repositories retain their original JSON schema objects. */
+		result = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+	}
+	else
+	{
+		if (n != 1 || nulls[0] || VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
+			memcmp(VARDATA_ANY(payload), DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE)))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid retained schema tree envelope")));
+		PG_TRY();
+		{
+			PLTree		tree;
+			DGRows		rows;
+			size_t		i;
+			StringInfoData json;
+
+			store = pl_store_create();
+			if (!store)
+				elog(ERROR, "cannot allocate schema reader");
+			dg_check(pl_open(store, import_node(store, DatumGetByteaP(values[0]), 0), &tree));
+			rows = dg_rows(&tree);
+			initStringInfo(&json);
+			appendStringInfoChar(&json, '{');
+			for (i = 0; i < rows.count; i++)
+			{
+				char	   *key = pnstrdup((char *) rows.items[i].key.data, rows.items[i].key.len);
+
+				if (i)
+					appendStringInfoChar(&json, ',');
+				escape_json(&json, key);
+				appendStringInfoChar(&json, ':');
+				appendBinaryStringInfo(&json, (char *) rows.items[i].value.data, rows.items[i].value.len);
+			}
+			appendStringInfoChar(&json, '}');
+			result = json.data;
+		}
+		PG_FINALLY();
+		{
+			if (store)
+				pl_store_free(store);
+		}
+		PG_END_TRY();
+	}
+	result = pg_any_to_server(result, strlen(result), PG_UTF8);
 	SPI_finish();
 	return result;
 }

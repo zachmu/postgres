@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 #include "access/doltcatalog.h"
+#include "access/doltbranch.h"
+#include "catalog/pg_am_d.h"
 
 #include <ctype.h>
 
@@ -1502,6 +1504,8 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation, int lockmode)
 								relation->relname)));
 		}
 	}
+	if (rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+		dg_catalog_check_relation(rel, dg_current_branch(), NULL);
 	cancel_parser_errposition_callback(&pcbstate);
 	return rel;
 }

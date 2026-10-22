@@ -15,6 +15,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 
 #include "access/reloptions.h"
@@ -590,6 +591,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
 
+	if (dg_catalog_drop(parsetree))
+	{
+		if (qc)
+			SetQueryCompletion(qc, CMDTAG_DROP_TABLE, 0);
+		free_parsestate(pstate);
+		return;
+	}
 	dg_guard_branch_ddl(parsetree);
 
 	switch (nodeTag(parsetree))

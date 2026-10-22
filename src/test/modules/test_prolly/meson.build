@@ -16,5 +16,7 @@ tests += {
     't/010_branch_sessions.pl',
     't/011_catalog_binding.pl',
     't/012_catalog_ddl_contract.pl',
+    't/013_schema_tree.pl',
+    't/014_branch_drop.pl',
   ]},
 }
