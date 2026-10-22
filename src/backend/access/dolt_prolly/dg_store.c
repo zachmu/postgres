@@ -249,18 +249,14 @@ append(Relation rel, const uint8 *data, Size length)
 	GenericXLogFinish(wal);
 	UnlockReleaseBuffer(buf);
 }
-void
-dg_save(Relation rel, DGState *s, CommandId cid)
+static void
+save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 {
 
 	size_t		i;
 	uint8		data[DG_HEADER + DG_PART];
 	PLHash		binding;
-	const char *branch = dg_relation_branch(rel);
 	PLSlice		branchbytes = {(const uint8 *) branch, strlen(branch)};
-
-	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
 
 	if (!pl_hash_bytes(branchbytes, &binding))
 		elog(ERROR, "branch hash failed");
@@ -303,6 +299,28 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 	memcpy(data + DG_HEADER + 80, binding.bytes, 32);
 	append(rel, data, DG_HEADER + 112);
 }
+void
+dg_save(Relation rel, DGState *s, CommandId cid)
+{
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical catalog handles require an explicit storage binding")));
+	save_state(rel, s, cid, dg_relation_branch(rel));
+}
+
+/* Only the transactional resource allocator calls this, before publishing any
+ * branch binding. WAL contains an empty, branch-tagged root under the caller XID. */
+void
+dg_initialize_resource(Relation rel, const char *branch)
+{
+	DGState    *state;
+
+	Assert(CatalogViewObjectContext(RelationGetRelid(rel)));
+	Assert(RelationGetNumberOfBlocks(rel) == 0);
+	state = dg_load_bound(rel, SnapshotSelf, branch);
+	save_state(rel, state, GetCurrentCommandId(true), branch);
+	dg_release(state);
+}
+
 static PLStatus
 collect(void *arg, PLSlice key, PLSlice value)
 {

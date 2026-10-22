@@ -11,6 +11,7 @@ CATALOG(pg_dolt_storage,9114,DoltStorageRelationId)
 	Oid			storagefile BKI_FORCE_NOT_NULL;
 	Oid			storageam BKI_FORCE_NOT_NULL;
 	char		storagekind BKI_FORCE_NOT_NULL;
+	bool		storageimported BKI_FORCE_NOT_NULL;
 #ifdef CATALOG_VARLEN
 	bytea		storageschema BKI_FORCE_NOT_NULL;
 #endif

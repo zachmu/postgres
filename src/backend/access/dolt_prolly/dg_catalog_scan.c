@@ -270,7 +270,7 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 
 		s->storage = dg_storage_open(definition, strVal(lsecond(plan->custom_private)), name,
 									 DatumGetByteaP(children[0]), (Oid) intVal(lthird(plan->custom_private)), s->snapshot);
-		s->live = dg_storage_load(s->storage, s->snapshot);
+		s->live = dg_storage_load(s->storage);
 		if (s->live->has_root)
 		{
 			dg_check(pl_cursor_init(&s->cursor, &s->live->content, NULL));

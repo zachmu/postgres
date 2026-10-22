@@ -1,5 +1,6 @@
 # src/test/modules/test_doltgres/Makefile
 MODULE_big = test_doltgres
+MODULES = storage_resource
 OBJS = $(WIN32RES) test_doltgres.o catalog_view.o
 PGFILEDESC = "test_doltgres - branch catalog projection experiment"
 REGRESS = branch_catalog
