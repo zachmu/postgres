@@ -298,3 +298,21 @@ now select independent working roots in one query and preserve snapshot visibili
 Historical scans use retained chunks without persistent projection. This does not
 remove table-wide writer serialization or implement branch-local DDL. The former
 persistent materializer has been removed entirely.
+
+## Schema identity and concurrent DDL — 2026-10-22
+
+Coordinate the [branch-local DDL gate](CATALOG-DDL-PLAN.md) with row publication.
+Each bound reader and pending write must identify the schema against which its
+rows, index keys and expressions are interpreted. Validate that identity before
+publishing or rebasing changes; tuple-layout compatibility alone is not proof of
+semantic compatibility. Conflicting DDL/DML must wait and recheck or fail explicitly,
+not reinterpret old tuple bytes using a newer definition.
+
+Readers on retained snapshots/cursors must keep their original metadata and data
+valid while another branch evolves. Lock identity must distinguish branches while
+still coordinating writers of the same logical branch object. Retention covers
+schema/dependency objects as well as data chunks; no reclamation is safe without
+live-reader and transaction lifetime rules. These are requirements for the next
+experiment, not claims that row-level concurrency or retention GC is implemented.
+Native providers replace historical projection; the current writer serialization
+and unsupported-operation guards remain until their replacements pass tests.

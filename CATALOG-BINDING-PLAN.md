@@ -54,3 +54,22 @@ then versioned types/functions/views/sequences. This is not proof that those pat
 can keep unchanged cache keys. Retention pins and writable binding authority must
 be designed alongside manifest publication and row-level tracking. Historical
 index access/statistics and general AS OF expressions remain follow-up work.
+
+## Direction and next gate — 2026-10-22
+
+Continue with native versioned providers, not persistent catalog projection.
+The read experiment supports this choice: independent descriptors and roots work
+on first access, in read-only transactions and on standbys. Generalized catalog
+viability remains unproven. In particular, table descriptors do not solve OID-based
+type/function lookup, dependencies, stored expressions, authorization or catalog
+introspection. These require deliberate core integration rather than scattered
+name-lookup overrides.
+
+The next gate is [CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md). Prove transactional
+branch-local schema changes and reader stability, then incompatible user-defined
+types/functions in a single cross-branch query. Every reference must carry enough
+version context to resolve its dependencies consistently. Do not use a mutable
+session-wide catalog switch to implement a multi-version statement. Runtime
+mappings may be necessary; their exact representation is an experimental choice,
+not a commitment to per-commit physical catalogs. The shared-schema freeze stays
+in force outside the subset actually proven safe.
