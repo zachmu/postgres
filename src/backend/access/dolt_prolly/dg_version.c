@@ -48,6 +48,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_language.h"
 #include "parser/parse_type.h"
+#include "parser/parse_func.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_publication_rel.h"

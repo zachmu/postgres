@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/detoast.h"
 #include "catalog/pg_language.h"
@@ -178,7 +179,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	}
 
 	/* Otherwise we need the pg_proc entry */
-	procedureTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionId));
+	procedureTuple = CatalogViewFunctionTuple(functionId);
 	if (!HeapTupleIsValid(procedureTuple))
 		elog(ERROR, "cache lookup failed for function %u", functionId);
 	procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
@@ -285,7 +286,7 @@ fmgr_symbol(Oid functionId, char **mod, char **fn)
 	Datum		prosrcattr;
 	Datum		probinattr;
 
-	procedureTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionId));
+	procedureTuple = CatalogViewFunctionTuple(functionId);
 	if (!HeapTupleIsValid(procedureTuple))
 		elog(ERROR, "cache lookup failed for function %u", functionId);
 	procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);

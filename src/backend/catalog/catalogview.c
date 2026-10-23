@@ -4,6 +4,7 @@
  * not consulted when the view provides a catalog, including an empty catalog.
  */
 #include "postgres.h"
+#include "utils/syscache.h"
 #include "catalog/pg_namespace.h"
 #include "fmgr.h"
 #include "utils/lsyscache.h"
@@ -662,4 +663,24 @@ CatalogViewNamespace(CatalogView *view, Oid namespaceid)
 	PG_END_TRY();
 	result = name ? CatalogViewFindObject(view, NamespaceRelationId, name) : InvalidOid;
 	return OidIsValid(result) ? result : namespaceid;
+}
+
+/* Resolve an already selected runtime function handle, not a name in the
+ * body's catalog scope. Shared helpers can execute over historical arguments. */
+HeapTuple
+CatalogViewFunctionTuple(Oid functionid)
+{
+	CatalogView *previous = CatalogViewSwitch(CatalogViewObjectContext(functionid));
+	HeapTuple	result;
+
+	PG_TRY();
+	{
+		result = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionid));
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
 }

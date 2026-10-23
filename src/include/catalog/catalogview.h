@@ -31,6 +31,7 @@ extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const cha
 extern CatalogView *CatalogViewObjectContext(Oid handle);
 extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);
+extern HeapTuple CatalogViewFunctionTuple(Oid functionid);
 extern Oid	CatalogViewObjectStorage(Oid handle);
 extern CatalogView *CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const int *attributes, const Datum *values);
 

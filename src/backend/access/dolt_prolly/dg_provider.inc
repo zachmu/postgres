@@ -11,7 +11,7 @@ typedef struct DGProvider
 static DGProvider *providers;
 
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId,
+	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
 	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId
 };
 

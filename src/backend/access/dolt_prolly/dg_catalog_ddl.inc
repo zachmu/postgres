@@ -214,6 +214,8 @@ dg_catalog_drop(Node *statement)
 			for (i = 0; i < nchildren; i++)
 				children[i] = cell(i, 1);
 			database = put("database", json, children, nchildren);
+			(void) provider_view(database); /* Validate retained definitions
+											 * before publication. */
 			move_ref(branch_ref("working"), working, database);
 		}
 		end_api(nest);
