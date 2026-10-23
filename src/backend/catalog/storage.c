@@ -209,6 +209,9 @@ RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
 
+	if (CatalogViewCaptureStorage(rel, CATALOG_STORAGE_DROP))
+		return;
+
 	/* Context handles describe retained definitions, not disposable files. */
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

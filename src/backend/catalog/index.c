@@ -35,6 +35,7 @@
 #include "bootstrap/bootstrap.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -790,7 +791,7 @@ index_create(Relation heapRelation,
 	 */
 	namespaceId = RelationGetNamespace(heapRelation);
 	shared_relation = heapRelation->rd_rel->relisshared;
-	mapped_relation = RelationIsMapped(heapRelation);
+	mapped_relation = !heapRelation->rd_catalogview && RelationIsMapped(heapRelation);
 	relpersistence = heapRelation->rd_rel->relpersistence;
 
 	/*
@@ -970,7 +971,8 @@ index_create(Relation heapRelation,
 		}
 		else
 		{
-			indexRelationId =
+			indexRelationId = CatalogViewIsProvisional(heapRelation->rd_catalogview) ?
+				CatalogViewNewObject(RelationRelationId) :
 				GetNewRelFileNumber(tableSpaceId, pg_class, relpersistence);
 		}
 	}
@@ -2851,6 +2853,17 @@ index_update_stats(Relation rel,
 	Form_pg_class rd_rel;
 	bool		dirty;
 
+	if (CatalogViewIsProvisional(rel->rd_catalogview))
+	{
+		pg_class = table_open(RelationRelationId, RowExclusiveLock);
+		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		((Form_pg_class) GETSTRUCT(tuple))->relhasindex = hasindex;
+		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+		heap_freetuple(tuple);
+		table_close(pg_class, RowExclusiveLock);
+		return;
+	}
+
 	/*
 	 * As a special hack, if we are dealing with an empty table and the
 	 * existing reltuples is -1, we leave that alone.  This ensures that
@@ -3038,6 +3051,13 @@ index_build(Relation heapRelation,
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
+
+	if (CatalogViewCaptureStorage(indexRelation, CATALOG_STORAGE_BUILD))
+	{
+		index_update_stats(heapRelation, true, -1);
+		CommandCounterIncrement();
+		return;
+	}
 
 	/*
 	 * sanity checks

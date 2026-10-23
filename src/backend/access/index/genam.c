@@ -394,7 +394,7 @@ systable_beginscan(Relation heapRelation,
 {
 	SysScanDesc sysscan;
 	Relation	irel;
-	CatalogViewScan *viewscan = CatalogViewBeginScan(heapRelation, nkeys, key);
+	CatalogViewScan *viewscan = CatalogViewBeginScanSnapshot(heapRelation, nkeys, key, snapshot);
 
 	if (viewscan)
 	{
@@ -678,7 +678,7 @@ systable_beginscan_ordered(Relation heapRelation,
 	int			i;
 	ScanKey		idxkey;
 
-	CatalogViewScan *viewscan = CatalogViewBeginScan(heapRelation, nkeys, key);
+	CatalogViewScan *viewscan = CatalogViewBeginScanSnapshot(heapRelation, nkeys, key, snapshot);
 
 	if (viewscan)
 	{

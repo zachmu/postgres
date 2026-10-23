@@ -1,9 +1,12 @@
+static List *table_index_names(const char *schema_json, const char *table);
+static bool name_selected(List *names, const char *name);
+
 /* Native ALTER runs against private command-visible catalog tuples. Publication
  * serializes the final definitions once; intermediate roots are not published. */
 static bool
 native_alter_action(AlterTableType type)
 {
-	return type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
+	return type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
 		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType;
 }
 
@@ -261,6 +264,94 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 	return strcell(0, 1);
 }
 
+typedef struct MutationIndex
+{
+	Oid			id;
+	char	   *name;
+	char	   *sql;
+	bytea	   *schema;
+	bytea	   *member;
+	Oid			resource;
+} MutationIndex;
+
+static bool native_mutation_indexes;
+
+static void
+mutation_storage(Relation relation, CatalogViewStorageEffect effect)
+{
+	if (relation->rd_catalogview != native_mutation_view ||
+		relation->rd_rel->relkind != RELKIND_INDEX ||
+		relation->rd_rel->relam != DOLT_PROLLY_INDEX_AM_OID)
+		unsupported("native mutation storage effect outside prolly indexes");
+	if (effect != CATALOG_STORAGE_CREATE && IndexGetRelation(RelationGetRelid(relation), false) != native_mutation_relation)
+		unsupported("native mutation index belongs to another table");
+	native_mutation_indexes = true;
+}
+
+/* Native pg_index is the authority after ALTER has completed all its passes. */
+static List *
+mutation_indexes(CatalogView *view, Oid table)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+	CatalogView *previous = CatalogViewSwitch(view);
+	int			nest = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		foreach(lc, CatalogViewTuples(view, IndexRelationId))
+		{
+			HeapTuple	tuple = lfirst(lc);
+			Form_pg_index index = (Form_pg_index) GETSTRUCT(tuple);
+			MutationIndex *item;
+
+			if (index->indrelid != table)
+				continue;
+			if (index->indisexclusion || !index->indisvalid || !index->indisready || !index->indimmediate)
+				unsupported("native index validity or deferred constraint codec");
+			for (int i = 0; i < index->indnatts; i++)
+				if (index->indkey.values[i] <= 0)
+					unsupported("canonical expression index codec");
+			if (!heap_attisnull(tuple, Anum_pg_index_indpred, NULL))
+				unsupported("canonical partial index codec");
+			item = palloc0(sizeof(*item));
+			item->id = index->indexrelid;
+			item->name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(item->id)), get_rel_name(item->id));
+			item->sql = TextDatumGetCString(DirectFunctionCall1(pg_get_indexdef, ObjectIdGetDatum(item->id)));
+			result = lappend(result, item);
+		}
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static char *
+mutation_index_list(const char *definition, List *indexes)
+{
+	StringInfoData json;
+	ListCell   *lc;
+
+	initStringInfo(&json);
+	appendStringInfoChar(&json, '[');
+	foreach(lc, indexes)
+	{
+		MutationIndex *item = lfirst(lc);
+
+		if (lc != list_head(indexes))
+			appendStringInfoChar(&json, ',');
+		escape_json(&json, item->sql);
+	}
+	appendStringInfoChar(&json, ']');
+	run("SELECT jsonb_set($1::jsonb,'{indexes}',coalesce((SELECT jsonb_agg(v ORDER BY v::text COLLATE \"C\") FROM jsonb_array_elements($2::jsonb) v),'[]'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
+	return strcell(0, 1);
+}
+
 static void
 native_alter_publish(Capture current, VersionRef working, const char *name, AlterTableStmt *statement, DGState *state, int oldcount, Oid caller)
 {
@@ -278,6 +369,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	Datum	   *children;
 	StringInfoData json;
 	int			count;
+	int			used = 0;
+	List	   *indexes = NIL,
+			   *oldindexes = NIL;
+	bool		saved_indexes = native_mutation_indexes;
 	bool		rewrite = false;
 	PLTree		tree = state->content;
 
@@ -290,6 +385,8 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		provider_populate(view, current.hash);
 		CatalogViewBeginMutation(view);
 		CatalogViewSetMutationValidator(view, mutation_validate_tuple);
+		CatalogViewSetStorageHandler(view, mutation_storage);
+		native_mutation_indexes = false;
 		native_mutation_view = view;
 		native_mutation_source = state;
 		native_mutation_destination = NULL;
@@ -302,8 +399,18 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
 
 			if (action->subtype == AT_AddConstraint &&
-				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL)
+				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL && castNode(Constraint, action->def)->contype != CONSTR_UNIQUE && castNode(Constraint, action->def)->contype != CONSTR_PRIMARY)
 				unsupported("native constraint storage codec");
+			if (action->subtype == AT_AddIndex)
+			{
+				IndexStmt  *index = castNode(IndexStmt, action->def);
+
+				if (index->concurrent || index->whereClause || index->options || index->tableSpace ||
+					(index->accessMethod && strcmp(index->accessMethod, "btree") && strcmp(index->accessMethod, "dolt_prolly_index")))
+					unsupported("canonical index storage properties");
+				index->accessMethod = pstrdup("dolt_prolly_index");
+				action->def = (Node *) transformIndexStmt(id, index, debug_query_string ? debug_query_string : "");
+			}
 			if (action->subtype == AT_AlterColumnType)
 			{
 				ColumnDef  *col = castNode(ColumnDef, action->def);
@@ -331,7 +438,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				{
 					Constraint *con = lfirst_node(Constraint, cc);
 
-					if (con->contype != CONSTR_DEFAULT && con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL && con->contype != CONSTR_CHECK)
+					if (con->contype != CONSTR_DEFAULT && con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL && con->contype != CONSTR_CHECK && con->contype != CONSTR_PRIMARY && con->contype != CONSTR_UNIQUE)
 						unsupported("native added-column constraint codec");
 				}
 			}
@@ -362,6 +469,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			PG_END_TRY(caller);
 		}
 		CommandCounterIncrement();
+		indexes = mutation_indexes(view, id);
 		CatalogViewSwitch(NULL);
 		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		count = SPI_processed;
@@ -369,18 +477,54 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		kinds = palloc_array(char *, Max(count, 1));
 		names = palloc_array(char *, Max(count, 1));
 		payloads = palloc_array(char *, Max(count, 1));
-		children = palloc_array(Datum, Max(count, 1));
+		children = palloc_array(Datum, Max(count + list_length(indexes), 1));
 		for (int i = 0; i < count; i++)
 		{
 			members[i] = DatumGetByteaPCopy(cell(i, 1));
 			kinds[i] = strcell(i, 2);
 			names[i] = strcell(i, 3);
 		}
+		for (int i = 0; i < count; i++)
+			if (names[i] && !strcmp(names[i], name))
+				oldindexes = table_index_names(metadata(child(members[i], 1), "schema"), name);
+
+		/*
+		 * Serialize all surviving indexes, including newly allocated native
+		 * handles.
+		 */
+		foreach(lc, indexes)
+		{
+			MutationIndex *item = lfirst(lc);
+			char	   *old = NULL,
+					   *definition;
+			int		   *mapping,
+						attributes;
+			PLTree		empty;
+
+			for (int i = 0; i < count; i++)
+				if (!strcmp(kinds[i], "index") && !strcmp(names[i], item->name))
+				{
+					bytea	   *schema = child(members[i], 1);
+
+					old = metadata(schema, "schema");
+					item->resource = binding_relation(dg_current_branch(), item->name, schema);
+				}
+			if (!old)
+				old = canonical_definition(item->name, caller, acldefault(OBJECT_TABLE, caller), "[]", "[]", "[]", item->sql);
+			definition = mutation_columns(view, item->id, old, &mapping, &attributes);
+			run("SELECT jsonb_set($1::jsonb,'{index_definition}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(item->sql)), NULL, true);
+			definition = strcell(0, 1);
+			dg_check(pl_build(state->store, NULL, 0, &empty));
+			item->member = canonical_empty_member("index", item->name, definition, &empty);
+			item->schema = child(item->member, 1);
+		}
 		initStringInfo(&json);
 		appendStringInfoChar(&json, '[');
 		for (int i = 0; i < count; i++)
 		{
 			payloads[i] = metadata(members[i], kinds[i]);
+			if (!strcmp(kinds[i], "index") && name_selected(oldindexes, names[i]))
+				continue;
 			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 			{
 				bytea	   *oldschema = child(members[i], 1);
@@ -407,6 +551,8 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 
 				if (!strcmp(kinds[i], "table"))
 					definition = mutation_constraints(view, object, definition);
+				if (!strcmp(names[i], name))
+					definition = mutation_index_list(definition, indexes);
 
 				if (strcmp(definition, old))
 				{
@@ -431,23 +577,46 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					binding_record(dg_current_branch(), names[i], schema, resource);
 				}
 			}
-			if (i)
+			if (used)
 				appendStringInfoChar(&json, ',');
 			if (!strcmp(kinds[i], "namespace"))
 				appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payloads[i]);
 			else
 				appendStringInfoString(&json, payloads[i]);
-			children[i] = PointerGetDatum(members[i]);
+			children[used++] = PointerGetDatum(members[i]);
+		}
+		foreach(lc, indexes)
+		{
+			MutationIndex *item = lfirst(lc);
+
+			if (used)
+				appendStringInfoChar(&json, ',');
+			appendStringInfoString(&json, metadata(item->member, "index"));
+			children[used++] = PointerGetDatum(item->member);
 		}
 		appendStringInfoChar(&json, ']');
 		run("SELECT jsonb_set($1::jsonb,'{members}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(json.data)), NULL, true);
 		{
-			bytea	   *database = canonical_database(strcell(0, 1), children, count);
+			bytea	   *database = canonical_database(strcell(0, 1), children, used);
 
-			(void) provider_view(database);
+			CatalogView *final = provider_view(database);
+
+			foreach(lc, indexes)
+			{
+				MutationIndex *item = lfirst(lc);
+
+				if (!OidIsValid(item->resource))
+				{
+					Relation	index = relation_open(CatalogViewLookupObject(final, RelationRelationId, item->name), NoLock);
+
+					item->resource = dg_storage_allocate(index, dg_current_branch());
+					relation_close(index, NoLock);
+				}
+				binding_record(dg_current_branch(), item->name, item->schema, item->resource);
+			}
 			move_ref(branch_ref("working"), working, database);
 			advance_snapshot();
-			if (rewrite)
+			if (rewrite || indexes != NIL || native_mutation_indexes)
 			{
 				Relation	target = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 
@@ -466,6 +635,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		native_mutation_destination = saved_destination;
 		native_mutation_relation = saved_relation;
 		native_mutation_width = saved_width;
+		native_mutation_indexes = saved_indexes;
 		if (CatalogViewIsProvisional(view))
 			CatalogViewRetireMutation(view);
 		CatalogViewRelease(view);

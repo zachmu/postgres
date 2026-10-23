@@ -3632,6 +3632,9 @@ RelationBuildLocalRelation(const char *relname,
 	 * allocate a new relation descriptor and fill in basic state fields.
 	 */
 	rel = (Relation) palloc0(sizeof(RelationData));
+	rel->rd_catalogview = CatalogViewObjectContext(relid);
+	if (rel->rd_catalogview)
+		CatalogViewRetain(rel->rd_catalogview);
 
 	/* make sure relation is marked as having no open file yet */
 	rel->rd_smgr = NULL;

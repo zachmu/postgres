@@ -30,6 +30,7 @@
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/catalogview.h"
+#include "catalog/catalogview.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -15962,6 +15963,12 @@ RebuildConstraintComment(AlteredTableInfo *tab, AlterTablePass pass, Oid objid,
 static void
 TryReuseIndex(Oid oldId, IndexStmt *stmt)
 {
+	/*
+	 * Retained branch roots are rebuilt by their publisher, never
+	 * file-swapped.
+	 */
+	if (CatalogViewObjectContext(oldId))
+		return;
 	if (CheckIndexCompatible(oldId,
 							 stmt->accessMethod,
 							 stmt->indexParams,

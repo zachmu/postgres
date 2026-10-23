@@ -49,8 +49,8 @@ is(sql(q{SELECT * FROM t ORDER BY id}),"1|a|kept|\n2|b|kept|\n3|c|kept|",'mixed 
 is(sql(q{SELECT attname,attnum FROM pg_attribute WHERE attrelid='t'::regclass AND attnum>0 ORDER BY attnum}),"id|1\npayload|2\nextra|3\nnewer|4",'canonical publication compacts transient dropped-column slots');
 rejects(q{ALTER TABLE t ADD COLUMN failed int, ALTER COLUMN failed SET COMPRESSION pglz},'failure in later pass rejects all layout changes');
 is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid='t'::regclass AND attname='failed'}),'0','failed multi-pass layout leaves no catalog residue');
-rejects(q{ALTER TABLE t DROP COLUMN id},'indexed drop fails before physical storage deletion');
-is(sql(q{SELECT count(*) FROM t WHERE id=2}),'1','failed indexed drop preserves data and indexes');
+sql(q{BEGIN; ALTER TABLE t DROP COLUMN id; ROLLBACK});
+is(sql(q{SELECT count(*) FROM t WHERE id=2}),'1','indexed drop rollback preserves data and indexes');
 sql(q{BEGIN; ALTER TABLE t DROP COLUMN extra; ROLLBACK});
 is(sql(q{SELECT extra FROM t ORDER BY id LIMIT 1}),'kept','layout and data publication roll back together');
 my ($unsupported_out,$unsupported_status)=$s->query(q{ALTER TABLE t ADD COLUMN unsupported int DEFAULT public.unportable_default()});
