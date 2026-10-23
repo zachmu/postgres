@@ -73,6 +73,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	VersionRef	ref;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
+	bool		already = false;
 
 	standalone(fcinfo, true);
 	nest = begin_api();
@@ -91,17 +92,30 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		move_ref(psprintf("staged/%s", name), empty_ref, child(commit, 1));
 		advance_snapshot();
 	}
-	else if (n == 1 && args[0][0] != '-')
+	else if (n >= 1 && args[0][0] != '-')
 	{
 		name = args[0];
 		ref = read_ref(psprintf("heads/%s", name));
 		commit = ref.target;
-		if (!commit)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch not found: %s", name)));
+		if (n == 1 && commit && !strcmp(name, dg_current_branch()))
+			already = true;
+		if (!commit || n > 1)
+		{
+			/* Not a branch: a tag or commit would detach HEAD; otherwise tables. */
+			if (n == 1 && !*name)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: cannot checkout empty string")));
+			if (n == 1 && (read_ref(psprintf("tags/%s", name)).target || (strlen(name) >= 8 && strspn(name, "0123456789abcdef") == strlen(name))))
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("dolt does not support a detached head state. To create a branch at this tag, run: dolt checkout %s -b {new_branch_name}", name)));
+			checkout_tables(args, n);
+			values[0] = Int64GetDatum(0);
+			values[1] = CStringGetTextDatum("");
+			end_api(nest);
+			return command_record(fcinfo, values, nulls);
+		}
 	}
 	else
 	{
-		unsupported("checkout supports branch or -b branch [start-point]");
+		unsupported("checkout supports branch, -b branch [start-point], or table names");
 		return 0;
 	}
 
@@ -120,7 +134,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		move_ref("views/enabled", ref, commit);
 	dg_select_branch(name);
 	values[0] = Int64GetDatum(0);
-	values[1] = CStringGetTextDatum(psprintf("Switched to branch '%s'", name));
+	values[1] = CStringGetTextDatum(psprintf(already ? "Already on branch '%s'" : "Switched to branch '%s'", name));
 	end_api(nest);
 	return command_record(fcinfo, values, nulls);
 }
@@ -708,7 +722,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	same_schema(metadata(oursdb, "database"), metadata(child(base, 1), "database"));
 	live = capture(true);
 	if (!same(live.hash, oursdb) || !same(read_ref(branch_ref("staged")).target, oursdb))
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("commit or discard working and staged changes before merge")));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
 	if (ffonly && !same(base, head.target))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);

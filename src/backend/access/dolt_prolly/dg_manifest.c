@@ -299,6 +299,9 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		manifest_execute("UPDATE pg_catalog.pg_dolt_ref SET reftarget=$3,reftoken=$4 WHERE refname=$1 AND reftoken=$2", 4, types, args, nulls, false, 0);
 	if (SPI_processed != 1)
 		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("manifest ref changed; reread and retry transaction")));
+	/* Branch and tag moves feed dolt_reflog. */
+	if (!PG_ARGISNULL(2) && (strncmp(text_to_cstring(name), "heads/", 6) == 0 || strncmp(text_to_cstring(name), "tags/", 5) == 0))
+		manifest_execute("INSERT INTO pg_catalog.pg_dolt_reflog(reflogname,reflogtime,reflogtarget) VALUES($1,clock_timestamp(),$3)", 4, types, args, nulls, false, 0);
 	/* Named revision bindings must be reanalyzed after ref publication. */
 	CacheInvalidateRelcacheByRelid(DoltRefRelationId);
 	SPI_finish();

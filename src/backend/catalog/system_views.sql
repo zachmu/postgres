@@ -1425,11 +1425,17 @@ CREATE TABLE pg_catalog.pg_dolt_remote (
     remotefetch jsonb NOT NULL,
     remoteparams jsonb NOT NULL
 );
+CREATE TABLE pg_catalog.pg_dolt_reflog (
+    reflogname text NOT NULL,
+    reflogtime timestamptz NOT NULL,
+    reflogtarget bytea NOT NULL,
+    PRIMARY KEY (reflogname, reflogtime, reflogtarget)
+);
 CREATE TABLE pg_catalog.pg_dolt_doc (
     docname text PRIMARY KEY,
     doctext text
 );
-REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc FROM PUBLIC;
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog FROM PUBLIC;
 
 -- Commits reachable from any branch, tag or remote-tracking ref.
 CREATE VIEW pg_dolt_commit_visible AS
