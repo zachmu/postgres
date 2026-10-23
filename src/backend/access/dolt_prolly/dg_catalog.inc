@@ -198,6 +198,15 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
 	}
 revision_selected:
+	/* AS OF and database/revision qualifiers also allow implicit pg_catalog. */
+	if (!rv->schemaname &&
+		catalog_supported(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
+	{
+		RangeVar   *qualified = (RangeVar *) copyObject(rv);
+
+		qualified->schemaname = pstrdup("pg_catalog");
+		rv = qualified;
+	}
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
 	GetUserIdAndSecContext(&user, &security);

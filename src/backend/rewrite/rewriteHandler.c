@@ -19,8 +19,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "access/doltcatalog.h"
 
+#include "access/doltcatalog.h"
 #include "access/relation.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -1798,7 +1798,6 @@ ApplyRetrieveRule(Query *parsetree,
 			TargetEntry *tle;
 
 			rte = rt_fetch(rt_index, parsetree->rtable);
-
 			newrte = copyObject(rte);
 			parsetree->rtable = lappend(parsetree->rtable, newrte);
 			parsetree->resultRelation = list_length(parsetree->rtable);
@@ -1881,7 +1880,6 @@ ApplyRetrieveRule(Query *parsetree,
 	 * original RTE to a subquery RTE.
 	 */
 	rte = rt_fetch(rt_index, parsetree->rtable);
-
 
 	rte->rtekind = RTE_SUBQUERY;
 	rte->subquery = rule_action;
@@ -2069,7 +2067,6 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 
 		/* Stored view actions bypass parser RangeVar binding. */
 		dg_catalog_rewrite_relation(rte);
-
 
 		/*
 		 * A subquery RTE can't have associated rules, so there's nothing to
@@ -2384,7 +2381,6 @@ CopyAndAddInvertedQual(Query *parsetree,
 	if (event == CMD_INSERT || event == CMD_UPDATE)
 	{
 		RangeTblEntry *rte = rt_fetch(rt_index, parsetree->rtable);
-
 		Relation	rel;
 		List	   *gen_cols;
 

@@ -45,6 +45,8 @@ is(sql(q{WITH t AS (SELECT 42 AS id) SELECT id FROM t AS OF 'HEAD'}),'1','explic
 my $before=sql(q{SELECT count(*) FROM pg_dolt_storage});
 is(sql(q{BEGIN READ ONLY; WITH cols AS MATERIALIZED (SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='t') SELECT column_name FROM cols ORDER BY ordinal_position; COMMIT}),"id\nvalue\nlater",'read-only CTE expansion carries context');
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),$before,'introspection allocates no persistent storage');
+is(sql(q{SELECT m.column_name,h.attname FROM information_schema.columns m CROSS JOIN (pg_attribute AS OF 'other' h JOIN pg_class AS OF 'other' c ON h.attrelid=c.oid) WHERE m.table_schema='public' AND m.table_name='t' AND m.column_name='later' AND c.relname='t' AND h.attname='extra'}),'later|extra','stored current view and explicit historical catalogs coexist');
+is(sql(q{SELECT c.relname,pg_get_indexdef(i.indexrelid,1,true) FROM pg_index AS OF 'other' i JOIN pg_class AS OF 'other' c ON c.oid=i.indrelid WHERE c.relname='t'}),'t|id','historical bound handles reach native index deparser');
 $s->quit;$node->stop;$node->start;
 is(sql($columns),"id\nvalue\nlater",'cold restart binds stored views automatically');
 $node->stop;done_testing();
