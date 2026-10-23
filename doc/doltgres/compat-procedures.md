@@ -52,8 +52,9 @@ streaming replication.
 
 ## dolt.query_catalog, dolt.branch_control, dolt.branch_namespace_control
 
-Unversioned `pg_catalog` tables (like `dolt_docs`) exposed through updatable
-views and `dolt_` aliases with Dolt's columns. Branch control rows are stored
+`dolt.query_catalog` and `dolt_query_catalog` access the ordinary versioned
+`public.dolt_query_catalog` prolly table. Branch control uses native unversioned
+catalog tables with updatable views and aliases. Branch control rows are stored
 but not enforced: every version-control call still requires superuser in this
 prototype.
 

@@ -21,11 +21,11 @@ advances the API snapshot before composed states are read back.
 | Command | Behavior |
 |---|---|
 | `dolt_add(table, ...)` | Stages only the named tables (qualified or resolved along the search path). `.`/`-A` unchanged. |
-| `dolt_reset()` / `('.')` | Unstages everything (staged ← HEAD). `dolt_reset(table, ...)` unstages tables. `dolt_reset(rev)` moves HEAD and staging (mixed). `--soft rev` moves HEAD only. `--hard [rev]` restores every table in the target state, drops working tables the target lacks, and moves HEAD, staging and working; it refuses targets whose tables are missing from the working set (recreating tables needs DDL). |
+| `dolt_reset()` / `('.')` | Unstages everything (staged ← HEAD). `dolt_reset(table, ...)` unstages tables. `dolt_reset(rev)` moves HEAD and staging (mixed). `--soft rev` moves HEAD only. `--hard [rev]` restores every table in the target state, drops working tables the target lacks, and moves HEAD, staging and working; canonical definitions restore missing tables and their dependencies without replaying user DDL. |
 | `dolt_clean([--dry-run] [table ...])` | Drops untracked tables (present in neither HEAD nor staging) through DDL. |
 | `dolt_rm([--cached] table ...)` | Removes tables from staging; without `--cached` also drops them. |
 | `dolt_checkout(table, ...)` | Restores working tables from HEAD; tables absent from HEAD are dropped (Dolt's MoveTablesFromHeadToWorking). Returns `(0, '')`. Unknown names: "tablespec 'x' did not match any table(s) known to dolt". Tags or hashes: the Dolt detached-HEAD error. Checking out the session branch reports "Already on branch". |
-| `dolt_branch` | `-d`/`-D [-f]` deletes (not the session branch; refs, pending merge and runtime bindings go), `-m [-f] old new` renames, `-c [-f] src dst` copies. Rename and copy require a clean source branch because branch-tagged relation roots cannot be re-labelled; the new branch starts from the source head. |
+| `dolt_branch` | `-d`/`-D [-f]` deletes (not the session branch; other attached sessions prevent deletion unless `-f`; refs, pending merge and runtime bindings go), `-m [-f] old new` renames, `-c [-f] src dst` copies. Rename and copy require a clean source branch because branch-tagged relation roots cannot be re-labelled; the new branch starts from the source head. |
 | `dolt_tag('-d', name)` | Deletes a tag. |
 | `dolt_revert(rev...)` | Three-way application of each commit's inverse (base = commit, ours = HEAD, theirs = parent) onto a clean working set, committed as `Revert "<message>"`. Conflicts abort the command. Returns `(hash, 0, 0, 0)`. |
 | `dolt_cherry_pick(rev)` | Applies one commit's changes (base = parent, ours = HEAD, theirs = commit) and commits with its message. |
@@ -46,10 +46,29 @@ The dirty-merge error is Dolt's "error: local changes would be stomped by merge"
 ## Limits
 
 Revert and cherry-pick require identical schemas and a clean working set and
-do not persist conflicts. Hard reset cannot recreate dropped tables. Branch
+do not persist conflicts. Branch
 rename/copy of dirty branches is refused. Reflog does not record deletions.
 
 Tests: `src/test/modules/test_prolly/t/021_workspace.pl`; Doltgres
 `TestDoltBranchStatus`, `TestDoltTag`, `TestDoltProcedureRecordResults`, the
 workspace smoke tests, `TestUserSpaceDoltTables/dolt_workspace_with_tablename`
 and `TestPostgresWorkspaceCommands` (the mixed-schema originals are excluded).
+
+## Integration repairs (2026-10-23)
+
+Restore publishes canonical definitions before installing matching retained table
+contents and rebuilding runtime/index state, within the same SQL transaction.
+Table checkout composes the selected table, owned indexes and required namespace;
+hard reset replaces the entire database definition, including routines and their row-type dependencies.
+Unrelated working tables are retained by table-scoped restore.
+
+Every branch creation/copy overwrites its working ref and installs starting roots
+for all tables. This currently does work proportional to table/index count and
+imports retained chunks; it is not an O(1) manifest-only operation. Existing storage
+resources are reused, without branch incarnation IDs. Deletion removes working,
+staging and binding records; recreation overwrites the old branch-tagged roots.
+
+Session advisory locks protect branches from ordinary deletion. Force deletion
+bypasses that protection. Subsequent writes fail once deletion is visible, but
+old snapshots and sessions surviving deletion plus same-name recreation still
+need the authority checks documented in KNOWN-ISSUES.md.

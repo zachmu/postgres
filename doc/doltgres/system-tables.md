@@ -9,11 +9,11 @@ Every database has a built-in `dolt` schema created by initdb. System tables
 are views in that schema (`dolt.branches`) with `dolt_`-prefixed aliases in
 `pg_catalog` (`dolt_branches`). A schema-qualified alias such as
 `public.dolt_branches` or `newschema.dolt_status` resolves to the pg_catalog
-alias when the schema exists but defines no relation of that name; a user
-relation with the alias name takes precedence in its own schema. Unqualified
-`dolt_branches` follows PostgreSQL's search path, so the implicit `pg_catalog`
-entry wins over a same-named user table unless `pg_catalog` is listed later
-explicitly. `SET search_path = dolt` makes the bare names (`branches`) visible.
+alias when the schema exists. User relation and namespace names beginning
+with `dolt` are reserved, including CREATE and rename paths. Internal versioned
+metadata tables are the exception: explicit `public.dolt_docs`, `public.dolt_tests`
+and `public.dolt_query_catalog` bind to their canonical branch definitions.
+`SET search_path = dolt` makes the bare built-in names (`branches`) visible.
 The `dolt` schema cannot be recreated and is not captured into commits; pg_dump
 skips it like `pg_catalog`.
 
@@ -51,7 +51,7 @@ Default committer/tagger email is `role@client-host` for TCP connections and
 | `dolt.merge_status` | `dolt_merge_status()` | is_merging, source (revision text), source_commit, target (`refs/heads/<branch>`), unmerged_tables (unqualified, comma separated). The merge object now records `source`. |
 | `dolt.conflicts` | SQL over the pending merge | Unqualified table name and numeric count, like Doltgres. |
 | `dolt.remotes` | `pg_dolt_remote` | `dolt_remote('add', name, url)` / `('remove', name)`. Database-local configuration. |
-| `dolt.docs` | `pg_dolt_doc` with INSTEAD rules | Insert/update/delete through `dolt.docs` or `dolt_docs`. `AGENT.md` defaults to Dolt's embedded text until overridden. Documents are not versioned. |
+| `dolt.docs` | `public.dolt_docs` (prolly) | Insert/update/delete through `dolt.docs` or `dolt_docs`. `AGENT.md` defaults to Dolt's embedded text until overridden. Documents are versioned with ordinary table data; the default text is virtual before allocation and seeded when the table is first created. |
 
 `dolt_hashof(revision)` and `hashof(revision)` return the commit hash of a
 revision expression.

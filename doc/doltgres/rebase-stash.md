@@ -64,7 +64,7 @@ procedures and functions, exposed as `dolt.help` / `dolt_help`.
 
 ## dolt.tests and dolt_test_run
 
-`pg_catalog.pg_dolt_test` (unversioned, like `dolt_docs`) backs `dolt.tests`
+`public.dolt_tests` (ordinary versioned prolly storage) backs `dolt.tests`
 / `dolt_tests` with Dolt's columns and check constraints on assertion types
 (`expected_rows`, `expected_columns`, `expected_single_value`) and
 comparators. `dolt_test_run([name | group | '*'])` runs each query read-only
