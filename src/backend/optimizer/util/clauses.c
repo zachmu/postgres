@@ -836,6 +836,8 @@ max_parallel_hazard_test(char proparallel, max_parallel_hazard_context *context)
 static bool
 max_parallel_hazard_checker(Oid func_id, void *context)
 {
+	if (CatalogViewObjectContext(func_id))
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 	return max_parallel_hazard_test(func_parallel(func_id),
 									(max_parallel_hazard_context *) context);
 }
@@ -845,6 +847,47 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 {
 	if (node == NULL)
 		return false;
+
+	/*
+	 * Runtime handles are backend-local. Until workers can import a context
+	 * with a coordinated handle map, execute these plans in the leader.
+	 */
+	if (CatalogViewCurrent())
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+	switch (nodeTag(node))
+	{
+		case T_Var:
+		case T_Const:
+		case T_Param:
+		case T_FuncExpr:
+		case T_RowExpr:
+		case T_ArrayExpr:
+		case T_RelabelType:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+
+			/*
+			 * An OID-producing cast/expression can reveal a runtime handle
+			 * only after constant folding. Do not ship it based on its input
+			 * type before folding. Literal shared OIDs remain safe.
+			 */
+			if (CatalogViewObjectContext(exprType(node)) ||
+				(!IsA(node, Const) && CatalogViewIsObjectIdType(exprType(node))))
+				return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+			break;
+		default:
+			break;
+	}
+	if (IsA(node, Const))
+	{
+		Const	   *value = (Const *) node;
+
+		if (!value->constisnull && CatalogViewIsObjectIdType(value->consttype) &&
+			CatalogViewObjectContext(DatumGetObjectId(value->constvalue)))
+			return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+	}
+	if (IsA(node, Param) && CatalogViewIsObjectIdType(((Param *) node)->paramtype))
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 
 	/* Check for hazardous functions in node itself */
 	if (check_functions_in_node(node, max_parallel_hazard_checker,
@@ -967,6 +1010,16 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 	else if (IsA(node, Query))
 	{
 		Query	   *query = (Query *) node;
+
+		ListCell   *lc;
+
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+			if (rte->dolt_database || CatalogViewObjectContext(rte->relid))
+				return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+		}
 
 		/* SELECT FOR UPDATE/SHARE must be treated as unsafe */
 		if (query->rowMarks != NULL)

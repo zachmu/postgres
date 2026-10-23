@@ -60,26 +60,29 @@ binding_relation(const char *branch, const char *name, bytea *schema)
 	return SPI_processed ? DatumGetObjectId(cell(0, 1)) : InvalidOid;
 }
 
-/* Branch administration can reuse an unambiguous, already captured generation.
- * Never synthesize schemas during a query or guess among different generations.
- * Historical branches with no compatible resource remain creatable, but cannot
- * be checked out for writes until a later DDL/bootstrap implementation supplies it. */
+/* Branch administration selects an allocation; the retained descriptor supplies
+ * its schema and initial data. Prefer an exact schema binding, otherwise reuse
+ * a same-kind resource. Never derive the definition from that resource's current
+ * physical catalog row. Branches without a reusable resource remain read-only. */
 static void
 binding_prepare(const char *branch, bytea *database, bool required)
 {
 	int			n,
 				i;
-	char	  **names;
+	char	  **names,
+			  **kinds;
 	bytea	  **schemas;
 
-	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	names = palloc(sizeof(char *) * Max(n, 1));
 	schemas = palloc(sizeof(bytea *) * Max(n, 1));
+	kinds = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		names[i] = strcell(i, 1);
 		schemas[i] = DatumGetByteaPCopy(cell(i, 2));
+		kinds[i] = strcell(i, 3);
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -90,12 +93,13 @@ binding_prepare(const char *branch, bytea *database, bool required)
 		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND b.bindschema=$2", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i])), NULL, true);
 
 		/*
-		 * An independent resource can hold roots for several schemas. A new
-		 * branch starts from its retained descriptor, never another branch's
-		 * root.
+		 * A resource can hold roots for several schemas, including an
+		 * imported allocation whose physical bridge validates only its
+		 * locator and AM. A new branch starts from its retained descriptor,
+		 * never another branch's root.
 		 */
 		if (SPI_processed != 1)
-			run("SELECT min(s.storageid::bigint)::oid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND NOT s.storageimported HAVING count(*)>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(names[i])), NULL, true);
+			run("SELECT min(s.storageid::bigint)::oid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND s.storagekind=CASE WHEN $2='table' THEN 'r'::\"char\" ELSE 'i'::\"char\" END HAVING count(*)>0", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(names[i]), CStringGetTextDatum(kinds[i])), NULL, true);
 		if (SPI_processed == 1)
 			binding_record(branch, names[i], schemas[i], DatumGetObjectId(cell(0, 1)));
 		else if (required)
