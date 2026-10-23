@@ -4,6 +4,9 @@
  * not consulted when the view provides a catalog, including an empty catalog.
  */
 #include "postgres.h"
+#include "access/xact.h"
+#include "access/transam.h"
+#include "access/parallel.h"
 #include "utils/syscache.h"
 #include "catalog/pg_namespace.h"
 #include "fmgr.h"
@@ -28,6 +31,15 @@ typedef struct CatalogViewRows
 struct CatalogView
 {
 	MemoryContext memory;
+	MemoryContext rows_memory;
+	List	   *catalog_ids;
+	uint64		touched;
+	TransactionId creator;
+	unsigned	scan_references;
+	bool		loaded;
+	bool		loading;
+	void		(*loader) (CatalogView *, void *);
+	void	   *loader_arg;
 	char	   *identity;
 	uint64		serial;
 	uint64		references;
@@ -67,17 +79,35 @@ static HTAB *objects;
 static Oid	next_handle = FirstCatalogViewObjectId;
 
 static uint64 next_view_serial = 1;
+static uint64 view_clock;
+int			catalog_view_cache_entries = 16;
+static void prune_catalog_views(XactEvent event, void *arg);
+static bool prune_registered;
 static CatalogView *current_view;
 static dlist_head views = DLIST_STATIC_INIT(views);
 
 CatalogView *
 CatalogViewCreate(const char *identity)
 {
-	MemoryContext memory = AllocSetContextCreate(TopMemoryContext, "catalog view", ALLOCSET_DEFAULT_SIZES);
-	MemoryContext previous = MemoryContextSwitchTo(memory);
-	CatalogView *view = palloc0(sizeof(*view));
+	MemoryContext memory;
+	MemoryContext previous;
+	CatalogView *view;
+
+	if (IsParallelWorker())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("revision catalog contexts cannot be constructed in parallel workers")));
+	memory = AllocSetContextCreate(TopMemoryContext, "catalog view", ALLOCSET_DEFAULT_SIZES);
+	previous = MemoryContextSwitchTo(memory);
+	view = palloc0(sizeof(*view));
 
 	view->memory = memory;
+	view->rows_memory = AllocSetContextCreate(memory, "catalog view rows", ALLOCSET_DEFAULT_SIZES);
+	view->touched = ++view_clock;
+	if (!prune_registered)
+	{
+		RegisterXactCallback(prune_catalog_views, NULL);
+		prune_registered = true;
+	}
 	view->identity = pstrdup(identity);
 	if (!next_view_serial)
 		elog(ERROR, "catalog context identifier space exhausted");
@@ -96,9 +126,17 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	ListCell   *lc;
 	uint32		ordinal = 0;
 
-	if (view->sealed || CatalogViewContains(view, catalog))
+	if (view->sealed && !view->loading)
 		elog(ERROR, "cannot modify published catalog view");
+	foreach(lc, view->catalogs)
+	{
+		if (((CatalogViewRows *) lfirst(lc))->catalog == catalog)
+			elog(ERROR, "duplicate catalog rows in view");
+	}
 	previous = MemoryContextSwitchTo(view->memory);
+	if (!list_member_oid(view->catalog_ids, catalog))
+		view->catalog_ids = lappend_oid(view->catalog_ids, catalog);
+	MemoryContextSwitchTo(view->rows_memory);
 	rows = palloc0(sizeof(*rows));
 	rows->catalog = catalog;
 	foreach(lc, tuples)
@@ -121,6 +159,7 @@ void
 CatalogViewSeal(CatalogView *view)
 {
 	view->sealed = true;
+	view->loaded = true;
 }
 
 void
@@ -163,6 +202,8 @@ CatalogViewSwitch(CatalogView *view)
 	CatalogView *previous = current_view;
 
 	Assert(!view || view->sealed);
+	if (view)
+		CatalogViewEnsureLoaded(view);
 	current_view = view;
 	return previous;
 }
@@ -170,14 +211,7 @@ CatalogViewSwitch(CatalogView *view)
 bool
 CatalogViewContains(CatalogView *view, Oid catalog)
 {
-	ListCell   *lc;
-
-	if (!view)
-		return false;
-	foreach(lc, view->catalogs)
-		if (((CatalogViewRows *) lfirst(lc))->catalog == catalog)
-		return true;
-	return false;
+	return view && list_member_oid(view->catalog_ids, catalog);
 }
 
 CatCache *
@@ -189,6 +223,7 @@ CatalogViewCache(CatalogView *view, CatCache *base)
 
 	if (!CatalogViewContains(view, base->cc_reloid))
 		return base;
+	CatalogViewEnsureLoaded(view);
 	foreach(lc, view->caches)
 	{
 		cache = lfirst(lc);
@@ -234,6 +269,8 @@ release_scan_pin(void *arg)
 		CatalogView *view = pin->view;
 
 		pin->view = NULL;
+		Assert(view->scan_references > 0);
+		view->scan_references--;
 		CatalogViewRelease(view);
 	}
 }
@@ -270,8 +307,10 @@ CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog scan of %u cannot follow this revision-bound handle", RelationGetRelid(relation))));
 		return NULL;
 	}
+	CatalogViewEnsureLoaded(view);
 	scan = palloc0(sizeof(*scan));
 	scan->view = view;
+	view->scan_references++;
 	CatalogViewRetain(scan->view);
 	scan->pin = palloc0(sizeof(CatalogViewPin));
 	scan->pin->view = scan->view;
@@ -422,6 +461,9 @@ lookup_object(Oid handle)
 {
 	CatalogViewObject *object;
 
+	if (handle >= FirstCatalogViewObjectId && IsParallelWorker())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("runtime catalog handles cannot be resolved in parallel workers")));
 	if (handle < FirstCatalogViewObjectId || handle >= next_handle)
 		return NULL;
 	object = objects ? hash_search(objects, &handle, HASH_FIND, NULL) : NULL;
@@ -715,4 +757,108 @@ CatalogViewCaptureUpdate(Relation relation, HeapTuple tuple)
 		return false;
 	catalog_mutation->update(relation, tuple, catalog_mutation->state);
 	return true;
+}
+
+/* Keep handle identities for the backend lifetime, but bound decoded row/cache
+ * residency. Plans and type caches may hold those handles after eviction. */
+void
+CatalogViewSetLoader(CatalogView *view, void (*loader) (CatalogView *, void *), void *arg)
+{
+	view->loader = loader;
+	view->loader_arg = arg;
+}
+
+void
+CatalogViewEnsureLoaded(CatalogView *view)
+{
+	view->touched = ++view_clock;
+	if (CatalogViewCreatorAborted(view))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("catalog handle refers to an aborted schema revision")));
+	if (view->loaded)
+		return;
+	if (!view->loader || view->loading)
+		elog(ERROR, "catalog view cannot reload its rows");
+	view->loading = true;
+	PG_TRY();
+	{
+		view->loader(view, view->loader_arg);
+		if (!view->loaded)
+			elog(ERROR, "catalog view loader did not seal its rows");
+	}
+	PG_CATCH();
+	{
+		view->loading = false;
+		view->loaded = false;
+		view->catalogs = NIL;
+		MemoryContextReset(view->rows_memory);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	view->loading = false;
+}
+
+static void
+prune_catalog_views(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
+		return;
+	for (;;)
+	{
+		dlist_iter	it;
+		CatalogView *oldest = NULL;
+		int			count = 0;
+		ListCell   *lc;
+		List	   *kept = NIL;
+		MemoryContext previous;
+
+		dlist_foreach(it, &views)
+		{
+			CatalogView *view = dlist_container(CatalogView, link, it.cur);
+
+			if (!view->loader || !view->loaded)
+				continue;
+			count++;
+			if (view == current_view || view->scan_references || view->loading)
+				continue;
+			if (!oldest || view->touched < oldest->touched)
+				oldest = view;
+		}
+		if (count <= catalog_view_cache_entries || !oldest)
+			break;
+		previous = MemoryContextSwitchTo(oldest->memory);
+		foreach(lc, oldest->caches)
+		{
+			CatCache   *cache = lfirst(lc);
+
+			/*
+			 * Referenced cache tuples own their bytes. They remain valid but
+			 * dead until their native resource owner releases them.
+			 */
+			if (!TryDestroyCatCache(cache))
+				kept = lappend(kept, cache);
+		}
+		list_free(oldest->caches);
+		oldest->caches = kept;
+		oldest->catalogs = NIL;
+		oldest->loaded = false;
+		MemoryContextReset(oldest->rows_memory);
+		MemoryContextSwitchTo(previous);
+	}
+}
+
+/* Only provisional roots need this guard. Committed canonical objects are
+ * retained; a backend handle must not make an aborted object visible. */
+void
+CatalogViewSetCreator(CatalogView *view, TransactionId creator)
+{
+	view->creator = creator;
+}
+
+bool
+CatalogViewCreatorAborted(CatalogView *view)
+{
+	return TransactionIdIsValid(view->creator) &&
+		!TransactionIdIsCurrentTransactionId(view->creator) &&
+		!TransactionIdDidCommit(view->creator);
 }

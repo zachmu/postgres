@@ -19,6 +19,7 @@
  *--------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #ifdef HAVE_COPYFILE_H
 #include <copyfile.h>
@@ -3622,6 +3623,15 @@ struct config_int ConfigureNamesInt[] =
 		&max_parallel_maintenance_workers,
 		2, 0, MAX_PARALLEL_WORKER_LIMIT,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_catalog_cache_entries", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the target number of decoded revision catalog views retained per session."),
+			gettext_noop("Active scans remain pinned; evicted rows reload using their original runtime handles.")
+		},
+		&catalog_view_cache_entries,
+		16, 1, 100000, NULL, NULL, NULL
 	},
 
 	{
