@@ -22,5 +22,12 @@ tests += {
     't/016_runtime_binding.pl',
     't/017_canonical_catalog.pl',
       't/018_storage_resources.pl',
+    't/019_system_tables.pl',
+    't/020_row_diff.pl',
+    't/021_workspace.pl',
+    't/022_conflicts.pl',
+    't/023_schema_tables.pl',
+    't/024_rebase_stash.pl',
+    't/025_compat.pl',
   ]},
 }

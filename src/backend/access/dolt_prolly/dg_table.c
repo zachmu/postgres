@@ -69,6 +69,9 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	dg_validate_descriptor(RelationGetDescr(rel));
+	/* ANALYZE opens its sample scan without a snapshot; read the live state. */
+	if (!snap && (flags & SO_TYPE_ANALYZE))
+		snap = GetActiveSnapshot();
 	scan->base.rs_rd = rel;
 	scan->base.rs_snapshot = snap;
 	scan->base.rs_flags = flags;

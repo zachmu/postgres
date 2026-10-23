@@ -184,7 +184,7 @@ catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native,
 
 		if (!strcmp(ns, "$user"))
 			ns = GetUserNameFromId(user, false);
-		if (!strcmp(ns, "pg_catalog") || !strcmp(ns, "information_schema"))
+		if (dg_system_namespace(ns))
 		{
 			namespace = get_namespace_oid(ns, true);
 			*native = OidIsValid(namespace) ? (type_lookup ? GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(rv->relname), ObjectIdGetDatum(namespace)) : get_relname_relid(rv->relname, namespace)) : InvalidOid;
@@ -245,6 +245,22 @@ dg_catalog_active(void)
 	return active;
 }
 
+/* schema.dolt_<table> names the built-in alias unless the schema defines it. */
+static const RangeVar *
+system_alias(const RangeVar *rv)
+{
+	RangeVar   *alias;
+
+	if (!rv->schemaname || dg_system_namespace(rv->schemaname) || !OidIsValid(dg_system_relation(rv)))
+		return rv;
+	if (OidIsValid(get_namespace_oid(rv->schemaname, true)) &&
+		OidIsValid(get_relname_relid(rv->relname, get_namespace_oid(rv->schemaname, true))))
+		return rv;
+	alias = copyObject(rv);
+	alias->schemaname = "pg_catalog";
+	return alias;
+}
+
 static TupleDesc
 catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool target)
 {
@@ -269,6 +285,7 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 
 	if (rangevar_projection_hook || catalog_api_depth)
 		return NULL;
+	rv = system_alias(rv);
 	if (!rte->dolt_database && !rv->dolt_revision &&
 		!(rv->catalogname && strpbrk(rv->catalogname, "@/")) && catalog_current_database())
 		rte->dolt_database = pstrdup(catalog_current_database());
@@ -349,11 +366,14 @@ revision_selected:
 			path = list_make1(resolved->schemaname);
 		}
 
-		if (rv->schemaname && (!strcmp(rv->schemaname, "pg_catalog") || !strcmp(rv->schemaname, "information_schema")))
+		if (rv->schemaname && dg_system_namespace(rv->schemaname))
 		{
 			Relation	catalog;
 			Oid			id = get_relname_relid(rv->relname, get_namespace_oid(rv->schemaname, false));
 
+			/* Built-in system tables are written natively (e.g. dolt_docs). */
+			if (target)
+				goto binding_done;
 			if (!catalog_supported(id) && get_rel_relkind(id) != RELKIND_VIEW)
 			{
 				if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")))
@@ -608,6 +628,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 
 	if (!dg_catalog_active())
 		return false;
+	rv = system_alias(rv);
 	if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 		return false;
 	if (rv->dolt_revision)
