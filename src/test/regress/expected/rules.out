@@ -1286,6 +1286,26 @@ drop table cchild;
 SELECT viewname, definition FROM pg_views
 WHERE schemaname = 'pg_catalog'
 ORDER BY viewname;
+dolt_backups| SELECT name,
+    url
+   FROM dolt.backups;
+dolt_branch_activity| SELECT branch,
+    last_read,
+    last_write,
+    active_sessions,
+    system_start_time
+   FROM dolt.branch_activity;
+dolt_branch_control| SELECT database,
+    branch,
+    "user",
+    host,
+    permissions
+   FROM dolt.branch_control;
+dolt_branch_namespace_control| SELECT database,
+    branch,
+    "user",
+    host
+   FROM dolt.branch_namespace_control;
 dolt_branches| SELECT name,
     hash,
     latest_committer,
@@ -1371,6 +1391,12 @@ dolt_merge_status| SELECT is_merging,
     target,
     unmerged_tables
    FROM dolt.merge_status;
+dolt_query_catalog| SELECT id,
+    display_order,
+    name,
+    query,
+    description
+   FROM dolt.query_catalog;
 dolt_rebase| SELECT rebase_order,
     action,
     commit_hash,
@@ -1403,6 +1429,23 @@ dolt_stashes| SELECT name,
     hash,
     commit_message
    FROM dolt.stashes;
+dolt_statistics| SELECT database_name,
+    table_name,
+    index_name,
+    row_count,
+    distinct_count,
+    null_count,
+    columns,
+    types,
+    upper_bound,
+    upper_bound_cnt,
+    created_at,
+    mcv1,
+    mcv2,
+    mcv3,
+    mcv4,
+    mcv_counts
+   FROM dolt.statistics;
 dolt_status| SELECT table_name,
     staged,
     status

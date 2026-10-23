@@ -1365,3 +1365,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_schemas.inc"
 #include "dg_rebase.inc"
 #include "dg_tools.inc"
+#include "dg_compat.inc"
