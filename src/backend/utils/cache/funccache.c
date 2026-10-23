@@ -512,7 +512,7 @@ cached_function_compile(FunctionCallInfo fcinfo,
 	/*
 	 * Lookup the pg_proc tuple by Oid; we'll need it in any case
 	 */
-	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
+	procTup = CatalogViewFunctionTuple(funcOid);
 	if (!HeapTupleIsValid(procTup))
 		elog(ERROR, "cache lookup failed for function %u", funcOid);
 	procStruct = (Form_pg_proc) GETSTRUCT(procTup);

@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
@@ -774,6 +775,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		FuncExpr   *funcexpr = makeNode(FuncExpr);
 
 		funcexpr->funcid = funcid;
+		funcexpr->dolt_working = CatalogViewObjectContext(funcid) != NULL && CatalogViewCurrent() == NULL;
 		funcexpr->funcresulttype = rettype;
 		funcexpr->funcretset = retset;
 		funcexpr->funcvariadic = func_variadic;

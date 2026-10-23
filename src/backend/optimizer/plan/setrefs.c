@@ -2076,6 +2076,8 @@ fix_expr_common(PlannerInfo *root, Node *node)
 		default:
 			break;
 	}
+	if (IsA(node, FuncExpr))
+		contextual |= CatalogViewObjectContext(((FuncExpr *) node)->funcid) != NULL;
 	if (contextual)
 	{
 		root->glob->relationOids = list_append_unique_oid(root->glob->relationOids, DoltRefRelationId);
