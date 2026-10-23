@@ -57,5 +57,5 @@ $node->stop('immediate');$pending->quit;$node->start;
 is(sql(q{SELECT to_regclass('crash_table') IS NULL}),'t','crash discards uncommitted schema and data publication');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING')}),'0','crash leaves no partial working membership');
 fails(q{CREATE TABLE bad_index(id int CONSTRAINT bad_index PRIMARY KEY)},qr/already exists/,'index and table cannot share one canonical name');
-fails(q{SELECT * FROM pg_tables},qr/stored catalog views/,'unsupported catalog view cannot expose physical definitions');
+is(sql(q{SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename='t'}),'1','stored catalog view exposes the canonical table without physical schema rows');
 $node->stop;done_testing();

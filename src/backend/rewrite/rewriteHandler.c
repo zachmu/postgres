@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/relation.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -2063,6 +2064,9 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 		++rt_index;
 
 		rte = rt_fetch(rt_index, parsetree->rtable);
+
+		/* Stored view actions bypass parser RangeVar binding. */
+		dg_catalog_rewrite_relation(rte);
 
 		/*
 		 * A subquery RTE can't have associated rules, so there's nothing to

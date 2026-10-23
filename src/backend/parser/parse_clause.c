@@ -1029,7 +1029,7 @@ getNSItemForSpecialRelationTypes(ParseState *pstate, RangeVar *rv)
 	/*
 	 * if it is a qualified name, it can't be a CTE or tuplestore reference
 	 */
-	if (rv->schemaname)
+	if (rv->schemaname || rv->catalogname || rv->dolt_revision)
 		return NULL;
 
 	cte = scanNameSpaceForCTE(pstate, rv->relname, &levelsup);
@@ -1078,9 +1078,9 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		ParseNamespaceItem *nsitem;
 
 		/* Check if it's a CTE or tuplestore reference */
-		nsitem = addRangeTableEntryForDolt(pstate, rv);
+		nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
 		if (!nsitem)
-			nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
+			nsitem = addRangeTableEntryForDolt(pstate, rv);
 
 		/* if not found above, must be a table reference */
 		if (!nsitem)

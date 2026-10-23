@@ -1,3 +1,15 @@
+/* All SQL entry paths use the provider's complete catalog family set. */
+static bool
+catalog_supported(Oid id)
+{
+	int			i;
+
+	for (i = 0; i < lengthof(provider_catalogs); i++)
+		if (provider_catalogs[i] == id)
+			return true;
+	return false;
+}
+
 /* Versioned metadata lookup. SPI is restricted to fixed internal read queries;
  * permissions on the selected symbolic objects are checked for the caller. */
 static void
@@ -136,6 +148,13 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 
 			if (!dg_catalog_active())
 				return NULL;
+
+			/*
+			 * Bootstrap information_schema views are expanded by the
+			 * rewriter.
+			 */
+			if (rv->schemaname && !strcmp(rv->schemaname, "information_schema"))
+				return NULL;
 			if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 				return NULL;
 			systemid = (!rv->schemaname || !strcmp(rv->schemaname, "pg_catalog")) ? get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE) : InvalidOid;
@@ -145,11 +164,11 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 
 				if (systemid >= FirstNormalObjectId || !strncmp(rv->relname, "pg_dolt_", 8))
 					return NULL;
-				/* Stored catalog views still contain context-free RTEs. */
-				if (!strcmp(rv->relname, "pg_tables") || !strcmp(rv->relname, "pg_indexes") || !strcmp(rv->relname, "pg_views") || !strcmp(rv->relname, "pg_matviews") || !strcmp(rv->relname, "pg_sequences") || !strcmp(rv->relname, "pg_stats") || !strcmp(rv->relname, "pg_stats_ext") || !strcmp(rv->relname, "pg_stats_ext_exprs"))
-					unsupported("stored catalog views over versioned objects");
+				/* Stored view actions are context-bound during rewrite. */
+				if (get_rel_relkind(systemid) == RELKIND_VIEW)
+					return NULL;
 				/* Only supported versioned catalog families are redirected. */
-				if (!list_member_oid(list_make5_oid(NamespaceRelationId, RelationRelationId, AttributeRelationId, TypeRelationId, IndexRelationId), systemid) && systemid != ConstraintRelationId && systemid != DescriptionRelationId && systemid != DependRelationId && systemid != CastRelationId)
+				if (!catalog_supported(systemid))
 					return NULL;
 				qualified = (RangeVar *) copyObject(rv);
 				qualified->schemaname = pstrdup("pg_catalog");
@@ -179,6 +198,15 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
 	}
 revision_selected:
+	/* AS OF and database/revision qualifiers also allow implicit pg_catalog. */
+	if (!rv->schemaname &&
+		catalog_supported(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
+	{
+		RangeVar   *qualified = (RangeVar *) copyObject(rv);
+
+		qualified->schemaname = pstrdup("pg_catalog");
+		rv = qualified;
+	}
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
 	GetUserIdAndSecContext(&user, &security);
@@ -213,7 +241,8 @@ revision_selected:
 			provider_catalog_index(id); /* reject unsupported catalogs
 										 * explicitly */
 			(void) provider_view(db);
-			if (pg_class_aclcheck(id, user, ACL_SELECT) != ACLCHECK_OK)
+			/* Stored-rule RTEs retain native checkAsUser permission entries. */
+			if (pstate && pg_class_aclcheck(id, user, ACL_SELECT) != ACLCHECK_OK)
 				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
 			catalog = table_open(id, AccessShareLock);
 			result = CreateTupleDescCopy(RelationGetDescr(catalog));
@@ -449,7 +478,8 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 
 	if (!dg_catalog_active())
 		return false;
-	if (rv->schemaname && !strcmp(rv->schemaname, "pg_catalog"))
+	if (rv->schemaname && (!strcmp(rv->schemaname, "pg_catalog") ||
+						   !strcmp(rv->schemaname, "information_schema")))
 		return false;
 	if (!rv->schemaname && OidIsValid(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
 		return false;
@@ -581,4 +611,39 @@ dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait)
 	} PG_END_TRY();
 	relation_close(definition, NoLock);
 	return true;
+}
+
+/* Bind catalog RTEs loaded from stored rules through the same provider as SQL
+ * RangeVars. Preserve aliases and native permission entries from view expansion.
+ * Catalog layouts are bootstrap-stable, so existing Vars remain well typed. */
+void
+dg_catalog_rewrite_relation(RangeTblEntry *rte)
+{
+	RangeVar   *rv;
+	TupleDesc	desc;
+	int			i;
+
+	if (rte->rtekind != RTE_RELATION || catalog_api_depth ||
+		rangevar_projection_hook || !dg_catalog_active())
+		return;
+	for (i = 0; i < lengthof(provider_catalogs); i++)
+		if (rte->relid == provider_catalogs[i])
+			break;
+	if (i == lengthof(provider_catalogs))
+		return;
+	rv = makeRangeVar("pg_catalog", get_rel_name(rte->relid), -1);
+	desc = catalog_bind(NULL, rv, rte, false);
+	if (!desc)
+		elog(ERROR, "could not bind stored catalog reference");
+	rte->rtekind = RTE_DOLT;
+	rte->inh = false;
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		rte->coltypes = lappend_oid(rte->coltypes, att->atttypid);
+		rte->coltypmods = lappend_int(rte->coltypmods, att->atttypmod);
+		rte->colcollations = lappend_oid(rte->colcollations, att->attcollation);
+	}
+	FreeTupleDesc(desc);
 }
