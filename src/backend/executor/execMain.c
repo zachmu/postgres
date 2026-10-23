@@ -600,9 +600,11 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 
 			/*
 			 * Only relation RTEs and subquery RTEs that were once relation
-			 * RTEs (views) have their perminfoindex set.
+			 * RTEs (views), plus catalog RTEs bound during rewrite, have
+			 * their perminfoindex set.
 			 */
 			Assert(rte->rtekind == RTE_RELATION ||
+				   (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_catalog)) ||
 				   (rte->rtekind == RTE_SUBQUERY &&
 					rte->relkind == RELKIND_VIEW));
 
