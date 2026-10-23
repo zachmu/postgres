@@ -1416,6 +1416,9 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	/* make WINDOW info available for window functions, too */
 	pstate->p_windowdefs = stmt->windowClause;
 
+	/* generated Dolt system tables may read commit filters from WHERE */
+	pstate->p_dolt_where = stmt->whereClause;
+
 	/* process the FROM clause */
 	transformFromClause(pstate, stmt->fromClause);
 

@@ -23,5 +23,6 @@ tests += {
     't/017_canonical_catalog.pl',
       't/018_storage_resources.pl',
     't/019_system_tables.pl',
+    't/020_row_diff.pl',
   ]},
 }

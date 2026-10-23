@@ -1299,6 +1299,18 @@ dolt_branches| SELECT name,
     latest_author_email,
     latest_author_date
    FROM dolt.branches;
+dolt_column_diff| SELECT commit_hash,
+    table_name,
+    column_name,
+    committer,
+    email,
+    date,
+    message,
+    diff_type,
+    author,
+    author_email,
+    author_date
+   FROM dolt.column_diff;
 dolt_commit_ancestors| SELECT commit_hash,
     parent_hash,
     parent_index
