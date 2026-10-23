@@ -15,5 +15,7 @@ extern bool dg_system_namespace(const char *name);
 extern struct RangeFunction *dg_system_table(struct ParseState *pstate, RangeVar *rv);
 extern List *dg_system_function_columns(struct ParseState *pstate, struct FuncCall *fc);
 extern Query *dg_system_delete(struct ParseState *pstate, DeleteStmt *stmt);
+extern void dg_system_insert_target(const RangeVar *rv);
+extern void dg_ensure_ignore_table(const char *schema);
 extern TupleDesc dg_diff_layout(const char *kind, const char *table, const char *from, const char *to);
 #endif

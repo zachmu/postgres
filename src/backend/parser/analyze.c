@@ -724,6 +724,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	targetPerms = ACL_INSERT;
 	if (isOnConflictUpdate)
 		targetPerms |= ACL_UPDATE;
+	dg_system_insert_target(stmt->relation);
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
 										 false, false, targetPerms);
 
