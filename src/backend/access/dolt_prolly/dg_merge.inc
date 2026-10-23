@@ -730,7 +730,9 @@ dolt_merge(PG_FUNCTION_ARGS)
 	if (conflicts.len || nocommit)
 	{
 		initStringInfo(&json);
-		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", squash ? "true" : "false", conflicts.data);
+		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", squash ? "true" : "false");
+		escape_json(&json, revision);
+		appendStringInfo(&json, ",\"conflicts\":[%s]}", conflicts.data);
 		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
 		conflicted = conflicts.len ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge successful";
@@ -868,7 +870,9 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		}
 	}
 	initStringInfo(&updated);
-	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", json_value(json, "squash") ? json_value(json, "squash") : "false", remaining.data);
+	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", json_value(json, "squash") ? json_value(json, "squash") : "false");
+	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
+	appendStringInfo(&updated, ",\"conflicts\":[%s]}", remaining.data);
 	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);

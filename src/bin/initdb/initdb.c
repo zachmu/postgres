@@ -286,6 +286,7 @@ static void setup_run_file(FILE *cmdfd, const char *filename);
 static void setup_description(FILE *cmdfd);
 static void setup_collation(FILE *cmdfd);
 static void setup_privileges(FILE *cmdfd);
+static void setup_dolt_repository(FILE *cmdfd);
 static void set_info_version(void);
 static void setup_schema(FILE *cmdfd);
 static void load_plpgsql(FILE *cmdfd);
@@ -1840,6 +1841,9 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text, text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_checkout(text[]), pg_catalog.dolt_merge(text[]), pg_catalog.dolt_conflicts_resolve(text[]), pg_catalog.dolt_conflict_rows(text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.dolt_conflicts, pg_catalog.dolt_merge_status FROM PUBLIC;\n");
+	PG_CMD_PUTS("GRANT USAGE ON SCHEMA dolt TO PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_init(), pg_catalog.dolt_hashof(text), pg_catalog.hashof(text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branches(), pg_catalog.dolt_status(), pg_catalog.dolt_merge_status(), pg_catalog.dolt_diff_changes(), pg_catalog.dolt_remote(), pg_catalog.dolt_remote(text[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"
@@ -1958,6 +1962,17 @@ setup_privileges(FILE *cmdfd)
 				"        pg_foreign_server"
 				"    WHERE"
 				"        srvacl IS NOT NULL;\n\n");
+}
+
+/*
+ * Initialize the Dolt version-control repository in template1 so that every
+ * database starts with a main branch whose initial commit records the
+ * initial namespaces.
+ */
+static void
+setup_dolt_repository(FILE *cmdfd)
+{
+	PG_CMD_PUTS("SELECT pg_catalog.dolt_init();\n\n");
 }
 
 /*
@@ -3159,6 +3174,8 @@ initialize_data_directory(void)
 	setup_run_file(cmdfd, dictionary_file);
 
 	setup_privileges(cmdfd);
+
+	setup_dolt_repository(cmdfd);
 
 	setup_schema(cmdfd);
 

@@ -36,6 +36,7 @@
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
+#include "access/doltsystem.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
@@ -799,6 +800,15 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 
 struct config_bool ConfigureNamesBool[] =
 {
+	{
+		{"dolt_show_system_tables", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Lists generated Dolt system tables in catalog views."),
+			NULL
+		},
+		&dolt_show_system_tables,
+		false,
+		NULL, NULL, NULL
+	},
 	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),

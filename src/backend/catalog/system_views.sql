@@ -1414,9 +1414,70 @@ CREATE VIEW pg_dolt_object_visible AS
  SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;
 REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;
 
-CREATE VIEW dolt_log WITH (security_invoker=true) AS
+-- Dolt system tables live in the dolt schema (dolt.branches) and have
+-- dolt_-prefixed aliases in pg_catalog (dolt_branches, public.dolt_branches).
+-- Relation-level access remains privileged until branch ACLs exist.
+CREATE SCHEMA dolt;
+
+CREATE TABLE pg_catalog.pg_dolt_remote (
+    remotename text PRIMARY KEY,
+    remoteurl text NOT NULL,
+    remotefetch jsonb NOT NULL,
+    remoteparams jsonb NOT NULL
+);
+CREATE TABLE pg_catalog.pg_dolt_doc (
+    docname text PRIMARY KEY,
+    doctext text
+);
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc FROM PUBLIC;
+
+-- Commits reachable from any branch, tag or remote-tracking ref.
+CREATE VIEW pg_dolt_commit_visible AS
+    WITH RECURSIVE walk(h) AS (
+        SELECT CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END
+        FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget
+        WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%' OR r.refname LIKE 'remotes/%'
+        UNION
+        SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit')
+    SELECT c.objhash, c.objchildren, convert_from(c.objpayload,'UTF8')::jsonb AS meta
+    FROM walk w JOIN pg_catalog.pg_dolt_object_visible c ON c.objhash=w.h WHERE c.objkind='commit';
+REVOKE ALL ON pg_dolt_commit_visible FROM PUBLIC;
+
+CREATE VIEW dolt.log WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_log();
-CREATE VIEW dolt_tags WITH (security_invoker=true) AS
+CREATE VIEW dolt.branches WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_branches();
+CREATE VIEW dolt.remote_branches WITH (security_invoker=true) AS
+    SELECT substr(r.refname,9) AS name,
+           encode(r.reftarget,'hex') AS hash,
+           o.meta->>'committer' AS latest_committer,
+           o.meta->>'email' AS latest_committer_email,
+           timestamp '2000-01-01' + (o.meta->>'date_us')::bigint * interval '1 microsecond' AS latest_commit_date,
+           o.meta->>'message' AS latest_commit_message,
+           o.meta->>'author' AS latest_author,
+           o.meta->>'author_email' AS latest_author_email,
+           timestamp '2000-01-01' + (o.meta->>'author_date_us')::bigint * interval '1 microsecond' AS latest_author_date
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_commit_visible o ON o.objhash=r.reftarget
+    WHERE r.refname LIKE 'remotes/%' ORDER BY 1;
+CREATE VIEW dolt.commits WITH (security_invoker=true) AS
+    SELECT encode(objhash,'hex') AS commit_hash,
+           meta->>'committer' AS committer,
+           meta->>'email' AS email,
+           timestamp '2000-01-01' + (meta->>'date_us')::bigint * interval '1 microsecond' AS date,
+           meta->>'message' AS message,
+           meta->>'author' AS author,
+           meta->>'author_email' AS author_email,
+           timestamp '2000-01-01' + (meta->>'author_date_us')::bigint * interval '1 microsecond' AS author_date
+    FROM pg_catalog.pg_dolt_commit_visible
+    ORDER BY (meta->>'height')::bigint DESC, (meta->>'date_us')::bigint DESC, objhash;
+CREATE VIEW dolt.commit_ancestors WITH (security_invoker=true) AS
+    SELECT encode(c.objhash,'hex') AS commit_hash,
+           encode(p.h,'hex') AS parent_hash,
+           coalesce(p.ord - 1, 0)::int AS parent_index
+    FROM pg_catalog.pg_dolt_commit_visible c
+         LEFT JOIN LATERAL unnest(c.objchildren[2:]) WITH ORDINALITY AS p(h, ord) ON true
+    ORDER BY (c.meta->>'height')::bigint DESC, (c.meta->>'date_us')::bigint DESC, c.objhash, p.ord;
+CREATE VIEW dolt.tags WITH (security_invoker=true) AS
     SELECT substr(r.refname,6) AS tag_name,
            encode(o.objchildren[1],'hex') AS tag_hash,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'tagger' AS tagger,
@@ -1424,15 +1485,53 @@ CREATE VIEW dolt_tags WITH (security_invoker=true) AS
            timestamp '2000-01-01' + ((convert_from(o.objpayload,'UTF8')::jsonb)->>'date_us')::bigint * interval '1 microsecond' AS date,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'message' AS message
     FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget
-    WHERE r.refname LIKE 'tags/%' AND o.objkind='tag';
-REVOKE ALL ON dolt_log, dolt_tags FROM PUBLIC;
+    WHERE r.refname LIKE 'tags/%' AND o.objkind='tag' ORDER BY 1;
+CREATE VIEW dolt.status WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_status();
+CREATE VIEW dolt.merge_status WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_merge_status();
+CREATE VIEW dolt.diff WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_diff_changes();
+CREATE VIEW dolt.conflicts WITH (security_invoker=true) AS
+    SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
+           count(*)::numeric AS num_conflicts
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
+    WHERE r.refname='merge/' || pg_catalog.active_branch()
+    GROUP BY 1 ORDER BY 1;
+CREATE VIEW dolt.remotes WITH (security_invoker=true) AS
+    SELECT remotename AS name, remoteurl AS url, remotefetch AS fetch_specs, remoteparams AS params
+    FROM pg_catalog.pg_dolt_remote ORDER BY 1;
+CREATE VIEW dolt.docs WITH (security_invoker=true) AS
+    SELECT docname AS doc_name, doctext AS doc_text FROM pg_catalog.pg_dolt_doc
+    UNION ALL
+    SELECT 'AGENT.md', pg_catalog.dolt_default_doc('AGENT.md')
+    WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dolt_doc WHERE docname='AGENT.md');
+CREATE RULE dolt_docs_insert AS ON INSERT TO dolt.docs DO INSTEAD
+    INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
+CREATE RULE dolt_docs_update AS ON UPDATE TO dolt.docs DO INSTEAD
+    UPDATE pg_catalog.pg_dolt_doc SET docname = NEW.doc_name, doctext = NEW.doc_text WHERE docname = OLD.doc_name;
+CREATE RULE dolt_docs_delete AS ON DELETE TO dolt.docs DO INSTEAD
+    DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
 
-CREATE VIEW dolt_conflicts AS
- SELECT v->>'table' AS "table", count(*)::bigint AS num_conflicts
- FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget,
- LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
- WHERE r.refname='merge/' || active_branch()
- GROUP BY v->>'table';
-
-CREATE VIEW dolt_merge_status AS
- SELECT EXISTS (SELECT 1 FROM pg_dolt_ref WHERE refname='merge/' || active_branch()) AS is_merging;
+CREATE VIEW dolt_log WITH (security_invoker=true) AS SELECT * FROM dolt.log;
+CREATE VIEW dolt_branches WITH (security_invoker=true) AS SELECT * FROM dolt.branches;
+CREATE VIEW dolt_remote_branches WITH (security_invoker=true) AS SELECT * FROM dolt.remote_branches;
+CREATE VIEW dolt_commits WITH (security_invoker=true) AS SELECT * FROM dolt.commits;
+CREATE VIEW dolt_commit_ancestors WITH (security_invoker=true) AS SELECT * FROM dolt.commit_ancestors;
+CREATE VIEW dolt_tags WITH (security_invoker=true) AS SELECT * FROM dolt.tags;
+CREATE VIEW dolt_status WITH (security_invoker=true) AS SELECT * FROM dolt.status;
+CREATE VIEW dolt_merge_status WITH (security_invoker=true) AS SELECT * FROM dolt.merge_status;
+CREATE VIEW dolt_diff WITH (security_invoker=true) AS SELECT * FROM dolt.diff;
+CREATE VIEW dolt_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.conflicts;
+CREATE VIEW dolt_remotes WITH (security_invoker=true) AS SELECT * FROM dolt.remotes;
+CREATE VIEW dolt_docs WITH (security_invoker=true) AS SELECT * FROM dolt.docs;
+CREATE RULE dolt_docs_insert AS ON INSERT TO dolt_docs DO INSTEAD
+    INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
+CREATE RULE dolt_docs_update AS ON UPDATE TO dolt_docs DO INSTEAD
+    UPDATE pg_catalog.pg_dolt_doc SET docname = NEW.doc_name, doctext = NEW.doc_text WHERE docname = OLD.doc_name;
+CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
+    DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
+REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
+REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
+    dolt_status, dolt_merge_status, dolt_diff, dolt_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;
