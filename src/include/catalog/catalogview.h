@@ -33,6 +33,7 @@ extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);
 extern HeapTuple CatalogViewFunctionTuple(Oid functionid);
 extern Oid	CatalogViewObjectStorage(Oid handle);
+extern const char *CatalogViewObjectIdentity(Oid handle, Oid objectclass);
 extern CatalogView *CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const int *attributes, const Datum *values);
 
 /* Callers must restore the previous value in PG_FINALLY, including on ERROR. */

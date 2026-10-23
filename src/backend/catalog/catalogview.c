@@ -684,3 +684,13 @@ CatalogViewFunctionTuple(Oid functionid)
 	PG_END_TRY();
 	return result;
 }
+
+const char *
+CatalogViewObjectIdentity(Oid handle, Oid objectclass)
+{
+	CatalogViewObject *object = lookup_object(handle);
+
+	if (!object || object->objectclass != objectclass)
+		elog(ERROR, "catalog handle %u does not identify class %u", handle, objectclass);
+	return object->identity;
+}

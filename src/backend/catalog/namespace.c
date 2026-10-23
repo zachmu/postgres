@@ -1770,6 +1770,9 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	Form_pg_proc procform;
 	Oid			pronamespace;
 	bool		visible;
+	bool		inpath = false;
+	ListCell   *path;
+	CatalogView *view;
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))
@@ -1791,8 +1794,14 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	pronamespace = procform->pronamespace;
-	if (pronamespace != PG_CATALOG_NAMESPACE &&
-		!list_member_oid(activeSearchPath, pronamespace))
+	view = dg_catalog_session_view();
+	foreach(path, activeSearchPath)
+		if (CatalogViewNamespace(view, lfirst_oid(path)) == pronamespace)
+	{
+		inpath = true;
+		break;
+	}
+	if (pronamespace != PG_CATALOG_NAMESPACE && !inpath)
 		visible = false;
 	else
 	{
