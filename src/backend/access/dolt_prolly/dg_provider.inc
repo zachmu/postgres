@@ -12,7 +12,7 @@ static DGProvider *providers;
 
 static const Oid provider_catalogs[] = {
 	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
-	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId
+	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
 typedef struct DGProviderRows
@@ -126,6 +126,9 @@ provider_acl(const char *definition)
 		ACLITEM_SET_PRIVS_GOPTIONS(*item, mode, grant ? mode : 0);
 		items[i] = PointerGetDatum(item);
 	}
+	/* ACLs require a one-dimensional header even when there are no items. */
+	if (!n)
+		return (ArrayType *) make_empty_acl();
 	return construct_array(items, n, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
 }
 
@@ -201,6 +204,18 @@ provider_columns(const char *definition)
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
+		{
+			char	   *storage,
+					   *compression;
+
+			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			storage = strcell(0, 1);
+			compression = strcell(0, 2);
+			if (storage)
+				TupleDescAttr(desc, i)->attstorage = storage[0];
+			if (compression)
+				TupleDescAttr(desc, i)->attcompression = compression[0];
+		}
 	}
 	dg_validate_descriptor(desc);
 	return desc;
@@ -215,6 +230,13 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 	bool		isnull;
 	Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
 
+	if (catalog == SharedDependRelationId)
+	{
+		Form_pg_shdepend dep = (Form_pg_shdepend) GETSTRUCT(tuple);
+
+		return dep->dbid == InvalidOid ||
+			(dep->dbid == MyDatabaseId && dep->objid < FirstNormalObjectId);
+	}
 	if (catalog == ProcedureRelationId)
 	{
 		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
@@ -420,6 +442,66 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+
+/* Shared role references are derived from canonical owners and ACLs. They
+ * remain runtime catalog tuples; local role OIDs never enter schema payloads. */
+static void
+provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
+						 Oid role, char kind)
+{
+	FormData_pg_shdepend dep = {0};
+
+	if (!OidIsValid(role))
+		return;					/* PUBLIC is not a role object */
+	dep.dbid = MyDatabaseId;
+	dep.classid = catalog;
+	dep.objid = object;
+	dep.refclassid = AuthIdRelationId;
+	dep.refobjid = role;
+	dep.deptype = kind;
+	provider_add(rows, SharedDependRelationId, &dep, sizeof(dep), Natts_pg_shdepend);
+}
+
+static void
+provider_role_dependencies(DGProviderRows *rows)
+{
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+
+	for (int i = 0; i < lengthof(catalogs); i++)
+	{
+		int			slot = provider_catalog_index(catalogs[i]);
+		TupleDesc	desc = RelationGetDescr(rows->relations[slot]);
+		ListCell   *lc;
+
+		foreach(lc, rows->rows[slot])
+		{
+			HeapTuple	tuple = lfirst(lc);
+			bool		isnull;
+			Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
+			Oid			owner;
+			Datum		acl;
+
+			if (!CatalogViewObjectContext(object))
+				continue;
+			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
+			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			acl = heap_getattr(tuple, acls[i], desc, &isnull);
+			if (!isnull)
+			{
+				Oid		   *members;
+				int			count = aclmembers(DatumGetAclP(acl), &members);
+
+				for (int j = 0; j < count; j++)
+					if (members[j] != owner)
+						provider_role_dependency(rows, catalogs[i], object, members[j], SHARED_DEPENDENCY_ACL);
+				if (members)
+					pfree(members);
+			}
+		}
+	}
+}
 
 static bool
 provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
@@ -636,6 +718,7 @@ provider_populate(CatalogView *view, bytea *database)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "routine"))
 			provider_routine(&rows, view, definitions[i]);
+	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
 		CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);

@@ -1,4 +1,5 @@
 #include "dg.h"
+#include "catalog/catalogview.h"
 #include "miscadmin.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -73,7 +74,7 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->base.rs_flags = flags;
 	scan->context = AllocSetContextCreate(CurrentMemoryContext, "prolly scan", ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(scan->context);
-	scan->state = dg_load(rel, snap);
+	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
 	scan->rows = dg_rows(&scan->state->handles);
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
@@ -400,6 +401,12 @@ index_am(Relation rel, const char *requested)
 static void
 validate_alter(Relation rel, struct AlterTableCmd *cmd)
 {
+	if (CatalogViewIsProvisional(rel->rd_catalogview) &&
+		(cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
+		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
+		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull))
+		return;
+
 	/*
 	 * These operations do not alter the stored value layout. pg_dump emits
 	 * primary/unique constraints as ALTER TABLE after restoring the data.

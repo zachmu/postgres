@@ -1,85 +1,4 @@
-/* A native catalog tuple proposal is transient. Only portable attribute values
- * enter the schema tree; MVCC headers, TIDs and runtime OIDs never do. */
-typedef struct AttributeProposal
-{
-	Oid			relation;
-	HeapTuple	tuple;
-}			AttributeProposal;
-
-static void
-attribute_proposal(Relation catalog, HeapTuple tuple, void *arg)
-{
-	AttributeProposal *proposal = arg;
-	Form_pg_attribute attr = (Form_pg_attribute) GETSTRUCT(tuple);
-	HeapTuple	before;
-	TupleDesc	desc = RelationGetDescr(catalog);
-
-	if (RelationGetRelid(catalog) != AttributeRelationId ||
-		attr->attrelid != proposal->relation || attr->attnum <= 0 || proposal->tuple)
-		unsupported("unexpected native catalog mutation");
-	before = SearchSysCache2(ATTNUM, ObjectIdGetDatum(attr->attrelid), Int16GetDatum(attr->attnum));
-	if (!HeapTupleIsValid(before))
-		elog(ERROR, "native catalog mutation target disappeared");
-	for (int i = 1; i <= desc->natts; i++)
-	{
-		bool		anull,
-					bnull;
-		Datum		a,
-					b;
-		Form_pg_attribute field = TupleDescAttr(desc, i - 1);
-
-		if (i == Anum_pg_attribute_attstattarget || i == Anum_pg_attribute_attoptions)
-			continue;
-		a = heap_getattr(before, i, desc, &anull);
-		b = heap_getattr(tuple, i, desc, &bnull);
-		if (anull != bnull || (!anull && !datumIsEqual(a, b, field->attbyval, field->attlen)))
-			unsupported("native mutation of an unencoded catalog field");
-	}
-	ReleaseSysCache(before);
-	proposal->tuple = heap_copytuple(tuple);
-}
-
-static char *
-alter_native_attribute(Relation definition, AlterTableCmd *cmd, const char *json)
-{
-	AttributeProposal proposal = {RelationGetRelid(definition), NULL};
-	CatalogViewMutation mutation = {CatalogViewObjectContext(proposal.relation), attribute_proposal, &proposal};
-	CatalogViewMutation *saved = CatalogViewSwitchMutation(&mutation);
-	CatalogView *previous = CatalogViewSwitch(mutation.view);
-	Relation	catalog;
-	bool		statsnull,
-				optionsnull;
-	Datum		stats,
-				options;
-	int			att;
-	char	   *result;
-	char		nulls[5] = "    ";
-
-	PG_TRY();
-	{
-		AlterTableColumnMetadata(definition, cmd);
-	}
-	PG_FINALLY();
-	{
-		CatalogViewSwitchMutation(saved);
-		CatalogViewSwitch(previous);
-	}
-	PG_END_TRY();
-	if (!proposal.tuple)
-		elog(ERROR, "native metadata command produced no catalog tuple");
-	catalog = table_open(AttributeRelationId, AccessShareLock);
-	stats = heap_getattr(proposal.tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
-	options = heap_getattr(proposal.tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &optionsnull);
-	att = ((Form_pg_attribute) GETSTRUCT(proposal.tuple))->attnum - 1;
-	nulls[2] = statsnull ? 'n' : ' ';
-	nulls[3] = optionsnull ? 'n' : ' ';
-	/* Absent/default values have one normal form; option ordering is stable. */
-	run("SELECT jsonb_set($1::jsonb,ARRAY['columns',$2::text], (($1::jsonb->'columns'->$2)-'statistics'-'options') || jsonb_strip_nulls(jsonb_build_object('statistics',$3::int,'options',(SELECT jsonb_agg(v ORDER BY v COLLATE \"C\") FROM unnest($4::text[]) v))))::text", 4, VC_TYPES(TEXTOID, INT4OID, INT4OID, TEXTARRAYOID), VC_ARGS(CStringGetTextDatum(json), Int32GetDatum(att), stats, options), nulls, true);
-	result = strcell(0, 1);
-	table_close(catalog, AccessShareLock);
-	heap_freetuple(proposal.tuple);
-	return result;
-}
+#include "dg_native_mutation.inc"
 
 /* Branch-local metadata revisions and eager tuple-layout rewrites. */
 static PLTree
@@ -231,40 +150,23 @@ dg_catalog_alter(Node *statement)
 	{
 		AlterTableStmt *stmt = (AlterTableStmt *) statement;
 
-		if (stmt->objtype == OBJECT_TABLE && list_length(stmt->cmds) > 1 && dg_catalog_active())
+
+		if (stmt->objtype != OBJECT_TABLE)
+			return false;
+		cmd = linitial_node(AlterTableCmd, stmt->cmds);
+		if (native_metadata_action(cmd->subtype))
 		{
 			ListCell   *lc;
 
-			/*
-			 * Metadata actions have native left-to-right semantics. Reopen a
-			 * fresh immutable definition for each action; SQL rollback covers
-			 * all publications if a later native validator fails.
-			 */
 			foreach(lc, stmt->cmds)
-			{
-				AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
-
-				if (action->subtype != AT_SetStatistics && action->subtype != AT_SetOptions && action->subtype != AT_ResetOptions)
-					unsupported("mixed canonical ALTER action families");
-			}
-			foreach(lc, stmt->cmds)
-			{
-				AlterTableStmt *single = copyObject(stmt);
-
-				single->cmds = list_make1(lfirst(lc));
-				if (!dg_catalog_alter((Node *) single))
-					elog(ERROR, "canonical metadata action not handled");
-				if (ActiveSnapshotSet())
-					UpdateActiveSnapshotCommandId();
-			}
-			return true;
+				if (!native_metadata_action(lfirst_node(AlterTableCmd, lc)->subtype))
+				unsupported("mixed native metadata and layout ALTER actions");
 		}
-		if (stmt->objtype != OBJECT_TABLE || list_length(stmt->cmds) != 1)
-			unsupported("canonical ALTER requires one table action");
-		cmd = linitial_node(AlterTableCmd, stmt->cmds);
-		if (cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn &&
-			cmd->subtype != AT_SetStatistics && cmd->subtype != AT_SetOptions && cmd->subtype != AT_ResetOptions)
+		else if (list_length(stmt->cmds) != 1)
+			unsupported("canonical layout ALTER requires one action");
+		if (!native_metadata_action(cmd->subtype) && cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
 			return false;
+
 		if (!dg_catalog_active())
 		{
 			Oid			nativeid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
@@ -405,75 +307,80 @@ dg_catalog_alter(Node *statement)
 		dg_storage_close_relation(source);
 		working = read_ref(branch_ref("working"));
 		current = capture(true);
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed != 1)
-			elog(ERROR, "canonical ALTER member missing");
-		descriptor = DatumGetByteaPCopy(cell(0, 1));
-		json = metadata(child(descriptor, 1), "schema");
-		if (!skip)
+		if (cmd && native_metadata_action(cmd->subtype))
 		{
-			if (comment)
-			{
-				char	   *path = column ? psprintf("{columns,%d,comment}", att) : "{comment}";
-
-				run("SELECT jsonb_set($1::jsonb,$2::text[],coalesce(to_jsonb($3::text),'null'::jsonb))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(path), comment->comment ? CStringGetTextDatum(comment->comment) : (Datum) 0), comment->comment ? NULL : "  n", true);
-				json = strcell(0, 1);
-			}
-			else if (cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions || cmd->subtype == AT_ResetOptions)
-			{
-				json = alter_native_attribute(definition, cmd, json);
-			}
-			else if (cmd->subtype == AT_AddColumn)
-			{
-				ColumnDef  *col = (ColumnDef *) cmd->def;
-				TupleDesc	desc;
-				Form_pg_attribute a;
-				char	   *added;
-
-				if (col->constraints || col->raw_default || col->cooked_default || col->identity || col->generated || col->collClause || col->storage || col->compression)
-					unsupported("canonical ADD COLUMN requires a plain nullable column");
-				if (oldcount >= MaxHeapAttributeNumber)
-					ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS), errmsg("tables can have at most %d columns", MaxHeapAttributeNumber)));
-				desc = BuildDescForRelation(list_make1(col));
-				dg_validate_descriptor(desc);
-				a = TupleDescAttr(desc, 0);
-				run("SELECT jsonb_build_object('name',$1::text,'comment',NULL,'type',t.typname,'typmod',$3::int,'notnull',false,'collation',CASE WHEN $4::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$4) END)::text FROM pg_type t WHERE t.oid=$2 AND t.typnamespace='pg_catalog'::regnamespace", 4, VC_TYPES(TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(col->colname), ObjectIdGetDatum(a->atttypid), Int32GetDatum(a->atttypmod), ObjectIdGetDatum(a->attcollation)), NULL, true);
-				if (SPI_processed != 1)
-					unsupported("canonical ADD COLUMN user-defined types");
-				added = strcell(0, 1);
-				run("SELECT jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')||jsonb_build_array($2::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(added)), NULL, true);
-				json = strcell(0, 1);
-				tree = alter_rows(state, oldcount, -1);
-			}
-			else
-			{
-				run("SELECT jsonb_set(jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')-$2),'{constraints}',coalesce((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1<>$3),'[]'::jsonb))::text", 3, VC_TYPES(TEXTOID, INT4OID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), Int32GetDatum(att), CStringGetTextDatum(psprintf("NOT NULL %s", quote_identifier(column)))), NULL, true);
-				json = strcell(0, 1);
-				tree = alter_rows(state, oldcount, att);
-			}
-			schema = put("schema", json, NULL, 0);
-			content = dg_history_export_tree(&tree);
-			payload = metadata(descriptor, "table");
-			raw = palloc(VARHDRSZ + PL_HASH_SIZE);
-			SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-			memcpy(VARDATA(raw), tree.root.bytes, PL_HASH_SIZE);
-			run("SELECT jsonb_set(jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex'))),'{content}',to_jsonb($3::text))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(json), CStringGetTextDatum(hex(raw))), NULL, true);
-			member = put("table", strcell(0, 1), VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
-			database = alter_database(current, name, member);
-			binding_record(dg_current_branch(), name, schema, resource);
-			move_ref(branch_ref("working"), working, database);
-			advance_snapshot();
-			if (rewrite)
-			{
-				target = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
-				dg_history_install(target, state, tree);
-				dg_storage_close_relation(target);
-				UpdateActiveSnapshotCommandId();
-				move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
-			}
+			native_metadata_publish(current, working, name, ((AlterTableStmt *) statement)->cmds);
+			dg_release(state);
+			end_api(nest);
 		}
-		dg_release(state);
-		end_api(nest);
+		else
+		{
+			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
+			if (SPI_processed != 1)
+				elog(ERROR, "canonical ALTER member missing");
+			descriptor = DatumGetByteaPCopy(cell(0, 1));
+			json = metadata(child(descriptor, 1), "schema");
+			if (!skip)
+			{
+				if (comment)
+				{
+					char	   *path = column ? psprintf("{columns,%d,comment}", att) : "{comment}";
+
+					run("SELECT jsonb_set($1::jsonb,$2::text[],coalesce(to_jsonb($3::text),'null'::jsonb))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(path), comment->comment ? CStringGetTextDatum(comment->comment) : (Datum) 0), comment->comment ? NULL : "  n", true);
+					json = strcell(0, 1);
+				}
+				else if (cmd->subtype == AT_AddColumn)
+				{
+					ColumnDef  *col = (ColumnDef *) cmd->def;
+					TupleDesc	desc;
+					Form_pg_attribute a;
+					char	   *added;
+
+					if (col->constraints || col->raw_default || col->cooked_default || col->identity || col->generated || col->collClause || col->storage || col->compression)
+						unsupported("canonical ADD COLUMN requires a plain nullable column");
+					if (oldcount >= MaxHeapAttributeNumber)
+						ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS), errmsg("tables can have at most %d columns", MaxHeapAttributeNumber)));
+					desc = BuildDescForRelation(list_make1(col));
+					dg_validate_descriptor(desc);
+					a = TupleDescAttr(desc, 0);
+					run("SELECT jsonb_build_object('name',$1::text,'comment',NULL,'type',t.typname,'typmod',$3::int,'notnull',false,'collation',CASE WHEN $4::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$4) END)::text FROM pg_type t WHERE t.oid=$2 AND t.typnamespace='pg_catalog'::regnamespace", 4, VC_TYPES(TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(col->colname), ObjectIdGetDatum(a->atttypid), Int32GetDatum(a->atttypmod), ObjectIdGetDatum(a->attcollation)), NULL, true);
+					if (SPI_processed != 1)
+						unsupported("canonical ADD COLUMN user-defined types");
+					added = strcell(0, 1);
+					run("SELECT jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')||jsonb_build_array($2::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(added)), NULL, true);
+					json = strcell(0, 1);
+					tree = alter_rows(state, oldcount, -1);
+				}
+				else
+				{
+					run("SELECT jsonb_set(jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')-$2),'{constraints}',coalesce((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1<>$3),'[]'::jsonb))::text", 3, VC_TYPES(TEXTOID, INT4OID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), Int32GetDatum(att), CStringGetTextDatum(psprintf("NOT NULL %s", quote_identifier(column)))), NULL, true);
+					json = strcell(0, 1);
+					tree = alter_rows(state, oldcount, att);
+				}
+				schema = put("schema", json, NULL, 0);
+				content = dg_history_export_tree(&tree);
+				payload = metadata(descriptor, "table");
+				raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+				SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
+				memcpy(VARDATA(raw), tree.root.bytes, PL_HASH_SIZE);
+				run("SELECT jsonb_set(jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex'))),'{content}',to_jsonb($3::text))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(json), CStringGetTextDatum(hex(raw))), NULL, true);
+				member = put("table", strcell(0, 1), VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
+				database = alter_database(current, name, member);
+				binding_record(dg_current_branch(), name, schema, resource);
+				move_ref(branch_ref("working"), working, database);
+				advance_snapshot();
+				if (rewrite)
+				{
+					target = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
+					dg_history_install(target, state, tree);
+					dg_storage_close_relation(target);
+					UpdateActiveSnapshotCommandId();
+					move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
+				}
+			}
+			dg_release(state);
+			end_api(nest);
+		}
 	}
 	PG_FINALLY();
 	{

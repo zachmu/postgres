@@ -52,6 +52,7 @@ extern DGState *dg_load_bound(Relation rel, Snapshot snapshot, const char *branc
 extern void dg_check(PLStatus status);
 extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
+extern DGState *dg_catalog_mutation_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_load_branch(Relation rel, Snapshot snapshot, const char *branch);
 extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
@@ -60,7 +61,7 @@ extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
 extern void dg_history_handles(DGState *state);
-extern bytea *dg_history_export_tree(const PLTree *tree);
+extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
 extern DGRows dg_rows(const PLTree * tree);
