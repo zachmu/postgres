@@ -536,6 +536,22 @@ provider_view(bytea *database)
 				{
 					FormData_pg_type type = {0};
 					int			attno;
+					char	   *arrayname = makeObjectName("", NameStr(form.relname), NULL);
+					int			arraypass = 0;
+					char	   *arrayidentity;
+					FormData_pg_type array = {0};
+
+					for (;;)
+					{
+						arrayidentity = quote_qualified_identifier(strVal(linitial(parts)), arrayname);
+						if (!catalog_contains(database, arrayidentity) &&
+							!OidIsValid(CatalogViewFindObject(view, TypeRelationId, arrayidentity)))
+							break;
+						pfree(arrayname);
+						arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
+					}
+					array.oid = CatalogViewBindObject(view, TypeRelationId, arrayidentity, InvalidOid);
+					type.typarray = array.oid;
 
 					type.oid = form.reltype;
 					type.typname = form.relname;
@@ -556,6 +572,27 @@ provider_view(bytea *database)
 					type.typtypmod = -1;
 					provider_add(&rows, TypeRelationId, &type, sizeof(type), Anum_pg_type_typcollation);
 					provider_dependency(&rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
+					namestrcpy(&array.typname, arrayname);
+					array.typnamespace = type.typnamespace;
+					array.typowner = type.typowner;
+					array.typlen = -1;
+					array.typtype = TYPTYPE_BASE;
+					array.typcategory = TYPCATEGORY_ARRAY;
+					array.typisdefined = true;
+					array.typdelim = ',';
+					array.typelem = type.oid;
+					array.typinput = F_ARRAY_IN;
+					array.typoutput = F_ARRAY_OUT;
+					array.typreceive = F_ARRAY_RECV;
+					array.typsend = F_ARRAY_SEND;
+					array.typanalyze = F_ARRAY_TYPANALYZE;
+					array.typsubscript = F_ARRAY_SUBSCRIPT_HANDLER;
+					array.typalign = TYPALIGN_DOUBLE;
+					array.typstorage = TYPSTORAGE_EXTENDED;
+					array.typtypmod = -1;
+					provider_add(&rows, TypeRelationId, &array, sizeof(array), Anum_pg_type_typcollation);
+					provider_dependency(&rows, TypeRelationId, array.oid, 0, TypeRelationId, type.oid, 0, DEPENDENCY_INTERNAL);
+
 					for (attno = -1; attno > FirstLowInvalidHeapAttributeNumber; attno--)
 					{
 						FormData_pg_attribute attr = *SystemAttributeDefinition(attno);

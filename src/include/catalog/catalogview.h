@@ -2,6 +2,7 @@
 #ifndef CATALOGVIEW_H
 #define CATALOGVIEW_H
 #include "access/htup.h"
+#include "fmgr.h"
 #include "access/skey.h"
 #include "access/sdir.h"
 #include "access/tupdesc.h"
@@ -28,6 +29,7 @@ extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char 
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
 extern CatalogView *CatalogViewObjectContext(Oid handle);
 extern bool CatalogViewIsObjectIdType(Oid type);
+extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);
 extern Oid	CatalogViewObjectStorage(Oid handle);
 extern CatalogView *CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const int *attributes, const Datum *values);
 

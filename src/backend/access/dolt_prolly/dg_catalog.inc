@@ -176,8 +176,7 @@ catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const
 			continue;
 		}
 		name = quote_qualified_identifier(ns, rv->relname);
-		if (catalog_contains(db, name) &&
-			(!type_lookup || OidIsValid(CatalogViewFindObject(provider_view(db), TypeRelationId, name))))
+		if (type_lookup ? OidIsValid(CatalogViewFindObject(provider_view(db), TypeRelationId, name)) : catalog_contains(db, name))
 		{
 			char	   *definition = catalog_namespace(db, ns);
 
@@ -875,4 +874,32 @@ dg_catalog_type_visible(Oid id, const char *name, bool *visible)
 	}
 	PG_END_TRY();
 	return handled;
+}
+
+/* Compilation scope for argument-free procedural routines. Execution retains
+ * its caller's read/write authority; this view only keys cached declarations. */
+CatalogView *
+dg_catalog_session_view(void)
+{
+	Oid			user;
+	int			security,
+				nest;
+	CatalogView *result = CatalogViewCurrent();
+
+	if (result || !dg_catalog_active())
+		return result;
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		result = provider_view(read_ref(branch_ref("working")).target);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return result;
 }
