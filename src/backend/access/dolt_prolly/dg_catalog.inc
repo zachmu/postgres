@@ -113,8 +113,33 @@ catalog_namespace(bytea *db, const char *name)
 
 /* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
  * candidates in that same order, never a shortcut ahead of an explicit path. */
+static char *catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok);
+
 static char *
 catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	char	   *result;
+
+	/*
+	 * Canonical candidates use the explicit database root. Shared system and
+	 * temporary candidates use their physical namespace, even in nested
+	 * scopes.
+	 */
+	PG_TRY();
+	{
+		result = catalog_resolve_candidates(db, rv, user, native, search_path, type_lookup, temp_ok);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static char *
+catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
 	List	   *path = NIL;
 	ListCell   *lc;
