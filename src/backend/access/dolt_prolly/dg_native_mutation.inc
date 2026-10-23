@@ -4,13 +4,14 @@ static bool
 native_alter_action(AlterTableType type)
 {
 	return type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
-		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn;
+		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint;
 }
 
 static char *
 mutation_columns(CatalogView *view, Oid relation, const char *definition, int **mapping, int *count)
 {
 	Relation	catalog = table_open(AttributeRelationId, AccessShareLock);
+	Relation	defaults = table_open(AttrDefaultRelationId, AccessShareLock);
 	ListCell   *lc;
 	StringInfoData columns;
 	HeapTuple	attributes[MaxHeapAttributeNumber] = {0};
@@ -50,12 +51,44 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 
 		if (attr->attisdropped)
 			continue;
-		if (attr->atthasdef || attr->attidentity || attr->attgenerated || attr->atthasmissing)
+		if (attr->attidentity || attr->attgenerated || attr->atthasmissing)
 			unsupported("canonical native column expression codec");
 		run("SELECT coalesce($1::jsonb->'columns'->$2, jsonb_build_object('name',$3::text,'comment',NULL,'type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
 		if (SPI_processed != 1)
 			unsupported("canonical native column user-defined type codec");
 		column = strcell(0, 1);
+		{
+			ListCell   *dc;
+			char	   *sql = NULL;
+			CatalogView *previous = CatalogViewSwitch(view);
+
+			PG_TRY();
+			{
+				foreach(dc, CatalogViewTuples(view, AttrDefaultRelationId))
+				{
+					HeapTuple	def = lfirst(dc);
+					Form_pg_attrdef form = (Form_pg_attrdef) GETSTRUCT(def);
+					bool		isnull;
+					Datum		expression;
+
+					if (form->adrelid != relation || form->adnum != attr->attnum)
+						continue;
+					expression = heap_getattr(def, Anum_pg_attrdef_adbin, RelationGetDescr(defaults), &isnull);
+					if (isnull)
+						elog(ERROR, "null native column default expression");
+					sql = schema_expression_sql(stringToNode(TextDatumGetCString(expression)), relation);
+				}
+			}
+			PG_FINALLY();
+			{
+				CatalogViewSwitch(previous);
+			}
+			PG_END_TRY();
+			if (attr->atthasdef != (sql != NULL))
+				elog(ERROR, "native attribute/default catalogs disagree");
+			run("SELECT (($1::jsonb-'default') || jsonb_strip_nulls(jsonb_build_object('default',$2::text)))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(column), sql ? CStringGetTextDatum(sql) : (Datum) 0), sql ? NULL : " n", true);
+			column = strcell(0, 1);
+		}
 		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
 		options = heap_getattr(tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &optionsnull);
 		nulls[2] = statsnull ? 'n' : ' ';
@@ -69,6 +102,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 		(*mapping)[(*count)++] = ordinal;
 	}
 	table_close(catalog, AccessShareLock);
+	table_close(defaults, AccessShareLock);
 	appendStringInfoChar(&columns, ']');
 	run("SELECT jsonb_set($1::jsonb,'{columns}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(columns.data)), NULL, true);
 	return strcell(0, 1);
@@ -145,9 +179,31 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 
 			if (constraint->conrelid != relation)
 				continue;
-			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE)
+			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE && constraint->contype != CONSTRAINT_CHECK)
 				unsupported("canonical codec for native constraint type");
-			sql = TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef, ObjectIdGetDatum(constraint->oid)));
+			if (constraint->contype == CONSTRAINT_CHECK)
+			{
+				bool		isnull;
+				Datum		expression = SysCacheGetAttr(CONSTROID, tuple, Anum_pg_constraint_conbin, &isnull);
+
+				if (isnull)
+					elog(ERROR, "null native CHECK expression");
+				(void) schema_expression_check(stringToNode(TextDatumGetCString(expression)), NULL);
+			}
+			{
+				int			nest = NewGUCNestLevel();
+
+				PG_TRY();
+				{
+					schema_expression_gucs();
+					sql = TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef, ObjectIdGetDatum(constraint->oid)));
+				}
+				PG_FINALLY();
+				{
+					AtEOXact_GUC(true, nest);
+				}
+				PG_END_TRY();
+			}
 			if (!first)
 				appendStringInfoChar(&json, ',');
 			first = false;
@@ -169,7 +225,7 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 }
 
 static void
-native_alter_publish(Capture current, VersionRef working, const char *name, List *commands, DGState *state, int oldcount)
+native_alter_publish(Capture current, VersionRef working, const char *name, AlterTableStmt *statement, DGState *state, int oldcount, Oid caller)
 {
 	CatalogView *view = CatalogViewCreate("provisional native ALTER");
 	CatalogView *previous;
@@ -193,11 +249,15 @@ native_alter_publish(Capture current, VersionRef working, const char *name, List
 		Oid			id = CatalogViewLookupObject(view, RelationRelationId, name);
 
 		ListCell   *lc;
+		List	   *commands = statement->cmds;
 
 		foreach(lc, commands)
 		{
 			AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
 
+			if (action->subtype == AT_AddConstraint &&
+				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL)
+				unsupported("native constraint storage codec");
 			if (action->subtype == AT_AddColumn)
 			{
 				ColumnDef  *col = castNode(ColumnDef, action->def);
@@ -213,7 +273,30 @@ native_alter_publish(Capture current, VersionRef working, const char *name, List
 			}
 		}
 
-		AlterTableInternal(id, copyObject(commands), false);
+		{
+			AlterTableUtilityContext context = {0};
+			PlannedStmt *plan = makeNode(PlannedStmt);
+			AlterTableStmt *stmt = copyObject(statement);
+			Oid			privileged;
+			int			security;
+
+			plan->commandType = CMD_UTILITY;
+			plan->utilityStmt = (Node *) stmt;
+			context.pstmt = plan;
+			context.queryString = debug_query_string ? debug_query_string : "";
+			context.relid = id;
+			GetUserIdAndSecContext(&privileged, &security);
+			SetUserIdAndSecContext(caller, security);
+			PG_TRY();
+			{
+				AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(privileged, security);
+			}
+			PG_END_TRY();
+		}
 		CommandCounterIncrement();
 		CatalogViewSwitch(NULL);
 		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);

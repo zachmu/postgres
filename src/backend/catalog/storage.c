@@ -211,8 +211,8 @@ RelationDropStorage(Relation rel)
 
 	/* Context handles describe retained definitions, not disposable files. */
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
-		ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					   errmsg("physical storage deletion requires canonical publication")));
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("physical storage deletion requires canonical publication")));
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)

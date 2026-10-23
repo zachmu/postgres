@@ -153,6 +153,12 @@ dg_catalog_alter(Node *statement)
 		if (stmt->objtype != OBJECT_TABLE)
 			return false;
 		cmd = linitial_node(AlterTableCmd, stmt->cmds);
+		/* Preserve native bootstrap/restore of primary and unique indexes. */
+		if (!dg_catalog_active() && cmd->subtype == AT_AddConstraint &&
+			castNode(Constraint, cmd->def)->contype != CONSTR_CHECK &&
+			castNode(Constraint, cmd->def)->contype != CONSTR_NOTNULL)
+			return false;
+
 
 		if (!dg_catalog_active())
 		{
@@ -279,7 +285,7 @@ dg_catalog_alter(Node *statement)
 		current = capture(true);
 		if (cmd && native_alter_action(cmd->subtype))
 		{
-			native_alter_publish(current, working, name, ((AlterTableStmt *) statement)->cmds, state, oldcount);
+			native_alter_publish(current, working, name, (AlterTableStmt *) statement, state, oldcount, user);
 			dg_release(state);
 			end_api(nest);
 		}
