@@ -2,6 +2,7 @@
 #include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -106,6 +107,10 @@ dg_guard_branch_ddl(Node *statement)
 		return;
 	guard = GetCommandLogLevel(statement) == LOGSTMT_DDL || IsA(statement, TruncateStmt);
 	if (!guard)
+		return;
+	/* Creating a schema that exists fails the same way on every branch. */
+	if (IsA(statement, CreateSchemaStmt) && ((CreateSchemaStmt *) statement)->schemaname &&
+		OidIsValid(get_namespace_oid(((CreateSchemaStmt *) statement)->schemaname, true)))
 		return;
 	LockDatabaseObject(DoltRefRelationId, 0, 0, ShareLock);
 	refs = table_open(DoltRefRelationId, AccessShareLock);

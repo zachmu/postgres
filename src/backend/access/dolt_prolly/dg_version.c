@@ -1363,3 +1363,5 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_workspace.inc"
 #include "dg_conflicts.inc"
 #include "dg_schemas.inc"
+#include "dg_rebase.inc"
+#include "dg_tools.inc"
