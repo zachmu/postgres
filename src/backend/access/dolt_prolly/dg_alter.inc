@@ -1,3 +1,86 @@
+/* A native catalog tuple proposal is transient. Only portable attribute values
+ * enter the schema tree; MVCC headers, TIDs and runtime OIDs never do. */
+typedef struct AttributeProposal
+{
+	Oid			relation;
+	HeapTuple	tuple;
+}			AttributeProposal;
+
+static void
+attribute_proposal(Relation catalog, HeapTuple tuple, void *arg)
+{
+	AttributeProposal *proposal = arg;
+	Form_pg_attribute attr = (Form_pg_attribute) GETSTRUCT(tuple);
+	HeapTuple	before;
+	TupleDesc	desc = RelationGetDescr(catalog);
+
+	if (RelationGetRelid(catalog) != AttributeRelationId ||
+		attr->attrelid != proposal->relation || attr->attnum <= 0 || proposal->tuple)
+		unsupported("unexpected native catalog mutation");
+	before = SearchSysCache2(ATTNUM, ObjectIdGetDatum(attr->attrelid), Int16GetDatum(attr->attnum));
+	if (!HeapTupleIsValid(before))
+		elog(ERROR, "native catalog mutation target disappeared");
+	for (int i = 1; i <= desc->natts; i++)
+	{
+		bool		anull,
+					bnull;
+		Datum		a,
+					b;
+		Form_pg_attribute field = TupleDescAttr(desc, i - 1);
+
+		if (i == Anum_pg_attribute_attstattarget || i == Anum_pg_attribute_attoptions)
+			continue;
+		a = heap_getattr(before, i, desc, &anull);
+		b = heap_getattr(tuple, i, desc, &bnull);
+		if (anull != bnull || (!anull && !datumIsEqual(a, b, field->attbyval, field->attlen)))
+			unsupported("native mutation of an unencoded catalog field");
+	}
+	ReleaseSysCache(before);
+	proposal->tuple = heap_copytuple(tuple);
+}
+
+static char *
+alter_native_attribute(Relation definition, AlterTableCmd *cmd, const char *json)
+{
+	AttributeProposal proposal = {RelationGetRelid(definition), NULL};
+	CatalogViewMutation mutation = {CatalogViewObjectContext(proposal.relation), attribute_proposal, &proposal};
+	CatalogViewMutation *saved = CatalogViewSwitchMutation(&mutation);
+	CatalogView *previous = CatalogViewSwitch(mutation.view);
+	Relation	catalog;
+	bool		statsnull,
+				optionsnull;
+	Datum		stats,
+				options;
+	int			att;
+	char	   *result;
+	char		nulls[5] = "    ";
+
+	PG_TRY();
+	{
+		AlterTableColumnMetadata(definition, cmd);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitchMutation(saved);
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	if (!proposal.tuple)
+		elog(ERROR, "native metadata command produced no catalog tuple");
+	catalog = table_open(AttributeRelationId, AccessShareLock);
+	stats = heap_getattr(proposal.tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
+	options = heap_getattr(proposal.tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &optionsnull);
+	att = ((Form_pg_attribute) GETSTRUCT(proposal.tuple))->attnum - 1;
+	nulls[2] = statsnull ? 'n' : ' ';
+	nulls[3] = optionsnull ? 'n' : ' ';
+	/* Absent/default values have one normal form; option ordering is stable. */
+	run("SELECT jsonb_set($1::jsonb,ARRAY['columns',$2::text], (($1::jsonb->'columns'->$2)-'statistics'-'options') || jsonb_strip_nulls(jsonb_build_object('statistics',$3::int,'options',(SELECT jsonb_agg(v ORDER BY v COLLATE \"C\") FROM unnest($4::text[]) v))))::text", 4, VC_TYPES(TEXTOID, INT4OID, INT4OID, TEXTARRAYOID), VC_ARGS(CStringGetTextDatum(json), Int32GetDatum(att), stats, options), nulls, true);
+	result = strcell(0, 1);
+	table_close(catalog, AccessShareLock);
+	heap_freetuple(proposal.tuple);
+	return result;
+}
+
 /* Branch-local metadata revisions and eager tuple-layout rewrites. */
 static PLTree
 alter_rows(DGState *state, int oldcount, int dropped)
@@ -148,10 +231,39 @@ dg_catalog_alter(Node *statement)
 	{
 		AlterTableStmt *stmt = (AlterTableStmt *) statement;
 
+		if (stmt->objtype == OBJECT_TABLE && list_length(stmt->cmds) > 1 && dg_catalog_active())
+		{
+			ListCell   *lc;
+
+			/*
+			 * Metadata actions have native left-to-right semantics. Reopen a
+			 * fresh immutable definition for each action; SQL rollback covers
+			 * all publications if a later native validator fails.
+			 */
+			foreach(lc, stmt->cmds)
+			{
+				AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
+
+				if (action->subtype != AT_SetStatistics && action->subtype != AT_SetOptions && action->subtype != AT_ResetOptions)
+					unsupported("mixed canonical ALTER action families");
+			}
+			foreach(lc, stmt->cmds)
+			{
+				AlterTableStmt *single = copyObject(stmt);
+
+				single->cmds = list_make1(lfirst(lc));
+				if (!dg_catalog_alter((Node *) single))
+					elog(ERROR, "canonical metadata action not handled");
+				if (ActiveSnapshotSet())
+					UpdateActiveSnapshotCommandId();
+			}
+			return true;
+		}
 		if (stmt->objtype != OBJECT_TABLE || list_length(stmt->cmds) != 1)
 			unsupported("canonical ALTER requires one table action");
 		cmd = linitial_node(AlterTableCmd, stmt->cmds);
-		if (cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
+		if (cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn &&
+			cmd->subtype != AT_SetStatistics && cmd->subtype != AT_SetOptions && cmd->subtype != AT_ResetOptions)
 			return false;
 		if (!dg_catalog_active())
 		{
@@ -239,7 +351,7 @@ dg_catalog_alter(Node *statement)
 		Oid			resource;
 		int			att = -1,
 					oldcount = RelationGetDescr(definition)->natts;
-		bool		rewrite = cmd != NULL,
+		bool		rewrite = cmd && (cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn),
 					skip = false;
 		PLTree		tree;
 
@@ -306,6 +418,10 @@ dg_catalog_alter(Node *statement)
 
 				run("SELECT jsonb_set($1::jsonb,$2::text[],coalesce(to_jsonb($3::text),'null'::jsonb))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(path), comment->comment ? CStringGetTextDatum(comment->comment) : (Datum) 0), comment->comment ? NULL : "  n", true);
 				json = strcell(0, 1);
+			}
+			else if (cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions || cmd->subtype == AT_ResetOptions)
+			{
+				json = alter_native_attribute(definition, cmd, json);
 			}
 			else if (cmd->subtype == AT_AddColumn)
 			{
