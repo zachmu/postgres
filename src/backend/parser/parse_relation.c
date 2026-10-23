@@ -2526,6 +2526,19 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 
 	if (!desc)
 		return NULL;
+	if (rte->relkind == RELKIND_VIEW)
+	{
+		RangeVar   *native = copyObject(rv);
+		ParseNamespaceItem *item;
+
+		native->catalogname = NULL;
+		native->dolt_revision = NULL;
+		native->schemaname = get_namespace_name(get_rel_namespace(rte->relid));
+		item = addRangeTableEntry(pstate, native, rv->alias, false, true);
+		item->p_rte->dolt_database = rte->dolt_database;
+		FreeTupleDesc(desc);
+		return item;
+	}
 	rte->rtekind = RTE_DOLT;
 	rte->alias = rv->alias;
 	rte->eref = makeAlias(rv->alias ? rv->alias->aliasname : rv->relname, NIL);

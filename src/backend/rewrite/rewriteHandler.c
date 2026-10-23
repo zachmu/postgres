@@ -95,6 +95,28 @@ static void markQueryForLocking(Query *qry, Node *jtnode,
 								bool pushedDown);
 static List *matchLocks(CmdType event, Relation relation,
 						int varno, Query *parsetree, bool *hasUpdate);
+
+/* Inherit immutable context into copied view actions, including nested queries.
+ * Never modify the relcache's stored rule tree or a sibling view reference. */
+static bool
+inherit_catalog_context(Node *node, const char *database)
+{
+	if (!node)
+		return false;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, inherit_catalog_context,
+								 (void *) database, QTW_EXAMINE_RTES_BEFORE);
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_RELATION && !rte->dolt_database)
+			rte->dolt_database = pstrdup(database);
+		return false;
+	}
+	return expression_tree_walker(node, inherit_catalog_context, (void *) database);
+}
+
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
 static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 static List *get_generated_columns(Relation rel, int rt_index, bool include_stored);
@@ -1852,6 +1874,9 @@ ApplyRetrieveRule(Query *parsetree,
 	 * rels if there's a FOR [KEY] UPDATE/SHARE clause affecting this view.
 	 */
 	rule_action = copyObject(linitial(rule->actions));
+	rte = rt_fetch(rt_index, parsetree->rtable);
+	if (rte->dolt_database)
+		inherit_catalog_context((Node *) rule_action, rte->dolt_database);
 
 	AcquireRewriteLocks(rule_action, true, (rc != NULL));
 
