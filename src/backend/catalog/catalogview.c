@@ -12,6 +12,8 @@
 #include "fmgr.h"
 #include "utils/lsyscache.h"
 #include "access/htup_details.h"
+#include "access/genam.h"
+#include "access/nbtree.h"
 #include "catalog/catalogview.h"
 #include "executor/tuptable.h"
 #include "utils/catcache.h"
@@ -21,6 +23,8 @@
 #include "utils/snapshot.h"
 #include "utils/sortsupport.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_class_d.h"
+#include "utils/inval.h"
 
 typedef struct CatalogViewRows
 {
@@ -32,6 +36,12 @@ struct CatalogView
 {
 	MemoryContext memory;
 	MemoryContext rows_memory;
+	bool		provisional;
+	bool		retired;
+	List	   *baseline;
+	List	   *changes;
+	uint64		next_tuple;
+	bool		dirty;
 	List	   *catalog_ids;
 	uint64		touched;
 	TransactionId creator;
@@ -83,6 +93,8 @@ static uint64 view_clock;
 int			catalog_view_cache_entries = 16;
 static void prune_catalog_views(XactEvent event, void *arg);
 static bool prune_registered;
+static bool stage_tuple(Relation relation, ItemPointer tid, HeapTuple tuple);
+static void refresh_mutation(CatalogView *view);
 static CatalogView *current_view;
 static dlist_head views = DLIST_STATIC_INIT(views);
 
@@ -435,7 +447,7 @@ CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, 
 			return handle;
 		}
 	}
-	if (view->sealed)
+	if (view->sealed && !view->provisional)
 		elog(ERROR, "cannot bind a new object in a published catalog context");
 
 	/*
@@ -737,26 +749,10 @@ CatalogViewObjectIdentity(Oid handle, Oid objectclass)
 	return object->identity;
 }
 
-/* Native DDL may propose tuples, but only its owner may publish a new root. */
-static CatalogViewMutation * catalog_mutation;
-
-CatalogViewMutation *
-CatalogViewSwitchMutation(CatalogViewMutation * mutation)
-{
-	CatalogViewMutation *previous = catalog_mutation;
-
-	catalog_mutation = mutation;
-	return previous;
-}
-
 bool
-CatalogViewCaptureUpdate(Relation relation, HeapTuple tuple)
+CatalogViewCaptureUpdate(Relation relation, ItemPointer tid, HeapTuple tuple)
 {
-	if (!catalog_mutation || CatalogViewCurrent() != catalog_mutation->view ||
-		!CatalogViewContains(catalog_mutation->view, RelationGetRelid(relation)))
-		return false;
-	catalog_mutation->update(relation, tuple, catalog_mutation->state);
-	return true;
+	return stage_tuple(relation, tid, tuple);
 }
 
 /* Keep handle identities for the backend lifetime, but bound decoded row/cache
@@ -772,6 +768,8 @@ void
 CatalogViewEnsureLoaded(CatalogView *view)
 {
 	view->touched = ++view_clock;
+	if (view->retired)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("provisional catalog context has been retired")));
 	if (CatalogViewCreatorAborted(view))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("catalog handle refers to an aborted schema revision")));
@@ -861,4 +859,343 @@ CatalogViewCreatorAborted(CatalogView *view)
 	return TransactionIdIsValid(view->creator) &&
 		!TransactionIdIsCurrentTransactionId(view->creator) &&
 		!TransactionIdDidCommit(view->creator);
+}
+
+/* Provisional views are private to native DDL. Tuple versions become visible
+ * at CCI; scans retain their original list and never observe an in-place edit. */
+typedef struct CatalogChange
+{
+	Oid			catalog;
+	ItemPointerData tid;
+	HeapTuple	tuple;
+	CommandId	command;
+	SubTransactionId subid;
+	bool		aborted;
+}			CatalogChange;
+
+static void
+mutation_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
+{
+	dlist_iter	it;
+
+	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
+		return;
+	dlist_foreach(it, &views)
+	{
+		CatalogView *view = dlist_container(CatalogView, link, it.cur);
+		ListCell   *lc;
+
+		if (!view->provisional || view->retired)
+			continue;
+		foreach(lc, view->changes)
+		{
+			CatalogChange *change = lfirst(lc);
+
+			if (change->subid == id)
+			{
+				if (event == SUBXACT_EVENT_ABORT_SUB)
+				{
+					change->aborted = true;
+					view->dirty = true;
+				}
+				else
+					change->subid = parent;
+			}
+		}
+		if (event == SUBXACT_EVENT_ABORT_SUB && view->dirty)
+			refresh_mutation(view);
+	}
+}
+
+void
+CatalogViewBeginMutation(CatalogView *view)
+{
+	static bool registered;
+	ListCell   *lc;
+
+	if (!view->sealed || view->provisional || view->loader)
+		elog(ERROR, "mutation requires a fresh private catalog view");
+	view->provisional = true;
+	view->baseline = view->catalogs;
+	foreach(lc, view->catalogs)
+		view->next_tuple = Max(view->next_tuple, list_length(((CatalogViewRows *) lfirst(lc))->tuples));
+	if (!registered)
+	{
+		RegisterSubXactCallback(mutation_subxact, NULL);
+		registered = true;
+	}
+}
+
+/* Validate against pending writes too, matching native unique-index behavior
+ * before CCI. Catalogs have ordinary non-expression btree identity indexes. */
+static void
+check_mutation_tuple(CatalogView *view, Relation relation, ItemPointer target, HeapTuple proposed)
+{
+	ListCell   *lc,
+			   *ic;
+	List	   *effective = NIL;
+	TupleDesc	desc = RelationGetDescr(relation);
+	bool		found_target = target == NULL;
+
+	foreach(lc, view->baseline)
+	{
+		CatalogViewRows *rows = lfirst(lc);
+
+		if (rows->catalog == RelationGetRelid(relation))
+			effective = list_copy(rows->tuples);
+	}
+	foreach(lc, view->changes)
+	{
+		CatalogChange *change = lfirst(lc);
+		List	   *next = NIL;
+		ListCell   *tc;
+		bool		found = false;
+
+		if (change->aborted || change->catalog != RelationGetRelid(relation))
+			continue;
+		foreach(tc, effective)
+		{
+			HeapTuple	tuple = lfirst(tc);
+
+			if (ItemPointerEquals(&tuple->t_self, &change->tid))
+			{
+				found = true;
+				if (change->tuple)
+					next = lappend(next, change->tuple);
+			}
+			else
+				next = lappend(next, tuple);
+		}
+		if (!found && change->tuple)
+			next = lappend(next, change->tuple);
+		list_free(effective);
+		effective = next;
+	}
+	foreach(lc, effective)
+		if (target && ItemPointerEquals(target, &((HeapTuple) lfirst(lc))->t_self))
+		found_target = true;
+	if (!found_target)
+		elog(ERROR, "provisional catalog mutation target does not exist");
+	if (!proposed)
+	{
+		list_free(effective);
+		return;
+	}
+	for (int i = 0; i < desc->natts; i++)
+	{
+		bool		isnull;
+
+		(void) heap_getattr(proposed, i + 1, desc, &isnull);
+		if (TupleDescAttr(desc, i)->attnotnull && isnull)
+			ereport(ERROR, (errcode(ERRCODE_NOT_NULL_VIOLATION), errmsg("null value in column \"%s\" of catalog \"%s\"", NameStr(TupleDescAttr(desc, i)->attname), RelationGetRelationName(relation))));
+	}
+	foreach(ic, RelationGetIndexList(relation))
+	{
+		Relation	index = index_open(lfirst_oid(ic), AccessShareLock);
+
+		if (index->rd_index->indisunique)
+		{
+			foreach(lc, effective)
+			{
+				HeapTuple	tuple = lfirst(lc);
+				bool		equal = true;
+
+				if (target && ItemPointerEquals(target, &tuple->t_self))
+					continue;
+				for (int k = 0; k < index->rd_index->indnkeyatts; k++)
+				{
+					int			att = index->rd_index->indkey.values[k];
+					Datum		a,
+								b;
+					bool		anull,
+								bnull;
+
+					if (att <= 0)
+						elog(ERROR, "unsupported provisional catalog index expression");
+					a = heap_getattr(tuple, att, desc, &anull);
+					b = heap_getattr(proposed, att, desc, &bnull);
+					if (anull || bnull)
+						equal = anull && bnull && index->rd_index->indnullsnotdistinct;
+					else
+						equal = DatumGetInt32(FunctionCall2Coll(index_getprocinfo(index, k + 1, BTORDER_PROC), index->rd_indcollation[k], a, b)) == 0;
+					if (!equal)
+						break;
+				}
+				if (equal)
+					ereport(ERROR, (errcode(ERRCODE_UNIQUE_VIOLATION), errmsg("duplicate key value violates unique constraint \"%s\"", RelationGetRelationName(index))));
+			}
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(effective);
+}
+
+static bool
+stage_tuple(Relation relation, ItemPointer tid, HeapTuple tuple)
+{
+	CatalogView *view = CatalogViewCurrent();
+	MemoryContext previous;
+	CatalogChange *change;
+
+	if (!view || !view->provisional || !CatalogViewContains(view, RelationGetRelid(relation)))
+		return false;
+	if (view->retired)
+		elog(ERROR, "cannot mutate retired catalog context");
+	check_mutation_tuple(view, relation, tid, tuple);
+	previous = MemoryContextSwitchTo(view->rows_memory);
+	change = palloc0(sizeof(*change));
+	change->catalog = RelationGetRelid(relation);
+	if (tid)
+		change->tid = *tid;
+	else
+	{
+		uint64		ordinal = view->next_tuple++;
+
+		ItemPointerSet(&change->tid, ordinal / MaxOffsetNumber + 1, ordinal % MaxOffsetNumber + 1);
+		tuple->t_self = change->tid;
+	}
+	change->tuple = tuple ? heap_copytuple(tuple) : NULL;
+	if (change->tuple)
+		change->tuple->t_self = change->tid;
+	change->command = GetCurrentCommandId(true);
+	change->subid = GetCurrentSubTransactionId();
+	view->changes = lappend(view->changes, change);
+	view->dirty = true;
+	MemoryContextSwitchTo(previous);
+	return true;
+}
+
+bool
+CatalogViewCaptureInsert(Relation relation, HeapTuple tuple)
+{
+	return stage_tuple(relation, NULL, tuple);
+}
+
+bool
+CatalogViewCaptureDelete(Relation relation, ItemPointer tid)
+{
+	return stage_tuple(relation, tid, NULL);
+}
+
+static void
+refresh_mutation(CatalogView *view)
+{
+	MemoryContext previous = MemoryContextSwitchTo(view->rows_memory);
+	List	   *catalogs = NIL;
+	ListCell   *lc;
+
+	foreach(lc, view->baseline)
+	{
+		CatalogViewRows *base = lfirst(lc);
+		CatalogViewRows *rows = palloc(sizeof(*rows));
+		ListCell   *change_cell;
+
+		*rows = *base;
+		rows->tuples = list_copy(base->tuples);
+		foreach(change_cell, view->changes)
+		{
+			CatalogChange *change = lfirst(change_cell);
+			List	   *updated = NIL;
+			ListCell   *tuple_cell;
+			bool		found = false;
+
+			if (change->aborted || change->catalog != rows->catalog || change->command >= GetCurrentCommandId(false))
+				continue;
+			foreach(tuple_cell, rows->tuples)
+			{
+				HeapTuple	tuple = lfirst(tuple_cell);
+
+				if (ItemPointerEquals(&tuple->t_self, &change->tid))
+				{
+					found = true;
+					if (change->tuple)
+						updated = lappend(updated, change->tuple);
+				}
+				else
+					updated = lappend(updated, tuple);
+			}
+			if (!found && change->tuple)
+				updated = lappend(updated, change->tuple);
+			rows->tuples = updated;
+		}
+		catalogs = lappend(catalogs, rows);
+	}
+	view->catalogs = catalogs;
+	view->dirty = false;
+	MemoryContextSwitchTo(previous);
+	foreach(lc, view->caches)
+		ResetCatalogCache(lfirst(lc), false);
+	foreach(lc, view->handles)
+	{
+		Oid			handle = lfirst_oid(lc);
+		CatalogViewObject *object = lookup_object(handle);
+
+		if (object->objectclass == RelationRelationId)
+			InvalidateLocalRelation(handle);
+	}
+}
+
+void
+CatalogViewMutationCommandEnd(void)
+{
+	CatalogView *view = CatalogViewCurrent();
+
+	if (view && view->provisional && view->dirty && !view->retired)
+		refresh_mutation(view);
+}
+
+List *
+CatalogViewTuples(CatalogView *view, Oid catalog)
+{
+	ListCell   *lc;
+
+	CatalogViewEnsureLoaded(view);
+	foreach(lc, view->catalogs)
+	{
+		CatalogViewRows *rows = lfirst(lc);
+
+		if (rows->catalog == catalog)
+			return rows->tuples;
+	}
+	elog(ERROR, "catalog is not provided by context");
+	return NIL;
+}
+
+void
+CatalogViewRetireMutation(CatalogView *view)
+{
+	ListCell   *lc;
+
+	if (!view->provisional || view == CatalogViewCurrent())
+		elog(ERROR, "invalid provisional catalog retirement");
+	view->retired = true;
+
+	/*
+	 * Existing local handle references fail explicitly after the statement.
+	 * Keep identity records until native type/relcache consumers release
+	 * them.
+	 */
+	foreach(lc, view->caches)
+		ResetCatalogCache(lfirst(lc), false);
+	if (!view->scan_references)
+	{
+		view->baseline = view->catalogs = view->changes = NIL;
+		MemoryContextReset(view->rows_memory);
+	}
+}
+
+bool
+CatalogViewIsProvisional(CatalogView *view)
+{
+	return view && view->provisional && !view->retired;
+}
+
+Oid
+CatalogViewNewObject(Oid catalog)
+{
+	CatalogView *view = CatalogViewCurrent();
+
+	if (!CatalogViewIsProvisional(view) || !CatalogViewContains(view, catalog))
+		elog(ERROR, "invalid provisional object allocation");
+	return CatalogViewBindObject(view, catalog, psprintf("$provisional/%u", next_handle), InvalidOid);
 }

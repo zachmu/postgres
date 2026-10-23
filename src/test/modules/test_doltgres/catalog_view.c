@@ -1,9 +1,11 @@
 /* Native cache and scan boundary tests; no physical projection objects. */
 #include "postgres.h"
+#include "access/xact.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "catalog/catalogview.h"
+#include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
@@ -11,6 +13,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_type.h"
 #include "utils/typcache.h"
+#include "utils/resowner.h"
 #include "access/relation.h"
 #include "utils/lsyscache.h"
 #include "executor/spi.h"
@@ -308,5 +311,118 @@ test_catalog_view_lifetime(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 	if (!rejected)
 		elog(ERROR, "retired handle did not fail closed");
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_catalog_mutation);
+Datum
+test_catalog_mutation(PG_FUNCTION_ARGS)
+{
+	Oid			id,
+				inserted;
+	CatalogView *view = make_view("mutation", &id, InvalidOid, NULL, NULL);
+	CatalogView *previous;
+	Relation	relation;
+	HeapTuple	old,
+				changed,
+				added;
+	CatalogViewScan *scan;
+	bool		found_old = false;
+
+	CatalogViewBeginMutation(view);
+	previous = CatalogViewSwitch(view);
+	PG_TRY();
+	{
+		relation = table_open(NamespaceRelationId, RowExclusiveLock);
+		old = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(id));
+		changed = heap_copytuple(old);
+		namestrcpy(&((Form_pg_namespace) GETSTRUCT(changed))->nspname, "view_changed");
+		scan = CatalogViewBeginScan(relation, 0, NULL);
+		CatalogTupleUpdate(relation, &old->t_self, changed);
+		if (!SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("view_example")))
+			elog(ERROR, "unpublished mutation changed current command");
+		CommandCounterIncrement();
+		if (!SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("view_changed")) ||
+			SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("view_example")))
+			elog(ERROR, "CCI failed to refresh staged namespace keys");
+		if (strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(old))->nspname), "view_example"))
+			elog(ERROR, "borrowed tuple changed in place");
+		while ((added = CatalogViewNext(scan, ForwardScanDirection)) != NULL)
+			if (!strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(added))->nspname), "view_example"))
+				found_old = true;
+		if (!found_old)
+			elog(ERROR, "old scan lost its command-visible tuple version");
+		CatalogViewEndScan(scan);
+		ReleaseSysCache(old);
+		inserted = GetNewOidWithIndex(relation, NamespaceOidIndexId, Anum_pg_namespace_oid);
+		added = heap_copytuple(changed);
+		((Form_pg_namespace) GETSTRUCT(added))->oid = inserted;
+		namestrcpy(&((Form_pg_namespace) GETSTRUCT(added))->nspname, "new_namespace");
+		CatalogTupleInsert(relation, added);
+		CommandCounterIncrement();
+		if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(inserted)))
+			elog(ERROR, "staged insert is invisible");
+		{
+			MemoryContext saved_memory = CurrentMemoryContext;
+			ResourceOwner saved_owner = CurrentResourceOwner;
+			volatile bool rejected = false;
+
+			BeginInternalSubTransaction(NULL);
+			PG_TRY();
+			{
+				HeapTuple	duplicate = heap_copytuple(added);
+
+				((Form_pg_namespace) GETSTRUCT(duplicate))->oid = GetNewOidWithIndex(relation, NamespaceOidIndexId, Anum_pg_namespace_oid);
+				CatalogTupleInsert(relation, duplicate);
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(saved_memory);
+				if (geterrcode() != ERRCODE_UNIQUE_VIOLATION)
+					PG_RE_THROW();
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+				rejected = true;
+			}
+			PG_END_TRY();
+			MemoryContextSwitchTo(saved_memory);
+			CurrentResourceOwner = saved_owner;
+			if (!rejected)
+				elog(ERROR, "provisional unique namespace name was not enforced");
+			BeginInternalSubTransaction(NULL);
+			{
+				HeapTuple	child = heap_copytuple(added);
+
+				namestrcpy(&((Form_pg_namespace) GETSTRUCT(child))->nspname, "child_namespace");
+				CatalogTupleUpdate(relation, &added->t_self, child);
+				CommandCounterIncrement();
+				if (!SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("child_namespace")))
+					elog(ERROR, "subtransaction mutation is invisible");
+				RollbackAndReleaseCurrentSubTransaction();
+			}
+			MemoryContextSwitchTo(saved_memory);
+			CurrentResourceOwner = saved_owner;
+			if (!SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("new_namespace")) ||
+				SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("child_namespace")))
+				elog(ERROR, "subtransaction rollback failed to restore parent catalog state");
+		}
+		CatalogTupleDelete(relation, &added->t_self);
+		CommandCounterIncrement();
+		if (SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(inserted)))
+			elog(ERROR, "staged delete is still visible");
+		heap_freetuple(added);
+		heap_freetuple(changed);
+		table_close(relation, RowExclusiveLock);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		CatalogViewRetireMutation(view);
+	}
+	PG_END_TRY();
+	CatalogViewRelease(view);
+	if (SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("view_changed")))
+		elog(ERROR, "provisional namespace leaked into physical catalog");
 	PG_RETURN_BOOL(true);
 }

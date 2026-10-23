@@ -744,7 +744,7 @@ CreateCacheMemoryContext(void)
  * resetting in-progress build entries in that case, or we'd never make any
  * progress.
  */
-static void
+void
 ResetCatalogCache(CatCache *cache, bool debug_discard)
 {
 	dlist_mutable_iter iter;

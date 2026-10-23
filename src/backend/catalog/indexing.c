@@ -235,6 +235,8 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 
+	if (CatalogViewCaptureInsert(heapRel, tup))
+		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
@@ -258,6 +260,8 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
+	if (CatalogViewCaptureInsert(heapRel, tup))
+		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
@@ -276,6 +280,27 @@ void
 CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 								 int ntuples, CatalogIndexState indstate)
 {
+	if (ntuples > 0)
+	{
+		bool		should_free;
+		HeapTuple	tuple = ExecFetchSlotHeapTuple(slot[0], true, &should_free);
+		bool		captured = CatalogViewCaptureInsert(heapRel, tuple);
+
+		if (should_free)
+			heap_freetuple(tuple);
+		if (captured)
+		{
+			for (int i = 1; i < ntuples; i++)
+			{
+				tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
+				if (!CatalogViewCaptureInsert(heapRel, tuple))
+					elog(ERROR, "inconsistent provisional multi-insert");
+				if (should_free)
+					heap_freetuple(tuple);
+			}
+			return;
+		}
+	}
 	CatalogViewRejectPhysicalAccess(heapRel);
 	/* Nothing to do */
 	if (ntuples <= 0)
@@ -319,7 +344,7 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
-	if (CatalogViewCaptureUpdate(heapRel, tup))
+	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
@@ -346,7 +371,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
 
-	if (CatalogViewCaptureUpdate(heapRel, tup))
+	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
@@ -374,6 +399,8 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 void
 CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 {
+	if (CatalogViewCaptureDelete(heapRel, tid))
+		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	simple_heap_delete(heapRel, tid);
 }

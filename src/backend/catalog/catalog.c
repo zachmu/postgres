@@ -25,6 +25,7 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
@@ -457,6 +458,9 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	bool		collides;
 	uint64		retries = 0;
 	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
+
+	if (CatalogViewIsProvisional(CatalogViewCurrent()) && CatalogViewContains(CatalogViewCurrent(), RelationGetRelid(relation)))
+		return CatalogViewNewObject(RelationGetRelid(relation));
 
 	/* Only system relations are supported */
 	Assert(IsSystemRelation(relation));
