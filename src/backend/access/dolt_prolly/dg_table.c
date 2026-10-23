@@ -404,7 +404,7 @@ validate_alter(Relation rel, struct AlterTableCmd *cmd)
 	if (CatalogViewIsProvisional(rel->rd_catalogview) &&
 		(cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
 		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
-		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull))
+		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn))
 		return;
 
 	/*

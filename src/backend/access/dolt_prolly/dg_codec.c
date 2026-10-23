@@ -159,7 +159,7 @@ dg_validate_descriptor(TupleDesc desc)
 	for (i = 0; i < desc->natts; i++)
 	{
 		if (TupleDescAttr(desc, i)->attisdropped)
-			dg_unsupported("dropped columns");
+			continue;
 		check_type(TupleDescAttr(desc, i)->atttypid);
 	}
 }
