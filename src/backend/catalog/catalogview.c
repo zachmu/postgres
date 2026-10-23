@@ -4,6 +4,8 @@
  * not consulted when the view provides a catalog, including an empty catalog.
  */
 #include "postgres.h"
+#include "fmgr.h"
+#include "utils/lsyscache.h"
 #include "access/htup_details.h"
 #include "catalog/catalogview.h"
 #include "executor/tuptable.h"
@@ -590,4 +592,42 @@ uint64
 CatalogViewCacheId(CatalogView *view)
 {
 	return view ? view->serial : 0;
+}
+
+/* Select a single invocation scope for SQL and procedural handlers alike. */
+CatalogView *
+CatalogViewCallContext(FunctionCallInfo fcinfo)
+{
+	CatalogView *view = NULL;
+	int			i;
+	Oid		   *declared = NULL;
+	int			nargs = 0;
+
+	for (i = 0; i < fcinfo->nargs; i++)
+	{
+		Oid			type = get_fn_expr_argtype(fcinfo->flinfo, i);
+		CatalogView *bound;
+
+		/* Internal fmgr callers need not supply an expression tree. */
+		if (!OidIsValid(type))
+		{
+			if (!declared)
+				(void) get_func_signature(fcinfo->flinfo->fn_oid, &declared, &nargs);
+			if (i < nargs)
+				type = declared[i];
+		}
+		bound = CatalogViewObjectContext(type);
+		if (!fcinfo->args[i].isnull &&
+			CatalogViewIsObjectIdType(type))
+			bound = CatalogViewObjectContext(DatumGetObjectId(fcinfo->args[i].value));
+		if (bound && view && view != bound)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("SQL function arguments span incompatible catalog contexts")));
+		if (bound)
+			view = bound;
+	}
+	if (declared)
+		pfree(declared);
+	if (!view)
+		view = CatalogViewCurrent();
+	return view;
 }

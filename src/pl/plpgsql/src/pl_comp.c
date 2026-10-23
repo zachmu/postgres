@@ -14,6 +14,8 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 
 #include <ctype.h>
 
@@ -106,6 +108,7 @@ PLpgSQL_function *
 plpgsql_compile(FunctionCallInfo fcinfo, bool forValidator)
 {
 	PLpgSQL_function *function;
+	CatalogView *previous = CatalogViewSwitch(dg_catalog_session_view());
 
 	/*
 	 * funccache.c manages re-use of existing PLpgSQL_function caches.
@@ -115,14 +118,22 @@ plpgsql_compile(FunctionCallInfo fcinfo, bool forValidator)
 	 * Also, we don't need to make the cache key depend on composite result
 	 * type (at least for now).
 	 */
-	function = (PLpgSQL_function *)
-		cached_function_compile(fcinfo,
-								fcinfo->flinfo->fn_extra,
-								plpgsql_compile_callback,
-								plpgsql_delete_callback,
-								sizeof(PLpgSQL_function),
-								false,
-								forValidator);
+	PG_TRY();
+	{
+		function = (PLpgSQL_function *)
+			cached_function_compile(fcinfo,
+									fcinfo->flinfo->fn_extra,
+									plpgsql_compile_callback,
+									plpgsql_delete_callback,
+									sizeof(PLpgSQL_function),
+									false,
+									forValidator);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
 
 	/*
 	 * Save pointer in FmgrInfo to avoid search on subsequent calls

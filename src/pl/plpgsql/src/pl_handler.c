@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "catalog/pg_proc.h"
@@ -220,8 +221,28 @@ _PG_init(void)
  */
 PG_FUNCTION_INFO_V1(plpgsql_call_handler);
 
+static Datum plpgsql_call_in_context(FunctionCallInfo fcinfo);
+
 Datum
 plpgsql_call_handler(PG_FUNCTION_ARGS)
+{
+	CatalogView *previous = CatalogViewSwitch(CatalogViewCallContext(fcinfo));
+	Datum		result;
+
+	PG_TRY();
+	{
+		result = plpgsql_call_in_context(fcinfo);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Datum
+plpgsql_call_in_context(FunctionCallInfo fcinfo)
 {
 	bool		nonatomic;
 	PLpgSQL_function *func;
