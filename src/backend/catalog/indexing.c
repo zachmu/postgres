@@ -319,6 +319,8 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	if (CatalogViewCaptureUpdate(heapRel, tup))
+		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
@@ -344,6 +346,8 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	if (CatalogViewCaptureUpdate(heapRel, tup))
+		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
 	CatalogTupleCheckConstraints(heapRel, tup);
 

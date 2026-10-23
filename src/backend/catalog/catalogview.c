@@ -694,3 +694,25 @@ CatalogViewObjectIdentity(Oid handle, Oid objectclass)
 		elog(ERROR, "catalog handle %u does not identify class %u", handle, objectclass);
 	return object->identity;
 }
+
+/* Native DDL may propose tuples, but only its owner may publish a new root. */
+static CatalogViewMutation * catalog_mutation;
+
+CatalogViewMutation *
+CatalogViewSwitchMutation(CatalogViewMutation * mutation)
+{
+	CatalogViewMutation *previous = catalog_mutation;
+
+	catalog_mutation = mutation;
+	return previous;
+}
+
+bool
+CatalogViewCaptureUpdate(Relation relation, HeapTuple tuple)
+{
+	if (!catalog_mutation || CatalogViewCurrent() != catalog_mutation->view ||
+		!CatalogViewContains(catalog_mutation->view, RelationGetRelid(relation)))
+		return false;
+	catalog_mutation->update(relation, tuple, catalog_mutation->state);
+	return true;
+}
