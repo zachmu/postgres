@@ -109,6 +109,7 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
+static bool canonical_drop(Node *statement);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
 static void binding_prepare(const char *branch, bytea *database, bool required);
@@ -1225,3 +1226,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_routine_ddl.inc"
 
 #include "dg_alter.inc"
+#include "dg_dependency.inc"

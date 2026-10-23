@@ -107,6 +107,8 @@ extern void ReleaseDeletionLock(const ObjectAddress *object);
 extern void performDeletion(const ObjectAddress *object,
 							DropBehavior behavior, int flags);
 
+extern List *collect_catalog_deletions(const ObjectAddresses *objects, DropBehavior behavior);
+
 extern void performMultipleDeletions(const ObjectAddresses *objects,
 									 DropBehavior behavior, int flags);
 

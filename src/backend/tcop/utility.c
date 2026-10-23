@@ -597,19 +597,19 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		CommandCounterIncrement();
 		return;
 	}
+	if (dg_catalog_drop(parsetree))
+	{
+		if (qc)
+			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+		free_parsestate(pstate);
+		return;
+	}
 	if (dg_catalog_alter(parsetree))
 	{
 		if (qc)
 			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
 		free_parsestate(pstate);
 		CommandCounterIncrement();
-		return;
-	}
-	if (dg_catalog_drop(parsetree))
-	{
-		if (qc)
-			SetQueryCompletion(qc, CMDTAG_DROP_TABLE, 0);
-		free_parsestate(pstate);
 		return;
 	}
 	if (dg_catalog_create(parsetree, queryString))

@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
@@ -395,6 +396,45 @@ performMultipleDeletions(const ObjectAddresses *objects,
 	table_close(depRel, RowExclusiveLock);
 }
 
+/* Collect native RESTRICT/CASCADE closure without physical catalog deletion.
+ * The caller holds the selected branch working-set lock throughout collection
+ * and publication. Backend-local handles are not inter-backend lock identities. */
+#define PERFORM_DELETION_CATALOG_VIEW 0x10000
+
+List *
+collect_catalog_deletions(const ObjectAddresses *objects, DropBehavior behavior)
+{
+	CatalogView *view = CatalogViewCurrent();
+	ObjectAddresses *targets = new_object_addresses();
+	Relation	depRel;
+	List	   *result = NIL;
+
+	if (!view)
+		elog(ERROR, "canonical dependency collection requires a catalog view");
+	depRel = table_open(DependRelationId, AccessShareLock);
+	for (int i = 0; i < objects->numrefs; i++)
+	{
+		const ObjectAddress *object = &objects->refs[i];
+
+		if (CatalogViewObjectContext(object->objectId) != view)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("deletion targets span incompatible catalog contexts")));
+		AcquireDeletionLock(object, PERFORM_DELETION_CATALOG_VIEW);
+		findDependentObjects(object, DEPFLAG_ORIGINAL, PERFORM_DELETION_CATALOG_VIEW,
+							 NULL, targets, objects, &depRel);
+	}
+	reportDependentObjects(targets, behavior, 0, objects->numrefs == 1 ? objects->refs : NULL);
+	for (int i = 0; i < targets->numrefs; i++)
+	{
+		ObjectAddress *copy = palloc(sizeof(*copy));
+
+		*copy = targets->refs[i];
+		result = lappend(result, copy);
+	}
+	free_object_addresses(targets);
+	table_close(depRel, AccessShareLock);
+	return result;
+}
+
 /*
  * findDependentObjects - find all objects that depend on 'object'
  *
@@ -660,7 +700,7 @@ findDependentObjects(const ObjectAddress *object,
 				 * deletion of the owning object.)
 				 */
 				ReleaseDeletionLock(object);
-				AcquireDeletionLock(&otherObject, 0);
+				AcquireDeletionLock(&otherObject, flags & PERFORM_DELETION_CATALOG_VIEW);
 
 				/*
 				 * The owning object might have been deleted while we waited
@@ -848,7 +888,7 @@ findDependentObjects(const ObjectAddress *object,
 		/*
 		 * Must lock the dependent object before recursing to it.
 		 */
-		AcquireDeletionLock(&otherObject, 0);
+		AcquireDeletionLock(&otherObject, flags & PERFORM_DELETION_CATALOG_VIEW);
 
 		/*
 		 * The dependent object might have been deleted while we waited to
@@ -1495,6 +1535,12 @@ doDeletion(const ObjectAddress *object, int flags)
 void
 AcquireDeletionLock(const ObjectAddress *object, int flags)
 {
+	if (CatalogViewObjectContext(object->objectId))
+	{
+		if (!(flags & PERFORM_DELETION_CATALOG_VIEW))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical object deletion requires branch-scoped publication")));
+		return;
+	}
 	if (object->classId == RelationRelationId)
 	{
 		/*
@@ -1527,6 +1573,8 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 void
 ReleaseDeletionLock(const ObjectAddress *object)
 {
+	if (CatalogViewObjectContext(object->objectId))
+		return;
 	if (object->classId == RelationRelationId)
 		UnlockRelationOid(object->objectId, AccessExclusiveLock);
 	else if (object->classId == AuthMemRelationId)

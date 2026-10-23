@@ -588,6 +588,9 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 	Snapshot	freshsnap;
 	bool		result;
 
+	/* A pinned immutable catalog view cannot change while a lock is acquired. */
+	if (sysscan->catalog_view)
+		return true;
 	Assert(tup == ExecFetchSlotHeapTuple(sysscan->slot, false, NULL));
 
 	freshsnap = GetCatalogSnapshot(RelationGetRelid(sysscan->heap_rel));

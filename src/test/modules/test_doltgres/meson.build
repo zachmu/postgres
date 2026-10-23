@@ -20,5 +20,5 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'regress': {'sql': ['branch_catalog'], 'dbname': 'contrib_regression'},
-  'tap': {'tests': ['t/001_branch_catalog.pl', 't/002_catalog_views.pl', 't/003_storage_allocation.pl', 't/004_storage_writes.pl', 't/005_canonical_sql.pl', 't/006_canonical_merge.pl', 't/007_canonical_alter.pl', 't/008_catalog_context.pl', 't/009_revision_views.pl', 't/010_search_path.pl', 't/011_nested_resolution.pl', 't/012_execution_context.pl', 't/013_routines.pl']},
+  'tap': {'tests': ['t/001_branch_catalog.pl', 't/002_catalog_views.pl', 't/003_storage_allocation.pl', 't/004_storage_writes.pl', 't/005_canonical_sql.pl', 't/006_canonical_merge.pl', 't/007_canonical_alter.pl', 't/008_catalog_context.pl', 't/009_revision_views.pl', 't/010_search_path.pl', 't/011_nested_resolution.pl', 't/012_execution_context.pl', 't/013_routines.pl', 't/014_dependencies.pl']},
 }
