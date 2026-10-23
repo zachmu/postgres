@@ -74,3 +74,13 @@ CATALOG-DDL-PLAN.md records the separate future experiment of storing native
 catalog tuple values in prolly trees. Raw heap bytes are insufficient because
 MVCC headers, local identifiers, external TOAST and serialized dependencies need
 portable identity and contextual mutation rules.
+
+## Verified results
+
+The final assertion-enabled build passes all 30 native groups (test_prolly,
+test_doltgres, core regression and isolation), including 25 new catalog-context
+checks, 231 core regression tests and 122 isolation tests. The repeatable Doltgres
+gate passes 20 suites, 61 scenarios and 302 leaf assertions; the new 16-assertion
+branch introspection scenario also passes against Doltgres itself. An intermediate
+compatibility run collided with a local binary reinstall (Text file busy); the
+reported final run used an unchanged installation and completed successfully.
