@@ -879,3 +879,28 @@ The native catalog-view infrastructure is on an unmerged feature branch; its
 fixtures do not establish production catalog/DDL completeness. The preserved
 same-name Doltgres suite still fails. See also the updated
 [runtime identity contract](CATALOG-RUNTIME-BINDING-PLAN.md#current-runtime-contract--2026-10-22).
+
+### Branch-aware catalog completion direction (2026-10-23)
+
+The five catalog milestones through 3717fc07817 establish execution context,
+canonical routines, native dependency traversal, a native tuple proposal boundary,
+and decoded-view reclamation/recovery validation. They are architectural gates,
+not complete PostgreSQL catalog or DDL coverage. See
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md) and the implementation notes under
+`doc/doltgres/catalog-*.md` for the bounded coverage and remaining restrictions.
+
+Remaining work is: (1) codecs and provider integration for additional schema
+objects and stored expressions; (2) general provisional catalog mutation state for
+native multi-pass DDL; (3) dependency/permission coverage including shared objects;
+(4) consumer audits and broader compatibility tests; (5) parallel context transport,
+further session-memory reclamation and persistent garbage collection; (6) prolonged
+concurrency, cancellation, savepoint and recovery tests, including investigation
+of the isolated nested-DDL timeout recorded in the lifecycle report. Row-level data
+write concurrency remains a related, separate storage workstream.
+
+Prioritize provisional catalog state next. Reuse native DDL validation and ordering
+against branch-local tuples, with command-visible intermediate definitions and
+one atomic schema/data/dependency publication. Do not extend this by accumulating
+independent SQL-command rewrites. User authorization includes broad core changes
+and broad native/Doltgres tests; unsupported paths must remain explicit rather
+than silently accessing a physical user definition.
