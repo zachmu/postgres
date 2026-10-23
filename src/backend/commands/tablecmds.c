@@ -5885,6 +5885,25 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 		}
 
 		/*
+		 * A versioned AM can retain the input root and collect replacement
+		 * tuples without temporary heap relations or a file-locator swap.
+		 */
+		if (tab->rewrite > 0 || tab->newvals != NIL)
+		{
+			Relation	rel = table_open(tab->relid, NoLock);
+			bool		private_rewrite = rel->rd_tableam->relation_begin_rewrite &&
+				rel->rd_tableam->relation_begin_rewrite(rel);
+
+			table_close(rel, NoLock);
+			if (private_rewrite)
+			{
+				tab->rewrite |= AT_REWRITE_DEFAULT_VAL;
+				ATRewriteTable(tab, tab->relid);
+				continue;
+			}
+		}
+
+		/*
 		 * We only need to rewrite the table if at least one column needs to
 		 * be recomputed, or we are changing its persistence or access method.
 		 *
@@ -6163,8 +6182,8 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 
 	if (OidIsValid(OIDNewHeap))
 	{
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-										  false));
+		Assert((OIDNewHeap == tab->relid && oldrel->rd_catalogview) ||
+			   CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
 		newrel = table_open(OIDNewHeap, NoLock);
 	}
 	else
@@ -6305,7 +6324,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 					(errmsg_internal("verifying table \"%s\"",
 									 RelationGetRelationName(oldrel))));
 
-		if (newrel)
+		if (newrel && !oldrel->rd_catalogview)
 		{
 			/*
 			 * All predicate locks on the tuples or pages are about to be made
@@ -9129,27 +9148,6 @@ ATExecSetOptions(Relation rel, const char *colName, Node *options,
 	table_close(attrelation, RowExclusiveLock);
 
 	return address;
-}
-
-/* Reuse native validation and tuple construction for an immutable catalog
- * mutation sink. The caller owns permissions, branch locks and publication. */
-void
-AlterTableColumnMetadata(Relation rel, AlterTableCmd *cmd)
-{
-	Assert(CatalogViewObjectContext(RelationGetRelid(rel)) != NULL);
-	switch (cmd->subtype)
-	{
-		case AT_SetStatistics:
-			ATExecSetStatistics(rel, cmd->name, cmd->num, cmd->def, NoLock);
-			break;
-		case AT_SetOptions:
-		case AT_ResetOptions:
-			ATExecSetOptions(rel, cmd->name, cmd->def,
-							 cmd->subtype == AT_ResetOptions, NoLock);
-			break;
-		default:
-			elog(ERROR, "unsupported native catalog metadata command");
-	}
 }
 
 /*

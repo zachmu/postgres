@@ -331,3 +331,93 @@ translate referenced identities, and establish contextual catalog writes, indexe
 cache invalidation and dependency traversal. Retaining tuple structure does not
 alone prove all DDL supported. Defer this experiment until context coverage gives
 us better evidence about those boundaries.
+
+### Provisional native catalog mutation workstream (2026-10-23)
+
+This status supersedes the older implementation-status paragraph above. Canonical
+providers, automatic binding, independent same-name CREATE, limited ALTER/DROP,
+SQL/PLpgSQL routines, native dependency closure and catalog lifetime tests have
+landed. CatalogTupleUpdate has an explicit proposal sink, exercised by statistics
+and column options. That sink alone does not let native multi-pass DDL reopen its
+own intermediate definition. The next objective is a general mutation session,
+not another collection of per-command canonical rewrites.
+
+#### Contract
+
+* Begin from the selected branch's snapshot-visible canonical database root and
+  hold branch-scoped publication authority. Preserve PostgreSQL transaction,
+  command-counter and savepoint behavior; other branches remain independently
+  readable and writable.
+* Create a private provisional catalog context. Existing immutable views, prepared
+  plans, cursors and explicit runtime type handles must not change underneath
+  their users. References within the mutation session use that session's handles.
+* Native catalog INSERT/UPDATE/DELETE and indexed/syscache scans see staged tuples
+  according to command visibility. Native relation/type caches must invalidate or
+  refresh consistently when those tuples change. Do not store historical physical
+  catalog projections or require a user preparation call.
+* Preserve native tuple values through catalog-specific portable codecs. Identity
+  references, dependency rows and expression trees require explicit translation;
+  raw heap headers, TIDs, local OIDs and physical TOAST pointers are not payloads.
+* Validate and publish the final schema, dependency and matching data/index state
+  atomically. Rollback/cancellation releases all provisional state and allocations.
+  Reject unsupported effects before they can reach physical catalog storage.
+
+#### Implementation and acceptance order
+
+1. Implement provisional tuple staging and command-visible catalog/cache refresh
+   through a common interface, including insertion/deletion, scan/index behavior,
+   resource cleanup and isolation from pinned immutable views.
+2. Route native ALTER orchestration through that interface. Start with operations
+   that force reopen/relookup, then cover mixed actions, constraints/defaults and
+   tuple-layout changes. Expand the value/expression codecs with each affected
+   catalog family; reuse native ordering, validation and dependency machinery.
+3. Exercise normal CREATE/ALTER/DROP consumers against the same mutation contract.
+   Unsupported object families or storage effects must be explicit and documented;
+   passing one metadata-only command is not evidence of a general solution.
+4. Validate statement/transaction atomicity, savepoints, failure at intermediate
+   passes, prepared/cursor history, same-name objects and simultaneous independent
+   branch DDL/DML. Compare supported native semantics with PostgreSQL regression
+   tests and version/branch semantics with original Doltgres cases. Broaden the
+   routine compatibility gate and record precise exclusions.
+5. Run restart/crash/standby and cache-pressure tests. Write an HTML report listing
+   architectural decisions, implemented coverage, failures and genuine blockers.
+
+#### Remaining catalog completion work
+
+Additional object families include stored views, independent user-defined types,
+operators and sequences. Defaults, generated expressions, expression indexes and
+parsed routine bodies require portable identifier-aware codecs. Native dependency
+closure must receive their edges and publication effects; shared-role lifetime and
+cross-database dependencies remain incomplete. Continue catalog-consumer audits
+and name-resolution/introspection testing. Worker context transport, session-lived
+handle/type-cache sizing and persistent history/storage garbage collection remain
+operational work. Retain the unexplained nested-DDL timeout as a stress-test target.
+
+#### Implemented provisional mutation checkpoint (2026-10-23)
+
+The common mutation context now stages native catalog INSERT/UPDATE/DELETE,
+validates identity constraints, exposes command-visible rows and refreshes local
+caches. Savepoint rollback removes child mutations; pinned scans retain their
+versions until release. Native multi-pass ALTER runs against this context with
+original-caller expression evaluation. Portable codecs retain column/default/CHECK
+values and reconstruct native tuples/dependencies on read.
+
+The native rewrite executor can now scan the original root and write a private
+prolly replacement stream through an optional table-AM callback. Final publication
+compacts dropped attribute slots and atomically installs matching schema, rows and
+rebuilt indexes. Tested coverage includes mixed ADD/DROP, constant/volatile defaults,
+NOT NULL, CHECK validation, non-indexed ALTER TYPE USING, caller input settings,
+statement cancellation, savepoints, simultaneous branch rewrites and crash recovery.
+
+Next: declare and implement independent index lifecycle effects in the publisher;
+indexed-column DROP/TYPE currently rejects before physical storage deletion.
+Then add foreign-key, sequence/identity/generated and further object codecs, and
+bring remaining CREATE/DROP consumers under the same contract. Stored expressions
+currently accept audited built-in scalar node families; user-defined functions,
+nonportable values and unsupported nodes reject. Nested utility commands reject
+inside a provisional mutation until their publication effects are modeled.
+Statistics fields are supported; branch-specific ANALYZE remains separate.
+Global role lifetime across retained history, worker transport, session handle
+reclamation and persistent GC remain open. Existing recovery/standby/cache-pressure
+suites continue to run; sustained DDL stress remains a follow-on, not a claim of
+production readiness.

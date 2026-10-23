@@ -13,5 +13,7 @@ is($node->safe_psql('postgres','BEGIN READ ONLY; SELECT test_catalog_views(); CO
 is($node->safe_psql('postgres',q{SELECT count(*) FROM pg_namespace WHERE nspname='view_example'}),'0','view rows never enter physical catalog');
 $node->safe_psql('postgres',q{CREATE FUNCTION test_catalog_view_lifetime() RETURNS boolean AS 'test_doltgres','test_catalog_view_lifetime' LANGUAGE C});
 is($node->safe_psql('postgres','SELECT test_catalog_view_lifetime()'),'t','borrowed cache tuples pin contexts; retired handles fail closed');
+$node->safe_psql('postgres',q{CREATE FUNCTION test_catalog_mutation() RETURNS boolean AS 'test_doltgres','test_catalog_mutation' LANGUAGE C});
+is($node->safe_psql('postgres','SELECT test_catalog_mutation()'),'t','provisional insert/update/delete obey CCI and preserve old scans and cache tuples');
 $node->stop;
 done_testing();

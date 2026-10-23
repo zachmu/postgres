@@ -25,6 +25,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/storage.h"
+#include "catalog/catalogview.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -207,6 +208,11 @@ void
 RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
+
+	/* Context handles describe retained definitions, not disposable files. */
+	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("physical storage deletion requires canonical publication")));
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)

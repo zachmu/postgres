@@ -74,6 +74,7 @@ extern void CacheRegisterRelSyncCallback(RelSyncCallbackFunction func,
 										 Datum arg);
 
 extern void CallSyscacheCallbacks(int cacheid, uint32 hashvalue);
+extern void InvalidateLocalRelation(Oid relid);
 
 extern void CallRelSyncCallbacks(Oid relid);
 

@@ -879,3 +879,48 @@ The native catalog-view infrastructure is on an unmerged feature branch; its
 fixtures do not establish production catalog/DDL completeness. The preserved
 same-name Doltgres suite still fails. See also the updated
 [runtime identity contract](CATALOG-RUNTIME-BINDING-PLAN.md#current-runtime-contract--2026-10-22).
+
+### Branch-aware catalog completion direction (2026-10-23)
+
+The five catalog milestones through 3717fc07817 establish execution context,
+canonical routines, native dependency traversal, a native tuple proposal boundary,
+and decoded-view reclamation/recovery validation. They are architectural gates,
+not complete PostgreSQL catalog or DDL coverage. See
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md) and the implementation notes under
+`doc/doltgres/catalog-*.md` for the bounded coverage and remaining restrictions.
+
+Remaining work is: (1) codecs and provider integration for additional schema
+objects and stored expressions; (2) general provisional catalog mutation state for
+native multi-pass DDL; (3) dependency/permission coverage including shared objects;
+(4) consumer audits and broader compatibility tests; (5) parallel context transport,
+further session-memory reclamation and persistent garbage collection; (6) prolonged
+concurrency, cancellation, savepoint and recovery tests, including investigation
+of the isolated nested-DDL timeout recorded in the lifecycle report. Row-level data
+write concurrency remains a related, separate storage workstream.
+
+Prioritize provisional catalog state next. Reuse native DDL validation and ordering
+against branch-local tuples, with command-visible intermediate definitions and
+one atomic schema/data/dependency publication. Do not extend this by accumulating
+independent SQL-command rewrites. User authorization includes broad core changes
+and broad native/Doltgres tests; unsupported paths must remain explicit rather
+than silently accessing a physical user definition.
+
+### Provisional catalog implementation checkpoint (2026-10-23)
+
+The provisional mutation infrastructure is implemented: native catalog tuple
+insert/update/delete staging, command-counter visibility, local cache refresh,
+savepoint rollback and immutable-reader isolation. Native multi-pass ALTER now
+uses this infrastructure, including column layout changes, scalar defaults/CHECKs
+and non-indexed ALTER TYPE USING. An optional table-AM rewrite callback lets the
+native executor produce private replacement rows without physical heap swaps.
+Canonical schema and matching data/index roots publish in the same PostgreSQL
+transaction. Independent branches can rewrite concurrently.
+
+This completes the common staging/rewrite mechanism, not all catalog codecs or
+DDL operations. The next integration boundary is index lifecycle publication
+(creation/deletion/replacement), followed by foreign keys, sequences/identity,
+generated expressions and additional schema object families. Existing CREATE/DROP
+adapters remain; they have not all been replaced by the provisional controller.
+Shared-role lifetime, worker transport, handle reclamation, history GC and row-level
+writer concurrency remain as listed above. See
+[implementation and limitations](doc/doltgres/catalog-native-mutation.md).

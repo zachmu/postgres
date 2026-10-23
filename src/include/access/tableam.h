@@ -584,7 +584,17 @@ typedef struct TableAmRoutine
 
 	/* Optional policy hooks, called before catalog changes are prepared. */
 	const char *(*relation_index_am) (Relation rel, const char *requested);
-	void (*relation_validate_alter) (Relation rel, struct AlterTableCmd *cmd);
+	void		(*relation_validate_alter) (Relation rel, struct AlterTableCmd *cmd);
+
+	/*
+	 * Optional native ALTER rewrite destination. Returning true starts a
+	 * private replacement stream: scans continue to read the original rows,
+	 * inserts into the same relation handle append replacement rows, and
+	 * publication remains the caller's transaction responsibility. This also
+	 * materializes added-column defaults that heap can represent as missing
+	 * values.
+	 */
+	bool		(*relation_begin_rewrite) (Relation rel);
 
 	/*
 	 * This callback needs to create new relation storage for `rel`, with

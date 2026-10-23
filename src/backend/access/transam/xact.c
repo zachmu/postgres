@@ -16,6 +16,7 @@
  */
 
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -1136,6 +1137,7 @@ CommandCounterIncrement(void)
 		 * read-only command.  (But see hacks in inval.c to make real sure we
 		 * don't think a command that queued inval messages was read-only.)
 		 */
+		CatalogViewMutationCommandEnd();
 		AtCCI_LocalCache();
 	}
 }

@@ -1537,7 +1537,8 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 {
 	if (CatalogViewObjectContext(object->objectId))
 	{
-		if (!(flags & PERFORM_DELETION_CATALOG_VIEW))
+		if (!(flags & PERFORM_DELETION_CATALOG_VIEW) &&
+			!(CatalogViewIsProvisional(CatalogViewCurrent()) && CatalogViewObjectContext(object->objectId) == CatalogViewCurrent()))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("canonical object deletion requires branch-scoped publication")));
 		return;
 	}

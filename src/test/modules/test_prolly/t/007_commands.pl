@@ -61,7 +61,8 @@ sql(q{CREATE TABLE heap_only(id int)});
 fails(q{SELECT dolt_commit('-Am','must fail')},qr/non-prolly/,'unsupported heap table is not silently omitted');
 sql('DROP TABLE heap_only');
 sql(q{CREATE TABLE with_default(id int DEFAULT 4) USING dolt_prolly_table});
-fails(q{SELECT dolt_commit('-Am','must fail')},qr/defaults/,'unsupported default rejected');
+sql(q{SELECT dolt_commit('-Am','captured default')});
+is(sql(q{SELECT count(*) FROM pg_attrdef WHERE adrelid='with_default'::regclass}),'1','portable default is captured');
 sql('DROP TABLE with_default');
 # Historical reads retain Repeatable Read views while HEAD advances.
 my $reader=$node->background_psql('postgres');

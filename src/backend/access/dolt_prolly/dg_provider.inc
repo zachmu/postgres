@@ -12,7 +12,7 @@ static DGProvider *providers;
 
 static const Oid provider_catalogs[] = {
 	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
-	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId
+	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
 typedef struct DGProviderRows
@@ -126,6 +126,9 @@ provider_acl(const char *definition)
 		ACLITEM_SET_PRIVS_GOPTIONS(*item, mode, grant ? mode : 0);
 		items[i] = PointerGetDatum(item);
 	}
+	/* ACLs require a one-dimensional header even when there are no items. */
+	if (!n)
+		return (ArrayType *) make_empty_acl();
 	return construct_array(items, n, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
 }
 
@@ -201,6 +204,19 @@ provider_columns(const char *definition)
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
+		{
+			char	   *storage,
+					   *compression;
+
+			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			storage = strcell(0, 1);
+			compression = strcell(0, 2);
+			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
+			if (storage)
+				TupleDescAttr(desc, i)->attstorage = storage[0];
+			if (compression)
+				TupleDescAttr(desc, i)->attcompression = compression[0];
+		}
 	}
 	dg_validate_descriptor(desc);
 	return desc;
@@ -215,6 +231,13 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 	bool		isnull;
 	Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
 
+	if (catalog == SharedDependRelationId)
+	{
+		Form_pg_shdepend dep = (Form_pg_shdepend) GETSTRUCT(tuple);
+
+		return dep->dbid == InvalidOid ||
+			(dep->dbid == MyDatabaseId && dep->objid < FirstNormalObjectId);
+	}
 	if (catalog == ProcedureRelationId)
 	{
 		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
@@ -243,6 +266,46 @@ provider_attribute(TupleDesc desc, const char *name)
 }
 
 static void
+provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definition)
+{
+	char	   *name = json_value(definition, "name");
+	Oid			relation = CatalogViewLookupObject(view, RelationRelationId, name);
+	TupleDesc	desc = provider_columns(definition);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		char	   *sql;
+		List	   *parsed;
+		SelectStmt *select;
+		Node	   *raw,
+				   *expression;
+		FormData_pg_attrdef form = {0};
+		HeapTuple	tuple;
+		int			slot = provider_catalog_index(AttrDefaultRelationId);
+
+		if (!TupleDescAttr(desc, i)->atthasdef)
+			continue;
+		run("SELECT $1::jsonb->'columns'->$2->>'default'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+		sql = strcell(0, 1);
+		parsed = schema_expression_parse(psprintf("SELECT %s", sql));
+		if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+			elog(ERROR, "invalid canonical default expression");
+		select = castNode(SelectStmt, linitial_node(RawStmt, parsed)->stmt);
+		if (list_length(select->targetList) != 1 || select->fromClause)
+			elog(ERROR, "invalid canonical default SELECT");
+		raw = linitial_node(ResTarget, select->targetList)->val;
+		expression = schema_expression_bind(view, relation, name, desc, raw, i + 1);
+		form.oid = CatalogViewBindObject(view, AttrDefaultRelationId, psprintf("%s/%s", name, NameStr(TupleDescAttr(desc, i)->attname)), InvalidOid);
+		form.adrelid = relation;
+		form.adnum = i + 1;
+		tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_attrdef_adnum);
+		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_attrdef_adbin, CStringGetTextDatum(nodeToString(expression)));
+		rows->rows[slot] = lappend(rows->rows[slot], tuple);
+		provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation, i + 1, DEPENDENCY_AUTO);
+	}
+}
+
+static void
 provider_constraints(DGProviderRows *rows, CatalogView *view, const char *definition)
 {
 	char	   *name = json_value(definition, "name");
@@ -266,10 +329,11 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	}
 	for (i = 0; i < n; i++)
 	{
-		List	   *parsed = raw_parser(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", quote_identifier(names[i]), defs[i]), RAW_PARSE_DEFAULT);
+		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", quote_identifier(names[i]), defs[i]));
 		Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
 		AlterTableStmt *alter;
 		Constraint *constraint;
+		Node	   *expression = NULL;
 		FormData_pg_constraint form = {0};
 		ListCell   *lc;
 		Datum	   *keys;
@@ -291,6 +355,10 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 			case CONSTR_UNIQUE:
 				form.contype = CONSTRAINT_UNIQUE;
 				break;
+			case CONSTR_CHECK:
+				form.contype = CONSTRAINT_CHECK;
+				expression = schema_expression_bind(view, relid, strVal(lsecond(parts)), desc, constraint->raw_expr, 0);
+				break;
 			case CONSTR_NOTNULL:
 				form.contype = CONSTRAINT_NOTNULL;
 				break;
@@ -303,16 +371,34 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.conrelid = relid;
 		form.condeferrable = constraint->deferrable;
 		form.condeferred = constraint->initdeferred;
-		form.conenforced = true;
+		form.conenforced = form.contype == CONSTRAINT_CHECK ? constraint->is_enforced : true;
 		form.convalidated = !constraint->skip_validation;
 		form.conislocal = true;
 		form.connoinherit = constraint->is_no_inherit;
 		form.confupdtype = ' ';
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';
-		if (form.contype != CONSTRAINT_NOTNULL)
+		if (form.contype == CONSTRAINT_PRIMARY || form.contype == CONSTRAINT_UNIQUE)
 			form.conindid = CatalogViewLookupObject(view, RelationRelationId, quote_qualified_identifier(strVal(linitial(parts)), names[i]));
-		keys = palloc_array(Datum, Max(list_length(constraint->keys), 1));
+		keys = palloc_array(Datum, Max(desc->natts, 1));
+		if (expression)
+		{
+			Bitmapset  *attributes = NULL;
+			int			att = -1;
+
+			pull_varattnos(expression, 1, &attributes);
+			while ((att = bms_next_member(attributes, att)) >= 0)
+			{
+				int			number = att + FirstLowInvalidHeapAttributeNumber;
+
+				keys[k++] = Int16GetDatum(number);
+				provider_dependency(rows, ConstraintRelationId, form.oid, 0, RelationRelationId, relid, number, DEPENDENCY_AUTO);
+			}
+			bms_free(attributes);
+			/* Constant checks still depend on their owning relation. */
+			if (!k)
+				provider_dependency(rows, ConstraintRelationId, form.oid, 0, RelationRelationId, relid, 0, DEPENDENCY_AUTO);
+		}
 		foreach(lc, constraint->keys)
 		{
 			int			att = provider_attribute(desc, strVal(lfirst(lc)));
@@ -322,6 +408,8 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		}
 		tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_constraint_conperiod);
 		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conkey, PointerGetDatum(construct_array(keys, k, INT2OID, 2, true, TYPALIGN_SHORT)));
+		if (expression)
+			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conbin, CStringGetTextDatum(nodeToString(expression)));
 		rows->rows[slot] = lappend(rows->rows[slot], tuple);
 		if (form.conindid)
 			provider_dependency(rows, RelationRelationId, form.conindid, 0, ConstraintRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
@@ -420,6 +508,66 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+
+/* Shared role references are derived from canonical owners and ACLs. They
+ * remain runtime catalog tuples; local role OIDs never enter schema payloads. */
+static void
+provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
+						 Oid role, char kind)
+{
+	FormData_pg_shdepend dep = {0};
+
+	if (!OidIsValid(role))
+		return;					/* PUBLIC is not a role object */
+	dep.dbid = MyDatabaseId;
+	dep.classid = catalog;
+	dep.objid = object;
+	dep.refclassid = AuthIdRelationId;
+	dep.refobjid = role;
+	dep.deptype = kind;
+	provider_add(rows, SharedDependRelationId, &dep, sizeof(dep), Natts_pg_shdepend);
+}
+
+static void
+provider_role_dependencies(DGProviderRows *rows)
+{
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+
+	for (int i = 0; i < lengthof(catalogs); i++)
+	{
+		int			slot = provider_catalog_index(catalogs[i]);
+		TupleDesc	desc = RelationGetDescr(rows->relations[slot]);
+		ListCell   *lc;
+
+		foreach(lc, rows->rows[slot])
+		{
+			HeapTuple	tuple = lfirst(lc);
+			bool		isnull;
+			Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
+			Oid			owner;
+			Datum		acl;
+
+			if (!CatalogViewObjectContext(object))
+				continue;
+			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
+			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			acl = heap_getattr(tuple, acls[i], desc, &isnull);
+			if (!isnull)
+			{
+				Oid		   *members;
+				int			count = aclmembers(DatumGetAclP(acl), &members);
+
+				for (int j = 0; j < count; j++)
+					if (members[j] != owner)
+						provider_role_dependency(rows, catalogs[i], object, members[j], SHARED_DEPENDENCY_ACL);
+				if (members)
+					pfree(members);
+			}
+		}
+	}
+}
 
 static bool
 provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
@@ -523,6 +671,8 @@ provider_populate(CatalogView *view, bytea *database)
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
+			run("SELECT count(*) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1 LIKE 'CHECK %'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+			form.relchecks = DatumGetInt64(cell(0, 1));
 			form.reltuples = -1;
 			form.relispopulated = true;
 			form.relreplident = REPLICA_IDENTITY_DEFAULT;
@@ -629,13 +779,17 @@ provider_populate(CatalogView *view, bytea *database)
 		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table"))
+		{
+			provider_defaults(&rows, view, definitions[i]);
 			provider_constraints(&rows, view, definitions[i]);
+		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "index"))
 			provider_index(&rows, view, definitions[i], n, definitions, kinds);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "routine"))
 			provider_routine(&rows, view, definitions[i]);
+	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
 		CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);

@@ -42,3 +42,60 @@ harness adds the same branch-isolation and transaction scenarios. These native
 metadata commands are additional fork coverage; no claim is made that current
 Doltgres implements all their syntax. The complete existing compatibility gate
 is also rerun, with original PostgreSQL regression outputs unchanged.
+
+## General provisional mutation checkpoint
+
+This supersedes the limited multi-action mechanism described above. Native ALTER
+now runs its own passes against one private CatalogView. CatalogTupleInsert,
+CatalogTupleUpdate and CatalogTupleDelete stage tuples; command-counter increments
+rebuild visible rows and invalidate only that context's native caches. Unique
+catalog identities and non-null fields are checked against pending writes too.
+Savepoint rollback removes child changes. Existing immutable views, borrowed
+catcache tuples and scans retain their definitions. Retirement defers decoded-row
+reclamation until outstanding scans release their pins.
+
+Supported ALTER families include column statistics/options/storage/compression,
+NOT NULL, mixed ADD/DROP COLUMN, defaults, CHECK creation/deletion/validation and
+non-indexed ALTER TYPE USING. Native ordering, permission/constraint checks and
+expression evaluation are reused. Defaults and CHECKs use canonical SQL with
+symbolic columns and normalized serialization settings; nodeToString output and
+local OIDs exist only in reconstructed runtime tuples. USING keeps caller input
+settings. Unsupported expressions reject before native planning/evaluation.
+
+The optional relation_begin_rewrite table-AM callback preserves the original scan
+root while inserts into the same contextual handle collect private replacement
+rows. This lets ATRewriteTable evaluate defaults and USING, and validate rows,
+without temporary heap relations or file swaps. It also materializes heap's
+fast-default missing values. Final publication compacts dropped columns, installs
+matching rows and rebuilds existing indexes under the same PostgreSQL transaction
+as the working root. Internal updates may occur more than once; they become visible
+atomically at transaction commit. Normal heap rewrite behavior is unchanged.
+
+Native ALTER expressions execute as the invoking role. Internal storage access is
+privileged only after target ownership authorization. Catalog mutation validators
+reject unsupported defaults/CHECKs before later passes. A USING preflight examines
+a copy of the parse tree: transformation must not modify the native controller's
+input. Nested utility operations reject until their publication effects are modeled.
+
+### Limits and next work
+
+Independent index creation/deletion/replacement, indexed-column DROP/TYPE, foreign
+keys, sequences/identity, generated columns, partitions and event triggers are not
+admitted by this controller. Scalar expression support is an audited built-in node
+set, not arbitrary user functions/types. Additional object codecs and shared-role
+lifetime across retained history remain incomplete. Existing CREATE/DROP adapters
+remain separate. This is a general staging and rewrite mechanism, not universal
+PostgreSQL DDL coverage. Branch-specific ANALYZE, parallel-worker context transport,
+handle/type-cache reclamation, persistent GC and row-level write concurrency remain
+separate workstreams.
+
+### Validation additions
+
+The provisional suite covers command-visible mutations, mixed native passes,
+constraints/defaults, original-caller evaluation, input/serialization settings,
+late failures, cancellation, transaction/savepoint rollback, parallel branch DDL/DML,
+parallel branch rewrites, historical queries and restart/crash recovery. Synthetic
+catalog tests cover pinned readers, uniqueness, subtransactions and nested utility
+rejection. The Doltgres gate now includes new atomic rewrite/history scenarios and
+unchanged original DROP COLUMN, ADD IF NOT EXISTS, default, constraint and USING
+cases. A harness fix makes SQLSTATE-only expected failures work correctly.

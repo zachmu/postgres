@@ -1967,3 +1967,16 @@ LogLogicalInvalidations(void)
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
 	}
 }
+
+/* Contextual runtime OIDs are local identities: never broadcast them. */
+void
+InvalidateLocalRelation(Oid relid)
+{
+	RelationCacheInvalidateEntry(relid);
+	for (int i = 0; i < relcache_callback_count; i++)
+	{
+		struct RELCACHECALLBACK *item = relcache_callback_list + i;
+
+		item->function(item->arg, relid);
+	}
+}
