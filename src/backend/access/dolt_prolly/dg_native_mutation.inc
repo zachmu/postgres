@@ -267,7 +267,9 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 typedef struct MutationIndex
 {
 	Oid			id;
+	Oid			owner;
 	char	   *name;
+	char	   *sortname;
 	char	   *sql;
 	bytea	   *schema;
 	bytea	   *member;
@@ -286,6 +288,12 @@ mutation_storage(Relation relation, CatalogViewStorageEffect effect)
 	if (effect != CATALOG_STORAGE_CREATE && IndexGetRelation(RelationGetRelid(relation), false) != native_mutation_relation)
 		unsupported("native mutation index belongs to another table");
 	native_mutation_indexes = true;
+}
+
+static int
+mutation_index_compare(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((MutationIndex *) lfirst(a))->sortname, ((MutationIndex *) lfirst(b))->sortname);
 }
 
 /* Native pg_index is the authority after ALTER has completed all its passes. */
@@ -317,6 +325,13 @@ mutation_indexes(CatalogView *view, Oid table)
 				unsupported("canonical partial index codec");
 			item = palloc0(sizeof(*item));
 			item->id = index->indexrelid;
+			{
+				HeapTuple	relation = SearchSysCache1(RELOID, ObjectIdGetDatum(item->id));
+
+				item->owner = ((Form_pg_class) GETSTRUCT(relation))->relowner;
+				ReleaseSysCache(relation);
+			}
+			item->sortname = get_rel_name(item->id);
 			item->name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(item->id)), get_rel_name(item->id));
 			item->sql = TextDatumGetCString(DirectFunctionCall1(pg_get_indexdef, ObjectIdGetDatum(item->id)));
 			result = lappend(result, item);
@@ -328,6 +343,7 @@ mutation_indexes(CatalogView *view, Oid table)
 		CatalogViewSwitch(previous);
 	}
 	PG_END_TRY();
+	list_sort(result, mutation_index_compare);
 	return result;
 }
 
@@ -348,7 +364,7 @@ mutation_index_list(const char *definition, List *indexes)
 		escape_json(&json, item->sql);
 	}
 	appendStringInfoChar(&json, ']');
-	run("SELECT jsonb_set($1::jsonb,'{indexes}',coalesce((SELECT jsonb_agg(v ORDER BY v::text COLLATE \"C\") FROM jsonb_array_elements($2::jsonb) v),'[]'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
+	run("SELECT jsonb_set($1::jsonb,'{indexes}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
 	return strcell(0, 1);
 }
 
@@ -510,7 +526,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					item->resource = binding_relation(dg_current_branch(), item->name, schema);
 				}
 			if (!old)
-				old = canonical_definition(item->name, caller, acldefault(OBJECT_TABLE, caller), "[]", "[]", "[]", item->sql);
+				old = canonical_definition(item->name, item->owner, acldefault(OBJECT_TABLE, item->owner), "[]", "[]", "[]", item->sql);
 			definition = mutation_columns(view, item->id, old, &mapping, &attributes);
 			run("SELECT jsonb_set($1::jsonb,'{index_definition}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(item->sql)), NULL, true);
 			definition = strcell(0, 1);

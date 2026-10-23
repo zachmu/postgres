@@ -73,6 +73,7 @@ struct CatalogViewScan
 	CatalogViewPin *pin;
 	Relation	relation;
 	List	   *rows;
+	bool		owns_rows;
 	HeapTuple  *ordered;
 	int			position;
 	bool		started;
@@ -360,7 +361,10 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 		}
 	}
 	if (CatalogViewIsProvisional(view) && snapshot && snapshot->snapshot_type == SNAPSHOT_SELF)
+	{
 		scan->rows = mutation_self_rows(view, RelationGetRelid(relation));
+		scan->owns_rows = true;
+	}
 
 	return scan;
 }
@@ -430,6 +434,8 @@ void
 CatalogViewEndScan(CatalogViewScan *scan)
 {
 	release_scan_pin(scan->pin);
+	if (scan->owns_rows)
+		list_free(scan->rows);
 	if (scan->ordered)
 		pfree(scan->ordered);
 	pfree(scan->keys);

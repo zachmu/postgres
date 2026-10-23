@@ -99,3 +99,41 @@ catalog tests cover pinned readers, uniqueness, subtransactions and nested utili
 rejection. The Doltgres gate now includes new atomic rewrite/history scenarios and
 unchanged original DROP COLUMN, ADD IF NOT EXISTS, default, constraint and USING
 cases. A harness fix makes SQLSTATE-only expected failures work correctly.
+
+## Index lifecycle publication checkpoint
+
+The index exclusions in the previous checkpoint are superseded for ordinary
+prolly indexes, immediate PRIMARY KEY/UNIQUE constraints, indexed-column DROP,
+and indexed ALTER TYPE USING. Standalone CREATE INDEX enters the same provisional
+native ALTER controller; direct DROP INDEX retains the existing canonical drop
+adapter. Native dependency traversal decides which owned indexes disappear or
+must be recreated. Canonical schema codecs remain the publication boundary.
+
+CatalogView now captures CREATE/DROP/BUILD storage effects. Provisional index
+creation does not allocate a native relation file, and deletion cannot remove
+historical storage. The publisher reads the final pg_index/pg_class definitions,
+encodes table/index members, installs matching data and rebuilds surviving indexes
+under the same PostgreSQL transaction as the working ref. Index ownership follows
+the native table owner. Surviving indexes are currently rebuilt eagerly, including
+some metadata-only operations; minimizing those builds is future work.
+
+Native dependency checks require SnapshotSelf access to pending catalog writes
+before command-counter increments. Contextual catalog scans now provide that
+visibility without exposing those writes to ordinary command-visible scans or
+syscache. Private storage descriptors also direct resource-owner pins to their
+stable relcache definition, so an executor error cannot leave a reference to a
+freed wrapper during cleanup.
+
+Validation includes exact-root roundtrips, duplicate-key rewrite failure,
+transaction/savepoint rollback, quoted names, ownership, primary/unique constraints,
+parallel sessions with independent branch DDL/DML, historical definitions and crash
+recovery. The Doltgres gate adds branch index lifecycle and two original indexed
+USING/failure scenarios. The shared duplicate-key assertion uses SQLSTATE 23505.
+
+This does not add expression, partial, concurrent, deferred or exclusion indexes,
+standalone REINDEX, new index opclasses, or general DROP COLUMN CASCADE. Revision
+SELECT still uses DoltVersionedScan, not normal index-scan planning. Canonical DROP
+compacts attribute numbers while native heap catalogs retain dropped slots; SQL
+results agree but physical catalog attnum values can differ. Foreign keys,
+sequences/identity, generated columns and the other previously listed workstreams
+remain subsequent gates.

@@ -2226,6 +2226,12 @@ ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
 void
 RelationIncrementReferenceCount(Relation rel)
 {
+	/*
+	 * Private storage descriptors may die before resource-owner error
+	 * cleanup.
+	 */
+	if (rel->rd_refparent)
+		rel = rel->rd_refparent;
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 	rel->rd_refcnt += 1;
 	if (!IsBootstrapProcessingMode())
@@ -2239,6 +2245,8 @@ RelationIncrementReferenceCount(Relation rel)
 void
 RelationDecrementReferenceCount(Relation rel)
 {
+	if (rel->rd_refparent)
+		rel = rel->rd_refparent;
 	Assert(rel->rd_refcnt > 0);
 	rel->rd_refcnt -= 1;
 	if (!IsBootstrapProcessingMode())

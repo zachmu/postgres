@@ -232,10 +232,10 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource properties do not match canonical definition")));
 
 	/*
-	 * Imported resources retain a physical allocation bridge. Only validate its
-	 * locator and AM: canonical ALTER can legitimately change the tuple layout
-	 * on one branch without changing that old physical schema. Independently
-	 * allocated resources have no physical schema row.
+	 * Imported resources retain a physical allocation bridge. Only validate
+	 * its locator and AM: canonical ALTER can legitimately change the tuple
+	 * layout on one branch without changing that old physical schema.
+	 * Independently allocated resources have no physical schema row.
 	 */
 	if (form.storageimported)
 	{
@@ -259,6 +259,7 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	if (storage->definition->rd_rel->relhasindex)
 		list_free(RelationGetIndexList(storage->definition));
 	storage->relation = *storage->definition;
+	storage->relation.rd_refparent = storage->definition;
 	storage->form = *storage->definition->rd_rel;
 	storage->relation.rd_rel = &storage->form;
 	storage->relation.rd_smgr = NULL;

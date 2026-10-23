@@ -25,7 +25,9 @@ fails(q{CREATE TABLE unsupported(id int DEFAULT 1)},qr/defaults or generated col
 is(sql(q{SELECT to_regclass('unsupported') IS NULL}),'t','rejected CREATE leaves no canonical object');
 sql(q{CREATE TABLE composite(a int,b int,PRIMARY KEY(a,b)); INSERT INTO composite VALUES(1,2)});
 is(sql('SELECT * FROM composite'),'1|2','table-level composite primary key supported');
-fails(q{CREATE INDEX forbidden_index ON new_table(id)},qr/schema changes/, 'standalone index DDL remains guarded');
+sql(q{CREATE INDEX additional_index ON new_table(id)});
+is(sql(q{SELECT count(*) FROM pg_indexes WHERE indexname='additional_index'}),'1','standalone index DDL publishes canonical membership');
+sql(q{DROP INDEX additional_index});
 fails(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)},qr/index properties/, 'deferred constraint remains rejected');
 fails(q{CREATE TABLE bad_index(id json PRIMARY KEY)},qr/default operator class/, 'native index creation failure aborts entire CREATE');
 is(sql(q{SELECT to_regclass('bad_index') IS NULL}),'t','failed index leaves no canonical table');
