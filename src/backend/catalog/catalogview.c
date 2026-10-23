@@ -42,6 +42,7 @@ struct CatalogView
 	List	   *changes;
 	uint64		next_tuple;
 	bool		dirty;
+	void		(*mutation_validator) (Relation, HeapTuple);
 	List	   *catalog_ids;
 	uint64		touched;
 	TransactionId creator;
@@ -283,6 +284,11 @@ release_scan_pin(void *arg)
 		pin->view = NULL;
 		Assert(view->scan_references > 0);
 		view->scan_references--;
+		if (view->retired && !view->scan_references)
+		{
+			view->baseline = view->catalogs = view->changes = NIL;
+			MemoryContextReset(view->rows_memory);
+		}
 		CatalogViewRelease(view);
 	}
 }
@@ -926,6 +932,16 @@ CatalogViewBeginMutation(CatalogView *view)
 	}
 }
 
+/* A portable codec can reject an unsupported proposed value before native
+ * DDL evaluates expressions or performs later passes based on that value. */
+void
+CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, HeapTuple))
+{
+	if (!CatalogViewIsProvisional(view) || view->changes)
+		elog(ERROR, "mutation validator must be installed before staging");
+	view->mutation_validator = validator;
+}
+
 /* Validate against pending writes too, matching native unique-index behavior
  * before CCI. Catalogs have ordinary non-expression btree identity indexes. */
 static void
@@ -1041,6 +1057,8 @@ stage_tuple(Relation relation, ItemPointer tid, HeapTuple tuple)
 		return false;
 	if (view->retired)
 		elog(ERROR, "cannot mutate retired catalog context");
+	if (tuple && view->mutation_validator)
+		view->mutation_validator(relation, tuple);
 	check_mutation_tuple(view, relation, tid, tuple);
 	previous = MemoryContextSwitchTo(view->rows_memory);
 	change = palloc0(sizeof(*change));

@@ -36,9 +36,8 @@ sql('DROP TABLE catalog_control');
 sql('CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,10)');
 my $old = sql(q{SELECT dolt_commit('-Am','base')});
 my $before = sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/main'});
-rejected('ALTER TABLE t ALTER COLUMN v TYPE bigint', qr/schema versioning is not implemented/,
- 'layout changes guarded even before branch activation');
-is(sql('SELECT * FROM t'), '1|10', 'rejected ALTER preserves existing tuple decoding');
+is(sql('BEGIN; ALTER TABLE t ALTER COLUMN v TYPE bigint; SELECT pg_typeof(v)::text FROM t; ROLLBACK'),'bigint','native type changes work before explicit branch activation');
+is(sql('SELECT * FROM t'), '1|10', 'rolled-back ALTER preserves existing tuple decoding');
 
 # Relation identity can change while canonical history remains valid, but current
 # single-branch CREATE/DROP rollback must not leak any replacement definition.
@@ -50,7 +49,6 @@ is(sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/ma
 
 sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
 for my $case (
- ['ALTER TABLE t ALTER COLUMN v TYPE bigint', 'ALTER'],
  ['TRUNCATE t', 'TRUNCATE'])
 {
  rejected(q{SELECT dolt_checkout('other'); } . $case->[0], qr/schema changes with multiple branches/, "$case->[1] remains guarded on activated branches");
@@ -64,7 +62,7 @@ is(sql(q{SELECT * FROM "postgres/main".public.t}), '1|10', 'failed branch DDL le
 my $writer = $node->background_psql('postgres', on_error_stop => 0);
 $writer->query_safe(q{SELECT dolt_checkout('other')});
 $writer->query_safe('BEGIN; UPDATE t SET v=20; SAVEPOINT ddl');
-my ($out, $err) = $writer->query('ALTER TABLE t ALTER COLUMN v TYPE bigint');
+my ($out, $err) = $writer->query('ALTER TABLE t ALTER COLUMN v TYPE integer USING (v / 0)');
 is($err, 1, 'DDL fails inside savepoint');
 $writer->query('ROLLBACK TO ddl');
 is(scalar $writer->query('SELECT v FROM t'), '20', 'savepoint failure preserves preceding own write');
@@ -75,7 +73,8 @@ is(sql(q{SELECT v FROM "postgres/other".public.t}), '20', 'committed working roo
 is(sql(q{SELECT v FROM "postgres/main".public.t}), '10', 'other branch root remains unchanged');
 $node->stop('immediate');
 $node->start;
-rejected('ALTER TABLE t ALTER COLUMN v TYPE bigint', qr/schema changes with multiple branches/, 'DDL activation guard survives restart');
+is(sql('ALTER TABLE t ALTER COLUMN v TYPE bigint; SELECT pg_typeof(v)::text FROM t'),'bigint','native branch DDL remains available after restart');
+is(sql(q{SELECT pg_typeof(v)::text FROM "postgres/other".public.t}),'integer','restarted DDL leaves the other branch definition intact');
 is(sql("SELECT * FROM t AS OF '$old'"), '1|10', 'retained schema survives restart');
 $node->stop;
 done_testing();

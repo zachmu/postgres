@@ -22,6 +22,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
@@ -571,6 +572,15 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	if (readOnlyTree)
 		pstmt = copyObject(pstmt);
 	parsetree = pstmt->utilityStmt;
+
+	/*
+	 * Provisional native ALTER invokes its controller directly. Nested
+	 * utility work needs its own declared publication/storage effects before
+	 * admission.
+	 */
+	if (CatalogViewIsProvisional(CatalogViewCurrent()))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("nested utility commands during native catalog mutation are not supported")));
 
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);

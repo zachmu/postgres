@@ -610,17 +610,17 @@ capture_inner(bool persist, bool all_catalogs)
 		{
 			int			nest = NewGUCNestLevel();
 
-			PG_TRY();
+			PG_TRY(schema);
 			{
 				schema_expression_gucs();
 				run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) || jsonb_strip_nulls(jsonb_build_object('default',(SELECT pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum),'storage',CASE WHEN a.attstorage<>t.typstorage THEN a.attstorage::text END,'compression',nullif(a.attcompression::text,''),'statistics',a.attstattarget,'options',(SELECT jsonb_agg(v ORDER BY v COLLATE \"C\") FROM unnest(a.attoptions) v))) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 				schema = strcell(0, 1);
 			}
-			PG_FINALLY();
+			PG_FINALLY(schema);
 			{
 				AtEOXact_GUC(true, nest);
 			}
-			PG_END_TRY();
+			PG_END_TRY(schema);
 		}
 		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 		schemahash = strcell(0, 1);

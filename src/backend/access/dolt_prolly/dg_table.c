@@ -117,7 +117,10 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	}
 	entry = &scan->rows.items[scan->position];
 	dg_tid(pl_read64(entry->key.data), &tid);
-	dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+	if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
+		dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+	else
+		dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
 	return true;
 }
 static bool
@@ -232,9 +235,15 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	PLHash		hash;
 	PLEdit		edit;
 	uint8		key[8];
+	bool		rewriting = CatalogViewIsProvisional(rel->rd_catalogview);
 
-	writer(rel);
-	s = dg_load(rel, SnapshotSelf);
+	if (rewriting)
+		s = dg_catalog_rewrite_state(rel);
+	else
+	{
+		writer(rel);
+		s = dg_load(rel, SnapshotSelf);
+	}
 	row = dg_encode(rel, slot);
 	multiplicity(s, row, 1);
 	pl_write64(key, s->nextid);
@@ -246,11 +255,14 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	edit.value.bytes.len = PL_HASH_SIZE;
 	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
 	dg_tid(s->nextid++, &slot->tts_tid);
-	dg_save(rel, s, cid);
-	dg_release(s);
+	if (!rewriting)
+	{
+		dg_save(rel, s, cid);
+		dg_release(s);
+	}
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
-	if (rel->rd_catalogview)
+	if (rel->rd_catalogview && !rewriting)
 		dg_rebuild_indexes(rel);
 }
 static void
@@ -404,7 +416,7 @@ validate_alter(Relation rel, struct AlterTableCmd *cmd)
 	if (CatalogViewIsProvisional(rel->rd_catalogview) &&
 		(cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
 		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
-		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn || cmd->subtype == AT_ColumnDefault || cmd->subtype == AT_AddConstraint || cmd->subtype == AT_DropConstraint || cmd->subtype == AT_ValidateConstraint))
+		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn || cmd->subtype == AT_ColumnDefault || cmd->subtype == AT_AddConstraint || cmd->subtype == AT_DropConstraint || cmd->subtype == AT_ValidateConstraint || cmd->subtype == AT_AlterColumnType))
 		return;
 
 	/*
@@ -443,6 +455,7 @@ dg_table_routine(void)
 		methods = *GetHeapamTableAmRoutine();
 		methods.relation_index_am = index_am;
 		methods.relation_validate_alter = validate_alter;
+		methods.relation_begin_rewrite = dg_catalog_begin_rewrite;
 		methods.slot_callbacks = slots;
 		methods.scan_begin = begin;
 		methods.scan_end = end;

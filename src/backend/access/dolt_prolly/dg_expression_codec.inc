@@ -51,6 +51,7 @@ schema_expression_check(Node *node, void *context)
 	}
 	if (exprType(node) >= FirstNormalObjectId)
 		unsupported("canonical expression user-defined result type");
+	if (!context || exprType(node) != VOIDOID)
 	{
 		TupleDesc	desc = CreateTemplateTupleDesc(1);
 
@@ -136,12 +137,18 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	addNSItemToQuery(pstate, nsitem, true, true, true);
 	PG_TRY();
 	{
-		schema_expression_gucs();
+		if (attribute >= 0)
+			schema_expression_gucs();
 		if (attribute > 0)
 		{
 			Form_pg_attribute attr = TupleDescAttr(desc, attribute - 1);
 
 			result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
+		}
+		else if (attribute < 0)
+		{
+			result = transformExpr(pstate, copyObject(raw), EXPR_KIND_ALTER_COL_TRANSFORM);
+			assign_expr_collations(pstate, result);
 		}
 		else
 		{
@@ -149,7 +156,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 			result = coerce_to_boolean(pstate, result, "CHECK");
 			assign_expr_collations(pstate, result);
 		}
-		(void) schema_expression_check(result, NULL);
+		(void) schema_expression_check(result, attribute < 0 ? (void *) pstate : NULL);
 	}
 	PG_FINALLY();
 	{

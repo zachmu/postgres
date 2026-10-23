@@ -512,6 +512,38 @@ dg_encode(Relation rel, TupleTableSlot *slot)
 	return result;
 }
 
+/* Native ALTER scans may request the old descriptor for an expression rewrite
+ * or the intermediate descriptor for constraint validation. Normalize only the
+ * transient tuple shape; canonical publication chooses the final live columns. */
+void
+dg_decode_mutation(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
+{
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	PLValue    *fields = palloc0_array(PLValue, Max(desc->natts, 1));
+	uint8	   *packed;
+	size_t		length;
+	HeapTuple	tuple;
+	uint32		count;
+	PLSlice		normalized;
+
+	if (bytes.len < 12)
+		elog(ERROR, "invalid provisional source row");
+	count = pl_read32(bytes.data + 8);
+	for (int i = 0; i < desc->natts && i < count; i++)
+		dg_check(pl_tuple_get(bytes, i, &fields[i]));
+	dg_check(pl_tuple_pack(fields, desc->natts, &packed, &length));
+	normalized.data = packed;
+	normalized.len = length;
+	tuple = dg_decode_descriptor(desc, normalized);
+	free(packed);
+	pfree(fields);
+	tuple->t_self = *tid;
+	tuple->t_tableOid = RelationGetRelid(rel);
+	ExecForceStoreHeapTuple(tuple, slot, true);
+	slot->tts_tid = *tid;
+	slot->tts_tableOid = RelationGetRelid(rel);
+}
+
 void
 dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 {

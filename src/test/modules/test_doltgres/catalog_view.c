@@ -327,10 +327,12 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 				changed,
 				added;
 	CatalogViewScan *scan;
+	CatalogViewScan *retained = NULL;
 	bool		found_old = false;
 
 	CatalogViewBeginMutation(view);
 	previous = CatalogViewSwitch(view);
+
 	PG_TRY();
 	{
 		relation = table_open(NamespaceRelationId, RowExclusiveLock);
@@ -390,6 +392,30 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 			CurrentResourceOwner = saved_owner;
 			if (!rejected)
 				elog(ERROR, "provisional unique namespace name was not enforced");
+			rejected = false;
+			BeginInternalSubTransaction(NULL);
+			PG_TRY(nested);
+			{
+				if (SPI_connect() != SPI_OK_CONNECT)
+					elog(ERROR, "cannot connect mutation test SPI");
+				SPI_execute("SET application_name='unpublished utility'", false, 0);
+				SPI_finish();
+				ReleaseCurrentSubTransaction();
+			}
+			PG_CATCH(nested);
+			{
+				MemoryContextSwitchTo(saved_memory);
+				if (geterrcode() != ERRCODE_FEATURE_NOT_SUPPORTED)
+					PG_RE_THROW();
+				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+				rejected = true;
+			}
+			PG_END_TRY(nested);
+			MemoryContextSwitchTo(saved_memory);
+			CurrentResourceOwner = saved_owner;
+			if (!rejected)
+				elog(ERROR, "nested utility escaped the mutation publication contract");
 			BeginInternalSubTransaction(NULL);
 			{
 				HeapTuple	child = heap_copytuple(added);
@@ -413,6 +439,7 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 			elog(ERROR, "staged delete is still visible");
 		heap_freetuple(added);
 		heap_freetuple(changed);
+		retained = CatalogViewBeginScan(relation, 0, NULL);
 		table_close(relation, RowExclusiveLock);
 	}
 	PG_FINALLY();
@@ -421,6 +448,9 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 		CatalogViewRetireMutation(view);
 	}
 	PG_END_TRY();
+	if (!HeapTupleIsValid(CatalogViewNext(retained, ForwardScanDirection)))
+		elog(ERROR, "retirement invalidated an already pinned catalog scan");
+	CatalogViewEndScan(retained);
 	CatalogViewRelease(view);
 	if (SearchSysCacheExists1(NAMESPACENAME, CStringGetDatum("view_changed")))
 		elog(ERROR, "provisional namespace leaked into physical catalog");

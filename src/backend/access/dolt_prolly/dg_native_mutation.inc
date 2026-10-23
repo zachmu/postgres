@@ -4,7 +4,32 @@ static bool
 native_alter_action(AlterTableType type)
 {
 	return type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
-		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint;
+		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType;
+}
+
+static CatalogView *native_mutation_view;
+static DGState *native_mutation_source;
+static DGState *native_mutation_destination;
+static Oid	native_mutation_relation;
+static int	native_mutation_width;
+
+
+static void
+mutation_validate_tuple(Relation catalog, HeapTuple tuple)
+{
+	int			field;
+	bool		isnull;
+	Datum		expression;
+
+	if (RelationGetRelid(catalog) == AttrDefaultRelationId)
+		field = Anum_pg_attrdef_adbin;
+	else if (RelationGetRelid(catalog) == ConstraintRelationId)
+		field = Anum_pg_constraint_conbin;
+	else
+		return;
+	expression = heap_getattr(tuple, field, RelationGetDescr(catalog), &isnull);
+	if (!isnull)
+		(void) schema_expression_check(stringToNode(TextDatumGetCString(expression)), NULL);
 }
 
 static char *
@@ -51,9 +76,9 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 
 		if (attr->attisdropped)
 			continue;
-		if (attr->attidentity || attr->attgenerated || attr->atthasmissing)
+		if (attr->attidentity || attr->attgenerated || (attr->atthasmissing && !native_mutation_destination))
 			unsupported("canonical native column expression codec");
-		run("SELECT coalesce($1::jsonb->'columns'->$2, jsonb_build_object('name',$3::text,'comment',NULL,'type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
+		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
 		if (SPI_processed != 1)
 			unsupported("canonical native column user-defined type codec");
 		column = strcell(0, 1);
@@ -108,7 +133,34 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 	return strcell(0, 1);
 }
 
-static CatalogView *native_mutation_view;
+
+bool
+dg_catalog_begin_rewrite(Relation definition)
+{
+	MemoryContext old;
+
+	if (!CatalogViewIsProvisional(definition->rd_catalogview))
+		return false;
+	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || native_mutation_destination)
+		elog(ERROR, "invalid native catalog rewrite authority");
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(native_mutation_source));
+	native_mutation_destination = palloc0(sizeof(DGState));
+	native_mutation_destination->store = native_mutation_source->store;
+	native_mutation_destination->nextid = 1;
+	native_mutation_width = RelationGetDescr(definition)->natts;
+	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->content));
+	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->handles));
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
+DGState *
+dg_catalog_rewrite_state(Relation definition)
+{
+	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || !native_mutation_destination)
+		elog(ERROR, "native catalog rewrite has no insertion authority");
+	return native_mutation_destination;
+}
 
 /* Native validation scans borrow the unchanged working-set data while catalog
  * definitions remain private. No provisional handle is a physical resource. */
@@ -120,40 +172,25 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 	Relation	source;
 	DGState    *state = NULL;
 	const char *name;
+	Oid			user;
+	int			security;
 
 	if (view != native_mutation_view || !CatalogViewIsProvisional(view))
 		elog(ERROR, "native catalog validation has no storage authority");
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
 	previous = CatalogViewSwitch(NULL);
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
 		source = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 		state = dg_load(source, snapshot);
-		{
-			TupleDesc	desc = RelationGetDescr(definition);
-			int			oldcount = RelationGetDescr(source)->natts;
-			int		   *mapping = palloc_array(int, Max(desc->natts, 1));
-			bool		changed = desc->natts != oldcount;
-
-			for (int i = 0; i < desc->natts; i++)
-			{
-				bool		dropped = TupleDescAttr(desc, i)->attisdropped;
-
-				mapping[i] = dropped ? oldcount : i;
-				changed |= dropped;
-			}
-			if (changed)
-			{
-				state->content = alter_rows(state, oldcount, desc->natts, mapping);
-				dg_history_handles(state);
-			}
-			pfree(mapping);
-		}
 		dg_storage_close_relation(source);
 	}
 	PG_FINALLY();
 	{
 		CatalogViewSwitch(previous);
+		SetUserIdAndSecContext(user, security);
 	}
 	PG_END_TRY();
 	return state;
@@ -193,16 +230,16 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 			{
 				int			nest = NewGUCNestLevel();
 
-				PG_TRY();
+				PG_TRY(deparse);
 				{
 					schema_expression_gucs();
 					sql = TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef, ObjectIdGetDatum(constraint->oid)));
 				}
-				PG_FINALLY();
+				PG_FINALLY(deparse);
 				{
 					AtEOXact_GUC(true, nest);
 				}
-				PG_END_TRY();
+				PG_END_TRY(deparse);
 			}
 			if (!first)
 				appendStringInfoChar(&json, ',');
@@ -228,8 +265,12 @@ static void
 native_alter_publish(Capture current, VersionRef working, const char *name, AlterTableStmt *statement, DGState *state, int oldcount, Oid caller)
 {
 	CatalogView *view = CatalogViewCreate("provisional native ALTER");
-	CatalogView *previous;
+	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *saved_mutation = native_mutation_view;
+	DGState    *saved_source = native_mutation_source;
+	DGState    *saved_destination = native_mutation_destination;
+	Oid			saved_relation = native_mutation_relation;
+	int			saved_width = native_mutation_width;
 	bytea	  **members;
 	char	  **kinds,
 			  **names,
@@ -240,16 +281,21 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	bool		rewrite = false;
 	PLTree		tree = state->content;
 
-	provider_populate(view, current.hash);
-	CatalogViewBeginMutation(view);
-	native_mutation_view = view;
-	previous = CatalogViewSwitch(view);
 	PG_TRY();
 	{
-		Oid			id = CatalogViewLookupObject(view, RelationRelationId, name);
-
+		Oid			id;
 		ListCell   *lc;
 		List	   *commands = statement->cmds;
+
+		provider_populate(view, current.hash);
+		CatalogViewBeginMutation(view);
+		CatalogViewSetMutationValidator(view, mutation_validate_tuple);
+		native_mutation_view = view;
+		native_mutation_source = state;
+		native_mutation_destination = NULL;
+		id = CatalogViewLookupObject(view, RelationRelationId, name);
+		native_mutation_relation = id;
+		CatalogViewSwitch(view);
 
 		foreach(lc, commands)
 		{
@@ -258,9 +304,20 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			if (action->subtype == AT_AddConstraint &&
 				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL)
 				unsupported("native constraint storage codec");
+			if (action->subtype == AT_AlterColumnType)
+			{
+				ColumnDef  *col = castNode(ColumnDef, action->def);
+				Relation	rel = relation_open(id, NoLock);
+
+				if (col->raw_default)
+					(void) schema_expression_bind(view, id, RelationGetRelationName(rel), RelationGetDescr(rel), col->raw_default, -1);
+				relation_close(rel, NoLock);
+			}
 			if (action->subtype == AT_AddColumn)
 			{
 				ColumnDef  *col = castNode(ColumnDef, action->def);
+				ListCell   *cc;
+				const char *typename = strVal(llast(col->typeName->names));
 
 				/*
 				 * PostgreSQL ignores an existing IF NOT EXISTS definition
@@ -268,8 +325,15 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				 */
 				if (action->missing_ok && get_attnum(id, col->colname) != InvalidAttrNumber)
 					continue;
-				if (col->constraints || col->raw_default || col->cooked_default || col->identity || col->generated)
-					unsupported("native ADD COLUMN expression and constraint codecs");
+				if (col->identity || col->generated || !strcmp(typename, "serial") || !strcmp(typename, "serial2") || !strcmp(typename, "serial4") || !strcmp(typename, "serial8") || !strcmp(typename, "smallserial") || !strcmp(typename, "bigserial"))
+					unsupported("native identity/sequence/generated column codec");
+				foreach(cc, col->constraints)
+				{
+					Constraint *con = lfirst_node(Constraint, cc);
+
+					if (con->contype != CONSTR_DEFAULT && con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL && con->contype != CONSTR_CHECK)
+						unsupported("native added-column constraint codec");
+				}
 			}
 		}
 
@@ -287,15 +351,15 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			context.relid = id;
 			GetUserIdAndSecContext(&privileged, &security);
 			SetUserIdAndSecContext(caller, security);
-			PG_TRY();
+			PG_TRY(caller);
 			{
 				AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
 			}
-			PG_FINALLY();
+			PG_FINALLY(caller);
 			{
 				SetUserIdAndSecContext(privileged, security);
 			}
-			PG_END_TRY();
+			PG_END_TRY(caller);
 		}
 		CommandCounterIncrement();
 		CatalogViewSwitch(NULL);
@@ -332,7 +396,12 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					for (int j = 0; j < attributes; j++)
 						if (mapping[j] != j)
 							rewrite = true;
-					if (rewrite)
+					if (native_mutation_destination)
+					{
+						rewrite = true;
+						tree = alter_rows(native_mutation_destination, native_mutation_width, attributes, mapping);
+					}
+					else if (rewrite)
 						tree = alter_rows(state, oldcount, attributes, mapping);
 				}
 
@@ -393,7 +462,12 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	{
 		CatalogViewSwitch(previous);
 		native_mutation_view = saved_mutation;
-		CatalogViewRetireMutation(view);
+		native_mutation_source = saved_source;
+		native_mutation_destination = saved_destination;
+		native_mutation_relation = saved_relation;
+		native_mutation_width = saved_width;
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
 		CatalogViewRelease(view);
 	}
 	PG_END_TRY();

@@ -177,7 +177,7 @@ CREATE INDEX bad_operators ON p(id misleading_ops);
 ERROR:  prolly phase 2 does not support custom index operators
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
 ALTER TABLE p ALTER COLUMN id TYPE text;
-ERROR:  prolly phase 2 does not support ALTER TABLE (schema versioning is not implemented)
+ERROR:  physical storage deletion requires canonical publication
 CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
 ERROR:  prolly storage rejects type gtsvector
 DETAIL:  Only codecs verified to exclude non-portable identifiers are supported.

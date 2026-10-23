@@ -53,6 +53,7 @@ extern bool CatalogViewCaptureUpdate(Relation relation, ItemPointer tid, HeapTup
 extern bool CatalogViewCaptureInsert(Relation relation, HeapTuple tuple);
 extern bool CatalogViewCaptureDelete(Relation relation, ItemPointer tid);
 extern void CatalogViewBeginMutation(CatalogView *view);
+extern void CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, HeapTuple));
 extern bool CatalogViewIsProvisional(CatalogView *view);
 extern Oid	CatalogViewNewObject(Oid catalog);
 extern void CatalogViewMutationCommandEnd(void);
