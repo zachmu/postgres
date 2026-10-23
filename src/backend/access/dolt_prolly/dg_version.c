@@ -110,6 +110,7 @@ branch_ref(const char *prefix)
 static bytea *merge_parent(void);
 static void finish_merge(void);
 static void stage_tables(List *tables);
+static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
 static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
@@ -994,8 +995,7 @@ dolt_add(PG_FUNCTION_ARGS)
 	}
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
-	current = capture(true);
-	move_ref(branch_ref("staged"), staged, current.hash);
+	move_ref(branch_ref("staged"), staged, staged_capture(&current));
 	move_ref(branch_ref("working"), working, current.hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);
@@ -1018,6 +1018,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	VersionRef	head,
 				staged,
 				working;
+	Capture		full;
 	bytea	   *database,
 			   *parentdb,
 			   *commit;
@@ -1072,7 +1073,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
 	parentdb = child(head.target, 1);
-	database = all ? capture(true).hash : staged.target;
+	database = all ? staged_capture(&full) : staged.target;
 	if (!database)
 		database = parentdb;
 	if (same(database, parentdb) && !allow_empty && !merge_parent())
@@ -1092,7 +1093,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	move_ref(branch_ref("heads"), head, commit);
 	move_ref(branch_ref("staged"), staged, database);
 	if (all)
-		move_ref(branch_ref("working"), working, database);
+		move_ref(branch_ref("working"), working, full.hash);
 	finish_merge();
 	answer = hex(commit);
 	end_api(nest);
@@ -1296,14 +1297,7 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 2)
 		table = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	if (table)
-	{
-		run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) SELECT DISTINCT v->>'name' FROM members WHERE v->>'kind'='table' AND (v->>'name'=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(v->>'name'))[2]=(parse_ident($3))[1]))", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), CStringGetTextDatum(table)), NULL, true);
-		if (!SPI_processed)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table does not exist in either revision: %s", table)));
-		if (SPI_processed > 1)
-			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
-		table = strcell(0, 1);
-	}
+		table = resolve_table_argument(table, from, to, true);
 
 	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table'),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table'),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,(av->>'content') IS DISTINCT FROM (bv->>'content'),(av->>'schema') IS DISTINCT FROM (bv->>'schema') FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(coalesce(av->>'name',bv->>'name')))[2]=(parse_ident($3))[1])) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
@@ -1365,5 +1359,7 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_alter.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
+#include "dg_patch.inc"
 #include "dg_workspace.inc"
 #include "dg_conflicts.inc"
+#include "dg_schemas.inc"

@@ -234,15 +234,95 @@ generated_base(const RangeVar *rv, const char *base, bool optional)
 	return NULL;
 }
 
+/* Per-schema tables generated from the catalog: dolt_ignore (when no real
+ * table exists yet), dolt_schemas and dolt_procedures. */
+static const struct
+{
+	const char *name;
+	const char *function;
+}			schema_tables[] = {
+	{"dolt_ignore", "dolt_ignore_table"},
+	{"dolt_schemas", "dolt_schemas_table"},
+	{"dolt_procedures", "dolt_procedures_table"},
+};
+
+/* The schema a per-schema table name refers to: the explicit schema, which
+ * must exist, or the first user schema on the search path. */
+static char *
+schema_table_namespace(const RangeVar *rv)
+{
+	List	   *path;
+	ListCell   *lc;
+
+	if (rv->schemaname)
+	{
+		if (!OidIsValid(get_namespace_oid(rv->schemaname, true)))
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s.%s", rv->schemaname, rv->relname)));
+		return pstrdup(rv->schemaname);
+	}
+	path = fetch_search_path(false);
+	foreach(lc, path)
+	{
+		char	   *ns = get_namespace_name(lfirst_oid(lc));
+
+		if (ns && !dg_system_namespace(ns) && strncmp(ns, "pg_", 3))
+			return ns;
+	}
+	return pstrdup("public");
+}
+
+static RangeFunction *
+schema_table(const RangeVar *rv)
+{
+	int			i;
+
+	for (i = 0; i < lengthof(schema_tables); i++)
+	{
+		const char *schema;
+		FuncCall   *fc;
+		RangeFunction *rf;
+
+		if (strcmp(rv->relname, schema_tables[i].name))
+			continue;
+		/* A real table of that name takes precedence. */
+		if (OidIsValid(RangeVarGetRelidExtended((RangeVar *) rv, NoLock, RVR_MISSING_OK, NULL, NULL)))
+			return NULL;
+		schema = schema_table_namespace(rv);
+		fc = makeFuncCall(list_make2(makeString("pg_catalog"), makeString(pstrdup(schema_tables[i].function))), list_make1(text_constant(schema)), COERCE_EXPLICIT_CALL, rv->location);
+		rf = makeNode(RangeFunction);
+		rf->functions = list_make1(list_make2(fc, NIL));
+		rf->alias = rv->alias ? rv->alias : makeAlias(rv->relname, NIL);
+		return rf;
+	}
+	return NULL;
+}
+
+/* INSERT INTO [schema.]dolt_ignore creates the schema's ignore table. */
+void
+dg_system_insert_target(const RangeVar *rv)
+{
+	if (strcmp(rv->relname, "dolt_ignore") || rv->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	if (rv->schemaname && dg_system_namespace(rv->schemaname))
+		return;
+	if (OidIsValid(RangeVarGetRelidExtended((RangeVar *) rv, NoLock, RVR_MISSING_OK, NULL, NULL)))
+		return;
+	dg_ensure_ignore_table(schema_table_namespace(rv));
+}
+
 RangeFunction *
 dg_system_table(ParseState *pstate, RangeVar *rv)
 {
 	int			i;
+	RangeFunction *per_schema;
 
 	if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")) || rv->relpersistence == RELPERSISTENCE_TEMP)
 		return NULL;
 	if (rv->schemaname && dg_system_namespace(rv->schemaname))
 		return NULL;
+	per_schema = schema_table(rv);
+	if (per_schema)
+		return per_schema;
 	for (i = 0; i < lengthof(generated_tables); i++)
 	{
 		const GeneratedTable *g = &generated_tables[i];

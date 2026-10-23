@@ -844,6 +844,8 @@ split_dots(const char *spec, char **from, char **to)
 	{
 		char	   *two = strstr(spec, "..");
 
+		if (!two)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dolt_diff with two arguments requires a from..to revision range")));
 		*from = pnstrdup(spec, two - spec);
 		*to = pstrdup(two + 2);
 		if (!**to)
