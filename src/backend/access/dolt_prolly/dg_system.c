@@ -58,6 +58,7 @@ dg_system_relation(const RangeVar *rv)
 #include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/parse_type.h"
+#include "parser/analyze.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
@@ -77,6 +78,20 @@ static const GeneratedTable generated_tables[] = {
 	{"dolt_history_", "history", "dolt_history_table", false, false},
 	{"dolt_blame_", "blame", "dolt_blame_table", false, false},
 	{"dolt_workspace_", "workspace", "dolt_workspace_table", false, true},
+	{"dolt_conflicts_", "conflicts", "dolt_conflicts_table", false, false},
+	{"dolt_constraint_violations_", "violations", "dolt_constraint_violations_table", false, false},
+};
+
+/* Generated tables whose rows can be deleted: the delete clears the pending
+ * merge entries of the table. */
+static const struct
+{
+	const char *prefix;
+	const char *function;
+}			deletable_tables[] =
+{
+	{"dolt_conflicts_", "dolt_conflicts_clear"},
+	{"dolt_constraint_violations_", "dolt_constraint_violations_clear"},
 };
 
 static Node *
@@ -276,6 +291,43 @@ dg_system_table(ParseState *pstate, RangeVar *rv)
 	return NULL;
 }
 
+/* DELETE FROM dolt_conflicts_<t> / dolt_constraint_violations_<t> clears the
+ * table's pending-merge entries. Rewritten into a SELECT of the clearing
+ * function; a WHERE clause is not supported. */
+Query *
+dg_system_delete(ParseState *pstate, DeleteStmt *stmt)
+{
+	RangeVar   *rv = stmt->relation;
+	int			i;
+
+	if (!rv || rv->dolt_revision || (rv->schemaname && dg_system_namespace(rv->schemaname)) || stmt->withClause || stmt->usingClause || stmt->returningClause)
+		return NULL;
+	for (i = 0; i < lengthof(deletable_tables); i++)
+	{
+		size_t		plen = strlen(deletable_tables[i].prefix);
+		char	   *qualified;
+		SelectStmt *select;
+		ResTarget  *target;
+		FuncCall   *fc;
+
+		if (strncmp(rv->relname, deletable_tables[i].prefix, plen) || !rv->relname[plen])
+			continue;
+		qualified = generated_base(rv, rv->relname + plen, false);
+		if (!qualified)
+			return NULL;
+		if (stmt->whereClause)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("DELETE FROM %s with a WHERE clause is not supported; delete all rows to clear the table", rv->relname)));
+		fc = makeFuncCall(list_make2(makeString("pg_catalog"), makeString(pstrdup(deletable_tables[i].function))), list_make1(text_constant(qualified)), COERCE_EXPLICIT_CALL, rv->location);
+		target = makeNode(ResTarget);
+		target->val = (Node *) fc;
+		target->location = rv->location;
+		select = makeNode(SelectStmt);
+		select->targetList = list_make1(target);
+		return transformStmt(pstate, (Node *) select);
+	}
+	return NULL;
+}
+
 /* Column definitions for Dolt table functions whose layout depends on the
  * table named in their constant arguments. */
 List *
@@ -296,10 +348,16 @@ dg_system_function_columns(ParseState *pstate, FuncCall *fc)
 	name = strVal(llast(fc->funcname));
 	if (strcmp(name, "dolt_diff") && strcmp(name, "dolt_preview_merge_conflicts"))
 		return NIL;
+	if (!strcmp(name, "dolt_preview_merge_conflicts") && nargs != 3)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("function 'dolt_preview_merge_conflicts' expected 3 arguments, %d received", nargs)));
 	args = palloc0(sizeof(char *) * Max(nargs, 1));
 	for (i = 0; i < nargs; i++)
 	{
-		args[i] = constant_text(pstate, (Node *) list_nth(fc->args, i));
+		Node	   *raw = (Node *) list_nth(fc->args, i);
+
+		if (IsA(raw, A_Const) && ((A_Const *) raw)->isnull)
+			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("Invalid argument to %s: NULL", name)));
+		args[i] = constant_text(pstate, raw);
 		if (!args[i])
 			return NIL;
 	}

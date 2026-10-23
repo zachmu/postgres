@@ -1507,6 +1507,22 @@ CREATE VIEW dolt.conflicts WITH (security_invoker=true) AS
          LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
     WHERE r.refname='merge/' || pg_catalog.active_branch()
     GROUP BY 1 ORDER BY 1;
+CREATE VIEW dolt.constraint_violations WITH (security_invoker=true) AS
+    SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
+           count(*)::numeric AS num_violations
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(coalesce(convert_from(o.objpayload,'UTF8')::jsonb->'violations','[]'::jsonb)) v
+    WHERE r.refname='merge/' || pg_catalog.active_branch()
+    GROUP BY 1 ORDER BY 1;
+CREATE VIEW dolt.schema_conflicts WITH (security_invoker=true) AS
+    SELECT v->>'table' AS table_name,
+           v->>'base_schema' AS base_schema,
+           v->>'our_schema' AS our_schema,
+           v->>'their_schema' AS their_schema,
+           v->>'description' AS description
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(coalesce(convert_from(o.objpayload,'UTF8')::jsonb->'schema_conflicts','[]'::jsonb)) v
+    WHERE r.refname='merge/' || pg_catalog.active_branch();
 CREATE VIEW dolt.remotes WITH (security_invoker=true) AS
     SELECT remotename AS name, remoteurl AS url, remotefetch AS fetch_specs, remoteparams AS params
     FROM pg_catalog.pg_dolt_remote ORDER BY 1;
@@ -1533,6 +1549,8 @@ CREATE VIEW dolt_merge_status WITH (security_invoker=true) AS SELECT * FROM dolt
 CREATE VIEW dolt_diff WITH (security_invoker=true) AS SELECT * FROM dolt.diff;
 CREATE VIEW dolt_column_diff WITH (security_invoker=true) AS SELECT * FROM dolt.column_diff;
 CREATE VIEW dolt_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.conflicts;
+CREATE VIEW dolt_constraint_violations WITH (security_invoker=true) AS SELECT * FROM dolt.constraint_violations;
+CREATE VIEW dolt_schema_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.schema_conflicts;
 CREATE VIEW dolt_remotes WITH (security_invoker=true) AS SELECT * FROM dolt.remotes;
 CREATE VIEW dolt_docs WITH (security_invoker=true) AS SELECT * FROM dolt.docs;
 CREATE RULE dolt_docs_insert AS ON INSERT TO dolt_docs DO INSTEAD
@@ -1543,4 +1561,5 @@ CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
     DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
-    dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;
+    dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
+    dolt_schema_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;

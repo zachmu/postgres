@@ -1327,6 +1327,9 @@ dolt_commits| SELECT commit_hash,
 dolt_conflicts| SELECT "table",
     num_conflicts
    FROM dolt.conflicts;
+dolt_constraint_violations| SELECT "table",
+    num_violations
+   FROM dolt.constraint_violations;
 dolt_diff| SELECT commit_hash,
     table_name,
     committer,
@@ -1376,6 +1379,12 @@ dolt_remotes| SELECT name,
     fetch_specs,
     params
    FROM dolt.remotes;
+dolt_schema_conflicts| SELECT table_name,
+    base_schema,
+    our_schema,
+    their_schema,
+    description
+   FROM dolt.schema_conflicts;
 dolt_status| SELECT table_name,
     staged,
     status

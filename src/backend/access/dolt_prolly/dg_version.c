@@ -115,6 +115,8 @@ static void checkout_tables(char **args, int n);
 static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
 static char *staged_state(void);
 static char *working_state(void);
+static TupleDesc conflict_layout(const char *table, const char *from, const char *to);
+static TupleDesc violation_layout(const char *table);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
 static void binding_prepare(const char *branch, bytea *database, bool required);
@@ -1364,3 +1366,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_tables.inc"
 #include "dg_diff.inc"
 #include "dg_workspace.inc"
+#include "dg_conflicts.inc"

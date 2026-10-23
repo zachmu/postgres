@@ -25,6 +25,7 @@
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "access/doltsystem.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -556,6 +557,11 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 
+	/* deleting from a generated Dolt conflict table clears its entries */
+	qry = dg_system_delete(pstate, stmt);
+	if (qry)
+		return qry;
+	qry = makeNode(Query);
 	qry->commandType = CMD_DELETE;
 
 	/* process the WITH clause independently of all else */

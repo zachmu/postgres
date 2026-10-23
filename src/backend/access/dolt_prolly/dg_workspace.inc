@@ -839,7 +839,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 				   *database;
 		char	   *meta = metadata(target, "commit"),
 				   *message;
-		StringInfoData conflicts;
+		StringInfoData conflicts,
+					violations;
 
 		if (parent_count(target) < 1)
 			unsupported("reverting or cherry-picking a root commit");
@@ -850,11 +851,12 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		same_schema(metadata(child(head.target, 1), "database"), metadata(targetdb, "database"));
 		same_schema(metadata(child(head.target, 1), "database"), metadata(parentdb, "database"));
 		initStringInfo(&conflicts);
+		initStringInfo(&violations);
 		if (revert)
-			install_database(targetdb, child(head.target, 1), parentdb, &conflicts);
+			install_database(targetdb, child(head.target, 1), parentdb, &conflicts, &violations);
 		else
-			install_database(parentdb, child(head.target, 1), targetdb, &conflicts);
-		if (conflicts.len)
+			install_database(parentdb, child(head.target, 1), targetdb, &conflicts, &violations);
+		if (conflicts.len || violations.len)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s resulted in conflicts; resolve them with dolt_merge", revert ? "revert" : "cherry-pick")));
 		database = capture_visible().hash;
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");

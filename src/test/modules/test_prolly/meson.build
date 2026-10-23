@@ -25,5 +25,6 @@ tests += {
     't/019_system_tables.pl',
     't/020_row_diff.pl',
     't/021_workspace.pl',
+    't/022_conflicts.pl',
   ]},
 }
