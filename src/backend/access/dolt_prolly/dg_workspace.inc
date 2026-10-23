@@ -185,9 +185,10 @@ state_tables(const char *json)
 
 /* ---- Live table installation and removal ---- */
 
-/* Replace a live table's working contents with its version in |db|. */
+/* Replace a live table's working contents on |branch| with its version in
+ * |db|. */
 static void
-restore_table(bytea *db, const char *name)
+restore_table_on(const char *branch, bytea *db, const char *name)
 {
 	bool		canonical = read_ref("views/enabled").target != NULL;
 	Relation	rel;
@@ -195,7 +196,7 @@ restore_table(bytea *db, const char *name)
 	PLTree		tree;
 
 	if (canonical)
-		rel = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
+		rel = dg_catalog_write_table(branch, name, ACL_UPDATE);
 	else
 	{
 		List	   *parts = stringToQualifiedNameList(name, NULL);
@@ -214,6 +215,12 @@ restore_table(bytea *db, const char *name)
 	else
 		relation_close(rel, NoLock);
 	UpdateActiveSnapshotCommandId();
+}
+
+static void
+restore_table(bytea *db, const char *name)
+{
+	restore_table_on(dg_current_branch(), db, name);
 }
 
 /* Drop a live table through ordinary DDL, which the branch-local catalog

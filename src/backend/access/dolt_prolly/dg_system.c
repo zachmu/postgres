@@ -9,6 +9,7 @@
 #include "dg.h"
 #include "access/doltsystem.h"
 #include "catalog/namespace.h"
+#include "miscadmin.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace_d.h"
 #include "utils/lsyscache.h"
@@ -58,6 +59,8 @@ dg_system_relation(const RangeVar *rv)
 #include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/parse_type.h"
+#include "parser/parser.h"
+#include "executor/executor.h"
 #include "parser/analyze.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -310,6 +313,68 @@ dg_system_insert_target(const RangeVar *rv)
 	dg_ensure_ignore_table(schema_table_namespace(rv));
 }
 
+/* dolt.rebase (and its dolt_rebase aliases) only exists while the session
+ * branch is rebasing, like Dolt's working-set table. */
+static void
+rebase_table_guard(const RangeVar *rv)
+{
+	Oid			relid,
+				dolt_schema;
+
+	if (strcmp(rv->relname, "rebase") && strcmp(rv->relname, "dolt_rebase"))
+		return;
+	if (!IsUnderPostmaster)
+		return;					/* initdb defines the alias views */
+	relid = RangeVarGetRelidExtended((RangeVar *) rv, NoLock, RVR_MISSING_OK, NULL, NULL);
+	if (!OidIsValid(relid))
+		return;
+	dolt_schema = get_namespace_oid("dolt", true);
+	if (relid != get_relname_relid("dolt_rebase", PG_CATALOG_NAMESPACE) && (!OidIsValid(dolt_schema) || relid != get_relname_relid("rebase", dolt_schema)))
+		return;
+	if (!dg_rebase_active())
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", rv->relname)));
+}
+
+/* Column layout of a query for dolt_query_diff: the query must be a single
+ * SELECT, analyzed with the caller's search path. */
+static TupleDesc
+query_layout(const char *sql)
+{
+	List	   *raw = raw_parser(sql, RAW_PARSE_DEFAULT);
+	Query	   *query;
+
+	if (list_length(raw) != 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("query must be a SELECT statement")));
+	query = parse_analyze_fixedparams((RawStmt *) linitial(raw), sql, NULL, 0, NULL);
+	if (query->commandType != CMD_SELECT || query->utilityStmt)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("query must be a SELECT statement")));
+	return ExecCleanTypeFromTL(query->targetList);
+}
+
+static TupleDesc
+query_diff_layout(const char *first, const char *second)
+{
+	TupleDesc	a = query_layout(first),
+				b = query_layout(second),
+				result = CreateTemplateTupleDesc(a->natts + b->natts + 1);
+	int			i;
+
+	for (i = 0; i < a->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(a, i);
+
+		TupleDescInitEntry(result, i + 1, psprintf("from_%s", NameStr(att->attname)), att->atttypid, att->atttypmod, 0);
+	}
+	for (i = 0; i < b->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(b, i);
+
+		TupleDescInitEntry(result, a->natts + i + 1, psprintf("to_%s", NameStr(att->attname)), att->atttypid, att->atttypmod, 0);
+	}
+	TupleDescInitEntry(result, result->natts, "diff_type", TEXTOID, -1, 0);
+	return result;
+}
+
 RangeFunction *
 dg_system_table(ParseState *pstate, RangeVar *rv)
 {
@@ -318,6 +383,7 @@ dg_system_table(ParseState *pstate, RangeVar *rv)
 
 	if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")) || rv->relpersistence == RELPERSISTENCE_TEMP)
 		return NULL;
+	rebase_table_guard(rv);
 	if (rv->schemaname && dg_system_namespace(rv->schemaname))
 		return NULL;
 	per_schema = schema_table(rv);
@@ -426,8 +492,10 @@ dg_system_function_columns(ParseState *pstate, FuncCall *fc)
 	if (list_length(fc->funcname) > 2)
 		return NIL;
 	name = strVal(llast(fc->funcname));
-	if (strcmp(name, "dolt_diff") && strcmp(name, "dolt_preview_merge_conflicts"))
+	if (strcmp(name, "dolt_diff") && strcmp(name, "dolt_preview_merge_conflicts") && strcmp(name, "dolt_query_diff"))
 		return NIL;
+	if (!strcmp(name, "dolt_query_diff") && nargs != 2)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("function 'dolt_query_diff' expected 2 arguments, %d received", nargs)));
 	if (!strcmp(name, "dolt_preview_merge_conflicts") && nargs != 3)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("function 'dolt_preview_merge_conflicts' expected 3 arguments, %d received", nargs)));
 	args = palloc0(sizeof(char *) * Max(nargs, 1));
@@ -448,6 +516,8 @@ dg_system_function_columns(ParseState *pstate, FuncCall *fc)
 		else if (nargs == 2)
 			desc = dg_diff_layout("diff", args[1], args[0], NULL);
 	}
+	else if (!strcmp(name, "dolt_query_diff"))
+		desc = query_diff_layout(args[0], args[1]);
 	else if (nargs == 3)
 		desc = dg_diff_layout("conflicts", args[2], args[0], args[1]);
 	return desc ? layout_columns(desc) : NIL;

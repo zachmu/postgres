@@ -1345,6 +1345,13 @@ dolt_diff| SELECT commit_hash,
 dolt_docs| SELECT doc_name,
     doc_text
    FROM dolt.docs;
+dolt_help| SELECT name,
+    type,
+    synopsis,
+    short_description,
+    long_description,
+    arguments
+   FROM dolt.help;
 dolt_log| SELECT commit_hash,
     committer,
     email,
@@ -1364,6 +1371,11 @@ dolt_merge_status| SELECT is_merging,
     target,
     unmerged_tables
    FROM dolt.merge_status;
+dolt_rebase| SELECT rebase_order,
+    action,
+    commit_hash,
+    commit_message
+   FROM dolt.rebase;
 dolt_remote_branches| SELECT name,
     hash,
     latest_committer,
@@ -1385,6 +1397,12 @@ dolt_schema_conflicts| SELECT table_name,
     their_schema,
     description
    FROM dolt.schema_conflicts;
+dolt_stashes| SELECT name,
+    stash_id,
+    branch,
+    hash,
+    commit_message
+   FROM dolt.stashes;
 dolt_status| SELECT table_name,
     staged,
     status
@@ -1396,6 +1414,13 @@ dolt_tags| SELECT tag_name,
     date,
     message
    FROM dolt.tags;
+dolt_tests| SELECT test_name,
+    test_group,
+    test_query,
+    assertion_type,
+    assertion_comparator,
+    assertion_value
+   FROM dolt.tests;
 pg_aios| SELECT pid,
     io_id,
     io_generation,

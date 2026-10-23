@@ -1435,7 +1435,23 @@ CREATE TABLE pg_catalog.pg_dolt_doc (
     docname text PRIMARY KEY,
     doctext text
 );
-REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog FROM PUBLIC;
+CREATE TABLE pg_catalog.pg_dolt_rebase (
+    rebasebranch text NOT NULL,
+    rebase_order float8 NOT NULL,
+    action text NOT NULL,
+    commit_hash text NOT NULL,
+    commit_message text,
+    PRIMARY KEY (rebasebranch, rebase_order)
+);
+CREATE TABLE pg_catalog.pg_dolt_test (
+    test_name text PRIMARY KEY,
+    test_group text,
+    test_query text NOT NULL,
+    assertion_type text NOT NULL CHECK (assertion_type IN ('expected_rows', 'expected_columns', 'expected_single_value')),
+    assertion_comparator text NOT NULL CHECK (assertion_comparator IN ('==', '!=', '<', '>', '<=', '>=')),
+    assertion_value text
+);
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_test FROM PUBLIC;
 
 -- Commits reachable from any branch, tag or remote-tracking ref.
 CREATE VIEW pg_dolt_commit_visible AS
@@ -1537,6 +1553,23 @@ CREATE RULE dolt_docs_update AS ON UPDATE TO dolt.docs DO INSTEAD
     UPDATE pg_catalog.pg_dolt_doc SET docname = NEW.doc_name, doctext = NEW.doc_text WHERE docname = OLD.doc_name;
 CREATE RULE dolt_docs_delete AS ON DELETE TO dolt.docs DO INSTEAD
     DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
+CREATE VIEW dolt.rebase WITH (security_invoker=true) AS
+    SELECT rebase_order, action, commit_hash, commit_message FROM pg_catalog.pg_dolt_rebase
+    WHERE rebasebranch = pg_catalog.active_branch();
+CREATE VIEW dolt.stashes WITH (security_invoker=true) AS
+    SELECT name, 'stash@{' || (row_number() OVER (PARTITION BY name ORDER BY seq DESC) - 1) || '}' AS stash_id,
+           branch, hash, commit_message
+    FROM (SELECT split_part(r.refname, '/', 2) AS name, split_part(r.refname, '/', 3)::bigint AS seq,
+                 m->>'branch' AS branch, m->>'head' AS hash, m->>'message' AS commit_message
+          FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash = r.reftarget,
+               LATERAL (SELECT convert_from(o.objpayload, 'UTF8')::jsonb) AS j(m)
+          WHERE r.refname LIKE 'stash/%') s
+    ORDER BY name, seq DESC;
+CREATE VIEW dolt.help WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_help();
+CREATE VIEW dolt.tests WITH (security_invoker=true) AS
+    SELECT test_name, test_group, test_query, assertion_type, assertion_comparator, assertion_value
+    FROM pg_catalog.pg_dolt_test;
 
 CREATE VIEW dolt_log WITH (security_invoker=true) AS SELECT * FROM dolt.log;
 CREATE VIEW dolt_branches WITH (security_invoker=true) AS SELECT * FROM dolt.branches;
@@ -1553,6 +1586,10 @@ CREATE VIEW dolt_constraint_violations WITH (security_invoker=true) AS SELECT * 
 CREATE VIEW dolt_schema_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.schema_conflicts;
 CREATE VIEW dolt_remotes WITH (security_invoker=true) AS SELECT * FROM dolt.remotes;
 CREATE VIEW dolt_docs WITH (security_invoker=true) AS SELECT * FROM dolt.docs;
+CREATE VIEW dolt_rebase WITH (security_invoker=true) AS SELECT * FROM dolt.rebase;
+CREATE VIEW dolt_stashes WITH (security_invoker=true) AS SELECT * FROM dolt.stashes;
+CREATE VIEW dolt_help WITH (security_invoker=true) AS SELECT * FROM dolt.help;
+CREATE VIEW dolt_tests WITH (security_invoker=true) AS SELECT * FROM dolt.tests;
 CREATE RULE dolt_docs_insert AS ON INSERT TO dolt_docs DO INSTEAD
     INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
 CREATE RULE dolt_docs_update AS ON UPDATE TO dolt_docs DO INSTEAD
@@ -1562,4 +1599,4 @@ CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
     dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
-    dolt_schema_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;
+    dolt_schema_conflicts, dolt_remotes, dolt_docs, dolt_rebase, dolt_stashes, dolt_help, dolt_tests FROM PUBLIC;
