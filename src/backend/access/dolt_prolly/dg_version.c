@@ -31,6 +31,7 @@
 #include "optimizer/optimizer.h"
 #include "access/xact.h"
 #include "access/doltbranch.h"
+#include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -62,6 +63,7 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "libpq/libpq-be.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -74,7 +76,8 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
-#define USER_NAMESPACE "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'"
+#define NAMESPACE_DEFINITIONS_SQL "SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\""
+#define USER_NAMESPACE "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND n.nspname <> 'dolt'"
 
 typedef struct VersionRef
 {
@@ -550,7 +553,7 @@ capture_inner(bool persist, bool all_catalogs)
 	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attoptions IS NOT NULL OR a.atthasdef OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n')", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("capture of defaults, generated/dropped columns, user types, triggers or non-unique constraints");
-	run("SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\"", 0, NULL, NULL, NULL, true);
+	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
 	nns = SPI_processed;
 	namespaces = palloc(sizeof(char *) * Max(nns, 1));
 	for (i = 0; i < nns; i++)
@@ -695,12 +698,24 @@ json_value(const char *json, const char *key)
 	run("SELECT $1::jsonb->>$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(key)), NULL, true);
 	return strcell(0, 1);
 }
+/* Doltgres derives the default committer email from the role and the client
+ * address; local (socket or bootstrap) sessions use localhost. */
+static char *
+default_email(const char *name)
+{
+	const char *host = "localhost";
+
+	if (MyProcPort && MyProcPort->remote_host && *MyProcPort->remote_host &&
+		MyProcPort->raddr.addr.ss_family != AF_UNIX)
+		host = MyProcPort->remote_host;
+	return psprintf("%s@%s", name, host);
+}
 static bytea *
 commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
 {
 	StringInfoData json;
 	const char *name = GetUserNameFromId(GetUserId(), false);
-	char	   *email = psprintf("%s@localhost", name);
+	char	   *email = default_email(name);
 	int64		height = 1;
 
 	if (parent)
@@ -734,7 +749,29 @@ ensure_repository(void)
 
 	if (head.target)
 		return;
-	db = put("database", "{\"format\":\"DGDB1\",\"members\":[]}", NULL, 0);
+	/* The initial state records the namespaces that exist at initialization
+	 * (public for a fresh database), mirroring Doltgres's database creation. */
+	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
+	{
+		int			n = SPI_processed,
+					i;
+		char	  **definitions = palloc(sizeof(char *) * Max(n, 1));
+		Datum	   *members = palloc(sizeof(Datum) * Max(n, 1));
+		StringInfoData json;
+
+		for (i = 0; i < n; i++)
+			definitions[i] = strcell(i, 1);
+		initStringInfo(&json);
+		appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+		for (i = 0; i < n; i++)
+		{
+			appendStringInfo(&json, "%s{\"kind\":\"namespace\",\"definition\":%s}", i ? "," : "", definitions[i]);
+			members[i] = PointerGetDatum(put("namespace", definitions[i], NULL, 0));
+		}
+		appendStringInfoString(&json, "]}");
+		run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
+		db = canonical_database(strcell(0, 1), members, n);
+	}
 	commit = commit_object(db, NULL, NULL, "Initialize data repository", NULL, NULL, GetCurrentTimestamp());
 	move_ref("heads/main", head, commit);
 	move_ref("staged/main", read_ref("staged/main"), db);
@@ -830,6 +867,18 @@ author_option(char *value, char **name, char **email)
 	while (**name && (*name)[strlen(*name) - 1] == ' ')
 		(*name)[strlen(*name) - 1] = '\0';
 	*email = pnstrdup(lt + 1, gt - lt - 1);
+}
+
+/* Initialize the version-control repository of the current database. initdb
+ * runs this for template1, so every database starts with a main branch. */
+Datum
+dolt_init(PG_FUNCTION_ARGS)
+{
+	int			nest = begin_api();
+
+	ensure_repository();
+	end_api(nest);
+	PG_RETURN_INT64(0);
 }
 
 Datum
@@ -1016,7 +1065,7 @@ dolt_tag(PG_FUNCTION_ARGS)
 	if (!author)
 	{
 		author = GetUserNameFromId(GetUserId(), false);
-		email = psprintf("%s@localhost", author);
+		email = default_email(author);
 	}
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '{');
@@ -1191,3 +1240,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_canonical_ddl.inc"
 
 #include "dg_alter.inc"
+#include "dg_tables.inc"

@@ -12,7 +12,7 @@ sub fails {
  my($q,$pat,$label)=@_;my($status,$out,$err)=$node->psql('postgres',$q);
  isnt($status,0,$label);like($err,$pat,"$label diagnostic");
 }
-is(sql('SELECT count(*) FROM dolt_log()'),'0','no history before lazy initialization');
+is(sql('SELECT message FROM dolt_log()'),'Initialize data repository','repository initialized with the database');
 sql(q{CREATE SCHEMA empty_space; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Test Author <author@example.com>','--date','2020-01-02 03:04:05+00')});
 like($first,qr/^[0-9a-f]{64}$/,'commit returns native SHA256 hash');

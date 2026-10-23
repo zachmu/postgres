@@ -22,5 +22,6 @@ tests += {
     't/016_runtime_binding.pl',
     't/017_canonical_catalog.pl',
       't/018_storage_resources.pl',
+    't/019_system_tables.pl',
   ]},
 }
