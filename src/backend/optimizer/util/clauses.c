@@ -4637,11 +4637,12 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * optimization.
 	 */
 	for (i = 0; i < funcform->pronargs; i++)
-		if (funcform->proargtypes.values[i] == OIDOID)
+		if (CatalogViewIsObjectIdType(exprType(list_nth(args, i))) ||
+			CatalogViewObjectContext(exprType(list_nth(args, i))))
 		{
 			Node	   *value = list_nth(args, i);
 
-			if (CatalogViewCurrent() || IsA(value, Param) ||
+			if (CatalogViewCurrent() || CatalogViewObjectContext(exprType(value)) || IsA(value, Param) ||
 				(context->root && has_catalog_context((Node *) context->root->parse, NULL)) ||
 				(IsA(value, Const) && !((Const *) value)->constisnull && CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))
 				return NULL;
@@ -5230,11 +5231,12 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 
 	/* A bound OID must retain the fmgr_sql context-selection boundary. */
 	for (int i = 0; i < funcform->pronargs; i++)
-		if (funcform->proargtypes.values[i] == OIDOID)
+		if (CatalogViewIsObjectIdType(exprType(list_nth(fexpr->args, i))) ||
+			CatalogViewObjectContext(exprType(list_nth(fexpr->args, i))))
 		{
 			Node	   *value = list_nth(fexpr->args, i);
 
-			if (CatalogViewCurrent() || IsA(value, Param) ||
+			if (CatalogViewCurrent() || CatalogViewObjectContext(exprType(value)) || IsA(value, Param) ||
 				has_catalog_context((Node *) root->parse, NULL) ||
 				(IsA(value, Const) && !((Const *) value)->constisnull &&
 				 CatalogViewObjectContext(DatumGetObjectId(((Const *) value)->constvalue))))

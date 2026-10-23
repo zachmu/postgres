@@ -426,6 +426,27 @@ lookup_object(Oid handle)
 	return object;
 }
 
+/* Only these by-value SQL types can carry catalog object handles.  Never
+ * interpret arbitrary scalar values or composite pointers as identifiers. */
+bool
+CatalogViewIsObjectIdType(Oid type)
+{
+	switch (type)
+	{
+		case OIDOID:
+		case REGCLASSOID:
+		case REGTYPEOID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGNAMESPACEOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
 CatalogView *
 CatalogViewObjectContext(Oid handle)
 {
@@ -539,7 +560,7 @@ CatalogViewRejectPhysicalAccess(Relation relation)
 }
 
 Oid
-CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity)
+CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity)
 {
 	ListCell   *lc;
 
@@ -551,6 +572,16 @@ CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity
 		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
 			return handle;
 	}
+	return InvalidOid;
+}
+
+Oid
+CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity)
+{
+	Oid			result = CatalogViewFindObject(view, objectclass, identity);
+
+	if (OidIsValid(result))
+		return result;
 	ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("object %s does not exist in catalog context", identity)));
 	return InvalidOid;
 }

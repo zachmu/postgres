@@ -1577,38 +1577,44 @@ postquel_get_single_result(TupleTableSlot *slot,
  */
 static Datum fmgr_sql_in_context(FunctionCallInfo fcinfo);
 
-/* OID arguments can identify immutable catalog objects in another revision.
- * Keep nested SQL catalog scans in that scope, and restore it on every exit. */
+/* Object-ID aliases and concrete composite argument types identify immutable
+ * catalog objects in another revision. Resolve polymorphic arguments from the
+ * call expression, not the declared signature. Nested calls without a binding
+ * inherit the enclosing scope. Always restore it, including on errors. */
 Datum
 fmgr_sql(PG_FUNCTION_ARGS)
 {
 	CatalogView *view = NULL,
 			   *previous;
 	Datum		result;
-	bool		candidate = false;
 	int			i;
+	Oid		   *declared = NULL;
+	int			nargs = 0;
 
 	for (i = 0; i < fcinfo->nargs; i++)
-		if (!fcinfo->args[i].isnull && DatumGetObjectId(fcinfo->args[i].value) >= FirstCatalogViewObjectId && (fcinfo->args[i].value <= PG_UINT32_MAX || (int64) fcinfo->args[i].value < 0))
-			candidate = true;
-	if (candidate)
 	{
-		Oid		   *types;
-		int			nargs;
+		Oid			type = get_fn_expr_argtype(fcinfo->flinfo, i);
+		CatalogView *bound;
 
-		(void) get_func_signature(fcinfo->flinfo->fn_oid, &types, &nargs);
-		for (i = 0; i < Min(nargs, fcinfo->nargs); i++)
-			if (types[i] == OIDOID && !fcinfo->args[i].isnull)
-			{
-				CatalogView *bound = CatalogViewObjectContext(DatumGetObjectId(fcinfo->args[i].value));
-
-				if (bound && view && view != bound)
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("SQL function arguments span incompatible catalog contexts")));
-				if (bound)
-					view = bound;
-			}
-		pfree(types);
+		/* Internal fmgr callers need not supply an expression tree. */
+		if (!OidIsValid(type))
+		{
+			if (!declared)
+				(void) get_func_signature(fcinfo->flinfo->fn_oid, &declared, &nargs);
+			if (i < nargs)
+				type = declared[i];
+		}
+		bound = CatalogViewObjectContext(type);
+		if (!fcinfo->args[i].isnull &&
+			CatalogViewIsObjectIdType(type))
+			bound = CatalogViewObjectContext(DatumGetObjectId(fcinfo->args[i].value));
+		if (bound && view && view != bound)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("SQL function arguments span incompatible catalog contexts")));
+		if (bound)
+			view = bound;
 	}
+	if (declared)
+		pfree(declared);
 	if (!view)
 		view = CatalogViewCurrent();
 	previous = CatalogViewSwitch(view);

@@ -10,6 +10,8 @@
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
+extern bool dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *result);
+extern bool dg_catalog_type_visible(Oid id, const char *name, bool *visible);
 extern bool dg_catalog_relation_visible(Oid id, const char *name, bool *visible);
 extern void dg_catalog_rewrite_relation(RangeTblEntry *rte);
 extern bool dg_catalog_alter(Node *statement);

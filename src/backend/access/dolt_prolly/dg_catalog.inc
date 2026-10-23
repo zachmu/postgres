@@ -1,3 +1,18 @@
+/* Nested SQL inherits an immutable provider selected by its bound arguments. */
+static const char *
+catalog_current_database(void)
+{
+	DGProvider *entry;
+	CatalogView *view = CatalogViewCurrent();
+
+	if (!view)
+		return NULL;
+	for (entry = providers; entry; entry = entry->next)
+		if (entry->view == view)
+			return entry->database;
+	return NULL;
+}
+
 /* All SQL entry paths use the provider's complete catalog family set. */
 static bool
 catalog_supported(Oid id)
@@ -99,7 +114,7 @@ catalog_namespace(bytea *db, const char *name)
 /* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
  * candidates in that same order, never a shortcut ahead of an explicit path. */
 static char *
-catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path)
+catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
 	List	   *path = NIL;
 	ListCell   *lc;
@@ -124,7 +139,7 @@ catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const
 			catalog = true;
 		if (!catalog)
 			path = lcons("pg_catalog", path);
-		if (OidIsValid(temp))
+		if (temp_ok && OidIsValid(temp))
 		{
 			bool		listed = false;
 
@@ -147,21 +162,22 @@ catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const
 		if (!strcmp(ns, "pg_catalog") || !strcmp(ns, "information_schema"))
 		{
 			namespace = get_namespace_oid(ns, true);
-			*native = OidIsValid(namespace) ? get_relname_relid(rv->relname, namespace) : InvalidOid;
+			*native = OidIsValid(namespace) ? (type_lookup ? GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(rv->relname), ObjectIdGetDatum(namespace)) : get_relname_relid(rv->relname, namespace)) : InvalidOid;
 			if (OidIsValid(*native))
 				return ns;
 			continue;
 		}
-		if (OidIsValid(temp) && (!strcmp(ns, "pg_temp") ||
-								 !strcmp(ns, get_namespace_name(temp))))
+		if (temp_ok && OidIsValid(temp) && (!strcmp(ns, "pg_temp") ||
+											!strcmp(ns, get_namespace_name(temp))))
 		{
-			*native = get_relname_relid(rv->relname, temp);
+			*native = type_lookup ? GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(rv->relname), ObjectIdGetDatum(temp)) : get_relname_relid(rv->relname, temp);
 			if (OidIsValid(*native))
 				return get_namespace_name(temp);
 			continue;
 		}
 		name = quote_qualified_identifier(ns, rv->relname);
-		if (catalog_contains(db, name))
+		if (catalog_contains(db, name) &&
+			(!type_lookup || OidIsValid(CatalogViewFindObject(provider_view(db), TypeRelationId, name))))
 		{
 			char	   *definition = catalog_namespace(db, ns);
 
@@ -228,7 +244,10 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	Oid			live = InvalidOid;
 
 	if (rangevar_projection_hook || catalog_api_depth)
-		return NULL;			/* isolated phase-1 fixture */
+		return NULL;
+	if (!rte->dolt_database && !rv->dolt_revision &&
+		!(rv->catalogname && strpbrk(rv->catalogname, "@/")) && catalog_current_database())
+		rte->dolt_database = pstrdup(catalog_current_database());
 	if (!rv->dolt_revision)
 	{
 		if (!rv->catalogname || !(sep = strpbrk(rv->catalogname, "@/")))
@@ -290,7 +309,7 @@ revision_selected:
 		rte->dolt_database = hex(db);
 		{
 			Oid			native;
-			char	   *ns = catalog_resolve_name(db, rv, user, &native, resolution_path);
+			char	   *ns = catalog_resolve_name(db, rv, user, &native, resolution_path, false, true);
 			RangeVar   *resolved = copyObject(rv);
 
 			if (!ns)
@@ -583,10 +602,11 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		bytea	   *db;
 
 		nest = begin_api();
-		db = read_ref(branch_ref("working")).target;
+		db = catalog_current_database() ? unhex(catalog_current_database()) :
+			read_ref(branch_ref("working")).target;
 		{
 			Oid			native;
-			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path);
+			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, false, true);
 
 			if (OidIsValid(native))
 			{
@@ -763,7 +783,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 
 		nest = begin_api();
 		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
-		ns = catalog_resolve_name(db, rv, user, &native, path);
+		ns = catalog_resolve_name(db, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
 						  CatalogViewLookupObject(provider_view(db), RelationRelationId,
 												  quote_qualified_identifier(ns, name)) == id);
@@ -777,4 +797,80 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 	}
 	PG_END_TRY();
 	return true;
+}
+
+/* Named types resolve against the same ordered namespace membership as tables.
+ * A handled miss is authoritative: never fall back to a physical user type. */
+bool
+dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *result)
+{
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+	RangeVar   *rv = makeRangeVar((char *) schema, (char *) name, -1);
+	char	   *search_path;
+
+	if (!dg_catalog_active())
+		return false;
+	search_path = pstrdup(GetConfigOption("search_path", false, false));
+	GetUserIdAndSecContext(&user, &security);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	*result = InvalidOid;
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bytea	   *db;
+
+		nest = begin_api();
+		db = catalog_current_database() ? unhex(catalog_current_database()) :
+			read_ref(branch_ref("working")).target;
+		{
+			Oid			native;
+			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, true, temp_ok);
+
+			if (OidIsValid(native))
+			{
+				*result = native;
+			}
+			else if (ns)
+				*result = CatalogViewLookupObject(provider_view(db), TypeRelationId,
+												  quote_qualified_identifier(ns, rv->relname));
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	return true;
+}
+
+bool
+dg_catalog_type_visible(Oid id, const char *name, bool *visible)
+{
+	CatalogView *view = CatalogViewObjectContext(id);
+	CatalogView *previous = CatalogViewSwitch(view ? view : CatalogViewCurrent());
+	bool		handled;
+	Oid			found;
+
+	PG_TRY();
+	{
+		handled = dg_catalog_lookup_type(NULL, name, true, &found);
+		if (handled)
+			*visible = found == id;
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return handled;
 }

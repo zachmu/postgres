@@ -24,8 +24,10 @@ extern void CatalogViewRelease(CatalogView *view);
 extern CatalogView *CatalogViewCurrent(void);
 extern uint64 CatalogViewCacheId(CatalogView *view);
 extern Oid	CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, Oid storage);
+extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity);
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
 extern CatalogView *CatalogViewObjectContext(Oid handle);
+extern bool CatalogViewIsObjectIdType(Oid type);
 extern Oid	CatalogViewObjectStorage(Oid handle);
 extern CatalogView *CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const int *attributes, const Datum *values);
 

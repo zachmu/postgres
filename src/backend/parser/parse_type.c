@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
@@ -168,7 +169,11 @@ LookupTypeNameExtended(ParseState *pstate,
 		/* deconstruct the name list */
 		DeconstructQualifiedName(typeName->names, &schemaname, &typname);
 
-		if (schemaname)
+		if (dg_catalog_lookup_type(schemaname, typname, temp_ok, &typoid))
+		{
+			/* Canonical membership is authoritative, including a miss. */
+		}
+		else if (schemaname)
 		{
 			/* Look in specific schema only */
 			Oid			namespaceId;
