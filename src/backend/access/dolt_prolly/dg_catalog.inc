@@ -759,6 +759,8 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 				nest;
 	bool		pushed = false;
 
+	if (!view)
+		view = CatalogViewCurrent();
 	if (catalog_api_depth || rangevar_projection_hook || (!view && !dg_catalog_active()))
 		return false;
 	for (provider = providers; provider; provider = provider->next)

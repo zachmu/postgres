@@ -26,12 +26,14 @@ CREATE FUNCTION pg_catalog.dg_leafcaller(regclass) RETURNS text LANGUAGE SQL STA
 CREATE FUNCTION pg_catalog.dg_outer(regclass) RETURNS text LANGUAGE SQL STABLE AS $$ SELECT dg_nested($1) $$;
 CREATE FUNCTION pg_catalog.dg_body(regclass) RETURNS text LANGUAGE SQL STABLE AS $$ SELECT string_agg(v,',' ORDER BY id) FROM t $$;
 CREATE FUNCTION pg_catalog.dg_poly(anyelement) RETURNS text LANGUAGE SQL STABLE AS $$ SELECT dg_body('t'::regclass) $$;
+CREATE FUNCTION pg_catalog.dg_visible(regclass) RETURNS bool LANGUAGE SQL STABLE AS $$ SELECT pg_table_is_visible('pg_catalog.pg_class'::regclass) $$;
 CREATE FUNCTION pg_catalog.dg_pair(regclass,regclass) RETURNS int LANGUAGE SQL STABLE AS $$ SELECT 1 $$;
 CREATE FUNCTION pg_catalog.dg_set(regclass) RETURNS SETOF text LANGUAGE SQL STABLE AS $$ SELECT attname::text FROM pg_attribute WHERE attrelid=$1 AND attnum>0 AND NOT attisdropped ORDER BY attnum $$;
 INSERT INTO t VALUES(1,'main');
 SELECT dolt_commit('-Am','base');
 SELECT dolt_checkout('-b','other');
 DROP TABLE only_main;
+CREATE TABLE a.pg_class(x int);
 ALTER TABLE t ADD COLUMN extra int;
 UPDATE t SET v='other',extra=7;
 SELECT dolt_commit('-Am','other');
@@ -59,6 +61,9 @@ is(sql(q{SELECT dg_leafcaller(oid::regclass) FROM pg_class AS OF 'other' WHERE r
 is(sql(q{SELECT dg_outer(oid::regclass) FROM (SELECT oid FROM pg_class AS OF 'main' WHERE relname='t' UNION ALL SELECT oid FROM pg_class AS OF 'other' WHERE relname='t') s}),"id,v\nid,v,extra",'one call site switches compiled function context');
 is(sql(q{SELECT ROW(1,'x')::t = ROW(1,'x')::t}),'t','native record comparison uses canonical descriptor');
 is(sql(q{SELECT to_jsonb(t)->>'extra' FROM t AS OF 'other' t}),'7','native polymorphic JSON conversion uses historical rowtype');
+is(sql(q{SELECT dg_poly(CASE WHEN false THEN t ELSE NULL END) FROM t AS OF 'other' t}),'other','null composite argument retains its type context');
+is(sql(q{SELECT oprname FROM pg_operator AS OF 'other' WHERE oprname='=' AND oprleft='record'::regtype AND oprright='record'::regtype}),'=','bootstrap operator metadata available in a revision');
+is(sql(q{SET search_path=a,pg_catalog; SELECT dg_visible(oid::regclass) FROM pg_catalog.pg_class AS OF 'other' WHERE relname='t'}),'f','native relation visibility honors enclosing revision');
 my $s=$node->background_psql('postgres', on_error_stop=>0);
 $s->query_safe(q{SELECT dolt_checkout('other')});
 my ($missing,$missing_failed)=$s->query(q{SELECT NULL::only_main});
