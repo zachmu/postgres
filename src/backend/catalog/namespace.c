@@ -1035,6 +1035,9 @@ TypenameGetTypidExtended(const char *typname, bool temp_ok)
 	Oid			typid;
 	ListCell   *l;
 
+	if (dg_catalog_lookup_type(NULL, typname, temp_ok, &typid))
+		return typid;
+
 	recomputeNamespacePath();
 
 	foreach(l, activeSearchPath)
@@ -1092,6 +1095,12 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
 		elog(ERROR, "cache lookup failed for type %u", typid);
 	}
 	typform = (Form_pg_type) GETSTRUCT(typtup);
+
+	if (dg_catalog_type_visible(typid, NameStr(typform->typname), &visible))
+	{
+		ReleaseSysCache(typtup);
+		return visible;
+	}
 
 	recomputeNamespacePath();
 

@@ -89,3 +89,8 @@ Follow-up: [revision-qualified views and ordered relation resolution](revision-c
 closes the historical bootstrap-view boundary above and expands search-path,
 visibility and serialization coverage. It records the remaining object-family
 and nested-execution audit boundaries.
+
+Follow-up: [named types and nested SQL execution](nested-catalog-resolution.md)
+connects canonical rowtype names, object-ID aliases and polymorphic arguments to
+nested SQL binding, adds manifest dependencies for type-only expressions, and
+records the bootstrap operator/range closure and remaining routine-family audit.

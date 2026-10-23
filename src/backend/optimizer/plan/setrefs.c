@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_dolt_ref.h"
 #include "catalog/pg_dolt_binding.h"
@@ -2043,6 +2044,44 @@ copyVar(Var *var)
 static void
 fix_expr_common(PlannerInfo *root, Node *node)
 {
+	bool		contextual = false;
+
+	/*
+	 * A named rowtype or reg* constant can bind a revision without any RTE.
+	 * Keep its parse tree subject to the same snapshot/ref revalidation as a
+	 * versioned table scan, even when planning later folds it to a scalar.
+	 */
+	switch (nodeTag(node))
+	{
+		case T_Const:
+			{
+				Const	   *con = (Const *) node;
+
+				if (!con->constisnull && CatalogViewIsObjectIdType(con->consttype))
+					contextual = CatalogViewObjectContext(DatumGetObjectId(con->constvalue)) != NULL;
+				contextual |= CatalogViewObjectContext(con->consttype) != NULL;
+				break;
+			}
+		case T_Var:
+		case T_Param:
+		case T_RowExpr:
+		case T_ConvertRowtypeExpr:
+		case T_CoerceViaIO:
+		case T_CoerceToDomain:
+		case T_RelabelType:
+		case T_FuncExpr:
+		case T_FieldSelect:
+			contextual = CatalogViewObjectContext(exprType(node)) != NULL;
+			break;
+		default:
+			break;
+	}
+	if (contextual)
+	{
+		root->glob->relationOids = list_append_unique_oid(root->glob->relationOids, DoltRefRelationId);
+		root->glob->dependsOnRole = true;
+	}
+
 	/* We assume callers won't call us on a NULL pointer */
 	if (IsA(node, Aggref))
 	{
