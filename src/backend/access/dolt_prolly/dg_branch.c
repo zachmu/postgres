@@ -12,6 +12,7 @@
 #include "utils/lsyscache.h"
 #include "catalog/pg_dolt_ref.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "tcop/utility.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -20,9 +21,40 @@ static char *selected_branch;
 static char *pending_branch;
 static bool registered;
 
+static bool session_branch_locked;
+
+static void
+branch_session_tag(LOCKTAG *tag, const char *name)
+{
+	PLHash		hash;
+	PLSlice		bytes = {(const uint8 *) name, strlen(name)};
+
+	if (!pl_hash_bytes(bytes, &hash))
+		elog(ERROR, "branch hash failed");
+	SET_LOCKTAG_ADVISORY(*tag, MyDatabaseId, pl_read32(hash.bytes), pl_read32(hash.bytes + 4), 3);
+}
+
+void
+dg_branch_require_unused(const char *name)
+{
+	LOCKTAG		tag;
+
+	branch_session_tag(&tag, name);
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("branch %s is in use by another session", name), errhint("Use -f to force deletion.")));
+}
+
 const char *
 dg_current_branch(void)
 {
+	if (IsUnderPostmaster && !session_branch_locked)
+	{
+		LOCKTAG		tag;
+
+		branch_session_tag(&tag, selected_branch ? selected_branch : "main");
+		LockAcquire(&tag, ShareLock, true, false);
+		session_branch_locked = true;
+	}
 	return selected_branch ? selected_branch : "main";
 }
 
@@ -38,6 +70,14 @@ branch_xact(XactEvent event, void *arg)
 {
 	if (event == XACT_EVENT_COMMIT && pending_branch)
 	{
+		if (session_branch_locked)
+		{
+			LOCKTAG		tag;
+
+			branch_session_tag(&tag, selected_branch ? selected_branch : "main");
+			LockRelease(&tag, ShareLock, true);
+		}
+		session_branch_locked = true;
 		if (selected_branch)
 			pfree(selected_branch);
 		selected_branch = pending_branch;
@@ -45,6 +85,10 @@ branch_xact(XactEvent event, void *arg)
 	}
 	else if (event == XACT_EVENT_ABORT && pending_branch)
 	{
+		LOCKTAG		tag;
+
+		branch_session_tag(&tag, pending_branch);
+		LockRelease(&tag, ShareLock, true);
 		pfree(pending_branch);
 		pending_branch = NULL;
 	}
@@ -58,7 +102,19 @@ dg_select_branch(const char *name)
 		registered = true;
 	}
 	if (pending_branch)
+	{
+		LOCKTAG		tag;
+
+		branch_session_tag(&tag, pending_branch);
+		LockRelease(&tag, ShareLock, true);
 		pfree(pending_branch);
+	}
+	{
+		LOCKTAG		tag;
+
+		branch_session_tag(&tag, name);
+		LockAcquire(&tag, ShareLock, true, false);
+	}
 	pending_branch = MemoryContextStrdup(TopMemoryContext, name);
 }
 

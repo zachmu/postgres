@@ -2924,15 +2924,6 @@ pg_wait_events| SELECT type,
 SELECT tablename, rulename, definition FROM pg_rules
 WHERE schemaname = 'pg_catalog'
 ORDER BY tablename, rulename;
-dolt_docs|dolt_docs_delete|CREATE RULE dolt_docs_delete AS
-    ON DELETE TO pg_catalog.dolt_docs DO INSTEAD  DELETE FROM pg_dolt_doc
-  WHERE (pg_dolt_doc.docname = old.doc_name);
-dolt_docs|dolt_docs_insert|CREATE RULE dolt_docs_insert AS
-    ON INSERT TO pg_catalog.dolt_docs DO INSTEAD  INSERT INTO pg_dolt_doc (docname, doctext)
-  VALUES (new.doc_name, new.doc_text);
-dolt_docs|dolt_docs_update|CREATE RULE dolt_docs_update AS
-    ON UPDATE TO pg_catalog.dolt_docs DO INSTEAD  UPDATE pg_dolt_doc SET docname = new.doc_name, doctext = new.doc_text
-  WHERE (pg_dolt_doc.docname = old.doc_name);
 pg_settings|pg_settings_n|CREATE RULE pg_settings_n AS
     ON UPDATE TO pg_catalog.pg_settings DO INSTEAD NOTHING;
 pg_settings|pg_settings_u|CREATE RULE pg_settings_u AS

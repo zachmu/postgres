@@ -3227,6 +3227,15 @@ AssertPendingSyncs_RelationCache(void)
 			LOCKTAG_RELATION)
 			continue;
 		relid = ObjectIdGetDatum(locallock->tag.lock.locktag_field2);
+
+		/*
+		 * Catalog-view handles describe logical definitions, not
+		 * independently allocated storage.  Their provisional contexts may
+		 * already be retired after DDL.  Check the backing physical relations
+		 * instead.
+		 */
+		if (CatalogViewObjectContext(relid))
+			continue;
 		r = RelationIdGetRelation(relid);
 		if (!RelationIsValid(r))
 			continue;
@@ -3240,7 +3249,8 @@ AssertPendingSyncs_RelationCache(void)
 
 	hash_seq_init(&status, RelationIdCache);
 	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
-		AssertPendingSyncConsistency(idhentry->reldesc);
+		if (!idhentry->reldesc->rd_catalogview)
+			AssertPendingSyncConsistency(idhentry->reldesc);
 
 	for (i = 0; i < nrels; i++)
 		RelationClose(rels[i]);

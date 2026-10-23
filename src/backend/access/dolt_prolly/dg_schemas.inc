@@ -15,7 +15,7 @@ typedef struct IgnorePattern
 	char	   *pattern;
 	bool		ignore;
 	bool		removed;		/* overridden by a more specific pattern */
-} IgnorePattern;
+}			IgnorePattern;
 
 /* Glob match. In specificity mode the pattern is matched against another
  * pattern: a '?' may stand for any character except a wildcard. */
@@ -69,7 +69,7 @@ normalize_pattern(const char *pattern)
  * pattern and every matching false pattern is overridden by a more specific
  * true pattern. Contradictory patterns leave the table tracked. */
 static bool
-table_ignored(IgnorePattern *patterns, int n, const char *table)
+table_ignored(IgnorePattern * patterns, int n, const char *table)
 {
 	int			i,
 				j,
@@ -117,7 +117,7 @@ table_ignored(IgnorePattern *patterns, int n, const char *table)
 static bool
 schema_has_ignore_table(const char *schema)
 {
-	run("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='dolt_ignore' AND c.relkind='r'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
+	run_context("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='dolt_ignore' AND c.relkind='r'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 	return SPI_processed > 0;
 }
 
@@ -130,7 +130,7 @@ schema_ignore_patterns(const char *schema, int *count)
 	*count = 0;
 	if (!schema_has_ignore_table(schema))
 		return NULL;
-	run(psprintf("SELECT pattern,ignored FROM %s.dolt_ignore ORDER BY pattern COLLATE \"C\"", quote_identifier(schema)), 0, NULL, NULL, NULL, true);
+	run_context(psprintf("SELECT pattern,ignored FROM %s.dolt_ignore ORDER BY pattern COLLATE \"C\"", quote_identifier(schema)), 0, NULL, NULL, NULL, true);
 	*count = SPI_processed;
 	result = palloc0(sizeof(IgnorePattern) * (*count + 1));
 	for (i = 0; i < *count; i++)
@@ -187,7 +187,7 @@ staged_capture(Capture *full)
 	*full = capture_visible();
 	foreach(lc, state_tables(metadata(full->hash, "database")))
 		if (!name_selected(tracked, (char *) lfirst(lc)))
-			candidates = lappend(candidates, lfirst(lc));
+		candidates = lappend(candidates, lfirst(lc));
 	ignored = ignored_tables(candidates);
 	if (ignored == NIL)
 		return full->hash;
@@ -200,11 +200,22 @@ dg_ensure_ignore_table(const char *schema)
 {
 	int			nest = begin_api();
 
-	if (!schema_has_ignore_table(schema))
+	bool		previous = dg_internal_system_ddl;
+
+	PG_TRY();
 	{
-		run(psprintf("CREATE TABLE %s.dolt_ignore (pattern text PRIMARY KEY, ignored boolean NOT NULL) USING dolt_prolly_table", quote_identifier(schema)), 0, NULL, NULL, NULL, false);
-		CommandCounterIncrement();
+		dg_internal_system_ddl = true;
+		if (!schema_has_ignore_table(schema))
+		{
+			run_context(psprintf("CREATE TABLE %s.dolt_ignore (pattern text PRIMARY KEY, ignored boolean NOT NULL) USING dolt_prolly_table", quote_identifier(schema)), 0, NULL, NULL, NULL, false);
+			CommandCounterIncrement();
+		}
 	}
+	PG_FINALLY();
+	{
+		dg_internal_system_ddl = previous;
+	}
+	PG_END_TRY();
 	end_api(nest);
 }
 
@@ -223,7 +234,7 @@ dolt_schemas_table(PG_FUNCTION_ARGS)
 	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int			nest = begin_api();
 
-	run("SELECT 'view'::text,c.relname::text,'CREATE VIEW ' || quote_ident(c.relname) || ' AS ' || pg_get_viewdef(c.oid,true),'{\"CreatedAt\":0}'::json,NULL::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='v' ORDER BY c.relname COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
+	run_context("SELECT 'view'::text,c.relname::text,'CREATE VIEW ' || quote_ident(c.relname) || ' AS ' || pg_get_viewdef(c.oid,true),'{\"CreatedAt\":0}'::json,NULL::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='v' ORDER BY c.relname COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -235,7 +246,7 @@ dolt_procedures_table(PG_FUNCTION_ARGS)
 	char	   *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	int			nest = begin_api();
 
-	run("SELECT p.proname::text,pg_get_functiondef(p.oid),NULL::timestamptz,NULL::timestamptz,NULL::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.prokind='p' ORDER BY p.proname COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
+	run_context("SELECT p.proname::text,pg_get_functiondef(p.oid),NULL::timestamptz,NULL::timestamptz,NULL::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.prokind='p' ORDER BY p.proname COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;
 }
@@ -285,4 +296,89 @@ Datum
 dolt_thread_dump(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(""));
+}
+
+/* Lazily allocated ordinary user tables, versioned by normal capture and DDL. */
+void
+dg_ensure_user_table(const char *name)
+{
+	int			nest = begin_api();
+	bool		previous = dg_internal_system_ddl;
+	const char *columns;
+
+	if (!strcmp(name, "dolt_docs"))
+		columns = "doc_name text PRIMARY KEY, doc_text text";
+	else if (!strcmp(name, "dolt_tests"))
+		columns = "test_name text PRIMARY KEY, test_group text, test_query text NOT NULL, assertion_type text NOT NULL, assertion_comparator text NOT NULL, assertion_value text";
+	else if (!strcmp(name, "dolt_query_catalog"))
+		columns = "id text PRIMARY KEY, display_order int4, name text, query text, description text";
+	else
+		elog(ERROR, "unknown versioned metadata table");
+	PG_TRY();
+	{
+		dg_internal_system_ddl = true;
+		run_context("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+		if (!DatumGetBool(cell(0, 1)))
+		{
+			run_context(psprintf("CREATE TABLE public.%s (%s) USING dolt_prolly_table", name, columns), 0, NULL, NULL, NULL, false);
+			if (!strcmp(name, "dolt_docs"))
+			{
+				CommandCounterIncrement();
+				UpdateActiveSnapshotCommandId();
+				run_context("INSERT INTO public.dolt_docs VALUES ('AGENT.md',pg_catalog.dolt_default_doc('AGENT.md'))", 0, NULL, NULL, NULL, false);
+			}
+			if (!strcmp(name, "dolt_tests"))
+				run_context("ALTER TABLE public.dolt_tests ADD CONSTRAINT assertion_type_check CHECK(assertion_type IN ('expected_rows','expected_columns','expected_single_value')), ADD CONSTRAINT assertion_comparator_check CHECK(assertion_comparator IN ('==','!=','<','>','<=','>='))", 0, NULL, NULL, NULL, false);
+			if (!strcmp(name, "dolt_query_catalog"))
+				run_context("ALTER TABLE public.dolt_query_catalog ALTER COLUMN display_order SET DEFAULT 0", 0, NULL, NULL, NULL, false);
+			CommandCounterIncrement();
+			UpdateActiveSnapshotCommandId();
+		}
+	}
+	PG_FINALLY();
+	{
+		dg_internal_system_ddl = previous;
+	}
+	PG_END_TRY();
+	end_api(nest);
+	CommandCounterIncrement();
+	if (ActiveSnapshotSet())
+		UpdateActiveSnapshotCommandId();
+}
+
+Datum
+dolt_user_table(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const char *columns;
+	const char *empty;
+	int			nest = begin_api();
+	bool		exists;
+	char	   *query;
+
+	if (!strcmp(name, "dolt_docs"))
+	{
+		columns = "doc_name,doc_text";
+		empty = "NULL::text AS doc_name,NULL::text AS doc_text";
+	}
+	else if (!strcmp(name, "dolt_tests"))
+	{
+		columns = "test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value";
+		empty = "NULL::text,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text";
+	}
+	else if (!strcmp(name, "dolt_query_catalog"))
+	{
+		columns = "id,display_order,name,query,description";
+		empty = "NULL::text,NULL::int4,NULL::text,NULL::text,NULL::text";
+	}
+	else
+		elog(ERROR, "unknown versioned metadata table");
+	run_context("SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	exists = DatumGetBool(cell(0, 1));
+	query = exists ? psprintf("SELECT %s FROM public.%s", columns, name) : psprintf("SELECT %s WHERE false", empty);
+	if (!strcmp(name, "dolt_docs"))
+		query = psprintf("%s UNION ALL SELECT 'AGENT.md'::text,pg_catalog.dolt_default_doc('AGENT.md') %s", query, exists ? "WHERE NOT EXISTS (SELECT 1 FROM public.dolt_docs WHERE doc_name='AGENT.md')" : "");
+	run_context(query, 0, NULL, NULL, NULL, true);
+	return_rows(fcinfo, nest);
+	return (Datum) 0;
 }

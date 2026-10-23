@@ -85,7 +85,13 @@ CATALOG_HEADERS := \
 	pg_dolt_object.h \
 	pg_dolt_ref.h \
 	pg_dolt_binding.h \
-	pg_dolt_storage.h
+	pg_dolt_storage.h \
+	pg_dolt_remote.h \
+	pg_dolt_reflog.h \
+	pg_dolt_rebase.h \
+	pg_dolt_backup.h \
+	pg_dolt_branch_control.h \
+	pg_dolt_branch_namespace_control.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 

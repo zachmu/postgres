@@ -35,15 +35,13 @@ workspace_clean(void)
 static void
 restore_tables(bytea *db)
 {
-	List	   *keep = state_tables(metadata(db, "database")),
-			   *live = state_tables(working_state());
-	ListCell   *lc;
+	List	   *keep = state_tables(metadata(db, "database"));
+	Capture		current = capture(true);
+	bytea	   *result;
 
-	foreach(lc, keep)
-		if (!name_selected(live, (char *) lfirst(lc)))
-			unsupported("restoring a state whose tables do not exist in the working set");
-	foreach(lc, keep)
-		restore_table(db, (char *) lfirst(lc));
+	advance_snapshot();
+	result = compose_database(current.hash, db, keep);
+	replace_working(dg_current_branch(), result, keep);
 }
 
 /* ---- dolt_rebase ---- */
@@ -142,9 +140,9 @@ start_rebase(FunctionCallInfo fcinfo, int nest, const char *upstream_spec)
 	StringInfoData json;
 
 	if (read_ref(branch_ref("merge")).target)
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unable to start rebase while a merge is in progress â€“ abort the current merge before proceeding")));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unable to start rebase while a merge is in progress â63“ abort the current merge before proceeding")));
 	if (rebase_state() || read_ref(psprintf("rebase/%s", rebasebranch)).target)
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unable to start rebase while another rebase is in progress â€“ abort the current rebase before proceeding")));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unable to start rebase while another rebase is in progress â63“ abort the current rebase before proceeding")));
 	if (!workspace_clean())
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot start a rebase with uncommitted changes")));
 	if (!*upstream_spec)
@@ -217,7 +215,7 @@ typedef struct RebaseStep
 	char	   *action;
 	char	   *hash;
 	char	   *message;
-} RebaseStep;
+}			RebaseStep;
 
 static RebaseStep *
 load_rebase_plan(const char *rebasebranch, int *count)
@@ -254,7 +252,7 @@ load_rebase_plan(const char *rebasebranch, int *count)
 /* Apply one commit's changes onto the session branch head, returning the
  * resulting database or NULL when the commit becomes empty. */
 static bytea *
-apply_rebase_step(RebaseStep *step)
+apply_rebase_step(RebaseStep * step)
 {
 	bytea	   *target = resolve(step->hash),
 			   *head = read_ref(branch_ref("heads")).target,
@@ -407,8 +405,7 @@ stash_push(const char *name)
 {
 	char	   *branch = dg_current_branch();
 	VersionRef	head = read_ref(branch_ref("heads")),
-				staged = read_ref(branch_ref("staged")),
-				working = read_ref(branch_ref("working"));
+				staged = read_ref(branch_ref("staged"));
 	bytea	   *headdb = child(head.target, 1),
 			   *stageddb = staged.target ? staged.target : headdb,
 			   *workingdb,
@@ -428,7 +425,7 @@ stash_push(const char *name)
 	/* Only tracked tables are stashed; untracked tables stay in place. */
 	foreach(lc, live)
 		if (name_selected(tracked, (char *) lfirst(lc)))
-			changed = lappend(changed, lfirst(lc));
+		changed = lappend(changed, lfirst(lc));
 	workingdb = compose_database(headdb, current.hash, changed);
 	run("SELECT coalesce(max(split_part(refname,'/',3)::bigint),0)+1 FROM pg_catalog.pg_dolt_ref WHERE refname LIKE 'stash/' || $1 || '/%'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
 	seq = DatumGetInt64(cell(0, 1));
@@ -439,7 +436,7 @@ stash_push(const char *name)
 	move_ref(psprintf("stash/%s/" INT64_FORMAT, name, seq), empty_ref, state);
 	restore_tables(headdb);
 	move_ref(branch_ref("staged"), staged, headdb);
-	move_ref(branch_ref("working"), working, capture_visible().hash);
+	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
 	advance_snapshot();
 }
 

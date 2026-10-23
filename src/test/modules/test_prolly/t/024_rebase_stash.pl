@@ -111,7 +111,7 @@ is(sql(q{SELECT count(*) > 30 FROM dolt_help}),'t','help covers the implemented 
 # ---- dolt_tests and dolt_test_run ----
 is(sql(q{SELECT * FROM dolt_tests}),'','no tests yet');
 sql(q{INSERT INTO dolt_tests VALUES ('rows','grp','SELECT * FROM t','expected_rows','>','1'),('cols','grp','SELECT pk FROM t','expected_columns','==','1'),('one',NULL,'SELECT count(*) FROM t','expected_single_value','>=','100'),('bad',NULL,'SELECT * FROM nope','expected_rows','==','0'),('multi',NULL,'SELECT * FROM t','expected_single_value','==','1')});
-is(sql(q{SELECT test_name,test_group_name,status,message FROM dolt_test_run()}),"bad||FAIL|Query error: relation \"nope\" does not exist\nmulti||FAIL|expected_single_value expects exactly one cell. Received multiple columns\none||FAIL|Assertion failed: expected_single_value greater than or equal to 100, got 3\ncols|grp|PASS|\nrows|grp|PASS|",'test results and messages');
+is(sql(q{SELECT test_name,test_group_name,status,message FROM dolt_test_run()}),"bad||FAIL|Query error: relation nope does not exist on branch main\nmulti||FAIL|expected_single_value expects exactly one cell. Received multiple columns\none||FAIL|Assertion failed: expected_single_value greater than or equal to 100, got 3\ncols|grp|PASS|\nrows|grp|PASS|",'test results and messages');
 is(sql(q{SELECT test_name,status FROM dolt_test_run('grp')}),"cols|PASS\nrows|PASS",'run a group');
 is(sql(q{SELECT status FROM dolt_test_run('one')}),'FAIL','run one test');
 is(sql(q{SELECT count(*) FROM dolt_test_run('*')}),'5','star runs everything');

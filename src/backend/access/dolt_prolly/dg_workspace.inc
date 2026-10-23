@@ -14,9 +14,10 @@ typedef struct Member
 {
 	bytea	   *hash;
 	char	   *kind;
-	char	   *name;			/* qualified table/index name or namespace name */
+	char	   *name;			/* qualified table/index name or namespace
+								 * name */
 	char	   *payload;
-} Member;
+}			Member;
 
 static Member *
 database_members(bytea *db, int *count)
@@ -73,13 +74,13 @@ name_selected(List *names, const char *name)
 
 	foreach(lc, names)
 		if (!strcmp((char *) lfirst(lc), name))
-			return true;
+		return true;
 	return false;
 }
 
 /* Expand selected tables to their index members in |members|. */
 static List *
-selected_objects(Member *members, int count, List *tables)
+selected_objects(Member * members, int count, List *tables)
 {
 	List	   *result = list_copy(tables);
 	int			i;
@@ -185,36 +186,80 @@ state_tables(const char *json)
 
 /* ---- Live table installation and removal ---- */
 
-/* Replace a live table's working contents on |branch| with its version in
- * |db|. */
+/* Publish the complete canonical definition first, then install matching
+ * contents under that definition. All changes share the caller's SQL commit.
+ * NIL tables replaces every table, including roots left by a deleted branch. */
+static void
+replace_working(const char *branch, bytea *database, List *tables)
+{
+	int			count;
+	Member	   *members;
+	CatalogView *view;
+	List	   *selected;
+	VersionRef	working;
+
+	advance_snapshot();
+	members = database_members(database, &count);
+	view = provider_view(database);
+	selected = tables ? selected_objects(members, count, tables) : NIL;
+	working = read_ref(psprintf("working/%s", branch));
+
+	binding_prepare(branch, database, false);
+	advance_snapshot();
+	for (int i = 0; i < count; i++)
+	{
+		Oid			resource;
+		Relation	definition;
+		bytea	   *schema;
+
+		if (strcmp(members[i].kind, "table") && strcmp(members[i].kind, "index"))
+			continue;
+		if (tables && !name_selected(selected, members[i].name))
+			continue;
+		schema = child(members[i].hash, 1);
+		resource = binding_relation(branch, members[i].name, schema);
+		if (OidIsValid(resource))
+			continue;
+		definition = relation_open(CatalogViewLookupObject(view, RelationRelationId, members[i].name), NoLock);
+		resource = dg_storage_allocate(definition, branch);
+		binding_record(branch, members[i].name, schema, resource);
+		relation_close(definition, NoLock);
+	}
+	move_ref(psprintf("working/%s", branch), working, database);
+	if (!strcmp(branch, dg_current_branch()) && !read_ref("views/enabled").target)
+		move_ref("views/enabled", empty_ref, read_ref(psprintf("heads/%s", branch)).target);
+	advance_snapshot();
+	for (int i = 0; i < count; i++)
+	{
+		Relation	rel;
+		DGState    *state;
+		PLTree		tree;
+
+		if (strcmp(members[i].kind, "table") ||
+			(tables && !name_selected(tables, members[i].name)))
+			continue;
+		rel = dg_catalog_write_table(branch, members[i].name, ACL_UPDATE);
+		state = dg_load(rel, SnapshotSelf);
+		tree = dg_history_import(state->store, table_chunk(database, members[i].name));
+		dg_history_install(rel, state, tree);
+		dg_release(state);
+		dg_storage_close_relation(rel);
+		UpdateActiveSnapshotCommandId();
+	}
+}
+
 static void
 restore_table_on(const char *branch, bytea *db, const char *name)
 {
-	bool		canonical = read_ref("views/enabled").target != NULL;
-	Relation	rel;
-	DGState    *state;
-	PLTree		tree;
+	bytea	   *current = !strcmp(branch, dg_current_branch()) ?
+		capture(true).hash : read_ref(psprintf("working/%s", branch)).target;
+	List	   *tables = list_make1(pstrdup(name));
+	bytea	   *result;
 
-	if (canonical)
-		rel = dg_catalog_write_table(branch, name, ACL_UPDATE);
-	else
-	{
-		List	   *parts = stringToQualifiedNameList(name, NULL);
-		Oid			relid = get_relname_relid(strVal(lsecond(parts)), get_namespace_oid(strVal(linitial(parts)), false));
+	advance_snapshot();
+	result = compose_database(current, db, tables);
 
-		if (!OidIsValid(relid))
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", name)));
-		rel = relation_open(relid, NoLock);
-	}
-	state = dg_load(rel, SnapshotSelf);
-	tree = dg_history_import(state->store, table_chunk(db, name));
-	dg_history_install(rel, state, tree);
-	dg_release(state);
-	if (canonical)
-		dg_storage_close_relation(rel);
-	else
-		relation_close(rel, NoLock);
-	UpdateActiveSnapshotCommandId();
+	replace_working(branch, result, tables);
 }
 
 static void
@@ -228,7 +273,7 @@ restore_table(bytea *db, const char *name)
 static void
 drop_table(const char *name)
 {
-	run(psprintf("DROP TABLE %s", name), 0, NULL, NULL, NULL, false);
+	run_context(psprintf("DROP TABLE %s", name), 0, NULL, NULL, NULL, false);
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
 }
@@ -274,8 +319,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 	char	   *target = NULL;
 	List	   *names = NIL;
 	VersionRef	head,
-				staged,
-				working;
+				staged;
 	bytea	   *headdb;
 
 	standalone(fcinfo, true);
@@ -296,7 +340,6 @@ dolt_reset(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: --hard and --soft are mutually exclusive options.")));
 	head = read_ref(branch_ref("heads"));
 	staged = read_ref(branch_ref("staged"));
-	working = read_ref(branch_ref("working"));
 	headdb = child(head.target, 1);
 	if (hard || soft)
 	{
@@ -309,20 +352,9 @@ dolt_reset(PG_FUNCTION_ARGS)
 		if (hard)
 		{
 			bytea	   *db = child(commit, 1);
-			List	   *keep = state_tables(metadata(db, "database")),
-					   *live = state_tables(working_state());
-			ListCell   *lc;
 
-			foreach(lc, keep)
-				if (!name_selected(live, (char *) lfirst(lc)))
-					unsupported("reset --hard to a revision whose tables do not exist in the working set");
-			foreach(lc, live)
-				if (!name_selected(keep, (char *) lfirst(lc)))
-					drop_table((char *) lfirst(lc));
-			foreach(lc, keep)
-				restore_table(db, (char *) lfirst(lc));
+			replace_working(dg_current_branch(), db, NIL);
 			move_ref(branch_ref("staged"), staged, db);
-			move_ref(branch_ref("working"), working, db);
 			finish_merge();
 		}
 		if (!same(commit, head.target))
@@ -341,7 +373,10 @@ dolt_reset(PG_FUNCTION_ARGS)
 
 		if (!is_table && list_length(names) == 1)
 		{
-			/* Mixed reset to a revision: HEAD and staging move, working stays. */
+			/*
+			 * Mixed reset to a revision: HEAD and staging move, working
+			 * stays.
+			 */
 			bytea	   *commit = resolve((char *) linitial(names));
 
 			move_ref(branch_ref("heads"), head, commit);
@@ -398,18 +433,18 @@ dolt_clean(PG_FUNCTION_ARGS)
 	live = state_tables(workingjson);
 	if (names)
 		foreach(lc, names)
-		{
-			char	   *name = resolve_table_argument((char *) lfirst(lc), workingjson, workingjson, false);
+	{
+		char	   *name = resolve_table_argument((char *) lfirst(lc), workingjson, workingjson, false);
 
-			if (!name)
-				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: '%s'", (char *) lfirst(lc))));
-			if (!name_selected(tracked, name))
-				untracked = lappend(untracked, name);
-		}
+		if (!name)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: '%s'", (char *) lfirst(lc))));
+		if (!name_selected(tracked, name))
+			untracked = lappend(untracked, name);
+	}
 	else
 		foreach(lc, live)
-			if (!name_selected(tracked, (char *) lfirst(lc)))
-				untracked = lappend(untracked, lfirst(lc));
+		if (!name_selected(tracked, (char *) lfirst(lc)))
+		untracked = lappend(untracked, lfirst(lc));
 	if (!dry)
 		foreach(lc, untracked)
 			drop_table((char *) lfirst(lc));
@@ -519,7 +554,7 @@ create_branch_refs(const char *name, bytea *commit, bytea *working_db)
 	move_ref(psprintf("heads/%s", name), read_ref(psprintf("heads/%s", name)), commit);
 	move_ref(psprintf("working/%s", name), read_ref(psprintf("working/%s", name)), working_db ? working_db : child(commit, 1));
 	move_ref(psprintf("staged/%s", name), read_ref(psprintf("staged/%s", name)), child(commit, 1));
-	binding_prepare(name, working_db ? working_db : child(commit, 1), false);
+	replace_working(name, working_db ? working_db : child(commit, 1), NIL);
 }
 
 static void
@@ -553,7 +588,7 @@ branch_management(char **args, int n)
 		if (!strcmp(args[i], "-d") || !strcmp(args[i], "--delete"))
 			del = true;
 		else if (!strcmp(args[i], "-D"))
-			del = force = true;
+			del = true;
 		else if (!strcmp(args[i], "-m") || !strcmp(args[i], "--move"))
 			rename = true;
 		else if (!strcmp(args[i], "-c") || !strcmp(args[i], "--copy"))
@@ -589,6 +624,8 @@ branch_management(char **args, int n)
 				ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("Cannot delete checked out branch '%s'", name)));
 			if (!read_ref(psprintf("heads/%s", name)).target)
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch not found: %s", name)));
+			if (!force)
+				dg_branch_require_unused(name);
 			delete_branch_refs(name);
 		}
 		return true;
@@ -612,6 +649,8 @@ branch_management(char **args, int n)
 			delete_branch_refs(dst);
 			advance_snapshot();
 		}
+		if (rename && strcmp(src, dg_current_branch()) && !force)
+			dg_branch_require_unused(src);
 		require_clean_branch(src);
 		create_branch_refs(dst, srchead.target, NULL);
 		if (rename)

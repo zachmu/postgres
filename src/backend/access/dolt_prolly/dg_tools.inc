@@ -5,9 +5,7 @@
 static void
 run_user_query(const char *sql)
 {
-	set_config_option("search_path", api_search_path ? api_search_path : "public", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	run(sql, 0, NULL, NULL, NULL, true);
-	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	run_context(sql, 0, NULL, NULL, NULL, true);
 }
 
 /* ---- dolt_query_diff ----
@@ -23,7 +21,7 @@ typedef struct QueryRow
 	char	   *key;
 	Datum	   *values;
 	bool	   *nulls;
-} QueryRow;
+}			QueryRow;
 
 static int
 query_row_compare(const void *a, const void *b)
@@ -146,7 +144,7 @@ typedef struct HelpEntry
 	const char *synopsis;
 	const char *short_description;
 	const char *arguments;
-} HelpEntry;
+}			HelpEntry;
 
 static const HelpEntry help_entries[] = {
 	{"dolt_add", "procedure", "dolt_add('.' | '-A' | table...)", "Add working set changes to the staged set.", "{\"-A, --all\": \"Stage all tables\", \"table\": \"Table to stage\"}"},
@@ -200,7 +198,7 @@ dolt_help(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	for (i = 0; i < lengthof(help_entries); i++)
 	{
-		const HelpEntry *h = &help_entries[i];
+		const		HelpEntry *h = &help_entries[i];
 		Datum		values[6];
 		bool		nulls[6] = {false, false, false, false, false, false};
 
@@ -359,7 +357,7 @@ dolt_test_run(PG_FUNCTION_ARGS)
 	nest = begin_api();
 	if (arg && (!*arg || !strcmp(arg, "*")))
 		arg = NULL;
-	run("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM pg_catalog.pg_dolt_test WHERE $1::text IS NULL OR test_name=$1 OR test_group=$1 ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
+	run_context("SELECT test_name,test_group,test_query,assertion_type,assertion_comparator,assertion_value FROM dolt.tests WHERE $1::text IS NULL OR test_name=$1 OR test_group=$1 ORDER BY test_group NULLS FIRST,test_name COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(arg ? CStringGetTextDatum(arg) : (Datum) 0), arg ? NULL : "n", true);
 	n = SPI_processed;
 	if (n == 0 && arg)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("could not find tests for argument: %s", arg)));

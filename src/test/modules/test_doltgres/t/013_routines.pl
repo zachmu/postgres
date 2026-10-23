@@ -64,12 +64,12 @@ is($s->query_safe(q{SELECT f('x')}),'x_main','other branch routine survives drop
 $s->quit;
 my $e=$node->background_psql('empty_routines',on_error_stop=>0);
 $e->query_safe(q{CREATE FUNCTION f(input text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN input; END$$; SELECT dolt_add('.')});
-my ($out,$failed)=$e->query(q{SELECT length(dolt_commit('-m','invalid nested commit'))});
-is($failed,1,'nested version-control commit rejected');$e->{stderr}='';
+my ($out,$failed)=$e->query(q{SELECT length(dolt_commit('-m','scalar-wrapped commit'))});
+is($failed,0,'standalone scalar-wrapped version-control commit');$e->{stderr}='';
 $e->query_safe(q{SELECT dolt_checkout('-b','other')});
 ($out,$failed)=$e->query(q{CREATE OR REPLACE FUNCTION f(input text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN input||'!'; END$$});
-is($failed,1,'genesis revision with no namespace rejects creation without physical fallback');$e->{stderr}='';
+is($failed,0,'initialized public namespace supports branch-local routine replacement');$e->{stderr}='';
 $e->query_safe(q{SELECT dolt_checkout('main')});
 $e->query_safe(q{CREATE OR REPLACE FUNCTION f(input text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN input||'!'; END$$});
-is($e->query_safe(q{SELECT f('x')}),'x!','routine creation recovers after missing canonical namespace');
+is($e->query_safe(q{SELECT f('x')}),'x!','routine replacement on main remains independent');
 $e->quit;$node->stop;done_testing();

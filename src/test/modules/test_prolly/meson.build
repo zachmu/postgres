@@ -29,5 +29,6 @@ tests += {
     't/023_schema_tables.pl',
     't/024_rebase_stash.pl',
     't/025_compat.pl',
+    't/026_function_integration.pl',
   ]},
 }

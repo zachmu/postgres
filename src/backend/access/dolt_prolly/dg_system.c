@@ -13,6 +13,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace_d.h"
 #include "utils/lsyscache.h"
+#include "utils/acl.h"
 
 bool		dolt_show_system_tables = false;
 
@@ -73,7 +74,7 @@ typedef struct GeneratedTable
 	const char *function;
 	bool		hints;			/* accepts from/to commit hints */
 	bool		optional;		/* unknown base table yields an empty result */
-} GeneratedTable;
+}			GeneratedTable;
 
 static const GeneratedTable generated_tables[] = {
 	{"dolt_commit_diff_", "commit_diff", "dolt_commit_diff_table", true, false},
@@ -92,6 +93,7 @@ static const struct
 	const char *prefix;
 	const char *function;
 }			deletable_tables[] =
+
 {
 	{"dolt_conflicts_", "dolt_conflicts_clear"},
 	{"dolt_constraint_violations_", "dolt_constraint_violations_clear"},
@@ -392,7 +394,7 @@ dg_system_table(ParseState *pstate, RangeVar *rv)
 		return per_schema;
 	for (i = 0; i < lengthof(generated_tables); i++)
 	{
-		const GeneratedTable *g = &generated_tables[i];
+		const		GeneratedTable *g = &generated_tables[i];
 		size_t		plen = strlen(g->prefix);
 		const char *base;
 		char	   *qualified,
@@ -522,4 +524,74 @@ dg_system_function_columns(ParseState *pstate, FuncCall *fc)
 	else if (nargs == 3)
 		desc = dg_diff_layout("conflicts", args[2], args[0], args[1]);
 	return desc ? layout_columns(desc) : NIL;
+}
+
+/* User content has ordinary branch-aware storage. Built-in aliases only name
+ * these tables; they do not own a second copy of their rows. */
+bool		dg_internal_system_ddl;
+
+void
+dg_system_user_target(RangeVar *rv)
+{
+	const char *name = rv->relname;
+
+	if (rv->schemaname && !strcmp(rv->schemaname, "dolt"))
+	{
+		if (!strcmp(name, "docs"))
+			name = "dolt_docs";
+		else if (!strcmp(name, "tests"))
+			name = "dolt_tests";
+		else if (!strcmp(name, "query_catalog"))
+			name = "dolt_query_catalog";
+	}
+	if (strcmp(name, "dolt_docs") && strcmp(name, "dolt_tests") && strcmp(name, "dolt_query_catalog"))
+		return;
+	if (rv->dolt_revision || rv->catalogname)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("revision-qualified metadata writes are not supported")));
+	dg_ensure_user_table(name);
+	rv->schemaname = pstrdup("public");
+	rv->relname = pstrdup(name);
+}
+
+static void
+reserved_name(const char *name)
+{
+	if (name && pg_strncasecmp(name, "dolt", 4) == 0)
+		ereport(ERROR, (errcode(ERRCODE_RESERVED_NAME), errmsg("name \"%s\" is reserved for Dolt", name)));
+}
+
+void
+dg_system_check_ddl(Node *statement)
+{
+	if (!IsUnderPostmaster || dg_internal_system_ddl)
+		return;
+	if (IsA(statement, CreateStmt))
+		reserved_name(((CreateStmt *) statement)->relation->relname);
+	else if (IsA(statement, CreateForeignTableStmt))
+		reserved_name(((CreateForeignTableStmt *) statement)->base.relation->relname);
+	else if (IsA(statement, CompositeTypeStmt))
+		reserved_name(((CompositeTypeStmt *) statement)->typevar->relname);
+	else if (IsA(statement, CreateSchemaStmt))
+	{
+		CreateSchemaStmt *stmt = (CreateSchemaStmt *) statement;
+
+		reserved_name(stmt->schemaname ? stmt->schemaname : get_rolespec_name(stmt->authrole));
+	}
+	else if (IsA(statement, ViewStmt))
+		reserved_name(((ViewStmt *) statement)->view->relname);
+	else if (IsA(statement, CreateTableAsStmt))
+		reserved_name(((CreateTableAsStmt *) statement)->into->rel->relname);
+	else if (IsA(statement, CreateSeqStmt))
+		reserved_name(((CreateSeqStmt *) statement)->sequence->relname);
+	else if (IsA(statement, RenameStmt))
+	{
+		RenameStmt *stmt = (RenameStmt *) statement;
+
+		if (stmt->renameType == OBJECT_SCHEMA || stmt->renameType == OBJECT_TABLE ||
+			stmt->renameType == OBJECT_VIEW || stmt->renameType == OBJECT_MATVIEW ||
+			stmt->renameType == OBJECT_FOREIGN_TABLE || stmt->renameType == OBJECT_SEQUENCE || stmt->renameType == OBJECT_INDEX)
+			reserved_name(stmt->newname);
+	}
+	else if (IsA(statement, IndexStmt) && !((IndexStmt *) statement)->isconstraint)
+		reserved_name(((IndexStmt *) statement)->idxname);
 }

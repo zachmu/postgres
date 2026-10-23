@@ -251,7 +251,10 @@ system_alias(const RangeVar *rv)
 {
 	RangeVar   *alias;
 
-	if (!rv->schemaname || dg_system_namespace(rv->schemaname) || !OidIsValid(dg_system_relation(rv)))
+	if (rv->schemaname && !strcmp(rv->schemaname, "public") &&
+		(!strcmp(rv->relname, "dolt_docs") || !strcmp(rv->relname, "dolt_tests") || !strcmp(rv->relname, "dolt_query_catalog")))
+		return rv;
+	if (!rv->schemaname || !strcmp(rv->schemaname, "pg_catalog") || !OidIsValid(dg_system_relation(rv)))
 		return rv;
 	if (OidIsValid(get_namespace_oid(rv->schemaname, true)) &&
 		OidIsValid(get_relname_relid(rv->relname, get_namespace_oid(rv->schemaname, true))))

@@ -91,6 +91,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		move_ref(psprintf("working/%s", name), empty_ref, child(commit, 1));
 		move_ref(psprintf("staged/%s", name), empty_ref, child(commit, 1));
 		advance_snapshot();
+		replace_working(name, child(commit, 1), NIL);
 	}
 	else if (n >= 1 && args[0][0] != '-')
 	{
@@ -101,7 +102,10 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			already = true;
 		if (!commit || n > 1)
 		{
-			/* Not a branch: a tag or commit would detach HEAD; otherwise tables. */
+			/*
+			 * Not a branch: a tag or commit would detach HEAD; otherwise
+			 * tables.
+			 */
 			if (n == 1 && !*name)
 				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: cannot checkout empty string")));
 			if (n == 1 && (read_ref(psprintf("tags/%s", name)).target || (strlen(name) >= 8 && strspn(name, "0123456789abcdef") == strlen(name))))

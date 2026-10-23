@@ -558,6 +558,7 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Node	   *qual;
 
 	/* deleting from a generated Dolt conflict table clears its entries */
+	dg_system_user_target(stmt->relation);
 	qry = dg_system_delete(pstate, stmt);
 	if (qry)
 		return qry;
@@ -724,6 +725,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	targetPerms = ACL_INSERT;
 	if (isOnConflictUpdate)
 		targetPerms |= ACL_UPDATE;
+	dg_system_user_target(stmt->relation);
 	dg_system_insert_target(stmt->relation);
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
 										 false, false, targetPerms);
@@ -2485,6 +2487,7 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 
+	dg_system_user_target(stmt->relation);
 	qry->commandType = CMD_UPDATE;
 	pstate->p_is_insert = false;
 

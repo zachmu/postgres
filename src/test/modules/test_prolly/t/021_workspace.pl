@@ -77,7 +77,8 @@ is($s->query_safe(q{SELECT message FROM dolt_log('-n','1')}),'third','cherry-pic
 $s->query_safe(q{INSERT INTO t VALUES(5,'five')});
 my($out,$err)=$s->query(q{SELECT dolt_cherry_pick('main')});
 is($err,1,'cherry-pick requires a clean working set');
-$s->query(q{SELECT dolt_checkout('t')});
+$s->{stderr} = '';
+$s->query_safe(q{SELECT dolt_checkout('t')});
 $s->quit;
 # Branch management and commit-graph helpers.
 is(sql(q{SELECT dolt_branch('-c','main','copy')}),'0','copy branch');

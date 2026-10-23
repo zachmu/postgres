@@ -1,4 +1,4 @@
--- Native revision lookup requires a repository before the fixture is loaded.
+-- The initialized main branch has no accounts table before fixture loading.
 SELECT * FROM "contrib_regression/main".public.accounts;
 LOAD 'test_doltgres';
 CREATE SCHEMA dg_4_main_public;

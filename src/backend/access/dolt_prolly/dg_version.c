@@ -122,6 +122,7 @@ static bytea *merge_parent(void);
 static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
+static void replace_working(const char *branch, bytea *database, List *tables);
 static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -228,15 +229,47 @@ end_api(int nest)
 	SPI_finish();
 	AtEOXact_GUC(true, nest);
 }
+
+/* User SQL must not inherit the internal manifest lookup bypass. Nested
+ * provider calls may enter begin_api again, so preserve the caller path. */
+static void
+run_context(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly)
+{
+	int			depth = catalog_api_depth;
+	int			nest = NewGUCNestLevel();
+	char	   *path = pstrdup(api_search_path ? api_search_path : "public");
+	SubTransactionId subids[64];
+	CatalogView *previous = CatalogViewSwitch(NULL);
+
+	memcpy(subids, catalog_api_subids, sizeof(subids));
+
+	PG_TRY();
+	{
+		catalog_api_depth = 0;
+		set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
+						  GUC_ACTION_SAVE, true, 0, false);
+		run(sql, nargs, types, args, nulls, readonly);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		catalog_api_depth = depth;
+		memcpy(catalog_api_subids, subids, sizeof(subids));
+		AtEOXact_GUC(true, nest);
+	}
+	PG_END_TRY();
+}
+
 typedef struct StandaloneCall
 {
 	Oid			funcid;
 	FuncExpr   *call;
 	int			count;
-} StandaloneCall;
+}			StandaloneCall;
 
 static bool
-standalone_walker(Node *node, StandaloneCall *found)
+standalone_walker(Node *node, StandaloneCall * found)
 {
 	if (node == NULL)
 		return false;
@@ -475,7 +508,7 @@ canonical_database(const char *json, Datum *members, int count)
 	bool	   *nulls;
 	int			n;
 
-	run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT jsonb_set($1::jsonb || jsonb_build_object('encoding',current_setting('server_encoding')),'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	normalized = strcell(0, 1);
 	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	array = DatumGetArrayTypeP(cell(0, 1));
@@ -807,6 +840,7 @@ json_value(const char *json, const char *key)
 	run("SELECT $1::jsonb->>$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(key)), NULL, true);
 	return strcell(0, 1);
 }
+
 /* Doltgres derives the default committer email from the role and the client
  * address; local (socket or bootstrap) sessions use localhost. */
 static char *
@@ -819,6 +853,7 @@ default_email(const char *name)
 		host = MyProcPort->remote_host;
 	return psprintf("%s@%s", name, host);
 }
+
 /* An explicit --committer overrides the author-derived committer identity. */
 static char *commit_committer_name;
 static char *commit_committer_email;
@@ -874,8 +909,11 @@ ensure_repository(void)
 
 	if (head.target)
 		return;
-	/* The initial state records the namespaces that exist at initialization
-	 * (public for a fresh database), mirroring Doltgres's database creation. */
+
+	/*
+	 * The initial state records the namespaces that exist at initialization
+	 * (public for a fresh database), mirroring Doltgres's database creation.
+	 */
 	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
 	{
 		int			n = SPI_processed,
@@ -1184,7 +1222,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	move_ref(psprintf("heads/%s", args[0]), ref, commit);
 	move_ref(psprintf("working/%s", args[0]), empty_ref, child(commit, 1));
 	move_ref(psprintf("staged/%s", args[0]), empty_ref, child(commit, 1));
-	binding_prepare(args[0], child(commit, 1), false);
+	replace_working(args[0], child(commit, 1), NIL);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }

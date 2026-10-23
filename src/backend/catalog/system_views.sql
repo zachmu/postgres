@@ -1419,66 +1419,11 @@ REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;
 -- Relation-level access remains privileged until branch ACLs exist.
 CREATE SCHEMA dolt;
 
-CREATE TABLE pg_catalog.pg_dolt_remote (
-    remotename text PRIMARY KEY,
-    remoteurl text NOT NULL,
-    remotefetch jsonb NOT NULL,
-    remoteparams jsonb NOT NULL
-);
-CREATE TABLE pg_catalog.pg_dolt_reflog (
-    reflogname text NOT NULL,
-    reflogtime timestamptz NOT NULL,
-    reflogtarget bytea NOT NULL,
-    PRIMARY KEY (reflogname, reflogtime, reflogtarget)
-);
-CREATE TABLE pg_catalog.pg_dolt_doc (
-    docname text PRIMARY KEY,
-    doctext text
-);
-CREATE TABLE pg_catalog.pg_dolt_rebase (
-    rebasebranch text NOT NULL,
-    rebase_order float8 NOT NULL,
-    action text NOT NULL,
-    commit_hash text NOT NULL,
-    commit_message text,
-    PRIMARY KEY (rebasebranch, rebase_order)
-);
-CREATE TABLE pg_catalog.pg_dolt_test (
-    test_name text PRIMARY KEY,
-    test_group text,
-    test_query text NOT NULL,
-    assertion_type text NOT NULL CHECK (assertion_type IN ('expected_rows', 'expected_columns', 'expected_single_value')),
-    assertion_comparator text NOT NULL CHECK (assertion_comparator IN ('==', '!=', '<', '>', '<=', '>=')),
-    assertion_value text
-);
-CREATE TABLE pg_catalog.pg_dolt_backup (
-    backupname text PRIMARY KEY,
-    backupurl text NOT NULL
-);
-CREATE TABLE pg_catalog.pg_dolt_query_catalog (
-    id text PRIMARY KEY,
-    display_order int4 NOT NULL DEFAULT 0,
-    name text,
-    query text NOT NULL,
-    description text
-);
-CREATE TABLE pg_catalog.pg_dolt_branch_control (
-    database text NOT NULL,
-    branch text NOT NULL,
-    "user" text NOT NULL,
-    host text NOT NULL,
-    permissions text NOT NULL CHECK (permissions IN ('admin', 'write')),
-    PRIMARY KEY (database, branch, "user", host)
-);
-CREATE TABLE pg_catalog.pg_dolt_branch_namespace_control (
-    database text NOT NULL,
-    branch text NOT NULL,
-    "user" text NOT NULL,
-    host text NOT NULL,
-    PRIMARY KEY (database, branch, "user", host)
-);
-REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_test,
-    pg_catalog.pg_dolt_backup, pg_catalog.pg_dolt_query_catalog, pg_catalog.pg_dolt_branch_control, pg_catalog.pg_dolt_branch_namespace_control FROM PUBLIC;
+ALTER TABLE pg_catalog.pg_dolt_branch_control
+    ADD CONSTRAINT pg_dolt_branch_control_permissions_check
+    CHECK (permissions IN ('admin', 'write'));
+
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_backup, pg_catalog.pg_dolt_branch_control, pg_catalog.pg_dolt_branch_namespace_control FROM PUBLIC;
 
 -- Commits reachable from any branch, tag or remote-tracking ref.
 CREATE VIEW pg_dolt_commit_visible AS
@@ -1570,16 +1515,7 @@ CREATE VIEW dolt.remotes WITH (security_invoker=true) AS
     SELECT remotename AS name, remoteurl AS url, remotefetch AS fetch_specs, remoteparams AS params
     FROM pg_catalog.pg_dolt_remote ORDER BY 1;
 CREATE VIEW dolt.docs WITH (security_invoker=true) AS
-    SELECT docname AS doc_name, doctext AS doc_text FROM pg_catalog.pg_dolt_doc
-    UNION ALL
-    SELECT 'AGENT.md', pg_catalog.dolt_default_doc('AGENT.md')
-    WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dolt_doc WHERE docname='AGENT.md');
-CREATE RULE dolt_docs_insert AS ON INSERT TO dolt.docs DO INSTEAD
-    INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
-CREATE RULE dolt_docs_update AS ON UPDATE TO dolt.docs DO INSTEAD
-    UPDATE pg_catalog.pg_dolt_doc SET docname = NEW.doc_name, doctext = NEW.doc_text WHERE docname = OLD.doc_name;
-CREATE RULE dolt_docs_delete AS ON DELETE TO dolt.docs DO INSTEAD
-    DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_docs') AS t(doc_name text, doc_text text);
 CREATE VIEW dolt.rebase WITH (security_invoker=true) AS
     SELECT rebase_order, action, commit_hash, commit_message FROM pg_catalog.pg_dolt_rebase
     WHERE rebasebranch = pg_catalog.active_branch();
@@ -1595,12 +1531,11 @@ CREATE VIEW dolt.stashes WITH (security_invoker=true) AS
 CREATE VIEW dolt.help WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_help();
 CREATE VIEW dolt.tests WITH (security_invoker=true) AS
-    SELECT test_name, test_group, test_query, assertion_type, assertion_comparator, assertion_value
-    FROM pg_catalog.pg_dolt_test;
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_tests') AS t(test_name text,test_group text,test_query text,assertion_type text,assertion_comparator text,assertion_value text);
 CREATE VIEW dolt.backups WITH (security_invoker=true) AS
     SELECT backupname AS name, backupurl AS url FROM pg_catalog.pg_dolt_backup;
 CREATE VIEW dolt.query_catalog WITH (security_invoker=true) AS
-    SELECT id, display_order, name, query, description FROM pg_catalog.pg_dolt_query_catalog;
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_query_catalog') AS t(id text,display_order int4,name text,query text,description text);
 CREATE VIEW dolt.branch_control WITH (security_invoker=true) AS
     SELECT database, branch, "user", host, permissions FROM pg_catalog.pg_dolt_branch_control;
 CREATE VIEW dolt.branch_namespace_control WITH (security_invoker=true) AS
@@ -1670,12 +1605,6 @@ CREATE VIEW dolt_branch_control WITH (security_invoker=true) AS SELECT * FROM do
 CREATE VIEW dolt_branch_namespace_control WITH (security_invoker=true) AS SELECT * FROM dolt.branch_namespace_control;
 CREATE VIEW dolt_statistics WITH (security_invoker=true) AS SELECT * FROM dolt.statistics;
 CREATE VIEW dolt_branch_activity WITH (security_invoker=true) AS SELECT * FROM dolt.branch_activity;
-CREATE RULE dolt_docs_insert AS ON INSERT TO dolt_docs DO INSTEAD
-    INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
-CREATE RULE dolt_docs_update AS ON UPDATE TO dolt_docs DO INSTEAD
-    UPDATE pg_catalog.pg_dolt_doc SET docname = NEW.doc_name, doctext = NEW.doc_text WHERE docname = OLD.doc_name;
-CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
-    DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
     dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,

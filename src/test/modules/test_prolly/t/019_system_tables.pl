@@ -27,18 +27,14 @@ is(sql(q{SELECT dolt.branches.name FROM dolt.branches}),'main','dolt schema colu
 fails(q{SELECT * FROM branches},qr/does not exist/,'unqualified system table name is not implicit');
 fails(q{SELECT * FROM public.branches},qr/does not exist/,'public does not contain system tables');
 fails(q{SELECT * FROM other.dolt_branches},qr/does not exist/,'alias requires an existing schema');
-fails(q{CREATE SCHEMA dolt},qr/already exists/,'dolt schema is reserved');
+fails(q{CREATE SCHEMA dolt},qr/reserved/,'dolt schema is reserved');
 sql(q{CREATE TABLE branches(id int PRIMARY KEY) USING dolt_prolly_table; INSERT INTO branches VALUES(1)});
 is(sql(q{SELECT * FROM branches}),'1','user table shadows nothing');
 is(sql(q{SET search_path=dolt; SELECT name FROM branches}),'main','search_path selects dolt schema');
 is(sql(q{SET search_path=dolt; SELECT * FROM public.branches}),'1','qualified user table under dolt search_path');
 is(sql(q{SET search_path=public,dolt; SELECT * FROM BRANCHES}),'1','user table precedes dolt schema in search_path');
-sql(q{CREATE TABLE public.dolt_branches(id int PRIMARY KEY) USING dolt_prolly_table; INSERT INTO public.dolt_branches VALUES(7)});
-is(sql(q{SELECT * FROM public.dolt_branches}),'7','user table with alias name wins in its schema');
-is(sql(q{SELECT name FROM dolt_branches}),'main','implicit pg_catalog precedes a same-named user table');
-is(sql(q{SET search_path=public,pg_catalog; SELECT * FROM dolt_branches}),'7','explicit search_path order selects the user table');
-sql(q{DROP TABLE public.dolt_branches});
-is(sql(q{SELECT name FROM dolt_branches}),'main','alias restored after drop');
+fails(q{CREATE TABLE public.dolt_branches(id int PRIMARY KEY) USING dolt_prolly_table},qr/reserved/,'user tables cannot collide with system aliases');
+is(sql(q{SELECT name FROM public.dolt_branches}),'main','reserved alias remains available');
 is(sql(q{SET dolt_show_system_tables=1; SHOW dolt_show_system_tables}),'on','dolt_show_system_tables setting');
 # Status tracks staged and unstaged tables and schemas.
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table});
@@ -118,7 +114,7 @@ sql(q{UPDATE dolt_docs SET doc_text='updated' WHERE doc_name='README.md'});
 is(sql(q{SELECT doc_text FROM public.dolt_docs WHERE doc_name='README.md'}),'updated','document updated');
 sql(q{DELETE FROM dolt.docs WHERE doc_name='README.md'});
 is(sql(q{SELECT count(*) FROM dolt.docs}),'1','document deleted');
-is(sql(q{SELECT count(*) FROM dolt.status}),'0','dolt schema objects are not versioned');
+is(sql(q{SELECT table_name FROM dolt.status}),'public.dolt_docs','documents are versioned user data');
 # Tags and log keep their aliases.
 sql(q{SELECT dolt_tag('v1')});
 is(sql(q{SELECT tag_name FROM dolt.tags}),'v1','tags in dolt schema');
