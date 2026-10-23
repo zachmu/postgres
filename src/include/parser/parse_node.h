@@ -203,6 +203,7 @@ struct ParseState
 	List	   *p_namespace;	/* currently-referenceable RTEs (List of
 								 * ParseNamespaceItem) */
 	bool		p_lateral_active;	/* p_lateral_only items visible? */
+	Node	   *p_dolt_where;	/* raw WHERE clause, for generated Dolt tables */
 	List	   *p_ctenamespace; /* current namespace for common table exprs */
 	List	   *p_future_ctes;	/* common table exprs not yet in namespace */
 	CommonTableExpr *p_parent_cte;	/* this query's containing CTE */

@@ -15,6 +15,7 @@
 
 #include "postgres.h"
 #include "access/doltcatalog.h"
+#include "access/doltsystem.h"
 
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -520,6 +521,10 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 		Assert(list_length(pair) == 2);
 		fexpr = (Node *) linitial(pair);
 		coldeflist = (List *) lsecond(pair);
+
+		/* Dolt table functions derive their columns from their arguments */
+		if (coldeflist == NIL && IsA(fexpr, FuncCall))
+			coldeflist = dg_system_function_columns(pstate, (FuncCall *) fexpr);
 
 		/*
 		 * If we find a function call unnest() with more than one argument and
@@ -1079,6 +1084,14 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 
 		/* Check if it's a CTE or tuplestore reference */
 		nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
+		if (!nsitem)
+		{
+			/* dolt_diff_<table> and friends are generated from functions */
+			RangeFunction *generated = dg_system_table(pstate, rv);
+
+			if (generated)
+				nsitem = transformRangeFunction(pstate, generated);
+		}
 		if (!nsitem)
 			nsitem = addRangeTableEntryForDolt(pstate, rv);
 

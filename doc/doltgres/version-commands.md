@@ -19,7 +19,7 @@ not Dolt's 32-character hashes. Unsupported flags raise errors.
 | Function | Implemented arguments and result |
 |---|---|
 | `dolt_add(...)` | `.`, `-A` or `--all`; stage all supported live objects; `status bigint` = 0. |
-| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
+| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--committer 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
 | `dolt_branch(...)` | `name [start-point]`; create only; `status bigint` = 0. |
 | `dolt_tag(...)` | `name [start-point]`, optional `-m/--message`, `--author`; create annotated tag; `status bigint` = 0. |
 | `dolt_log(...)` | Optional revision, `-n/--max-count`, `--parents`, `--show-signature`; twelve-column history result. |
@@ -32,7 +32,8 @@ separated hashes; unsigned signature is NULL unless requested, then empty text.
 The `pg_catalog.dolt_log` view exposes default history. `pg_catalog.dolt_tags`
 has tag_name, tag_hash (target commit), tagger, email, date, message. No branch
 listing view yet. Committer defaults to the SQL role and role@client-host (localhost for local connections); dates
-are rendered as UTC timestamps. Author overrides do not change the committer.
+are rendered as UTC timestamps. Like Dolt, `--author` also becomes the committer
+unless `--committer 'Name <email>'` is given.
 
 Diff columns are from_table_name, to_table_name, diff_type, data_change,
 schema_change. Names are qualified; the missing side of an added/dropped table

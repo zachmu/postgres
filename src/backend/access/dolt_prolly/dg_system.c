@@ -41,3 +41,276 @@ dg_system_relation(const RangeVar *rv)
 		return InvalidOid;
 	return id;
 }
+
+/* ---- Generated per-table system tables and dynamic table functions ----
+ *
+ * dolt_diff_<table>, dolt_commit_diff_<table>, dolt_history_<table>,
+ * dolt_blame_<table> and dolt_workspace_<table> are rewritten in the parser
+ * into set-returning function calls with an explicit column definition list
+ * computed from the table's schema. The same column service lets
+ * dolt_diff(from, to, table) be used without a column definition list. */
+
+#include "catalog/namespace.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_expr.h"
+#include "parser/parse_node.h"
+#include "parser/parse_type.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/regproc.h"
+
+typedef struct GeneratedTable
+{
+	const char *prefix;
+	const char *kind;
+	const char *function;
+	bool		hints;			/* accepts from/to commit hints */
+	bool		optional;		/* unknown base table yields an empty result */
+} GeneratedTable;
+
+static const GeneratedTable generated_tables[] = {
+	{"dolt_commit_diff_", "commit_diff", "dolt_commit_diff_table", true, false},
+	{"dolt_diff_", "diff", "dolt_diff_table", true, false},
+	{"dolt_history_", "history", "dolt_history_table", false, false},
+	{"dolt_blame_", "blame", "dolt_blame_table", false, false},
+	{"dolt_workspace_", "workspace", "dolt_workspace_table", false, true},
+};
+
+static Node *
+text_constant(const char *value)
+{
+	A_Const    *c = makeNode(A_Const);
+
+	if (!value)
+	{
+		TypeCast   *cast = makeNode(TypeCast);
+
+		c->isnull = true;
+		c->location = -1;
+		cast->arg = (Node *) c;
+		cast->typeName = makeTypeNameFromNameList(list_make2(makeString("pg_catalog"), makeString("text")));
+		cast->location = -1;
+		return (Node *) cast;
+	}
+	c->val.sval.type = T_String;
+	c->val.sval.sval = pstrdup(value);
+	c->location = -1;
+	return (Node *) c;
+}
+
+/* Evaluate a raw argument expression to a text constant at parse time.
+ * Non-constant expressions (parameters, column references) return NULL. */
+static char *
+constant_text(ParseState *pstate, Node *raw)
+{
+	Node	   *expr;
+	Const	   *c;
+
+	if (IsA(raw, ColumnRef))
+		return NULL;
+	expr = transformExpr(pstate, copyObject(raw), EXPR_KIND_OTHER);
+	expr = coerce_to_target_type(pstate, expr, exprType(expr), TEXTOID, -1, COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+	if (!expr || contain_var_clause(expr) || contain_volatile_functions(expr))
+		return NULL;
+	expr = (Node *) evaluate_expr((Expr *) expr, TEXTOID, -1, InvalidOid);
+	if (!IsA(expr, Const))
+		return NULL;
+	c = (Const *) expr;
+	if (c->constisnull)
+		return NULL;
+	return TextDatumGetCString(c->constvalue);
+}
+
+static List *
+layout_columns(TupleDesc desc)
+{
+	List	   *result = NIL;
+	int			i;
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute a = TupleDescAttr(desc, i);
+
+		result = lappend(result, makeColumnDef(NameStr(a->attname), a->atttypid, a->atttypmod, a->attcollation));
+	}
+	return result;
+}
+
+/* Find "column = expression" filters in the raw WHERE clause for the
+ * generated table, so that diff partitions can be selected directly. */
+static void
+commit_hints(ParseState *pstate, Node *where, const char *refname, char **from, char **to)
+{
+	if (!where)
+		return;
+	if (IsA(where, BoolExpr) && ((BoolExpr *) where)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) where)->args)
+			commit_hints(pstate, (Node *) lfirst(lc), refname, from, to);
+		return;
+	}
+	if (IsA(where, A_Expr) && ((A_Expr *) where)->kind == AEXPR_OP &&
+		list_length(((A_Expr *) where)->name) == 1 && !strcmp(strVal(linitial(((A_Expr *) where)->name)), "="))
+	{
+		A_Expr	   *op = (A_Expr *) where;
+		Node	   *column = IsA(op->lexpr, ColumnRef) ? op->lexpr : IsA(op->rexpr, ColumnRef) ? op->rexpr : NULL;
+		Node	   *value = column == op->lexpr ? op->rexpr : op->lexpr;
+		ColumnRef  *ref = (ColumnRef *) column;
+		const char *name;
+
+		if (!column || column == value)
+			return;
+		if (list_length(ref->fields) == 2 && IsA(linitial(ref->fields), String) && strcmp(strVal(linitial(ref->fields)), refname))
+			return;
+		if (list_length(ref->fields) > 2 || !IsA(llast(ref->fields), String))
+			return;
+		name = strVal(llast(ref->fields));
+		if (!strcmp(name, "to_commit") && !*to)
+			*to = constant_text(pstate, value);
+		else if (!strcmp(name, "from_commit") && !*from)
+			*from = constant_text(pstate, value);
+	}
+}
+
+/* Resolve the base table of a generated name within a schema or the search
+ * path, returning its qualified logical name. */
+static char *
+generated_base(const RangeVar *rv, const char *base, bool optional)
+{
+	List	   *schemas = NIL;
+	ListCell   *lc;
+
+	if (rv->schemaname)
+	{
+		if (!OidIsValid(get_namespace_oid(rv->schemaname, true)))
+			return NULL;
+		schemas = list_make1(pstrdup(rv->schemaname));
+	}
+	else
+	{
+		List	   *path = fetch_search_path(false);
+		ListCell   *plc;
+
+		foreach(plc, path)
+		{
+			char	   *ns = get_namespace_name(lfirst_oid(plc));
+
+			if (ns && !dg_system_namespace(ns) && strncmp(ns, "pg_", 3))
+				schemas = lappend(schemas, ns);
+		}
+		if (schemas == NIL)
+			schemas = list_make1(pstrdup("public"));
+	}
+	foreach(lc, schemas)
+	{
+		RangeVar   *candidate = makeRangeVar((char *) lfirst(lc), pstrdup(base), -1);
+		Oid			relid = RangeVarGetRelidExtended(candidate, NoLock, RVR_MISSING_OK, NULL, NULL);
+
+		if (OidIsValid(relid) && get_rel_relkind(relid) == RELKIND_RELATION)
+			return quote_qualified_identifier((char *) lfirst(lc), base);
+	}
+	if (optional)
+		return quote_qualified_identifier((char *) linitial(schemas), base);
+	return NULL;
+}
+
+RangeFunction *
+dg_system_table(ParseState *pstate, RangeVar *rv)
+{
+	int			i;
+
+	if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")) || rv->relpersistence == RELPERSISTENCE_TEMP)
+		return NULL;
+	if (rv->schemaname && dg_system_namespace(rv->schemaname))
+		return NULL;
+	for (i = 0; i < lengthof(generated_tables); i++)
+	{
+		const GeneratedTable *g = &generated_tables[i];
+		size_t		plen = strlen(g->prefix);
+		const char *base;
+		char	   *qualified,
+				   *from = NULL,
+				   *to = NULL;
+		const char *refname;
+		TupleDesc	desc = NULL;
+		RangeFunction *rf;
+		FuncCall   *fc;
+		List	   *args;
+
+		if (strncmp(rv->relname, g->prefix, plen) || !rv->relname[plen])
+			continue;
+		base = rv->relname + plen;
+		qualified = generated_base(rv, base, g->optional);
+		if (!qualified)
+			return NULL;
+		refname = rv->alias ? rv->alias->aliasname : rv->relname;
+		if (g->hints)
+			commit_hints(pstate, pstate->p_dolt_where, refname, &from, &to);
+		if (!g->optional || OidIsValid(RangeVarGetRelidExtended(makeRangeVar((char *) strVal(linitial(stringToQualifiedNameList(qualified, NULL))), pstrdup(base), -1), NoLock, RVR_MISSING_OK, NULL, NULL)))
+			desc = dg_diff_layout(g->kind, qualified, NULL, NULL);
+		else
+		{
+			/* dolt_workspace_<unknown> is empty with the fixed columns only */
+			desc = CreateTemplateTupleDesc(3);
+			TupleDescInitEntry(desc, 1, "id", INT8OID, -1, 0);
+			TupleDescInitEntry(desc, 2, "staged", BOOLOID, -1, 0);
+			TupleDescInitEntry(desc, 3, "diff_type", TEXTOID, -1, 0);
+		}
+		args = list_make1(text_constant(qualified));
+		if (g->hints)
+			args = lappend(lappend(args, text_constant(from)), text_constant(to));
+		fc = makeFuncCall(list_make2(makeString("pg_catalog"), makeString(pstrdup(g->function))), args, COERCE_EXPLICIT_CALL, rv->location);
+		rf = makeNode(RangeFunction);
+		rf->functions = list_make1(list_make2(fc, layout_columns(desc)));
+		rf->alias = rv->alias ? rv->alias : makeAlias(rv->relname, NIL);
+		rf->lateral = false;
+		rf->ordinality = false;
+		rf->is_rowsfrom = false;
+		return rf;
+	}
+	return NULL;
+}
+
+/* Column definitions for Dolt table functions whose layout depends on the
+ * table named in their constant arguments. */
+List *
+dg_system_function_columns(ParseState *pstate, FuncCall *fc)
+{
+	const char *name;
+	int			nargs = list_length(fc->args);
+	char	  **args;
+	int			i;
+	TupleDesc	desc = NULL;
+
+	if (fc->agg_star || fc->agg_distinct || fc->func_variadic || fc->over || fc->agg_order || fc->agg_filter)
+		return NIL;
+	if (list_length(fc->funcname) == 2 && strcmp(strVal(linitial(fc->funcname)), "pg_catalog"))
+		return NIL;
+	if (list_length(fc->funcname) > 2)
+		return NIL;
+	name = strVal(llast(fc->funcname));
+	if (strcmp(name, "dolt_diff") && strcmp(name, "dolt_preview_merge_conflicts"))
+		return NIL;
+	args = palloc0(sizeof(char *) * Max(nargs, 1));
+	for (i = 0; i < nargs; i++)
+	{
+		args[i] = constant_text(pstate, (Node *) list_nth(fc->args, i));
+		if (!args[i])
+			return NIL;
+	}
+	if (!strcmp(name, "dolt_diff"))
+	{
+		if (nargs == 3)
+			desc = dg_diff_layout("diff", args[2], args[0], args[1]);
+		else if (nargs == 2)
+			desc = dg_diff_layout("diff", args[1], args[0], NULL);
+	}
+	else if (nargs == 3)
+		desc = dg_diff_layout("conflicts", args[2], args[0], args[1]);
+	return desc ? layout_columns(desc) : NIL;
+}

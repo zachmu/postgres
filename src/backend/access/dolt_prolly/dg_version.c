@@ -161,11 +161,23 @@ catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId pa
 				catalog_api_subids[i] = parent;
 }
 
+/* The caller's search_path, captured before the API scope replaces it. */
+static char *api_search_path;
+
 static int
 begin_api(void)
 {
 	MemoryContext c = CurrentMemoryContext;
 	int			nest = NewGUCNestLevel();
+
+	if (catalog_api_depth == 0)
+	{
+		const char *path = GetConfigOption("search_path", true, false);
+
+		if (api_search_path)
+			pfree(api_search_path);
+		api_search_path = MemoryContextStrdup(TopMemoryContext, path ? path : "public");
+	}
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("version-control prototype requires superuser")));
@@ -710,6 +722,10 @@ default_email(const char *name)
 		host = MyProcPort->remote_host;
 	return psprintf("%s@%s", name, host);
 }
+/* An explicit --committer overrides the author-derived committer identity. */
+static char *commit_committer_name;
+static char *commit_committer_email;
+
 static bytea *
 commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
 {
@@ -717,6 +733,18 @@ commit_object(bytea *database, bytea *parent, bytea *second, const char *message
 	const char *name = GetUserNameFromId(GetUserId(), false);
 	char	   *email = default_email(name);
 	int64		height = 1;
+
+	/* Dolt treats --author as the committer too unless --committer is given. */
+	if (commit_committer_name)
+	{
+		name = commit_committer_name;
+		email = commit_committer_email;
+	}
+	else if (author)
+	{
+		name = author;
+		email = (char *) author_email;
+	}
 
 	if (parent)
 	{
@@ -791,6 +819,14 @@ valid_name(const char *s)
 		if ((unsigned char) *p <= 32 || (unsigned char) *p == 127 || strchr("~^:?*[\\", *p))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid branch or tag name: %s", s)));
 }
+static int
+parent_count(bytea *commit)
+{
+	run("SELECT coalesce(array_length(objchildren,1),1)-1 FROM pg_dolt_object_visible WHERE objhash=$1 AND objkind='commit'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(commit)), NULL, true);
+	if (!SPI_processed)
+		return 0;
+	return DatumGetInt32(cell(0, 1));
+}
 static bytea *
 resolve(const char *revision)
 {
@@ -843,6 +879,8 @@ resolve(const char *revision)
 			unsupported("ancestor count outside supported range");
 		if (*orig == '^')
 		{
+			if (n && n > parent_count(hash))
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid ancestor spec: %s", revision)));
 			if (n)
 				hash = child(hash, n + 1);
 		}
@@ -850,6 +888,8 @@ resolve(const char *revision)
 			for (i = 0; i < n; i++)
 			{
 				CHECK_FOR_INTERRUPTS();
+				if (parent_count(hash) < 1)
+					ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid ancestor spec: %s", revision)));
 				hash = child(hash, 2);
 			}
 	}
@@ -912,7 +952,9 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	  **args = arguments(fcinfo, &n),
 			   *message = NULL,
 			   *author = NULL,
-			   *email = NULL;
+			   *email = NULL,
+			   *committer = NULL,
+			   *committer_email = NULL;
 	bool		all = false,
 				allow_empty = false,
 				skip_empty = false;
@@ -950,6 +992,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 				unsupported("missing author");
 			author_option(args[i], &author, &email);
 		}
+		else if (!strcmp(args[i], "--committer"))
+		{
+			if (++i == n)
+				unsupported("missing committer");
+			author_option(args[i], &committer, &committer_email);
+		}
 		else if (!strcmp(args[i], "--date"))
 		{
 			if (++i == n)
@@ -980,7 +1028,11 @@ dolt_commit(PG_FUNCTION_ARGS)
 		}
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("nothing to commit")));
 	}
+	commit_committer_name = committer;
+	commit_committer_email = committer_email;
 	commit = commit_object(database, head.target, merge_parent(), message, author, email, author_date);
+	commit_committer_name = NULL;
+	commit_committer_email = NULL;
 	move_ref(branch_ref("heads"), head, commit);
 	move_ref(branch_ref("staged"), staged, database);
 	if (all)
@@ -1241,3 +1293,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_alter.inc"
 #include "dg_tables.inc"
+#include "dg_diff.inc"

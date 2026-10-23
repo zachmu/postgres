@@ -1843,6 +1843,7 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.dolt_conflicts, pg_catalog.dolt_merge_status FROM PUBLIC;\n");
 	PG_CMD_PUTS("GRANT USAGE ON SCHEMA dolt TO PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_init(), pg_catalog.dolt_hashof(text), pg_catalog.hashof(text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff(text,text,text), pg_catalog.dolt_diff(text,text), pg_catalog.dolt_diff_table(text,text,text), pg_catalog.dolt_commit_diff_table(text,text,text), pg_catalog.dolt_history_table(text), pg_catalog.dolt_blame_table(text), pg_catalog.dolt_workspace_table(text), pg_catalog.dolt_column_diff(), pg_catalog.dolt_diff_stat(text,text), pg_catalog.dolt_diff_stat(text,text,text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branches(), pg_catalog.dolt_status(), pg_catalog.dolt_merge_status(), pg_catalog.dolt_diff_changes(), pg_catalog.dolt_remote(), pg_catalog.dolt_remote(text[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"

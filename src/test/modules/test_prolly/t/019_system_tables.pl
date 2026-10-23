@@ -54,7 +54,7 @@ is(sql(q{SELECT name,dirty FROM dolt.branches}),'main|t','session branch dirty')
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Author <a@example.com>')});
 is(sql(q{SELECT count(*) FROM dolt.status}),'0','clean after commit');
 is(sql(q{SELECT name,dirty,latest_commit_message,latest_author,latest_author_email FROM dolt.branches}),'main|f|first|Author|a@example.com','branch metadata follows head');
-is(sql(q{SELECT table_name,committer=current_user,message,data_change,schema_change FROM dolt.diff ORDER BY table_name}),"public.branches|t|first|t|t\npublic.t|t|first|t|t",'commit rows in dolt_diff');
+is(sql(q{SELECT table_name,committer,message,data_change,schema_change FROM dolt.diff ORDER BY table_name}),"public.branches|Author|first|t|t\npublic.t|Author|first|t|t",'commit rows in dolt_diff');
 is(sql("SELECT commit_hash FROM dolt.diff LIMIT 1"),$first,'dolt_diff reports commit hashes');
 is(sql(q{SELECT message FROM dolt.commits}),"first\nInitialize data repository",'commits newest first');
 is(sql(q{SELECT count(*) FROM dolt.commit_ancestors WHERE parent_hash IS NOT NULL}),'1','ancestor edge recorded');

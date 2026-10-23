@@ -1492,6 +1492,8 @@ CREATE VIEW dolt.merge_status WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_merge_status();
 CREATE VIEW dolt.diff WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_diff_changes();
+CREATE VIEW dolt.column_diff WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_column_diff();
 CREATE VIEW dolt.conflicts WITH (security_invoker=true) AS
     SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
            count(*)::numeric AS num_conflicts
@@ -1523,6 +1525,7 @@ CREATE VIEW dolt_tags WITH (security_invoker=true) AS SELECT * FROM dolt.tags;
 CREATE VIEW dolt_status WITH (security_invoker=true) AS SELECT * FROM dolt.status;
 CREATE VIEW dolt_merge_status WITH (security_invoker=true) AS SELECT * FROM dolt.merge_status;
 CREATE VIEW dolt_diff WITH (security_invoker=true) AS SELECT * FROM dolt.diff;
+CREATE VIEW dolt_column_diff WITH (security_invoker=true) AS SELECT * FROM dolt.column_diff;
 CREATE VIEW dolt_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.conflicts;
 CREATE VIEW dolt_remotes WITH (security_invoker=true) AS SELECT * FROM dolt.remotes;
 CREATE VIEW dolt_docs WITH (security_invoker=true) AS SELECT * FROM dolt.docs;
@@ -1534,4 +1537,4 @@ CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
     DELETE FROM pg_catalog.pg_dolt_doc WHERE docname = OLD.doc_name;
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
-    dolt_status, dolt_merge_status, dolt_diff, dolt_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;
+    dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_remotes, dolt_docs FROM PUBLIC;

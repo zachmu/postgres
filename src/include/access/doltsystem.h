@@ -2,9 +2,17 @@
 #ifndef DOLT_SYSTEM_H
 #define DOLT_SYSTEM_H
 #include "nodes/primnodes.h"
+#include "nodes/parsenodes.h"
+#include "access/tupdesc.h"
 
 extern PGDLLIMPORT bool dolt_show_system_tables;
 
+struct ParseState;
+struct RangeFunction;
+struct FuncCall;
 extern Oid	dg_system_relation(const RangeVar *rv);
 extern bool dg_system_namespace(const char *name);
+extern struct RangeFunction *dg_system_table(struct ParseState *pstate, RangeVar *rv);
+extern List *dg_system_function_columns(struct ParseState *pstate, struct FuncCall *fc);
+extern TupleDesc dg_diff_layout(const char *kind, const char *table, const char *from, const char *to);
 #endif
