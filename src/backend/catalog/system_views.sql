@@ -1451,7 +1451,34 @@ CREATE TABLE pg_catalog.pg_dolt_test (
     assertion_comparator text NOT NULL CHECK (assertion_comparator IN ('==', '!=', '<', '>', '<=', '>=')),
     assertion_value text
 );
-REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_test FROM PUBLIC;
+CREATE TABLE pg_catalog.pg_dolt_backup (
+    backupname text PRIMARY KEY,
+    backupurl text NOT NULL
+);
+CREATE TABLE pg_catalog.pg_dolt_query_catalog (
+    id text PRIMARY KEY,
+    display_order int4 NOT NULL DEFAULT 0,
+    name text,
+    query text NOT NULL,
+    description text
+);
+CREATE TABLE pg_catalog.pg_dolt_branch_control (
+    database text NOT NULL,
+    branch text NOT NULL,
+    "user" text NOT NULL,
+    host text NOT NULL,
+    permissions text NOT NULL CHECK (permissions IN ('admin', 'write')),
+    PRIMARY KEY (database, branch, "user", host)
+);
+CREATE TABLE pg_catalog.pg_dolt_branch_namespace_control (
+    database text NOT NULL,
+    branch text NOT NULL,
+    "user" text NOT NULL,
+    host text NOT NULL,
+    PRIMARY KEY (database, branch, "user", host)
+);
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_doc, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_test,
+    pg_catalog.pg_dolt_backup, pg_catalog.pg_dolt_query_catalog, pg_catalog.pg_dolt_branch_control, pg_catalog.pg_dolt_branch_namespace_control FROM PUBLIC;
 
 -- Commits reachable from any branch, tag or remote-tracking ref.
 CREATE VIEW pg_dolt_commit_visible AS
@@ -1570,6 +1597,53 @@ CREATE VIEW dolt.help WITH (security_invoker=true) AS
 CREATE VIEW dolt.tests WITH (security_invoker=true) AS
     SELECT test_name, test_group, test_query, assertion_type, assertion_comparator, assertion_value
     FROM pg_catalog.pg_dolt_test;
+CREATE VIEW dolt.backups WITH (security_invoker=true) AS
+    SELECT backupname AS name, backupurl AS url FROM pg_catalog.pg_dolt_backup;
+CREATE VIEW dolt.query_catalog WITH (security_invoker=true) AS
+    SELECT id, display_order, name, query, description FROM pg_catalog.pg_dolt_query_catalog;
+CREATE VIEW dolt.branch_control WITH (security_invoker=true) AS
+    SELECT database, branch, "user", host, permissions FROM pg_catalog.pg_dolt_branch_control;
+CREATE VIEW dolt.branch_namespace_control WITH (security_invoker=true) AS
+    SELECT database, branch, "user", host FROM pg_catalog.pg_dolt_branch_namespace_control;
+-- Dolt's histogram table approximated with one bucket per index from pg_statistic.
+CREATE VIEW dolt.statistics WITH (security_invoker=true) AS
+    SELECT current_database()::text AS database_name,
+           c.relname::text AS table_name,
+           CASE WHEN i.indisprimary THEN 'primary' ELSE ic.relname::text END AS index_name,
+           greatest(c.reltuples, 0)::numeric AS row_count,
+           CASE WHEN s.n_distinct IS NULL THEN greatest(c.reltuples, 0)::numeric
+                WHEN s.n_distinct < 0 THEN round((-s.n_distinct * greatest(c.reltuples, 0))::numeric)
+                ELSE s.n_distinct::numeric END AS distinct_count,
+           round((coalesce(s.null_frac, 0) * greatest(c.reltuples, 0))::numeric) AS null_count,
+           k.columns, k.types,
+           (s.histogram_bounds::text::text[])[array_length(s.histogram_bounds::text::text[], 1)] AS upper_bound,
+           CASE WHEN s.histogram_bounds IS NULL THEN NULL ELSE 1::numeric END AS upper_bound_cnt,
+           coalesce(st.last_analyze, st.last_autoanalyze) AS created_at,
+           (s.most_common_vals::text::text[])[1] AS mcv1,
+           (s.most_common_vals::text::text[])[2] AS mcv2,
+           (s.most_common_vals::text::text[])[3] AS mcv3,
+           (s.most_common_vals::text::text[])[4] AS mcv4,
+           (SELECT string_agg(round((f * greatest(c.reltuples, 0))::numeric)::text, ',')
+            FROM unnest(s.most_common_freqs[1:4]) f) AS mcv_counts
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_index i ON i.indrelid = c.oid
+    JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+    CROSS JOIN LATERAL (SELECT string_agg(a.attname, ',' ORDER BY x.ord) AS columns,
+                               string_agg(format_type(a.atttypid, a.atttypmod), ',' ORDER BY x.ord) AS types,
+                               min(a.attname::text) FILTER (WHERE x.ord = 1) AS first_column
+                        FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS x(attnum, ord)
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.attnum) k
+    LEFT JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = k.first_column
+    LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = c.oid
+    WHERE c.relkind = 'r' AND c.reltuples >= 0
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'dolt') AND n.nspname NOT LIKE 'pg\_%'
+    ORDER BY 2, 3;
+CREATE VIEW dolt.branch_activity WITH (security_invoker=true) AS
+    SELECT b.name AS branch, NULL::timestamptz AS last_read,
+           (SELECT max(r.reflogtime) FROM pg_catalog.pg_dolt_reflog r WHERE r.reflogname = 'heads/' || b.name) AS last_write,
+           0::int4 AS active_sessions, pg_catalog.pg_postmaster_start_time() AS system_start_time
+    FROM dolt.branches b;
 
 CREATE VIEW dolt_log WITH (security_invoker=true) AS SELECT * FROM dolt.log;
 CREATE VIEW dolt_branches WITH (security_invoker=true) AS SELECT * FROM dolt.branches;
@@ -1590,6 +1664,12 @@ CREATE VIEW dolt_rebase WITH (security_invoker=true) AS SELECT * FROM dolt.rebas
 CREATE VIEW dolt_stashes WITH (security_invoker=true) AS SELECT * FROM dolt.stashes;
 CREATE VIEW dolt_help WITH (security_invoker=true) AS SELECT * FROM dolt.help;
 CREATE VIEW dolt_tests WITH (security_invoker=true) AS SELECT * FROM dolt.tests;
+CREATE VIEW dolt_backups WITH (security_invoker=true) AS SELECT * FROM dolt.backups;
+CREATE VIEW dolt_query_catalog WITH (security_invoker=true) AS SELECT * FROM dolt.query_catalog;
+CREATE VIEW dolt_branch_control WITH (security_invoker=true) AS SELECT * FROM dolt.branch_control;
+CREATE VIEW dolt_branch_namespace_control WITH (security_invoker=true) AS SELECT * FROM dolt.branch_namespace_control;
+CREATE VIEW dolt_statistics WITH (security_invoker=true) AS SELECT * FROM dolt.statistics;
+CREATE VIEW dolt_branch_activity WITH (security_invoker=true) AS SELECT * FROM dolt.branch_activity;
 CREATE RULE dolt_docs_insert AS ON INSERT TO dolt_docs DO INSTEAD
     INSERT INTO pg_catalog.pg_dolt_doc(docname, doctext) VALUES (NEW.doc_name, NEW.doc_text);
 CREATE RULE dolt_docs_update AS ON UPDATE TO dolt_docs DO INSTEAD
@@ -1599,4 +1679,5 @@ CREATE RULE dolt_docs_delete AS ON DELETE TO dolt_docs DO INSTEAD
 REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
 REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
     dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
-    dolt_schema_conflicts, dolt_remotes, dolt_docs, dolt_rebase, dolt_stashes, dolt_help, dolt_tests FROM PUBLIC;
+    dolt_schema_conflicts, dolt_remotes, dolt_docs, dolt_rebase, dolt_stashes, dolt_help, dolt_tests, dolt_backups,
+    dolt_query_catalog, dolt_branch_control, dolt_branch_namespace_control, dolt_statistics, dolt_branch_activity FROM PUBLIC;
