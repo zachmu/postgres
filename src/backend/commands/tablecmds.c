@@ -10134,6 +10134,9 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	else
 		pkrel = table_openrv(fkconstraint->pktable, ShareRowExclusiveLock);
 
+	if (pkrel->rd_catalogview)
+		dg_catalog_foreign_lock(pkrel);
+
 	/*
 	 * Validity checks (permission checks wait till we have the column
 	 * numbers)
@@ -10944,8 +10947,8 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 	Oid			deleteTriggerOid = InvalidOid,
 				updateTriggerOid = InvalidOid;
 
-	Assert(CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
-	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(pkrel->rd_catalogview) || CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(rel->rd_catalogview) || CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
 
 	/*
 	 * Create action triggers to enforce the constraint, or skip them if the
@@ -11082,8 +11085,8 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 				updateTriggerOid = InvalidOid;
 
 	Assert(OidIsValid(parentConstr));
-	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
-	Assert(CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(rel->rd_catalogview) || CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(pkrel->rd_catalogview) || CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
 
 	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,

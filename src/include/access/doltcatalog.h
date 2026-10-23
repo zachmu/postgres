@@ -20,6 +20,8 @@ extern bool dg_catalog_type_visible(Oid id, const char *name, bool *visible);
 extern bool dg_catalog_relation_visible(Oid id, const char *name, bool *visible);
 extern void dg_catalog_rewrite_relation(RangeTblEntry *rte);
 extern bool dg_catalog_alter(Node *statement);
+extern Relation dg_catalog_trigger_relation(Oid id, const char *branch);
+extern void dg_catalog_foreign_lock(Relation definition);
 extern bool dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait);
 extern bool dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result);
 extern Relation dg_catalog_target(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);

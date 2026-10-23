@@ -239,17 +239,26 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	 */
 	if (form.storageimported)
 	{
-		Relation	source = try_relation_open(resource, NoLock);
-		RelFileLocator locator = {form.storagespc, form.storagedb, form.storagefile};
-		bool		compatible;
+		CatalogView *previous = CatalogViewSwitch(NULL);
 
-		if (!source)
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
-		/* The physical bridge validates the allocation, never the schema. */
-		compatible = RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
-		relation_close(source, NoLock);
-		if (!compatible)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("imported resource allocation changed")));
+		PG_TRY();
+		{
+			Relation	source = try_relation_open(resource, NoLock);
+			RelFileLocator locator = {form.storagespc, form.storagedb, form.storagefile};
+			bool		compatible;
+
+			if (!source)
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
+			compatible = RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
+			relation_close(source, NoLock);
+			if (!compatible)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("imported resource allocation changed")));
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(previous);
+		}
+		PG_END_TRY();
 	}
 
 	/*

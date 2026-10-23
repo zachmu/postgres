@@ -41,7 +41,8 @@ dg_catalog_create(Node *statement, const char *query)
 				skip = false;
 	char	   *name;
 	List	   *commands,
-			   *indexcmds = NIL;
+			   *indexcmds = NIL,
+			   *foreigncmds = NIL;
 	ListCell   *lc;
 	TupleDesc	desc;
 	Acl		   *acl;
@@ -98,6 +99,20 @@ dg_catalog_create(Node *statement, const char *query)
 			stmt = (CreateStmt *) command;
 		else if (IsA(command, IndexStmt))
 			indexcmds = lappend(indexcmds, command);
+		else if (IsA(command, AlterTableStmt))
+		{
+			AlterTableStmt *alter = castNode(AlterTableStmt, command);
+			ListCell   *cc;
+
+			foreach(cc, alter->cmds)
+			{
+				AlterTableCmd *action = lfirst_node(AlterTableCmd, cc);
+
+				if (action->subtype != AT_AddConstraint || !IsA(action->def, Constraint) || castNode(Constraint, action->def)->contype != CONSTR_FOREIGN)
+					unsupported("canonical CREATE auxiliary ALTER command");
+			}
+			foreigncmds = lappend(foreigncmds, alter);
+		}
 		else
 			unsupported("canonical CREATE auxiliary command");
 	}
@@ -290,5 +305,21 @@ dg_catalog_create(Node *statement, const char *query)
 			PopActiveSnapshot();
 	}
 	PG_END_TRY();
+	if (foreigncmds)
+	{
+		CommandCounterIncrement();
+		PushActiveSnapshot(GetLatestSnapshot());
+		PG_TRY();
+		{
+			foreach(lc, foreigncmds)
+				if (!dg_catalog_alter(lfirst(lc)))
+				elog(ERROR, "canonical foreign key CREATE was not handled");
+		}
+		PG_FINALLY();
+		{
+			PopActiveSnapshot();
+		}
+		PG_END_TRY();
+	}
 	return true;
 }

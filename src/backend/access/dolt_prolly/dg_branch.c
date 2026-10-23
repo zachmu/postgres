@@ -18,6 +18,23 @@
 #include "access/htup_details.h"
 
 static char *selected_branch;
+static const char *execution_branch;
+
+const char *
+dg_execution_branch(void)
+{
+	return execution_branch;
+}
+
+const char *
+dg_switch_execution_branch(const char *branch)
+{
+	const char *previous = execution_branch;
+
+	execution_branch = branch;
+	return previous;
+}
+
 static char *pending_branch;
 static bool registered;
 
@@ -47,6 +64,8 @@ dg_branch_require_unused(const char *name)
 const char *
 dg_current_branch(void)
 {
+	if (execution_branch)
+		return execution_branch;
 	if (IsUnderPostmaster && !session_branch_locked)
 	{
 		LOCKTAG		tag;
@@ -56,6 +75,28 @@ dg_current_branch(void)
 		session_branch_locked = true;
 	}
 	return selected_branch ? selected_branch : "main";
+}
+
+/* Backend-local exact branch identities for cached plans; never persisted. */
+uint64
+dg_branch_cache_id(void)
+{
+	static List *names;
+	const char *branch = dg_current_branch();
+	uint64		id = 1;
+	ListCell   *lc;
+	MemoryContext previous;
+
+	foreach(lc, names)
+	{
+		if (!strcmp(lfirst(lc), branch))
+			return id;
+		id++;
+	}
+	previous = MemoryContextSwitchTo(TopMemoryContext);
+	names = lappend(names, pstrdup(branch));
+	MemoryContextSwitchTo(previous);
+	return id;
 }
 
 /* Keep the AM's binding entrypoint relation-specific for future qualified RTEs. */

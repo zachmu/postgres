@@ -293,7 +293,7 @@ canonical_drop(Node *statement)
 			if (CatalogViewObjectContext(object->objectId) != view || object->objectSubId != 0 ||
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
-				 object->classId != ConstraintRelationId))
+				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
 		CatalogViewSwitch(NULL);

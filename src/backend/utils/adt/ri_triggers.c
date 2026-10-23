@@ -24,6 +24,10 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/doltcatalog.h"
+#include "access/doltbranch.h"
+#include "catalog/catalogview.h"
+#include "catalog/pg_am_d.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -143,6 +147,8 @@ typedef struct RI_QueryKey
 {
 	Oid			constr_id;		/* OID of pg_constraint entry */
 	int32		constr_queryno; /* query type ID, see RI_PLAN_XXX above */
+	uint64		branch_id;		/* exact backend-local execution branch
+								 * identity */
 } RI_QueryKey;
 
 /*
@@ -423,7 +429,8 @@ RI_FKey_check(TriggerData *trigdata)
 			querysep = "AND";
 			queryoids[i] = fk_type;
 		}
-		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+		if (pk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 		if (riinfo->hasperiod)
 		{
 			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
@@ -592,7 +599,8 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 			querysep = "AND";
 			queryoids[i] = pk_type;
 		}
-		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+		if (pk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 		if (riinfo->hasperiod)
 		{
 			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
@@ -880,7 +888,8 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 			appendStringInfoString(&querybuf, ", false)");
 		}
 
-		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+		if (fk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 
 		/* Prepare and save the plan */
 		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
@@ -1487,7 +1496,12 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 	 * this if we knew the INSERT trigger already fired, but there is no easy
 	 * way to know that.)
 	 */
-	if (slot_is_current_xact_tuple(oldslot))
+
+	/*
+	 * Prolly virtual tuples have no per-tuple XID; conservatively retain the
+	 * check.
+	 */
+	if (fk_rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID || slot_is_current_xact_tuple(oldslot))
 		return true;
 
 	/* If all old and new key values are equal, no check is needed */
@@ -2159,6 +2173,7 @@ ri_BuildQueryKey(RI_QueryKey *key, const RI_ConstraintInfo *riinfo,
 	else
 		key->constr_id = riinfo->constraint_id;
 	key->constr_queryno = constr_queryno;
+	key->branch_id = CatalogViewObjectContext(riinfo->constraint_id) ? dg_branch_cache_id() : 0;
 }
 
 /*
@@ -2455,6 +2470,8 @@ ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
 	else
 		query_rel = fk_rel;
 
+	dg_catalog_foreign_lock(query_rel);
+
 	/* Switch to proper UID to perform check as */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 	SetUserIdAndSecContext(RelationGetForm(query_rel)->relowner,
@@ -2508,6 +2525,8 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 		query_rel = pk_rel;
 	else
 		query_rel = fk_rel;
+
+	dg_catalog_foreign_lock(query_rel);
 
 	/*
 	 * The values for the query are taken from the table on which the trigger

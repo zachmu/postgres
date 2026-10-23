@@ -305,8 +305,10 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 	}
 }
 
+#include "dg_foreign_provider.inc"
+
 static void
-provider_constraints(DGProviderRows *rows, CatalogView *view, const char *definition)
+provider_constraints(DGProviderRows *rows, CatalogView *view, const char *definition, int count, char **definitions, char **kinds)
 {
 	char	   *name = json_value(definition, "name");
 	List	   *parts = stringToQualifiedNameList(name, NULL);
@@ -314,18 +316,21 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	Oid			ns = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 	TupleDesc	desc = provider_columns(definition);
 	char	  **names,
-			  **defs;
+			  **defs,
+			  **metadata;
 	int			n,
 				i;
 
-	run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT v->>0,v->>1,(v->2)::text FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	n = SPI_processed;
 	names = palloc_array(char *, Max(n, 1));
 	defs = palloc_array(char *, Max(n, 1));
+	metadata = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		names[i] = strcell(i, 1);
 		defs[i] = strcell(i, 2);
+		metadata[i] = strcell(i, 3);
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -354,6 +359,10 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 				break;
 			case CONSTR_UNIQUE:
 				form.contype = CONSTRAINT_UNIQUE;
+				break;
+			case CONSTR_FOREIGN:
+				form.contype = CONSTRAINT_FOREIGN;
+				constraint->keys = constraint->fk_attrs;
 				break;
 			case CONSTR_CHECK:
 				form.contype = CONSTRAINT_CHECK;
@@ -410,6 +419,8 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conkey, PointerGetDatum(construct_array(keys, k, INT2OID, 2, true, TYPALIGN_SHORT)));
 		if (expression)
 			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conbin, CStringGetTextDatum(nodeToString(expression)));
+		if (form.contype == CONSTRAINT_FOREIGN)
+			tuple = provider_foreign(rows, view, tuple, constraint, desc, metadata[i], count, definitions, kinds);
 		rows->rows[slot] = lappend(rows->rows[slot], tuple);
 		if (form.conindid)
 			provider_dependency(rows, RelationRelationId, form.conindid, 0, ConstraintRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
@@ -468,7 +479,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT((HeapTuple) lfirst(lc));
 
-		if (con->conindid == form.indexrelid)
+		if (con->conindid == form.indexrelid && (con->contype == CONSTRAINT_PRIMARY || con->contype == CONSTRAINT_UNIQUE))
 		{
 			form.indisprimary = con->contype == CONSTRAINT_PRIMARY;
 			form.indimmediate = !con->condeferrable;
@@ -781,7 +792,7 @@ provider_populate(CatalogView *view, bytea *database)
 		if (!strcmp(kinds[i], "table"))
 		{
 			provider_defaults(&rows, view, definitions[i]);
-			provider_constraints(&rows, view, definitions[i]);
+			provider_constraints(&rows, view, definitions[i], n, definitions, kinds);
 		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "index"))
