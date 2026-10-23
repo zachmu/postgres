@@ -757,6 +757,18 @@ dg_diff_layout(const char *kind, const char *table, const char *from, const char
 			   *b;
 	TupleDesc	result;
 
+	if (!strcmp(kind, "conflicts"))
+	{
+		result = conflict_layout(table, from, to);
+		end_api(nest);
+		return result;
+	}
+	if (!strcmp(kind, "violations"))
+	{
+		result = violation_layout(table);
+		end_api(nest);
+		return result;
+	}
 	if (from && !to)
 	{
 		char	   *f,

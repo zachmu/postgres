@@ -103,7 +103,7 @@ dolt_status(PG_FUNCTION_ARGS)
 	run("WITH h AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v),"
 		"s AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v),"
 		"w AS (SELECT v FROM jsonb_array_elements($3::jsonb->'members') v),"
-		"conflicts AS (SELECT DISTINCT v->>'table' AS name FROM jsonb_array_elements($4::jsonb->'conflicts') v),"
+		"conflicts AS (SELECT DISTINCT v->>'table' AS name FROM jsonb_array_elements($4::jsonb->'conflicts') v UNION SELECT DISTINCT v->>'table' FROM jsonb_array_elements(coalesce($4::jsonb->'violations','[]'::jsonb)) v),"
 		"tables AS ("
 		" SELECT 1 AS grp,coalesce(a.v->>'name',b.v->>'name') AS name,true AS staged,CASE WHEN a.v IS NULL THEN 'new table' WHEN b.v IS NULL THEN 'deleted' ELSE 'modified' END AS status"
 		" FROM (SELECT v FROM h WHERE v->>'kind'='table') a FULL JOIN (SELECT v FROM s WHERE v->>'kind'='table') b ON a.v->>'name'=b.v->>'name'"
@@ -120,7 +120,7 @@ dolt_status(PG_FUNCTION_ARGS)
 		" SELECT 4,coalesce(a.v->'definition'->>'name',b.v->'definition'->>'name'),false,CASE WHEN a.v IS NULL THEN 'new schema' ELSE 'deleted schema' END"
 		" FROM (SELECT v FROM s WHERE v->>'kind'='namespace') a FULL JOIN (SELECT v FROM w WHERE v->>'kind'='namespace') b ON a.v->'definition'->>'name'=b.v->'definition'->>'name'"
 		" WHERE a.v IS NULL OR b.v IS NULL) "
-		"SELECT name,staged,status FROM (SELECT 0 AS grp,name,false AS staged,'conflict'::text AS status FROM conflicts"
+		"SELECT name,staged,status FROM (SELECT 0 AS grp,name,false AS staged,CASE WHEN name IN (SELECT v->>'table' FROM jsonb_array_elements($4::jsonb->'conflicts') v) THEN 'conflict' ELSE 'constraint violation' END::text AS status FROM conflicts"
 		" UNION ALL SELECT grp,name,staged,status FROM tables WHERE name NOT IN (SELECT name FROM conflicts)) x ORDER BY grp,name COLLATE \"C\"",
 		4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(head), CStringGetTextDatum(staged), CStringGetTextDatum(working), CStringGetTextDatum(merge)), NULL, true);
 	return_rows(fcinfo, nest);
@@ -143,7 +143,7 @@ dolt_merge_status(PG_FUNCTION_ARGS)
 		char	   *source = json_value(json, "source");
 		char	   *unmerged;
 
-		run("SELECT coalesce(string_agg(name,', ' ORDER BY name COLLATE \"C\"),'') FROM (SELECT DISTINCT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS name FROM jsonb_array_elements($1::jsonb->'conflicts') v) x", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+		run("SELECT coalesce(string_agg(name,', ' ORDER BY name COLLATE \"C\"),'') FROM (SELECT DISTINCT (parse_ident(t))[array_length(parse_ident(t),1)] AS name FROM (SELECT v->>'table' AS t FROM jsonb_array_elements($1::jsonb->'conflicts') v UNION SELECT v->>'table' FROM jsonb_array_elements(coalesce($1::jsonb->'violations','[]'::jsonb)) v) y) x", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 		unmerged = strcell(0, 1);
 		values[1] = CStringGetTextDatum(source ? source : hex(child(pending.target, 2)));
 		values[2] = CStringGetTextDatum(hex(child(pending.target, 2)));

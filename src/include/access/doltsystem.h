@@ -14,5 +14,6 @@ extern Oid	dg_system_relation(const RangeVar *rv);
 extern bool dg_system_namespace(const char *name);
 extern struct RangeFunction *dg_system_table(struct ParseState *pstate, RangeVar *rv);
 extern List *dg_system_function_columns(struct ParseState *pstate, struct FuncCall *fc);
+extern Query *dg_system_delete(struct ParseState *pstate, DeleteStmt *stmt);
 extern TupleDesc dg_diff_layout(const char *kind, const char *table, const char *from, const char *to);
 #endif
