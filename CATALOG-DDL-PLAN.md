@@ -392,3 +392,32 @@ cross-database dependencies remain incomplete. Continue catalog-consumer audits
 and name-resolution/introspection testing. Worker context transport, session-lived
 handle/type-cache sizing and persistent history/storage garbage collection remain
 operational work. Retain the unexplained nested-DDL timeout as a stress-test target.
+
+#### Implemented provisional mutation checkpoint (2026-10-23)
+
+The common mutation context now stages native catalog INSERT/UPDATE/DELETE,
+validates identity constraints, exposes command-visible rows and refreshes local
+caches. Savepoint rollback removes child mutations; pinned scans retain their
+versions until release. Native multi-pass ALTER runs against this context with
+original-caller expression evaluation. Portable codecs retain column/default/CHECK
+values and reconstruct native tuples/dependencies on read.
+
+The native rewrite executor can now scan the original root and write a private
+prolly replacement stream through an optional table-AM callback. Final publication
+compacts dropped attribute slots and atomically installs matching schema, rows and
+rebuilt indexes. Tested coverage includes mixed ADD/DROP, constant/volatile defaults,
+NOT NULL, CHECK validation, non-indexed ALTER TYPE USING, caller input settings,
+statement cancellation, savepoints, simultaneous branch rewrites and crash recovery.
+
+Next: declare and implement independent index lifecycle effects in the publisher;
+indexed-column DROP/TYPE currently rejects before physical storage deletion.
+Then add foreign-key, sequence/identity/generated and further object codecs, and
+bring remaining CREATE/DROP consumers under the same contract. Stored expressions
+currently accept audited built-in scalar node families; user-defined functions,
+nonportable values and unsupported nodes reject. Nested utility commands reject
+inside a provisional mutation until their publication effects are modeled.
+Statistics fields are supported; branch-specific ANALYZE remains separate.
+Global role lifetime across retained history, worker transport, session handle
+reclamation and persistent GC remain open. Existing recovery/standby/cache-pressure
+suites continue to run; sustained DDL stress remains a follow-on, not a claim of
+production readiness.

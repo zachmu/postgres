@@ -205,3 +205,14 @@ refresh/reopen behavior is part of that interface, not a caller-specific workaro
 Decoded row eviction now exists, but stable handle mappings and native type/relation
 caches remain session-lived. Parallel context transport and persistent reclamation
 are still outstanding; current revision-dependent plans execute in the leader.
+
+#### Implemented provisional context contract (2026-10-23)
+
+Private native ALTER contexts now own staged tuples and command-visible local cache
+refresh. Their runtime handles never become canonical schema payloads. Retirement
+reclaims decoded rows once borrowed scans release their pins; cached handle/type
+lifetimes remain a separate concern. Native rewrite destinations are private row
+streams over the existing chunk store, not persisted schema projections or new
+per-revision physical relations. The final schema and matching data roots share
+PostgreSQL's transaction outcome. See the implemented checkpoint in
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md).

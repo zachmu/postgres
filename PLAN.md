@@ -904,3 +904,23 @@ one atomic schema/data/dependency publication. Do not extend this by accumulatin
 independent SQL-command rewrites. User authorization includes broad core changes
 and broad native/Doltgres tests; unsupported paths must remain explicit rather
 than silently accessing a physical user definition.
+
+### Provisional catalog implementation checkpoint (2026-10-23)
+
+The provisional mutation infrastructure is implemented: native catalog tuple
+insert/update/delete staging, command-counter visibility, local cache refresh,
+savepoint rollback and immutable-reader isolation. Native multi-pass ALTER now
+uses this infrastructure, including column layout changes, scalar defaults/CHECKs
+and non-indexed ALTER TYPE USING. An optional table-AM rewrite callback lets the
+native executor produce private replacement rows without physical heap swaps.
+Canonical schema and matching data/index roots publish in the same PostgreSQL
+transaction. Independent branches can rewrite concurrently.
+
+This completes the common staging/rewrite mechanism, not all catalog codecs or
+DDL operations. The next integration boundary is index lifecycle publication
+(creation/deletion/replacement), followed by foreign keys, sequences/identity,
+generated expressions and additional schema object families. Existing CREATE/DROP
+adapters remain; they have not all been replaced by the provisional controller.
+Shared-role lifetime, worker transport, handle reclamation, history GC and row-level
+writer concurrency remain as listed above. See
+[implementation and limitations](doc/doltgres/catalog-native-mutation.md).
