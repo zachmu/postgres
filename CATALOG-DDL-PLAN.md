@@ -312,3 +312,22 @@ selected compatibility tests pass, but the preserved same-name CREATE suite fail
 No completed writable architecture or fundamental impossibility has been proved.
 The next work is production integration through the gates above, not another
 private-namespace workaround or an isolated cache-only milestone.
+
+### Context coverage and catalog tuple storage exploration (2026-10-23)
+
+Prioritize propagating immutable revision context through stored catalog views,
+lookup consumers and cached queries, with broader routine Doltgres compatibility
+coverage. Existing canonical CREATE/DROP and limited ALTER establish the mutation
+path; this gate expands read-side coverage rather than adding DDL syntax.
+
+Explore retaining PostgreSQL catalog tuple representations as prolly payloads in
+branch-specific schema storage. This could let native DDL mutate catalog tuples
+through a contextual storage interface instead of reimplementing each operation
+in a separate canonical schema format. It is not ruled out, but simply copying
+raw heap tuples is insufficient: transaction headers, physical TOAST references,
+local OIDs, dependencies and serialized expressions contain nonportable identity.
+An experiment should separate tuple values from heap MVCC metadata, normalize or
+translate referenced identities, and establish contextual catalog writes, indexes,
+cache invalidation and dependency traversal. Retaining tuple structure does not
+alone prove all DDL supported. Defer this experiment until context coverage gives
+us better evidence about those boundaries.
