@@ -43,6 +43,7 @@ struct CatalogView
 	uint64		next_tuple;
 	bool		dirty;
 	void		(*mutation_validator) (Relation, HeapTuple);
+	void		(*storage_handler) (Relation, CatalogViewStorageEffect);
 	List	   *catalog_ids;
 	uint64		touched;
 	TransactionId creator;
@@ -72,6 +73,7 @@ struct CatalogViewScan
 	CatalogViewPin *pin;
 	Relation	relation;
 	List	   *rows;
+	bool		owns_rows;
 	HeapTuple  *ordered;
 	int			position;
 	bool		started;
@@ -293,8 +295,16 @@ release_scan_pin(void *arg)
 	}
 }
 
+static List *mutation_self_rows(CatalogView *view, Oid catalog);
+
 CatalogViewScan *
 CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys)
+{
+	return CatalogViewBeginScanSnapshot(relation, nkeys, keys, NULL);
+}
+
+CatalogViewScan *
+CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapshot snapshot)
 {
 	CatalogViewScan *scan;
 	ListCell   *lc;
@@ -350,6 +360,12 @@ CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys)
 			break;
 		}
 	}
+	if (CatalogViewIsProvisional(view) && snapshot && snapshot->snapshot_type == SNAPSHOT_SELF)
+	{
+		scan->rows = mutation_self_rows(view, RelationGetRelid(relation));
+		scan->owns_rows = true;
+	}
+
 	return scan;
 }
 
@@ -418,6 +434,8 @@ void
 CatalogViewEndScan(CatalogViewScan *scan)
 {
 	release_scan_pin(scan->pin);
+	if (scan->owns_rows)
+		list_free(scan->rows);
 	if (scan->ordered)
 		pfree(scan->ordered);
 	pfree(scan->keys);
@@ -877,7 +895,7 @@ typedef struct CatalogChange
 	CommandId	command;
 	SubTransactionId subid;
 	bool		aborted;
-}			CatalogChange;
+} CatalogChange;
 
 static void
 mutation_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
@@ -944,20 +962,17 @@ CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, 
 
 /* Validate against pending writes too, matching native unique-index behavior
  * before CCI. Catalogs have ordinary non-expression btree identity indexes. */
-static void
-check_mutation_tuple(CatalogView *view, Relation relation, ItemPointer target, HeapTuple proposed)
+static List *
+mutation_self_rows(CatalogView *view, Oid catalog)
 {
-	ListCell   *lc,
-			   *ic;
+	ListCell   *lc;
 	List	   *effective = NIL;
-	TupleDesc	desc = RelationGetDescr(relation);
-	bool		found_target = target == NULL;
 
 	foreach(lc, view->baseline)
 	{
 		CatalogViewRows *rows = lfirst(lc);
 
-		if (rows->catalog == RelationGetRelid(relation))
+		if (rows->catalog == catalog)
 			effective = list_copy(rows->tuples);
 	}
 	foreach(lc, view->changes)
@@ -967,7 +982,7 @@ check_mutation_tuple(CatalogView *view, Relation relation, ItemPointer target, H
 		ListCell   *tc;
 		bool		found = false;
 
-		if (change->aborted || change->catalog != RelationGetRelid(relation))
+		if (change->aborted || change->catalog != catalog)
 			continue;
 		foreach(tc, effective)
 		{
@@ -987,6 +1002,20 @@ check_mutation_tuple(CatalogView *view, Relation relation, ItemPointer target, H
 		list_free(effective);
 		effective = next;
 	}
+	return effective;
+}
+
+
+static void
+check_mutation_tuple(CatalogView *view, Relation relation, ItemPointer target, HeapTuple proposed)
+{
+	ListCell   *lc,
+			   *ic;
+	List	   *effective = NIL;
+	TupleDesc	desc = RelationGetDescr(relation);
+	bool		found_target = target == NULL;
+
+	effective = mutation_self_rows(view, RelationGetRelid(relation));
 	foreach(lc, effective)
 		if (target && ItemPointerEquals(target, &((HeapTuple) lfirst(lc))->t_self))
 		found_target = true;
@@ -1216,4 +1245,25 @@ CatalogViewNewObject(Oid catalog)
 	if (!CatalogViewIsProvisional(view) || !CatalogViewContains(view, catalog))
 		elog(ERROR, "invalid provisional object allocation");
 	return CatalogViewBindObject(view, catalog, psprintf("$provisional/%u", next_handle), InvalidOid);
+}
+
+/* Storage effects need an explicit publisher; immutable contexts never own files. */
+void
+CatalogViewSetStorageHandler(CatalogView *view, void (*handler) (Relation, CatalogViewStorageEffect))
+{
+	Assert(CatalogViewIsProvisional(view));
+	view->storage_handler = handler;
+}
+
+bool
+CatalogViewCaptureStorage(Relation relation, CatalogViewStorageEffect effect)
+{
+	CatalogView *view = CatalogViewObjectContext(RelationGetRelid(relation));
+
+	if (!view)
+		return false;
+	if (view != CatalogViewCurrent() || !CatalogViewIsProvisional(view) || !view->storage_handler)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("storage effect requires canonical publication")));
+	view->storage_handler(relation, effect);
+	return true;
 }

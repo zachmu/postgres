@@ -361,6 +361,18 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 		((Form_pg_namespace) GETSTRUCT(added))->oid = inserted;
 		namestrcpy(&((Form_pg_namespace) GETSTRUCT(added))->nspname, "new_namespace");
 		CatalogTupleInsert(relation, added);
+		{
+			CatalogViewScan *self = CatalogViewBeginScanSnapshot(relation, 0, NULL, SnapshotSelf);
+			HeapTuple	tuple;
+			bool		found = false;
+
+			while ((tuple = CatalogViewNext(self, ForwardScanDirection)) != NULL)
+				if (((Form_pg_namespace) GETSTRUCT(tuple))->oid == inserted)
+					found = true;
+			CatalogViewEndScan(self);
+			if (!found || SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(inserted)))
+				elog(ERROR, "SnapshotSelf must see pending inserts without exposing them to the current command");
+		}
 		CommandCounterIncrement();
 		if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(inserted)))
 			elog(ERROR, "staged insert is invisible");
@@ -434,6 +446,15 @@ test_catalog_mutation(PG_FUNCTION_ARGS)
 				elog(ERROR, "subtransaction rollback failed to restore parent catalog state");
 		}
 		CatalogTupleDelete(relation, &added->t_self);
+		{
+			CatalogViewScan *self = CatalogViewBeginScanSnapshot(relation, 0, NULL, SnapshotSelf);
+			HeapTuple	tuple;
+
+			while ((tuple = CatalogViewNext(self, ForwardScanDirection)) != NULL)
+				if (((Form_pg_namespace) GETSTRUCT(tuple))->oid == inserted)
+					elog(ERROR, "SnapshotSelf exposed a pending deletion");
+			CatalogViewEndScan(self);
+		}
 		CommandCounterIncrement();
 		if (SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(inserted)))
 			elog(ERROR, "staged delete is still visible");

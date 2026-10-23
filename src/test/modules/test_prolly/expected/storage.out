@@ -177,7 +177,6 @@ CREATE INDEX bad_operators ON p(id misleading_ops);
 ERROR:  prolly phase 2 does not support custom index operators
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
 ALTER TABLE p ALTER COLUMN id TYPE text;
-ERROR:  physical storage deletion requires canonical publication
 CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
 ERROR:  prolly storage rejects type gtsvector
 DETAIL:  Only codecs verified to exclude non-portable identifiers are supported.
@@ -185,5 +184,5 @@ HINT:  OID and other local identifier translation is not implemented.
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
 ERROR:  prolly phase 2 does not support non-MVCC snapshots
 SELECT * FROM p FOR UPDATE;
-ERROR:  prolly phase 2 does not support row locking
+ERROR:  row locking on versioned relations is not supported
 DROP TABLE p,q,u,large_text;

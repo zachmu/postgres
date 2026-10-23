@@ -52,6 +52,14 @@ extern void CatalogViewRejectPhysicalAccess(Relation relation);
 extern bool CatalogViewCaptureUpdate(Relation relation, ItemPointer tid, HeapTuple tuple);
 extern bool CatalogViewCaptureInsert(Relation relation, HeapTuple tuple);
 extern bool CatalogViewCaptureDelete(Relation relation, ItemPointer tid);
+typedef enum CatalogViewStorageEffect
+{
+	CATALOG_STORAGE_CREATE,
+	CATALOG_STORAGE_DROP,
+	CATALOG_STORAGE_BUILD
+} CatalogViewStorageEffect;
+extern void CatalogViewSetStorageHandler(CatalogView *view, void (*handler) (Relation, CatalogViewStorageEffect));
+extern bool CatalogViewCaptureStorage(Relation relation, CatalogViewStorageEffect effect);
 extern void CatalogViewBeginMutation(CatalogView *view);
 extern void CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, HeapTuple));
 extern bool CatalogViewIsProvisional(CatalogView *view);
@@ -60,6 +68,7 @@ extern void CatalogViewMutationCommandEnd(void);
 extern List *CatalogViewTuples(CatalogView *view, Oid catalog);
 extern void CatalogViewRetireMutation(CatalogView *view);
 extern CatalogViewScan *CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys);
+extern CatalogViewScan *CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapshot snapshot);
 extern void CatalogViewOrderScan(CatalogViewScan *scan, Relation index);
 extern HeapTuple CatalogViewNext(CatalogViewScan *scan, ScanDirection direction);
 extern void CatalogViewRescan(CatalogViewScan *scan, ScanKey keys);

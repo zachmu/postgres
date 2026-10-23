@@ -56,13 +56,17 @@ table_index_names(const char *schema_json, const char *table)
 	char	   *ns = strVal(linitial(stringToQualifiedNameList(table, NULL)));
 	int			i;
 
-	run("SELECT substring(d FROM 'INDEX (\"[^\"]+\"|[^ ]+) ON ') FROM jsonb_array_elements_text($1::jsonb->'indexes') d", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema_json)), NULL, true);
+	run("SELECT d FROM jsonb_array_elements_text($1::jsonb->'indexes') d", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema_json)), NULL, true);
 	for (i = 0; i < SPI_processed; i++)
 	{
-		char	   *raw = strcell(i, 1);
+		List	   *parsed = raw_parser(strcell(i, 1), RAW_PARSE_DEFAULT);
+		Node	   *node = linitial_node(RawStmt, parsed)->stmt;
+		IndexStmt  *index;
 
-		if (raw)
-			result = lappend(result, quote_qualified_identifier(ns, strip_identifier(raw)));
+		if (list_length(parsed) != 1 || !IsA(node, IndexStmt))
+			elog(ERROR, "invalid canonical index definition");
+		index = (IndexStmt *) node;
+		result = lappend(result, quote_qualified_identifier(ns, index->idxname));
 	}
 	return result;
 }

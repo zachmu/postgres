@@ -141,6 +141,19 @@ dg_catalog_alter(Node *statement)
 
 	if (rangevar_projection_hook || catalog_api_depth)
 		return false;
+	if (IsA(statement, IndexStmt) && dg_catalog_active())
+	{
+		IndexStmt  *index = copyObject((IndexStmt *) statement);
+		AlterTableStmt *alter = makeNode(AlterTableStmt);
+		AlterTableCmd *action = makeNode(AlterTableCmd);
+
+		alter->relation = index->relation;
+		alter->objtype = OBJECT_TABLE;
+		action->subtype = AT_AddIndex;
+		action->def = (Node *) index;
+		alter->cmds = list_make1(action);
+		statement = (Node *) alter;
+	}
 	if (!IsA(statement, AlterTableStmt) && !IsA(statement, CommentStmt))
 		return false;
 	if (!dg_catalog_active() && (!IsA(statement, AlterTableStmt) || ((AlterTableStmt *) statement)->objtype != OBJECT_TABLE))

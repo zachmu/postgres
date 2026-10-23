@@ -1142,7 +1142,7 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	scan->rs_strategy = NULL;	/* set in initscan */
 	scan->rs_cbuf = InvalidBuffer;
 
-	scan->rs_catalogview = CatalogViewBeginScan(relation, nkeys, key);
+	scan->rs_catalogview = CatalogViewBeginScanSnapshot(relation, nkeys, key, snapshot);
 	if (scan->rs_catalogview)
 	{
 		if (parallel_scan || (flags & (SO_TYPE_BITMAPSCAN | SO_TYPE_TIDSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_SAMPLESCAN)))

@@ -36,6 +36,7 @@
 #include "access/tableam.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/objectaccess.h"
@@ -379,6 +380,8 @@ heap_create(const char *relname,
 	 * For others, only the main fork is created; the other forks will be
 	 * created on demand.
 	 */
+	if (CatalogViewCaptureStorage(rel, CATALOG_STORAGE_CREATE))
+		create_storage = false;
 	if (create_storage)
 	{
 		if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
