@@ -536,8 +536,21 @@ provider_view(bytea *database)
 				{
 					Form_pg_attribute attr = TupleDescAttr(desc, j);
 
+					int			aslot = provider_catalog_index(AttributeRelationId);
+					HeapTuple	atuple;
+					bool		nullvalue;
+					Datum		value;
+
 					attr->attrelid = form.oid;
-					provider_add(&rows, AttributeRelationId, attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
+					atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
+					run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM (SELECT $1::jsonb->'columns'->$2 v) s", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(j)), NULL, true);
+					value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &nullvalue);
+					if (!nullvalue)
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, value);
+					value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &nullvalue);
+					if (!nullvalue && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(value)), ARR_DIMS(DatumGetArrayTypeP(value))) > 0)
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, value);
+					rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
 					provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
 				}
 				if (!index)

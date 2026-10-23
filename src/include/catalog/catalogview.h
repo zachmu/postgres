@@ -42,6 +42,17 @@ extern bool CatalogViewContains(CatalogView *view, Oid catalog);
 extern struct catcache *CatalogViewCache(CatalogView *view, struct catcache *base);
 extern void CatalogViewInvalidateCache(int cacheid, uint32 hashvalue);
 extern void CatalogViewRejectPhysicalAccess(Relation relation);
+
+/* A narrowly scoped mutation sink captures native writes without changing the
+ * immutable source view. Restore the previous sink in PG_FINALLY. */
+typedef struct CatalogViewMutation
+{
+	CatalogView *view;
+	void		(*update) (Relation relation, HeapTuple tuple, void *state);
+	void	   *state;
+}			CatalogViewMutation;
+extern CatalogViewMutation * CatalogViewSwitchMutation(CatalogViewMutation * mutation);
+extern bool CatalogViewCaptureUpdate(Relation relation, HeapTuple tuple);
 extern CatalogViewScan *CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys);
 extern void CatalogViewOrderScan(CatalogViewScan *scan, Relation index);
 extern HeapTuple CatalogViewNext(CatalogViewScan *scan, ScanDirection direction);

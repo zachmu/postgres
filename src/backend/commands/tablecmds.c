@@ -29,6 +29,7 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -9128,6 +9129,27 @@ ATExecSetOptions(Relation rel, const char *colName, Node *options,
 	table_close(attrelation, RowExclusiveLock);
 
 	return address;
+}
+
+/* Reuse native validation and tuple construction for an immutable catalog
+ * mutation sink. The caller owns permissions, branch locks and publication. */
+void
+AlterTableColumnMetadata(Relation rel, AlterTableCmd *cmd)
+{
+	Assert(CatalogViewObjectContext(RelationGetRelid(rel)) != NULL);
+	switch (cmd->subtype)
+	{
+		case AT_SetStatistics:
+			ATExecSetStatistics(rel, cmd->name, cmd->num, cmd->def, NoLock);
+			break;
+		case AT_SetOptions:
+		case AT_ResetOptions:
+			ATExecSetOptions(rel, cmd->name, cmd->def,
+							 cmd->subtype == AT_ResetOptions, NoLock);
+			break;
+		default:
+			elog(ERROR, "unsupported native catalog metadata command");
+	}
 }
 
 /*
