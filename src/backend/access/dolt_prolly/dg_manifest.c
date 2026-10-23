@@ -19,7 +19,7 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash"};
 
 static void
 manifest_begin(void)
@@ -118,7 +118,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3) || (id == 9 && n != 1))
+	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3) || (id == 9 && n != 1) || (id == 10 && n != 2) || (id == 11 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
 	if ((id == 1 || id == 6) && n == 1 &&
 		(VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
@@ -137,7 +137,9 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
 			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 :
-			id == 9 ? strcmp(child, "schema") == 0 : false;
+			id == 9 ? strcmp(child, "schema") == 0 :
+			id == 10 ? strcmp(child, "commit") == 0 :
+			id == 11 ? strcmp(child, i < 2 ? "database" : "commit") == 0 : false;
 		if (!valid)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s child for manifest %s", child, kind)));
 	}
@@ -237,10 +239,10 @@ static void
 check_name(text *name)
 {
 	char	   *s = text_to_cstring(name);
-	int			prefix = strncmp(s, "merge/", 6) == 0 ? 6 : strncmp(s, "views/", 6) == 0 ? 6 : strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : strncmp(s, "staged/", 7) == 0 ? 7 : 0;
+	int			prefix = strncmp(s, "merge/", 6) == 0 ? 6 : strncmp(s, "views/", 6) == 0 ? 6 : strncmp(s, "rebase/", 7) == 0 ? 7 : strncmp(s, "stash/", 6) == 0 ? 6 : strncmp(s, "heads/", 6) == 0 ? 6 : strncmp(s, "tags/", 5) == 0 ? 5 : strncmp(s, "working/", 8) == 0 ? 8 : strncmp(s, "staged/", 7) == 0 ? 7 : 0;
 
 	if (!prefix || strlen(s) == prefix || strlen(s) > 512)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/, staged/, working/, merge/ or views/ and a nonempty name (maximum 512 bytes)")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest ref requires heads/, tags/, staged/, working/, merge/, rebase/, stash/ or views/ and a nonempty name (maximum 512 bytes)")));
 }
 
 Datum
@@ -282,7 +284,8 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	else
 	{
 		char	   *kind = object_kind(PG_GETARG_BYTEA_PP(2), false);
-		char	   *expected = strncmp(text_to_cstring(name), "merge/", 6) == 0 ? "merge" : (strncmp(text_to_cstring(name), "working/", 8) == 0 || strncmp(text_to_cstring(name), "staged/", 7) == 0) ? "database" : "commit";
+		const char *refname = text_to_cstring(name);
+		char	   *expected = strncmp(refname, "merge/", 6) == 0 ? "merge" : strncmp(refname, "rebase/", 7) == 0 ? "rebase" : strncmp(refname, "stash/", 6) == 0 ? "stash" : (strncmp(refname, "working/", 8) == 0 || strncmp(refname, "staged/", 7) == 0) ? "database" : "commit";
 
 		if (strcmp(kind, expected) != 0 &&
 			!(strncmp(text_to_cstring(name), "tags/", 5) == 0 && strcmp(kind, "tag") == 0))
@@ -300,6 +303,9 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		manifest_execute("UPDATE pg_catalog.pg_dolt_ref SET reftarget=$3,reftoken=$4 WHERE refname=$1 AND reftoken=$2", 4, types, args, nulls, false, 0);
 	if (SPI_processed != 1)
 		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("manifest ref changed; reread and retry transaction")));
+	/* Branch and tag moves feed dolt_reflog. */
+	if (!PG_ARGISNULL(2) && (strncmp(text_to_cstring(name), "heads/", 6) == 0 || strncmp(text_to_cstring(name), "tags/", 5) == 0))
+		manifest_execute("INSERT INTO pg_catalog.pg_dolt_reflog(reflogname,reflogtime,reflogtarget) VALUES($1,clock_timestamp(),$3)", 4, types, args, nulls, false, 0);
 	/* Named revision bindings must be reanalyzed after ref publication. */
 	CacheInvalidateRelcacheByRelid(DoltRefRelationId);
 	SPI_finish();

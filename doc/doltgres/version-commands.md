@@ -19,7 +19,7 @@ not Dolt's 32-character hashes. Unsupported flags raise errors.
 | Function | Implemented arguments and result |
 |---|---|
 | `dolt_add(...)` | `.`, `-A` or `--all`; stage all supported live objects; `status bigint` = 0. |
-| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
+| `dolt_commit(...)` | Required `-m/--message`; optional `-A/--all` (also `-Am message` / `-am message`), `--author 'Name <email>'`, `--committer 'Name <email>'`, `--date`, `--allow-empty`, `--skip-empty`; `hash text`, NULL for skipped empty commit. |
 | `dolt_branch(...)` | `name [start-point]`; create only; `status bigint` = 0. |
 | `dolt_tag(...)` | `name [start-point]`, optional `-m/--message`, `--author`; create annotated tag; `status bigint` = 0. |
 | `dolt_log(...)` | Optional revision, `-n/--max-count`, `--parents`, `--show-signature`; twelve-column history result. |
@@ -31,8 +31,9 @@ commit_order is graph height. Parents are NULL unless requested, then comma-spac
 separated hashes; unsigned signature is NULL unless requested, then empty text.
 The `pg_catalog.dolt_log` view exposes default history. `pg_catalog.dolt_tags`
 has tag_name, tag_hash (target commit), tagger, email, date, message. No branch
-listing view yet. Committer defaults to the SQL role and role@localhost; dates
-are rendered as UTC timestamps. Author overrides do not change the committer.
+listing view yet. Committer defaults to the SQL role and role@client-host (localhost for local connections); dates
+are rendered as UTC timestamps. Like Dolt, `--author` also becomes the committer
+unless `--committer 'Name <email>'` is given.
 
 Diff columns are from_table_name, to_table_name, diff_type, data_change,
 schema_change. Names are qualified; the missing side of an added/dropped table
@@ -44,9 +45,10 @@ exist in either input, even when unchanged. This is not the row-level dolt_diff.
 History revisions support HEAD, branch/tag names, full hashes and a single
 `~N` (first-parent distance) or `^N` (parent ordinal) suffix. Diff also accepts
 STAGED and WORKING. Short hashes, compound revision expressions and ranges are
-not supported. A read of history before initialization returns an empty log.
-The first mutation lazily creates one repository initialization history node
-and initializes main refs. Doltgres additionally records CREATE DATABASE as an
+not supported. initdb initializes the repository (`dolt_init()`) in template1,
+so every database starts with main refs and one repository initialization
+commit recording the initial namespaces; see [system tables](system-tables.md).
+Doltgres additionally records CREATE DATABASE as an
 artifact of the Dolt storage library; that extra commit is deliberately not
 reproduced here. Cross-engine tests accept either bootstrap count while checking
 user-created history independently. Existing history is not rewritten.
@@ -56,7 +58,8 @@ user-created history independently. Existing history is not rewritten.
 Commit, branch and tag calls must be standalone SELECT commands outside explicit
 transaction blocks. The approved first-slice contract uses PostgreSQL's normal
 statement commit rather than attempting implicit commit of an already-open SQL
-transaction. Expressions, joins and per-row invocation are rejected. dolt_add
+transaction. A single call may be wrapped in scalar expressions (casts,
+`substring`, `length`); joins, subqueries and per-row invocation are rejected. dolt_add
 also requires a standalone SELECT, but can run inside BEGIN and rolls back with
 its transaction. Argument arrays and prepared-statement parameters are supported.
 

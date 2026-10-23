@@ -286,6 +286,7 @@ static void setup_run_file(FILE *cmdfd, const char *filename);
 static void setup_description(FILE *cmdfd);
 static void setup_collation(FILE *cmdfd);
 static void setup_privileges(FILE *cmdfd);
+static void setup_dolt_repository(FILE *cmdfd);
 static void set_info_version(void);
 static void setup_schema(FILE *cmdfd);
 static void load_plpgsql(FILE *cmdfd);
@@ -1840,6 +1841,15 @@ setup_privileges(FILE *cmdfd)
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff_summary(text, text, text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_checkout(text[]), pg_catalog.dolt_merge(text[]), pg_catalog.dolt_conflicts_resolve(text[]), pg_catalog.dolt_conflict_rows(text) FROM PUBLIC;\n");
 	PG_CMD_PUTS("REVOKE ALL ON pg_catalog.dolt_conflicts, pg_catalog.dolt_merge_status FROM PUBLIC;\n");
+	PG_CMD_PUTS("GRANT USAGE ON SCHEMA dolt TO PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_init(), pg_catalog.dolt_hashof(text), pg_catalog.hashof(text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_reset(), pg_catalog.dolt_reset(text[]), pg_catalog.dolt_clean(), pg_catalog.dolt_clean(text[]), pg_catalog.dolt_rm(text[]), pg_catalog.dolt_revert(text[]), pg_catalog.dolt_cherry_pick(text[]), pg_catalog.dolt_count_commits(text[]), pg_catalog.dolt_branch_status(text[]), pg_catalog.dolt_merge_base(text,text), pg_catalog.dolt_hashof_table(text), pg_catalog.dolt_hashof_db(), pg_catalog.dolt_hashof_db(text), pg_catalog.dolt_reflog(), pg_catalog.dolt_reflog(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_conflicts_table(text), pg_catalog.dolt_constraint_violations_table(text), pg_catalog.dolt_conflicts_clear(text), pg_catalog.dolt_constraint_violations_clear(text), pg_catalog.dolt_preview_merge_conflicts(text[]), pg_catalog.dolt_preview_merge_conflicts_summary(text[]), pg_catalog.dolt_verify_constraints(), pg_catalog.dolt_verify_constraints(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_patch(text,text), pg_catalog.dolt_patch(text,text,text), pg_catalog.dolt_schema_diff(text,text), pg_catalog.dolt_schema_diff(text,text,text), pg_catalog.dolt_ignore_table(text), pg_catalog.dolt_schemas_table(text), pg_catalog.dolt_procedures_table(text), pg_catalog.dolt_gc(), pg_catalog.dolt_gc(text[]), pg_catalog.dolt_purge_dropped_databases(), pg_catalog.dolt_undrop(text[]), pg_catalog.dolt_thread_dump() FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_rebase(text[]), pg_catalog.dolt_stash(text[]), pg_catalog.dolt_query_diff(text,text), pg_catalog.dolt_help(), pg_catalog.dolt_test_run(), pg_catalog.dolt_test_run(text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_stats_once(), pg_catalog.dolt_stats_wait(), pg_catalog.dolt_stats_flush(), pg_catalog.dolt_stats_stop(), pg_catalog.dolt_stats_restart(), pg_catalog.dolt_stats_gc(), pg_catalog.dolt_stats_purge(), pg_catalog.dolt_stats_info(), pg_catalog.dolt_stats_timers(text[]), pg_catalog.dolt_backup(text[]), pg_catalog.dolt_fetch(text[]), pg_catalog.dolt_push(text[]), pg_catalog.dolt_pull(text[]), pg_catalog.dolt_clone(text[]), pg_catalog.dolt_assume_cluster_role(text[]), pg_catalog.dolt_cluster_transition_to_standby(text[]) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_diff(text,text,text), pg_catalog.dolt_diff(text,text), pg_catalog.dolt_diff_table(text,text,text), pg_catalog.dolt_commit_diff_table(text,text,text), pg_catalog.dolt_history_table(text), pg_catalog.dolt_blame_table(text), pg_catalog.dolt_workspace_table(text), pg_catalog.dolt_column_diff(), pg_catalog.dolt_diff_stat(text,text), pg_catalog.dolt_diff_stat(text,text,text) FROM PUBLIC;\n");
+	PG_CMD_PUTS("REVOKE ALL ON FUNCTION pg_catalog.dolt_branches(), pg_catalog.dolt_status(), pg_catalog.dolt_merge_status(), pg_catalog.dolt_diff_changes(), pg_catalog.dolt_remote(), pg_catalog.dolt_remote(text[]) FROM PUBLIC;\n");
 	PG_CMD_PUTS("INSERT INTO pg_init_privs "
 				"  (objoid, classoid, objsubid, initprivs, privtype)"
 				"    SELECT"
@@ -1958,6 +1968,17 @@ setup_privileges(FILE *cmdfd)
 				"        pg_foreign_server"
 				"    WHERE"
 				"        srvacl IS NOT NULL;\n\n");
+}
+
+/*
+ * Initialize the Dolt version-control repository in template1 so that every
+ * database starts with a main branch whose initial commit records the
+ * initial namespaces.
+ */
+static void
+setup_dolt_repository(FILE *cmdfd)
+{
+	PG_CMD_PUTS("SELECT pg_catalog.dolt_init();\n\n");
 }
 
 /*
@@ -3159,6 +3180,8 @@ initialize_data_directory(void)
 	setup_run_file(cmdfd, dictionary_file);
 
 	setup_privileges(cmdfd);
+
+	setup_dolt_repository(cmdfd);
 
 	setup_schema(cmdfd);
 

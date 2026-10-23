@@ -25,6 +25,7 @@
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "access/doltsystem.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -556,6 +557,12 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 
+	/* deleting from a generated Dolt conflict table clears its entries */
+	dg_system_user_target(stmt->relation);
+	qry = dg_system_delete(pstate, stmt);
+	if (qry)
+		return qry;
+	qry = makeNode(Query);
 	qry->commandType = CMD_DELETE;
 
 	/* process the WITH clause independently of all else */
@@ -718,6 +725,8 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	targetPerms = ACL_INSERT;
 	if (isOnConflictUpdate)
 		targetPerms |= ACL_UPDATE;
+	dg_system_user_target(stmt->relation);
+	dg_system_insert_target(stmt->relation);
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
 										 false, false, targetPerms);
 
@@ -1415,6 +1424,9 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 
 	/* make WINDOW info available for window functions, too */
 	pstate->p_windowdefs = stmt->windowClause;
+
+	/* generated Dolt system tables may read commit filters from WHERE */
+	pstate->p_dolt_where = stmt->whereClause;
 
 	/* process the FROM clause */
 	transformFromClause(pstate, stmt->fromClause);
@@ -2475,6 +2487,7 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
 
+	dg_system_user_target(stmt->relation);
 	qry->commandType = CMD_UPDATE;
 	pstate->p_is_insert = false;
 

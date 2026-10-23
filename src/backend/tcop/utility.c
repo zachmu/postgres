@@ -21,6 +21,7 @@
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "access/doltsystem.h"
 #include "access/xlog.h"
 #include "catalog/catalogview.h"
 #include "catalog/namespace.h"
@@ -597,6 +598,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			PreventCommandDuringRecovery(GetCommandTagName(commandtag));
 	}
 
+	dg_system_check_ddl(parsetree);
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;

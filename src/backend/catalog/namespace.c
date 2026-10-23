@@ -20,6 +20,7 @@
 #include "postgres.h"
 #include "catalog/catalogview.h"
 #include "access/doltcatalog.h"
+#include "access/doltsystem.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -552,6 +553,9 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 				relId = InvalidOid;
 			else
 				relId = get_relname_relid(relation->relname, namespaceId);
+			/* schema.dolt_<table> aliases the built-in system table. */
+			if (!OidIsValid(relId))
+				relId = dg_system_relation(relation);
 		}
 		else
 		{

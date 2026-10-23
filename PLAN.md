@@ -924,3 +924,27 @@ adapters remain; they have not all been replaced by the provisional controller.
 Shared-role lifetime, worker transport, handle reclamation, history GC and row-level
 writer concurrency remain as listed above. See
 [implementation and limitations](doc/doltgres/catalog-native-mutation.md).
+
+### Dolt function integration decisions (2026-10-23)
+
+Follow func-review.txt: restore canonical schemas/dependencies with matching
+data/index roots; branch creation must replace working state, and deletion must
+invalidate it. Do not introduce branch incarnation identifiers for this repair.
+User SQL in helpers must re-enter branch-aware binding. Reserve relation and
+namespace names beginning with `dolt` for internal use. Documents, stored tests
+and saved queries belong in ordinary versioned prolly tables, not pg_catalog
+heap tables. Fix native catalog sanity invariants. Explicitly deferred defects
+are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Active-session deletion/write
+coordination may be deferred if necessary, but branch recreation must not retain
+old working roots.
+
+Integration implementation: canonical restore now publishes definitions and
+matching data/index roots together; hard reset restores dropped objects and
+whole-database dependencies. Branch create/copy overwrite working state and
+install fresh starting roots while reusing storage resources. This is currently
+O(tables + indexes), with chunk import, rather than manifest-only publication.
+Session locks deny ordinary deletion of an attached branch; forced-deletion
+old-snapshot/recreation authority remains deferred in KNOWN-ISSUES.md.
+Docs, stored tests and saved queries are public prolly tables reached through
+built-in aliases. The six administrative heap tables now use native catalog
+headers, C-collated text indexes and valid pg_proc argument metadata.

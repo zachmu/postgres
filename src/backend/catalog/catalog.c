@@ -32,6 +32,12 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/pg_dolt_remote.h"
+#include "catalog/pg_dolt_reflog.h"
+#include "catalog/pg_dolt_rebase.h"
+#include "catalog/pg_dolt_backup.h"
+#include "catalog/pg_dolt_branch_control.h"
+#include "catalog/pg_dolt_branch_namespace_control.h"
 #include "catalog/pg_dolt_binding.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
@@ -160,6 +166,12 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 {
 	switch (relid)
 	{
+		case DoltRemoteKeyIndexId:
+		case DoltReflogKeyIndexId:
+		case DoltRebaseKeyIndexId:
+		case DoltBackupKeyIndexId:
+		case DoltBranchControlKeyIndexId:
+		case DoltBranchNamespaceControlKeyIndexId:
 		case DoltRefKeyIndexId:
 		case DoltBindingKeyIndexId:
 		case ParameterAclParnameIndexId:
