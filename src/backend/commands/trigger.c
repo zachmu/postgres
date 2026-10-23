@@ -21,6 +21,9 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
+#include "access/doltbranch.h"
+#include "access/doltcatalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -2322,6 +2325,8 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	PgStat_FunctionCallUsage fcusage;
 	Datum		result;
 	MemoryContext oldContext;
+	CatalogView *previous;
+	const char *previous_branch;
 
 	/*
 	 * Protect against code paths that may fail to initialize transition table
@@ -2368,6 +2373,12 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 
 	pgstat_init_function_usage(fcinfo, &fcusage);
 
+	/*
+	 * Trigger SQL resolves names in the owning definition, including deferred
+	 * calls.
+	 */
+	previous_branch = dg_switch_execution_branch(trigdata->tg_relation->rd_catalogview ? dg_relation_branch(trigdata->tg_relation) : NULL);
+	previous = CatalogViewSwitch(trigdata->tg_relation->rd_catalogview);
 	MyTriggerDepth++;
 	PG_TRY();
 	{
@@ -2376,6 +2387,8 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	PG_FINALLY();
 	{
 		MyTriggerDepth--;
+		CatalogViewSwitch(previous);
+		dg_switch_execution_branch(previous_branch);
 	}
 	PG_END_TRY();
 
@@ -3694,6 +3707,37 @@ typedef uint32 TriggerFlags;
 #define AFTER_TRIGGER_2CTID				0x30000000
 #define AFTER_TRIGGER_CP_UPDATE			0x08000000
 #define AFTER_TRIGGER_TUP_BITS			0x38000000
+/* Event context outlives the executor that queued a cascaded/deferred event. */
+typedef struct TriggerCatalogPin
+{
+	MemoryContextCallback callback;
+	CatalogView *view;
+} TriggerCatalogPin;
+
+static void
+release_trigger_catalog(void *arg)
+{
+	TriggerCatalogPin *pin = arg;
+
+	CatalogViewRelease(pin->view);
+}
+
+static const char *
+retain_trigger_branch(Relation rel)
+{
+	TriggerCatalogPin *pin;
+
+	if (!rel->rd_catalogview)
+		return NULL;
+	pin = MemoryContextAlloc(TopTransactionContext, sizeof(*pin));
+	pin->view = rel->rd_catalogview;
+	CatalogViewRetain(pin->view);
+	pin->callback.func = release_trigger_catalog;
+	pin->callback.arg = pin;
+	MemoryContextRegisterResetCallback(TopTransactionContext, &pin->callback);
+	return MemoryContextStrdup(TopTransactionContext, dg_relation_branch(rel));
+}
+
 typedef struct AfterTriggerSharedData *AfterTriggerShared;
 
 typedef struct AfterTriggerSharedData
@@ -3701,6 +3745,8 @@ typedef struct AfterTriggerSharedData
 	TriggerEvent ats_event;		/* event type indicator, see trigger.h */
 	Oid			ats_tgoid;		/* the trigger's ID */
 	Oid			ats_relid;		/* the relation it's on */
+	const char *ats_branch;		/* explicit working branch for revision-bound
+								 * events */
 	Oid			ats_rolid;		/* role to execute the trigger */
 	CommandId	ats_firing_id;	/* ID for firing cycle */
 	struct AfterTriggersTableData *ats_table;	/* transition table access */
@@ -4174,6 +4220,8 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 			newshared->ats_firing_id == 0 &&
 			newshared->ats_table == evtshared->ats_table &&
 			newshared->ats_relid == evtshared->ats_relid &&
+			((!newshared->ats_branch && !evtshared->ats_branch) ||
+			 (newshared->ats_branch && evtshared->ats_branch && !strcmp(newshared->ats_branch, evtshared->ats_branch))) &&
 			newshared->ats_rolid == evtshared->ats_rolid &&
 			bms_equal(newshared->ats_modifiedcols,
 					  evtshared->ats_modifiedcols))
@@ -4752,9 +4800,10 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 				 * So let's fire it... but first, find the correct relation if
 				 * this is not the same relation as before.
 				 */
-				if (rel == NULL || RelationGetRelid(rel) != evtshared->ats_relid)
+				if (rel == NULL || RelationGetRelid(rel) != evtshared->ats_relid ||
+					(evtshared->ats_branch && strcmp(dg_relation_branch(rel), evtshared->ats_branch)))
 				{
-					rInfo = ExecGetTriggerResultRel(estate, evtshared->ats_relid,
+					rInfo = ExecGetTriggerResultRel(estate, evtshared->ats_relid, evtshared->ats_branch,
 													NULL);
 					rel = rInfo->ri_RelationDesc;
 					/* Catch calls with insufficient relcache refcounting */
@@ -4788,10 +4837,10 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 					Assert(OidIsValid(event->ate_src_part) &&
 						   OidIsValid(event->ate_dst_part));
 					src_rInfo = ExecGetTriggerResultRel(estate,
-														event->ate_src_part,
+														event->ate_src_part, NULL,
 														rInfo);
 					dst_rInfo = ExecGetTriggerResultRel(estate,
-														event->ate_dst_part,
+														event->ate_dst_part, NULL,
 														rInfo);
 				}
 				else
@@ -5768,8 +5817,40 @@ SetConstraintStateAddItem(SetConstraintState state,
  *	Execute the SET CONSTRAINTS ... utility command.
  * ----------
  */
+static void AfterTriggerSetStateContext(ConstraintsSetStmt *stmt);
+
 void
 AfterTriggerSetState(ConstraintsSetStmt *stmt)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	bool		pushed;
+
+	/* ALL does not resolve catalog names and must not establish a snapshot. */
+	if (stmt->constraints == NIL)
+	{
+		AfterTriggerSetStateContext(stmt);
+		return;
+	}
+	pushed = !ActiveSnapshotSet();
+
+	if (pushed)
+		PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		CatalogViewSwitch(dg_catalog_session_view());
+		AfterTriggerSetStateContext(stmt);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
+}
+
+static void
+AfterTriggerSetStateContext(ConstraintsSetStmt *stmt)
 {
 	int			my_level = GetCurrentTransactionNestLevel();
 
@@ -5865,7 +5946,7 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 			found = false;
 			foreach(nslc, namespacelist)
 			{
-				Oid			namespaceId = lfirst_oid(nslc);
+				Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nslc));
 				SysScanDesc conscan;
 				ScanKeyData skey[2];
 				HeapTuple	tup;
@@ -6083,6 +6164,21 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
  * of knowledge of the trigger semantics we can't do this in general.
  * ----------
  */
+static bool
+trigger_event_matches_relation(AfterTriggerShared shared, Oid relid)
+{
+	const char *name;
+
+	if (shared->ats_branch && strcmp(shared->ats_branch, dg_current_branch()))
+		return false;
+	if (shared->ats_relid == relid)
+		return true;
+	if (!shared->ats_branch || !CatalogViewObjectContext(relid))
+		return false;
+	name = CatalogViewObjectIdentity(relid, RelationRelationId);
+	return !strcmp(name, CatalogViewObjectIdentity(shared->ats_relid, RelationRelationId));
+}
+
 bool
 AfterTriggerPendingOnRel(Oid relid)
 {
@@ -6103,7 +6199,7 @@ AfterTriggerPendingOnRel(Oid relid)
 		if (event->ate_flags & AFTER_TRIGGER_DONE)
 			continue;
 
-		if (evtshared->ats_relid == relid)
+		if (trigger_event_matches_relation(evtshared, relid))
 			return true;
 	}
 
@@ -6121,7 +6217,7 @@ AfterTriggerPendingOnRel(Oid relid)
 			if (event->ate_flags & AFTER_TRIGGER_DONE)
 				continue;
 
-			if (evtshared->ats_relid == relid)
+			if (trigger_event_matches_relation(evtshared, relid))
 				return true;
 		}
 	}
@@ -6537,6 +6633,7 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			(trigger->tginitdeferred ? AFTER_TRIGGER_INITDEFERRED : 0);
 		new_shared.ats_tgoid = trigger->tgoid;
 		new_shared.ats_relid = RelationGetRelid(rel);
+		new_shared.ats_branch = retain_trigger_branch(rel);
 		new_shared.ats_rolid = GetUserId();
 		new_shared.ats_firing_id = 0;
 		if ((trigger->tgoldtable || trigger->tgnewtable) &&

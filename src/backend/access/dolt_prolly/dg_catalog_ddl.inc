@@ -55,7 +55,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 				nest;
 	bool		pushed = false;
 
-	if (!IsUnderPostmaster || catalog_new_member(RelationGetRelid(rel)))
+	if (!IsUnderPostmaster || CatalogViewIsProvisional(rel->rd_catalogview) || catalog_new_member(RelationGetRelid(rel)))
 		return;
 	GetUserIdAndSecContext(&user, &security);
 	if (!ActiveSnapshotSet() || (snapshot && IsMVCCSnapshot(snapshot)))

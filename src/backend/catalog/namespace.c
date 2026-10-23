@@ -915,7 +915,7 @@ RelnameGetRelid(const char *relname)
 
 	foreach(l, activeSearchPath)
 	{
-		Oid			namespaceId = lfirst_oid(l);
+		Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(l));
 
 		relid = get_relname_relid(relname, namespaceId);
 		if (OidIsValid(relid))

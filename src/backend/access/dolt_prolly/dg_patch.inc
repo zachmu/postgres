@@ -255,7 +255,7 @@ table_patch(const char *from_rev, const char *to_rev, const char *name, List **s
 		diff_table_close(b);
 		return;
 	}
-	else if (strcmp(a->schema, b->schema))
+	else if (!same_schema_definition(a->schema, b->schema))
 		*schema_stmts = alter_table_statements(a, b);
 	e.table = quoted_identifier(strVal(lsecond(stringToQualifiedNameList(b->name, NULL))));
 	if (a->present && b->present && (a->keyed != b->keyed || (a->keyed && !same_key_columns(a, b))))
@@ -364,7 +364,7 @@ dolt_schema_diff(PG_FUNCTION_ARGS)
 		Datum		values[4];
 		bool		nulls[4] = {false, false, false, false};
 
-		if ((!a->present && !b->present) || (a->present && b->present && !strcmp(a->schema, b->schema)))
+		if ((!a->present && !b->present) || (a->present && b->present && same_schema_definition(a->schema, b->schema)))
 			continue;
 		values[0] = CStringGetTextDatum(a->present ? a->name : "");
 		values[1] = CStringGetTextDatum(b->present ? b->name : "");

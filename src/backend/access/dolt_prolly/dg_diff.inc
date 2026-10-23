@@ -1,3 +1,13 @@
+/* Retained property-tree JSON and native JSONB output have different whitespace
+ * and property ordering. Compare their values, not their presentation. */
+static bool
+same_schema_definition(const char *a, const char *b)
+{
+	return DatumGetBool(DirectFunctionCall2(jsonb_eq,
+											DirectFunctionCall1(jsonb_in, CStringGetDatum(a)),
+											DirectFunctionCall1(jsonb_in, CStringGetDatum(b))));
+}
+
 /* Row-level diff engine and generated per-table system tables.
  * See doc/doltgres/row-diff.md. Included by dg_version.c. */
 
@@ -126,13 +136,6 @@ schema_descriptor(const char *json, int *nkeys, int **keys)
 		}
 	}
 	return desc;
-}
-
-static char *
-table_schema_json(Oid relid)
-{
-	run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',NULL)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, VC_TYPES(OIDOID), VC_ARGS(ObjectIdGetDatum(relid)), NULL, true);
-	return strcell(0, 1);
 }
 
 /* Logical rows of a content tree, aligned on primary-key values. */
@@ -281,7 +284,7 @@ diff_table_working(const char *name, bool rows)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("diff of non-prolly table %s", name)));
 		}
 		t->present = true;
-		t->schema = table_schema_json(relid);
+		t->schema = native_schema_definition(relid);
 		t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
 		FreeTupleDesc(t->desc);
 		t->desc = CreateTupleDescCopy(RelationGetDescr(rel));
@@ -1608,7 +1611,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		values[10] = Int64GetDatum(s.old_cells);
 		values[11] = Int64GetDatum(s.new_cells);
 		/* Unchanged tables produce no row, even when named explicitly. */
-		if (s.rows_added || s.rows_deleted || s.rows_modified || !a->present || !b->present || strcmp(a->schema, b->schema))
+		if (s.rows_added || s.rows_deleted || s.rows_modified || !a->present || !b->present || !same_schema_definition(a->schema, b->schema))
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		diff_table_close(a);
 		diff_table_close(b);

@@ -129,7 +129,9 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 {
-	DGState    *s = snap == SnapshotAny ? dg_load_tid(rel, dg_id(tid)) : dg_load(rel, snap);
+	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
+		dg_catalog_mutation_load(rel, snap) :
+		(snap == SnapshotAny ? dg_load_tid(rel, dg_id(tid)) : dg_load(rel, snap));
 	uint8		key[8];
 	PLSlice		k = {key, 8};
 	PLValue		value;
@@ -417,7 +419,7 @@ static void
 validate_alter(Relation rel, struct AlterTableCmd *cmd)
 {
 	if (CatalogViewIsProvisional(rel->rd_catalogview) &&
-		(cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
+		(cmd->subtype == AT_AlterConstraint || cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
 		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
 		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn || cmd->subtype == AT_ColumnDefault || cmd->subtype == AT_AddConstraint || cmd->subtype == AT_DropConstraint || cmd->subtype == AT_ValidateConstraint || cmd->subtype == AT_AlterColumnType))
 		return;
@@ -432,6 +434,8 @@ validate_alter(Relation rel, struct AlterTableCmd *cmd)
 	{
 		Constraint *constraint = (Constraint *) cmd->def;
 
+		if (constraint->contype == CONSTR_FOREIGN)
+			return;
 		if ((constraint->contype == CONSTR_PRIMARY || constraint->contype == CONSTR_UNIQUE) &&
 			!constraint->deferrable)
 			return;
@@ -459,6 +463,7 @@ dg_table_routine(void)
 		methods.relation_index_am = index_am;
 		methods.relation_validate_alter = validate_alter;
 		methods.relation_begin_rewrite = dg_catalog_begin_rewrite;
+		methods.relation_finish_rewrite = dg_catalog_finish_rewrite;
 		methods.slot_callbacks = slots;
 		methods.scan_begin = begin;
 		methods.scan_end = end;

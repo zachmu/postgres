@@ -5,7 +5,7 @@ catalog_current_database(void)
 	DGProvider *entry;
 	CatalogView *view = CatalogViewCurrent();
 
-	if (!view)
+	if (!view || dg_execution_branch())
 		return NULL;
 	for (entry = providers; entry; entry = entry->next)
 		if (entry->view == view)
@@ -629,6 +629,34 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 	bool		native_found = false;
 	char	   *search_path;
 
+	if (CatalogViewIsProvisional(CatalogViewCurrent()))
+	{
+		if ((!rv->schemaname || dg_system_namespace(rv->schemaname)) && OidIsValid(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
+			return false;
+		List	   *path = NIL;
+		ListCell   *lc;
+		char	   *raw = pstrdup(api_search_path ? api_search_path : "public");
+
+		*result = InvalidOid;
+		if (rv->schemaname)
+			path = list_make1(pstrdup(rv->schemaname));
+		else if (!SplitIdentifierString(raw, ',', &path))
+			elog(ERROR, "invalid search_path");
+		foreach(lc, path)
+		{
+			char	   *ns = lfirst(lc);
+
+			if (!strcmp(ns, "$user"))
+				ns = GetUserNameFromId(GetUserId(), false);
+			*result = CatalogViewFindObject(CatalogViewCurrent(), RelationRelationId,
+											quote_qualified_identifier(ns, rv->relname));
+			if (OidIsValid(*result))
+				break;
+		}
+		if (!OidIsValid(*result) && !missing_ok)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in provisional schema", rv->relname)));
+		return true;
+	}
 	if (!dg_catalog_active())
 		return false;
 	rv = system_alias(rv);
@@ -948,6 +976,119 @@ dg_catalog_session_view(void)
 	PG_FINALLY();
 	{
 		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* A relation lock cannot make an old transaction snapshot see a deletion.
+ * Until tuple-version locking exists, reject changed roots under fixed snapshots. */
+static void
+foreign_check_snapshot(Relation rel)
+{
+	DGState    *visible,
+			   *latest;
+	bool		same_root;
+
+	if (!IsolationUsesXactSnapshot())
+		return;
+	visible = dg_load(rel, GetTransactionSnapshot());
+	latest = dg_load(rel, GetLatestSnapshot());
+	same_root = !memcmp(visible->content.root.bytes, latest->content.root.bytes, PL_HASH_SIZE);
+	dg_release(visible);
+	dg_release(latest);
+	if (!same_root)
+		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("foreign key relation changed since transaction snapshot")));
+}
+
+/* RI takes the same branch-local relation lock as a writer. This is deliberately
+ * coarser than native tuple locks until prolly row-level locking is available. */
+void
+dg_catalog_foreign_lock(Relation definition)
+{
+	CatalogView *previous;
+	Oid			user;
+	int			security;
+	Relation	bound;
+	const char *name;
+
+	if (!definition->rd_catalogview)
+	{
+		if (definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+		{
+			LockRelationOid(RelationGetRelid(definition), ExclusiveLock);
+			foreign_check_snapshot(definition);
+		}
+		return;
+	}
+	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
+	GetUserIdAndSecContext(&user, &security);
+	previous = CatalogViewSwitch(NULL);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bound = catalog_open_table(dg_current_branch(), name, ACL_UPDATE);
+		foreign_check_snapshot(bound);
+		dg_storage_close_relation(bound);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+}
+
+/* Reopen a queued event with its original definition and explicit branch.
+ * Data roots use the firing snapshot; schema replacement is never substituted. */
+Relation
+dg_catalog_trigger_relation(Oid id, const char *branch)
+{
+	CatalogView *view = CatalogViewObjectContext(id);
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	DGProvider *provider;
+	Relation	result = NULL;
+	Oid			user;
+	int			security,
+				nest;
+	const char *name = CatalogViewObjectIdentity(id, RelationRelationId);
+
+	if (!view || !branch)
+		elog(ERROR, "queued trigger has no revision binding");
+	for (provider = providers; provider && provider->view != view; provider = provider->next)
+	{
+	}
+	if (!provider)
+		elog(ERROR, "queued trigger catalog provider disappeared");
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bytea	   *database,
+				   *schema,
+				   *content;
+		Oid			resource;
+		DGStorage  *storage;
+
+		nest = begin_api();
+		database = read_ref(psprintf("working/%s", branch)).target;
+		run("SELECT t.objchildren[1],t.objchildren[2] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(database), CStringGetTextDatum(name)), NULL, true);
+		if (SPI_processed != 1)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("queued trigger relation disappeared")));
+		schema = DatumGetByteaPCopy(cell(0, 1));
+		content = DatumGetByteaPCopy(cell(0, 2));
+		run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2 AND t.objchildren[1]=$3", 3, VC_TYPES(BYTEAOID, TEXTOID, BYTEAOID), VC_ARGS(PointerGetDatum(unhex(provider->database)), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
+		if (SPI_processed != 1)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("cannot change a relation with pending versioned trigger events")));
+		resource = binding_relation(branch, name, schema);
+		storage = dg_storage_open(id, branch, name, schema, resource, GetActiveSnapshot());
+		result = dg_storage_enable_write(storage, content);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		CatalogViewSwitch(previous);
 	}
 	PG_END_TRY();
 	return result;

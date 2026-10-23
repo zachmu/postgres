@@ -6,7 +6,7 @@ static bool name_selected(List *names, const char *name);
 static bool
 native_alter_action(AlterTableType type)
 {
-	return type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
+	return type == AT_AlterConstraint || type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
 		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType;
 }
 
@@ -15,6 +15,7 @@ static DGState *native_mutation_source;
 static DGState *native_mutation_destination;
 static Oid	native_mutation_relation;
 static int	native_mutation_width;
+static bool native_mutation_rewritten;
 
 
 static void
@@ -157,6 +158,14 @@ dg_catalog_begin_rewrite(Relation definition)
 	return true;
 }
 
+void
+dg_catalog_finish_rewrite(Relation definition)
+{
+	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || !native_mutation_destination)
+		elog(ERROR, "native rewrite completion has no storage authority");
+	native_mutation_rewritten = true;
+}
+
 DGState *
 dg_catalog_rewrite_state(Relation definition)
 {
@@ -180,6 +189,8 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 
 	if (view != native_mutation_view || !CatalogViewIsProvisional(view))
 		elog(ERROR, "native catalog validation has no storage authority");
+	if (native_mutation_rewritten && RelationGetRelid(definition) == native_mutation_relation)
+		return native_mutation_destination;
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
 	previous = CatalogViewSwitch(NULL);
 	GetUserIdAndSecContext(&user, &security);
@@ -219,7 +230,7 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 
 			if (constraint->conrelid != relation)
 				continue;
-			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE && constraint->contype != CONSTRAINT_CHECK)
+			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE && constraint->contype != CONSTRAINT_CHECK && constraint->contype != CONSTRAINT_FOREIGN)
 				unsupported("canonical codec for native constraint type");
 			if (constraint->contype == CONSTRAINT_CHECK)
 			{
@@ -251,6 +262,11 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 			escape_json(&json, NameStr(constraint->conname));
 			appendStringInfoChar(&json, ',');
 			escape_json(&json, sql);
+			if (constraint->contype == CONSTRAINT_FOREIGN)
+			{
+				appendStringInfoChar(&json, ',');
+				appendStringInfoString(&json, foreign_metadata(tuple));
+			}
 			appendStringInfoChar(&json, ']');
 		}
 	}
@@ -389,6 +405,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	List	   *indexes = NIL,
 			   *oldindexes = NIL;
 	bool		saved_indexes = native_mutation_indexes;
+	bool		saved_rewritten = native_mutation_rewritten;
 	bool		rewrite = false;
 	PLTree		tree = state->content;
 
@@ -406,6 +423,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		native_mutation_view = view;
 		native_mutation_source = state;
 		native_mutation_destination = NULL;
+		native_mutation_rewritten = false;
 		id = CatalogViewLookupObject(view, RelationRelationId, name);
 		native_mutation_relation = id;
 		CatalogViewSwitch(view);
@@ -415,7 +433,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
 
 			if (action->subtype == AT_AddConstraint &&
-				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL && castNode(Constraint, action->def)->contype != CONSTR_UNIQUE && castNode(Constraint, action->def)->contype != CONSTR_PRIMARY)
+				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL && castNode(Constraint, action->def)->contype != CONSTR_UNIQUE && castNode(Constraint, action->def)->contype != CONSTR_PRIMARY && castNode(Constraint, action->def)->contype != CONSTR_FOREIGN)
 				unsupported("native constraint storage codec");
 			if (action->subtype == AT_AddIndex)
 			{
@@ -454,7 +472,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 				{
 					Constraint *con = lfirst_node(Constraint, cc);
 
-					if (con->contype != CONSTR_DEFAULT && con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL && con->contype != CONSTR_CHECK && con->contype != CONSTR_PRIMARY && con->contype != CONSTR_UNIQUE)
+					if (con->contype != CONSTR_DEFAULT && con->contype != CONSTR_NULL && con->contype != CONSTR_NOTNULL && con->contype != CONSTR_CHECK && con->contype != CONSTR_PRIMARY && con->contype != CONSTR_UNIQUE && con->contype != CONSTR_FOREIGN)
 						unsupported("native added-column constraint codec");
 				}
 			}
@@ -466,6 +484,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			AlterTableStmt *stmt = copyObject(statement);
 			Oid			privileged;
 			int			security;
+			int			pathnest = NewGUCNestLevel();
 
 			plan->commandType = CMD_UTILITY;
 			plan->utilityStmt = (Node *) stmt;
@@ -476,10 +495,12 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			SetUserIdAndSecContext(caller, security);
 			PG_TRY(caller);
 			{
+				set_config_option("search_path", api_search_path, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 				AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
 			}
 			PG_FINALLY(caller);
 			{
+				AtEOXact_GUC(true, pathnest);
 				SetUserIdAndSecContext(privileged, security);
 			}
 			PG_END_TRY(caller);
@@ -652,6 +673,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		native_mutation_relation = saved_relation;
 		native_mutation_width = saved_width;
 		native_mutation_indexes = saved_indexes;
+		native_mutation_rewritten = saved_rewritten;
 		if (CatalogViewIsProvisional(view))
 			CatalogViewRetireMutation(view);
 		CatalogViewRelease(view);

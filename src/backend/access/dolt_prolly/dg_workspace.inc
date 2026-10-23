@@ -250,6 +250,8 @@ replace_working(const char *branch, bytea *database, List *tables)
 		dg_storage_close_relation(rel);
 		UpdateActiveSnapshotCommandId();
 	}
+	if (tables)
+		validate_working_foreign_keys(branch);
 }
 
 static void

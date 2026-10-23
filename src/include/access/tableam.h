@@ -595,6 +595,8 @@ typedef struct TableAmRoutine
 	 * values.
 	 */
 	bool		(*relation_begin_rewrite) (Relation rel);
+	/* Subsequent validation scans must see the completed replacement stream. */
+	void		(*relation_finish_rewrite) (Relation rel);
 
 	/*
 	 * This callback needs to create new relation storage for `rel`, with

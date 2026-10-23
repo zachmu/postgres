@@ -707,6 +707,8 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, 
 			relation_close(rel, NoLock);
 		UpdateActiveSnapshotCommandId();
 	}
+	if (base)
+		validate_working_foreign_keys(dg_current_branch());
 }
 
 Datum
@@ -963,6 +965,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			UpdateActiveSnapshotCommandId();
 		}
 	}
+	validate_working_foreign_keys(dg_current_branch());
 	initStringInfo(&updated);
 	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", json_value(json, "squash") ? json_value(json, "squash") : "false");
 	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
