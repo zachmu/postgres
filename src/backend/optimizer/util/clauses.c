@@ -2641,6 +2641,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->funcresulttype = expr->funcresulttype;
 				newexpr->funcretset = expr->funcretset;
 				newexpr->funcvariadic = expr->funcvariadic;
+				newexpr->dolt_working = expr->dolt_working;
 				newexpr->funcformat = expr->funcformat;
 				newexpr->funccollid = expr->funccollid;
 				newexpr->inputcollid = expr->inputcollid;
@@ -4130,6 +4131,13 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		*args_p = args;
 	}
 
+	/* Preserve canonical call identity and working/immutable execution scope. */
+	if (CatalogViewObjectContext(funcid))
+	{
+		ReleaseSysCache(func_tuple);
+		return NULL;
+	}
+
 	/* Now attempt simplification of the function call proper. */
 
 	newexpr = evaluate_function(funcid, result_type, result_typmod,
@@ -4154,6 +4162,7 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		fexpr.funcresulttype = result_type;
 		fexpr.funcretset = func_form->proretset;
 		fexpr.funcvariadic = funcvariadic;
+		fexpr.dolt_working = false;
 		fexpr.funcformat = COERCE_EXPLICIT_CALL;
 		fexpr.funccollid = result_collid;
 		fexpr.inputcollid = input_collid;
@@ -4622,7 +4631,8 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * Forget it if the function is not SQL-language or has other showstopper
 	 * properties.  (The prokind and nargs checks are just paranoia.)
 	 */
-	if (funcform->prolang != SQLlanguageId ||
+	if (CatalogViewObjectContext(funcid) ||
+		funcform->prolang != SQLlanguageId ||
 		funcform->prokind != PROKIND_FUNCTION ||
 		funcform->prosecdef ||
 		funcform->proretset ||
@@ -5167,6 +5177,8 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	fexpr = (FuncExpr *) rtfunc->funcexpr;
 
 	func_oid = fexpr->funcid;
+	if (CatalogViewObjectContext(func_oid))
+		return NULL;
 
 	/*
 	 * The function must be declared to return a set, else inlining would

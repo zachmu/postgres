@@ -11,7 +11,7 @@ typedef struct DGProvider
 static DGProvider *providers;
 
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, RelationRelationId, AttributeRelationId,
+	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId,
 	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId
 };
 
@@ -215,6 +215,12 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 	bool		isnull;
 	Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
 
+	if (catalog == ProcedureRelationId)
+	{
+		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
+
+		return ns == PG_CATALOG_NAMESPACE || !strcmp(get_namespace_name(ns), "information_schema");
+	}
 	if (catalog == DependRelationId)
 		object = ((Form_pg_depend) GETSTRUCT(tuple))->objid;
 	if (catalog == NamespaceRelationId && object == PG_PUBLIC_NAMESPACE)
@@ -413,6 +419,8 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);
 }
 
+#include "dg_routine_provider.inc"
+
 static CatalogView *
 provider_view(bytea *database)
 {
@@ -464,7 +472,7 @@ provider_view(bytea *database)
 		{
 			if (!strcmp(kinds[i], "namespace"))
 				definitions[i] = metadata(addresses[i], "namespace");
-			else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+			else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine"))
 				definitions[i] = metadata(child(addresses[i], 1), "schema");
 			else
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
@@ -488,10 +496,10 @@ provider_view(bytea *database)
 			}
 		/* Bind all class identities before resolving cross-object edges. */
 		for (i = 0; i < n; i++)
-			if (strcmp(kinds[i], "namespace"))
+			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 				(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
 		for (i = 0; i < n; i++)
-			if (strcmp(kinds[i], "namespace"))
+			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 			{
 				const char *definition = definitions[i];
 				char	   *name = json_value(definition, "name");
@@ -611,6 +619,9 @@ provider_view(bytea *database)
 		for (i = 0; i < n; i++)
 			if (!strcmp(kinds[i], "index"))
 				provider_index(&rows, view, definitions[i], n, definitions, kinds);
+		for (i = 0; i < n; i++)
+			if (!strcmp(kinds[i], "routine"))
+				provider_routine(&rows, view, definitions[i]);
 		for (i = 0; i < lengthof(provider_catalogs); i++)
 		{
 			CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);

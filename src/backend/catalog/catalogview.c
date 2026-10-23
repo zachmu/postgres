@@ -4,6 +4,7 @@
  * not consulted when the view provides a catalog, including an empty catalog.
  */
 #include "postgres.h"
+#include "catalog/pg_namespace.h"
 #include "fmgr.h"
 #include "utils/lsyscache.h"
 #include "access/htup_details.h"
@@ -603,6 +604,13 @@ CatalogViewCallContext(FunctionCallInfo fcinfo)
 	Oid		   *declared = NULL;
 	int			nargs = 0;
 
+	if (fcinfo->flinfo->fn_expr && IsA(fcinfo->flinfo->fn_expr, FuncExpr) &&
+		((FuncExpr *) fcinfo->flinfo->fn_expr)->dolt_working)
+		return NULL;
+	view = CatalogViewObjectContext(fcinfo->flinfo->fn_oid);
+	if (view)
+		return view;
+
 	for (i = 0; i < fcinfo->nargs; i++)
 	{
 		Oid			type = get_fn_expr_argtype(fcinfo->flinfo, i);
@@ -630,4 +638,28 @@ CatalogViewCallContext(FunctionCallInfo fcinfo)
 	if (!view)
 		view = CatalogViewCurrent();
 	return view;
+}
+
+/* Search-path entries are session-global; translate them at the consumer. */
+Oid
+CatalogViewNamespace(CatalogView *view, Oid namespaceid)
+{
+	CatalogView *previous;
+	char	   *name;
+	Oid			result;
+
+	if (!view || !OidIsValid(namespaceid) || CatalogViewObjectContext(namespaceid))
+		return namespaceid;
+	previous = CatalogViewSwitch(NULL);
+	PG_TRY();
+	{
+		name = get_namespace_name(namespaceid);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	result = name ? CatalogViewFindObject(view, NamespaceRelationId, name) : InvalidOid;
+	return OidIsValid(result) ? result : namespaceid;
 }

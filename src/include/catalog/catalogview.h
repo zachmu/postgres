@@ -23,6 +23,7 @@ extern void CatalogViewSeal(CatalogView *view);
 extern void CatalogViewRetain(CatalogView *view);
 extern void CatalogViewRelease(CatalogView *view);
 extern CatalogView *CatalogViewCurrent(void);
+extern Oid	CatalogViewNamespace(CatalogView *view, Oid namespaceid);
 extern uint64 CatalogViewCacheId(CatalogView *view);
 extern Oid	CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, Oid storage);
 extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity);

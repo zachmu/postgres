@@ -26,6 +26,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "commands/defrem.h"
+#include "commands/proclang.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "optimizer/optimizer.h"
@@ -45,6 +46,8 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_language.h"
+#include "parser/parse_type.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_publication_rel.h"
@@ -417,6 +420,8 @@ canonical_database(const char *json, Datum *members, int count)
 	return put("database", normalized, values, n);
 }
 
+#include "dg_routine_codec.inc"
+
 /* Capture canonical membership and schema, selecting only data from local roots.
  * Physical pg_class enumeration cannot describe branch-only objects. */
 static Capture
@@ -452,6 +457,8 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
+		else if (!strcmp(kinds[i], "routine"))
+			appendStringInfoString(&json, payload);
 		else
 		{
 			char	   *name = json_value(payload, "name");
@@ -541,7 +548,7 @@ capture_inner(bool persist, bool all_catalogs)
 	PopActiveSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 	/* Reject unsupported definitions instead of producing incomplete commits. */
-	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
+	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("database capture containing non-prolly relations, routines, custom types or unsupported relation properties");
 	run("SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE " USER_NAMESPACE, 0, NULL, NULL, NULL, true);
@@ -629,6 +636,31 @@ capture_inner(bool persist, bool all_catalogs)
 			appendStringInfoChar(&json, ',');
 		appendStringInfoString(&json, member.data);
 		used++;
+	}
+	run("SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " ORDER BY p.oid", 0, NULL, NULL, NULL, true);
+	{
+		int			nroutines = SPI_processed;
+		Oid		   *ids = palloc_array(Oid, Max(nroutines, 1));
+
+		for (i = 0; i < nroutines; i++)
+			ids[i] = DatumGetObjectId(cell(i, 1));
+		members = repalloc(members, sizeof(Datum) * Max(used + nroutines, 1));
+		for (i = 0; i < nroutines; i++)
+		{
+			HeapTuple	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(ids[i]));
+			Relation	catalog = table_open(ProcedureRelationId, AccessShareLock);
+			char	   *definition = routine_encode(tuple, RelationGetDescr(catalog));
+			char	   *payload = routine_payload(definition);
+
+			ReleaseSysCache(tuple);
+			table_close(catalog, AccessShareLock);
+			if (used)
+				appendStringInfoChar(&json, ',');
+			appendStringInfoString(&json, payload);
+			if (persist)
+				members[used] = PointerGetDatum(routine_member(definition));
+			used++;
+		}
 	}
 	appendStringInfoString(&json, "]}");
 	/* Sort members by symbolic identity, never relation OID / creation order. */
@@ -1189,5 +1221,6 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
+#include "dg_routine_ddl.inc"
 
 #include "dg_alter.inc"

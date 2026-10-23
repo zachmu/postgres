@@ -10,6 +10,10 @@
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
+extern bool dg_catalog_create_routine(struct ParseState *pstate, Node *statement);
+extern bool dg_catalog_creating_routine(void);
+extern Oid	dg_catalog_routine_namespace(Oid namespaceid);
+extern Oid	dg_catalog_store_routine(HeapTuple tuple, TupleDesc desc);
 extern struct CatalogView *dg_catalog_session_view(void);
 extern bool dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *result);
 extern bool dg_catalog_type_visible(Oid id, const char *name, bool *visible);

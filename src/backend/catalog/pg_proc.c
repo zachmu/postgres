@@ -13,6 +13,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
+#include "catalog/catalogview.h"
+#include "catalog/namespace.h"
 
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -583,7 +586,8 @@ ProcedureCreate(const char *procedureName,
 
 		/* Okay, do it... */
 		tup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
-		CatalogTupleUpdate(rel, &tup->t_self, tup);
+		if (!dg_catalog_creating_routine())
+			CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 		ReleaseSysCache(oldtup);
 		is_update = true;
@@ -594,21 +598,49 @@ ProcedureCreate(const char *procedureName,
 		Oid			newOid;
 
 		/* First, get default permissions and set up proacl */
-		proacl = get_user_default_acl(OBJECT_FUNCTION, proowner,
-									  procNamespace);
+		if (dg_catalog_creating_routine())
+		{
+			char	   *namespaceName = get_namespace_name(procNamespace);
+			CatalogView *previous = CatalogViewSwitch(NULL);
+
+			PG_TRY();
+			{
+				proacl = get_user_default_acl(OBJECT_FUNCTION, proowner,
+											  get_namespace_oid(namespaceName, true));
+			}
+			PG_FINALLY();
+			{
+				CatalogViewSwitch(previous);
+			}
+			PG_END_TRY();
+		}
+		else
+			proacl = get_user_default_acl(OBJECT_FUNCTION, proowner, procNamespace);
 		if (proacl != NULL)
 			values[Anum_pg_proc_proacl - 1] = PointerGetDatum(proacl);
 		else
 			nulls[Anum_pg_proc_proacl - 1] = true;
 
-		newOid = GetNewOidWithIndex(rel, ProcedureOidIndexId,
-									Anum_pg_proc_oid);
+		newOid = dg_catalog_creating_routine() ? InvalidOid : GetNewOidWithIndex(rel, ProcedureOidIndexId,
+																				 Anum_pg_proc_oid);
 		values[Anum_pg_proc_oid - 1] = ObjectIdGetDatum(newOid);
 		tup = heap_form_tuple(tupDesc, values, nulls);
-		CatalogTupleInsert(rel, tup);
+		if (!dg_catalog_creating_routine())
+			CatalogTupleInsert(rel, tup);
 		is_update = false;
 	}
 
+
+	if (dg_catalog_creating_routine())
+	{
+		retval = dg_catalog_store_routine(tup, tupDesc);
+		ObjectAddressSet(myself, ProcedureRelationId, retval);
+		CatalogViewSwitch(CatalogViewObjectContext(retval));
+		InvokeObjectPostCreateHook(ProcedureRelationId, retval, 0);
+		heap_freetuple(tup);
+		table_close(rel, RowExclusiveLock);
+		goto validate_body;
+	}
 
 	retval = ((Form_pg_proc) GETSTRUCT(tup))->oid;
 
@@ -695,6 +727,7 @@ ProcedureCreate(const char *procedureName,
 
 	table_close(rel, RowExclusiveLock);
 
+validate_body:
 	/* Verify function body */
 	if (OidIsValid(languageValidator))
 	{
@@ -734,7 +767,7 @@ ProcedureCreate(const char *procedureName,
 	}
 
 	/* ensure that stats are dropped if transaction aborts */
-	if (!is_update)
+	if (!is_update && !dg_catalog_creating_routine())
 		pgstat_create_function(retval);
 
 	return myself;

@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 #include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
@@ -1222,10 +1223,34 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
  * schema-qualified with a schema that does not exist.  Likewise if no
  * candidate is found for other reasons.
  */
+static FuncCandidateList FuncnameGetCandidatesInContext(List *, int, List *, bool, bool, bool, bool);
+
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool expand_variadic, bool expand_defaults,
 					  bool include_out_arguments, bool missing_ok)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	FuncCandidateList result;
+
+	CatalogViewSwitch(dg_catalog_session_view());
+	PG_TRY();
+	{
+		result = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
+												expand_defaults, include_out_arguments, missing_ok);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static FuncCandidateList
+FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
+							   bool expand_variadic, bool expand_defaults,
+							   bool include_out_arguments, bool missing_ok)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -1244,7 +1269,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, missing_ok));
 		if (!OidIsValid(namespaceId))
 			return NULL;
 	}
@@ -1288,7 +1313,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (procform->pronamespace == lfirst_oid(nsp) &&
+				if (procform->pronamespace == CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nsp)) &&
 					procform->pronamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -4332,8 +4357,26 @@ cachedNamespacePath(const char *searchPath, Oid roleid)
 /*
  * recomputeNamespacePath - recompute path derived variables if needed.
  */
+static void recomputeNamespacePathPhysical(void);
+
 static void
 recomputeNamespacePath(void)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+
+	PG_TRY();
+	{
+		recomputeNamespacePathPhysical();
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+}
+
+static void
+recomputeNamespacePathPhysical(void)
 {
 	Oid			roleid = GetUserId();
 	bool		pathChanged;

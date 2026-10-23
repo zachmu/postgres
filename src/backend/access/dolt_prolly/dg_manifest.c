@@ -19,7 +19,7 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine"};
 
 static void
 manifest_begin(void)
@@ -118,7 +118,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3))
+	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3) || (id == 9 && n != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
 	if ((id == 1 || id == 6) && n == 1 &&
 		(VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
@@ -134,9 +134,10 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		child = object_kind(DatumGetByteaPP(links[i]), false);
 		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
-			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0) :
+			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
-			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 : false;
+			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 :
+			id == 9 ? strcmp(child, "schema") == 0 : false;
 		if (!valid)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid %s child for manifest %s", child, kind)));
 	}
