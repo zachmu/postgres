@@ -31,6 +31,7 @@ query_row_compare(const void *a, const void *b)
 	return strcmp(((const QueryRow *) a)->key, ((const QueryRow *) b)->key);
 }
 
+/* TODO KNOWN-ISSUES.md: replace delimiter-based row comparison keys. */
 static QueryRow *
 query_rows(const char *sql, MemoryContext cxt, int *count, int *natts)
 {

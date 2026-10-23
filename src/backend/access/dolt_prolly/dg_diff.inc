@@ -689,6 +689,7 @@ place_values(TupleDesc out, int base, TupleDesc layout, DiffTable *side, PLValue
 	}
 }
 
+/* TODO KNOWN-ISSUES.md: validate/rebind prepared dynamic result layouts. */
 static void
 emit_diff_row(DiffTable *from, DiffTable *to, DiffRow *row, void *arg)
 {

@@ -301,6 +301,7 @@ schema_table(const RangeVar *rv)
 }
 
 /* INSERT INTO [schema.]dolt_ignore creates the schema's ignore table. */
+/* TODO KNOWN-ISSUES.md: move lazy creation from analysis to execution. */
 void
 dg_system_insert_target(const RangeVar *rv)
 {

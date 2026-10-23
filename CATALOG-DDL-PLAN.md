@@ -421,3 +421,16 @@ Global role lifetime across retained history, worker transport, session handle
 reclamation and persistent GC remain open. Existing recovery/standby/cache-pressure
 suites continue to run; sustained DDL stress remains a follow-on, not a claim of
 production readiness.
+
+### Dolt function integration decisions (2026-10-23)
+
+Follow func-review.txt: restore canonical schemas/dependencies with matching
+data/index roots; branch creation must replace working state, and deletion must
+invalidate it. Do not introduce branch incarnation identifiers for this repair.
+User SQL in helpers must re-enter branch-aware binding. Reserve relation and
+namespace names beginning with `dolt` for internal use. Documents, stored tests
+and saved queries belong in ordinary versioned prolly tables, not pg_catalog
+heap tables. Fix native catalog sanity invariants. Explicitly deferred defects
+are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Active-session deletion/write
+coordination may be deferred if necessary, but branch recreation must not retain
+old working roots.
