@@ -54,6 +54,7 @@ extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_catalog_mutation_load(Relation rel, Snapshot snapshot);
 extern bool dg_catalog_begin_rewrite(Relation definition);
+extern void dg_catalog_finish_rewrite(Relation definition);
 extern DGState *dg_catalog_rewrite_state(Relation definition);
 extern void dg_decode_mutation(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot);
 extern DGState *dg_load_branch(Relation rel, Snapshot snapshot, const char *branch);

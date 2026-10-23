@@ -15,6 +15,7 @@ static DGState *native_mutation_source;
 static DGState *native_mutation_destination;
 static Oid	native_mutation_relation;
 static int	native_mutation_width;
+static bool native_mutation_rewritten;
 
 
 static void
@@ -157,6 +158,14 @@ dg_catalog_begin_rewrite(Relation definition)
 	return true;
 }
 
+void
+dg_catalog_finish_rewrite(Relation definition)
+{
+	if (definition->rd_catalogview != native_mutation_view || RelationGetRelid(definition) != native_mutation_relation || !native_mutation_destination)
+		elog(ERROR, "native rewrite completion has no storage authority");
+	native_mutation_rewritten = true;
+}
+
 DGState *
 dg_catalog_rewrite_state(Relation definition)
 {
@@ -180,6 +189,8 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 
 	if (view != native_mutation_view || !CatalogViewIsProvisional(view))
 		elog(ERROR, "native catalog validation has no storage authority");
+	if (native_mutation_rewritten && RelationGetRelid(definition) == native_mutation_relation)
+		return native_mutation_destination;
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
 	previous = CatalogViewSwitch(NULL);
 	GetUserIdAndSecContext(&user, &security);
@@ -394,6 +405,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	List	   *indexes = NIL,
 			   *oldindexes = NIL;
 	bool		saved_indexes = native_mutation_indexes;
+	bool		saved_rewritten = native_mutation_rewritten;
 	bool		rewrite = false;
 	PLTree		tree = state->content;
 
@@ -411,6 +423,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		native_mutation_view = view;
 		native_mutation_source = state;
 		native_mutation_destination = NULL;
+		native_mutation_rewritten = false;
 		id = CatalogViewLookupObject(view, RelationRelationId, name);
 		native_mutation_relation = id;
 		CatalogViewSwitch(view);
@@ -660,6 +673,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		native_mutation_relation = saved_relation;
 		native_mutation_width = saved_width;
 		native_mutation_indexes = saved_indexes;
+		native_mutation_rewritten = saved_rewritten;
 		if (CatalogViewIsProvisional(view))
 			CatalogViewRetireMutation(view);
 		CatalogViewRelease(view);

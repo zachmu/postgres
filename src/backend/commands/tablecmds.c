@@ -5900,6 +5900,10 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 			{
 				tab->rewrite |= AT_REWRITE_DEFAULT_VAL;
 				ATRewriteTable(tab, tab->relid);
+				rel = table_open(tab->relid, NoLock);
+				if (rel->rd_tableam->relation_finish_rewrite)
+					rel->rd_tableam->relation_finish_rewrite(rel);
+				table_close(rel, NoLock);
 				continue;
 			}
 		}

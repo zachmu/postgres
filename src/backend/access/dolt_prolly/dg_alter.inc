@@ -205,7 +205,7 @@ dg_catalog_alter(Node *statement)
 		if (!native_alter_action(cmd->subtype) && cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
 			return false;
 
-		if (cmd->behavior != DROP_RESTRICT)
+		if (cmd->behavior != DROP_RESTRICT && cmd->subtype != AT_DropColumn)
 			unsupported("canonical column DROP CASCADE");
 		rv = stmt->relation;
 		missing = stmt->missing_ok;

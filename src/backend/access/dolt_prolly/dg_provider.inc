@@ -383,7 +383,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.conenforced = form.contype == CONSTRAINT_CHECK ? constraint->is_enforced : true;
 		form.convalidated = !constraint->skip_validation;
 		form.conislocal = true;
-		form.connoinherit = constraint->is_no_inherit;
+		form.connoinherit = form.contype == CONSTRAINT_FOREIGN || constraint->is_no_inherit;
 		form.confupdtype = ' ';
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';

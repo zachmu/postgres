@@ -5823,7 +5823,15 @@ void
 AfterTriggerSetState(ConstraintsSetStmt *stmt)
 {
 	CatalogView *previous = CatalogViewCurrent();
-	bool		pushed = !ActiveSnapshotSet();
+	bool		pushed;
+
+	/* ALL does not resolve catalog names and must not establish a snapshot. */
+	if (stmt->constraints == NIL)
+	{
+		AfterTriggerSetStateContext(stmt);
+		return;
+	}
+	pushed = !ActiveSnapshotSet();
 
 	if (pushed)
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -6156,6 +6164,21 @@ AfterTriggerSetStateContext(ConstraintsSetStmt *stmt)
  * of knowledge of the trigger semantics we can't do this in general.
  * ----------
  */
+static bool
+trigger_event_matches_relation(AfterTriggerShared shared, Oid relid)
+{
+	const char *name;
+
+	if (shared->ats_branch && strcmp(shared->ats_branch, dg_current_branch()))
+		return false;
+	if (shared->ats_relid == relid)
+		return true;
+	if (!shared->ats_branch || !CatalogViewObjectContext(relid))
+		return false;
+	name = CatalogViewObjectIdentity(relid, RelationRelationId);
+	return !strcmp(name, CatalogViewObjectIdentity(shared->ats_relid, RelationRelationId));
+}
+
 bool
 AfterTriggerPendingOnRel(Oid relid)
 {
@@ -6176,7 +6199,7 @@ AfterTriggerPendingOnRel(Oid relid)
 		if (event->ate_flags & AFTER_TRIGGER_DONE)
 			continue;
 
-		if (evtshared->ats_relid == relid)
+		if (trigger_event_matches_relation(evtshared, relid))
 			return true;
 	}
 
@@ -6194,7 +6217,7 @@ AfterTriggerPendingOnRel(Oid relid)
 			if (event->ate_flags & AFTER_TRIGGER_DONE)
 				continue;
 
-			if (evtshared->ats_relid == relid)
+			if (trigger_event_matches_relation(evtshared, relid))
 				return true;
 		}
 	}

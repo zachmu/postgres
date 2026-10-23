@@ -289,6 +289,19 @@ canonical_drop(Node *statement)
 		foreach(lc, targets)
 		{
 			ObjectAddress *object = lfirst(lc);
+			Oid			relation = InvalidOid;
+
+			if (object->classId == RelationRelationId)
+				relation = object->objectId;
+			else if (object->classId == ConstraintRelationId)
+			{
+				HeapTuple	tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(object->objectId));
+
+				relation = ((Form_pg_constraint) GETSTRUCT(tuple))->conrelid;
+				ReleaseSysCache(tuple);
+			}
+			if (OidIsValid(relation) && AfterTriggerPendingOnRel(relation))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("cannot alter a relation with pending trigger events")));
 
 			if (CatalogViewObjectContext(object->objectId) != view || object->objectSubId != 0 ||
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&

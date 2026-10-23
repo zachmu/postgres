@@ -981,6 +981,26 @@ dg_catalog_session_view(void)
 	return result;
 }
 
+/* A relation lock cannot make an old transaction snapshot see a deletion.
+ * Until tuple-version locking exists, reject changed roots under fixed snapshots. */
+static void
+foreign_check_snapshot(Relation rel)
+{
+	DGState    *visible,
+			   *latest;
+	bool		same_root;
+
+	if (!IsolationUsesXactSnapshot())
+		return;
+	visible = dg_load(rel, GetTransactionSnapshot());
+	latest = dg_load(rel, GetLatestSnapshot());
+	same_root = !memcmp(visible->content.root.bytes, latest->content.root.bytes, PL_HASH_SIZE);
+	dg_release(visible);
+	dg_release(latest);
+	if (!same_root)
+		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("foreign key relation changed since transaction snapshot")));
+}
+
 /* RI takes the same branch-local relation lock as a writer. This is deliberately
  * coarser than native tuple locks until prolly row-level locking is available. */
 void
@@ -995,7 +1015,10 @@ dg_catalog_foreign_lock(Relation definition)
 	if (!definition->rd_catalogview)
 	{
 		if (definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+		{
 			LockRelationOid(RelationGetRelid(definition), ExclusiveLock);
+			foreign_check_snapshot(definition);
+		}
 		return;
 	}
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
@@ -1005,6 +1028,7 @@ dg_catalog_foreign_lock(Relation definition)
 	PG_TRY();
 	{
 		bound = catalog_open_table(dg_current_branch(), name, ACL_UPDATE);
+		foreign_check_snapshot(bound);
 		dg_storage_close_relation(bound);
 	}
 	PG_FINALLY();
