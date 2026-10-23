@@ -1,6 +1,7 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "catalog/catalogview.h"
@@ -108,6 +109,12 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
+static void stage_tables(List *tables);
+static bool branch_management(char **args, int n);
+static void checkout_tables(char **args, int n);
+static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
+static char *staged_state(void);
+static char *working_state(void);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
 static void binding_prepare(const char *branch, bytea *database, bool required);
@@ -206,6 +213,32 @@ end_api(int nest)
 	SPI_finish();
 	AtEOXact_GUC(true, nest);
 }
+typedef struct StandaloneCall
+{
+	Oid			funcid;
+	FuncExpr   *call;
+	int			count;
+} StandaloneCall;
+
+static bool
+standalone_walker(Node *node, StandaloneCall *found)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid == found->funcid)
+	{
+		found->call = (FuncExpr *) node;
+		found->count++;
+		return false;
+	}
+	if (IsA(node, SubPlan) || IsA(node, SubLink) || IsA(node, Var))
+	{
+		found->count += 2;		/* disqualify */
+		return true;
+	}
+	return expression_tree_walker(node, standalone_walker, found);
+}
+
 static void
 standalone(FunctionCallInfo fcinfo, bool commits)
 {
@@ -224,9 +257,12 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	if (IsA(plan, Result) && list_length(plan->targetlist) == 1)
 	{
 		Node	   *expr = (Node *) linitial_node(TargetEntry, plan->targetlist)->expr;
+		StandaloneCall found = {fcinfo->flinfo->fn_oid, NULL, 0};
 
-		if (IsA(expr, FuncExpr))
-			call = (FuncExpr *) expr;
+		/* The call may be wrapped in scalar expressions (casts, substring). */
+		standalone_walker(expr, &found);
+		if (found.count == 1)
+			call = found.call;
 	}
 	else if (IsA(plan, FunctionScan) && list_length(((FunctionScan *) plan)->functions) == 1)
 	{
@@ -933,9 +969,27 @@ dolt_add(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, false);
 	nest = begin_api();
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
-		unsupported("dolt_add currently requires '.', '-A' or '--all'");
 	ensure_repository();
+	if (n == 0)
+		unsupported("dolt_add requires '.', '-A' or table names");
+	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	{
+		/* Stage only the named tables. */
+		List	   *tables = NIL;
+		int			i;
+		char	   *stagedjson = staged_state(),
+				   *workingjson = working_state();
+
+		for (i = 0; i < n; i++)
+		{
+			if (args[i][0] == '-')
+				unsupported(args[i]);
+			tables = lappend(tables, resolve_table_argument(args[i], stagedjson, workingjson, true));
+		}
+		stage_tables(tables);
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
 	current = capture(true);
@@ -1053,6 +1107,11 @@ dolt_branch(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
+	if (branch_management(args, n))
+	{
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	if (n < 1 || n > 2 || args[0][0] == '-')
 		unsupported("dolt_branch supports creation: name [start-point]");
 	valid_name(args[0]);
@@ -1087,6 +1146,16 @@ dolt_tag(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
+	if (n == 2 && (!strcmp(args[0], "-d") || !strcmp(args[0], "--delete")))
+	{
+		VersionRef	existing = read_ref(psprintf("tags/%s", args[1]));
+
+		if (!existing.target)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("tag not found: %s", args[1])));
+		move_ref(psprintf("tags/%s", args[1]), existing, NULL);
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-m") || !strcmp(args[i], "--message"))
@@ -1294,3 +1363,4 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 #include "dg_alter.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
+#include "dg_workspace.inc"

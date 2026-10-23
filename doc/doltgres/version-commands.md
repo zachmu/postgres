@@ -58,7 +58,8 @@ user-created history independently. Existing history is not rewritten.
 Commit, branch and tag calls must be standalone SELECT commands outside explicit
 transaction blocks. The approved first-slice contract uses PostgreSQL's normal
 statement commit rather than attempting implicit commit of an already-open SQL
-transaction. Expressions, joins and per-row invocation are rejected. dolt_add
+transaction. A single call may be wrapped in scalar expressions (casts,
+`substring`, `length`); joins, subqueries and per-row invocation are rejected. dolt_add
 also requires a standalone SELECT, but can run inside BEGIN and rolls back with
 its transaction. Argument arrays and prepared-statement parameters are supported.
 
