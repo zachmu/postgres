@@ -357,6 +357,7 @@ _readRangeTblEntry(void)
 	READ_NODE_FIELD(alias);
 	READ_NODE_FIELD(eref);
 	READ_ENUM_FIELD(rtekind, RTEKind);
+	READ_STRING_FIELD(dolt_database);
 
 	switch (local_node->rtekind)
 	{
@@ -417,8 +418,12 @@ _readRangeTblEntry(void)
 			READ_NODE_FIELD(colcollations);
 			break;
 		case RTE_DOLT:
+			READ_OID_FIELD(relid);
+			READ_BOOL_FIELD(inh);
+			READ_CHAR_FIELD(relkind);
+			READ_INT_FIELD(rellockmode);
+			READ_UINT_FIELD(perminfoindex);
 			READ_STRING_FIELD(dolt_table);
-			READ_STRING_FIELD(dolt_database);
 			READ_OID_FIELD(dolt_catalog);
 			READ_OID_FIELD(dolt_rowtype);
 			READ_STRING_FIELD(dolt_branch);

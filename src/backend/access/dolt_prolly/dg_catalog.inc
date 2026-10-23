@@ -12,8 +12,8 @@ catalog_supported(Oid id)
 
 /* Versioned metadata lookup. SPI is restricted to fixed internal read queries;
  * permissions on the selected symbolic objects are checked for the caller. */
-static void
-catalog_acl(const char *definition, const char *privilege, Oid user)
+static bool
+catalog_acl_allows(const char *definition, const char *privilege, Oid user)
 {
 	char	   *owner = json_value(definition, "owner");
 	Oid			role;
@@ -22,10 +22,10 @@ catalog_acl(const char *definition, const char *privilege, Oid user)
 	char	  **grantees;
 
 	if (superuser_arg(user))
-		return;
+		return true;
 	role = owner ? get_role_oid(owner, true) : InvalidOid;
 	if (OidIsValid(role) && has_privs_of_role(user, role))
-		return;
+		return true;
 	run("SELECT v->>1 FROM jsonb_array_elements($1::jsonb->'acl') v WHERE v->>2=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(privilege)), NULL, true);
 	n = SPI_processed;
 	grantees = palloc(sizeof(char *) * Max(n, 1));
@@ -34,12 +34,19 @@ catalog_acl(const char *definition, const char *privilege, Oid user)
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(grantees[i], "PUBLIC"))
-			return;
+			return true;
 		role = get_role_oid(grantees[i], true);
 		if (OidIsValid(role) && has_privs_of_role(user, role))
-			return;
+			return true;
 	}
-	ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("permission denied for versioned object")));
+	return false;
+}
+
+static void
+catalog_acl(const char *definition, const char *privilege, Oid user)
+{
+	if (!catalog_acl_allows(definition, privilege, user))
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("permission denied for versioned object")));
 }
 
 void
@@ -89,6 +96,87 @@ catalog_namespace(bytea *db, const char *name)
 	return NULL;
 }
 
+/* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
+ * candidates in that same order, never a shortcut ahead of an explicit path. */
+static char *
+catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path)
+{
+	List	   *path = NIL;
+	ListCell   *lc;
+	bool		explicit = rv->schemaname != NULL;
+	Oid			temp,
+				toast;
+
+	GetTempNamespaceState(&temp, &toast);
+
+	*native = InvalidOid;
+	if (explicit)
+		path = list_make1(rv->schemaname);
+	else
+	{
+		char	   *raw = pstrdup(search_path);
+		bool		catalog = false;
+
+		if (!SplitIdentifierString(raw, ',', &path))
+			elog(ERROR, "invalid search_path");
+		foreach(lc, path)
+			if (!strcmp((char *) lfirst(lc), "pg_catalog"))
+			catalog = true;
+		if (!catalog)
+			path = lcons("pg_catalog", path);
+		if (OidIsValid(temp))
+		{
+			bool		listed = false;
+
+			foreach(lc, path)
+				if (!strcmp((char *) lfirst(lc), "pg_temp") ||
+					!strcmp((char *) lfirst(lc), get_namespace_name(temp)))
+				listed = true;
+			if (!listed)
+				path = lcons("pg_temp", path);
+		}
+	}
+	foreach(lc, path)
+	{
+		char	   *ns = (char *) lfirst(lc);
+		char	   *name;
+		Oid			namespace;
+
+		if (!strcmp(ns, "$user"))
+			ns = GetUserNameFromId(user, false);
+		if (!strcmp(ns, "pg_catalog") || !strcmp(ns, "information_schema"))
+		{
+			namespace = get_namespace_oid(ns, true);
+			*native = OidIsValid(namespace) ? get_relname_relid(rv->relname, namespace) : InvalidOid;
+			if (OidIsValid(*native))
+				return ns;
+			continue;
+		}
+		if (OidIsValid(temp) && (!strcmp(ns, "pg_temp") ||
+								 !strcmp(ns, get_namespace_name(temp))))
+		{
+			*native = get_relname_relid(rv->relname, temp);
+			if (OidIsValid(*native))
+				return get_namespace_name(temp);
+			continue;
+		}
+		name = quote_qualified_identifier(ns, rv->relname);
+		if (catalog_contains(db, name))
+		{
+			char	   *definition = catalog_namespace(db, ns);
+
+			if (!catalog_acl_allows(definition, "USAGE", user))
+			{
+				if (explicit)
+					catalog_acl(definition, "USAGE", user);
+				continue;
+			}
+			return ns;
+		}
+	}
+	return NULL;
+}
+
 bool
 dg_catalog_active(void)
 {
@@ -121,6 +209,7 @@ static TupleDesc
 catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool target)
 {
 	const char *sep = NULL;
+	char	   *resolution_path = pstrdup(GetConfigOption("search_path", false, false));
 	char	   *revision,
 			   *dbname,
 			   *schema = NULL,
@@ -144,36 +233,10 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	{
 		if (!rv->catalogname || !(sep = strpbrk(rv->catalogname, "@/")))
 		{
-			Oid			systemid;
-
-			if (!dg_catalog_active())
-				return NULL;
-
-			/*
-			 * Bootstrap information_schema views are expanded by the
-			 * rewriter.
-			 */
-			if (rv->schemaname && !strcmp(rv->schemaname, "information_schema"))
+			if (!rte->dolt_database && !dg_catalog_active())
 				return NULL;
 			if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 				return NULL;
-			systemid = (!rv->schemaname || !strcmp(rv->schemaname, "pg_catalog")) ? get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE) : InvalidOid;
-			if (OidIsValid(systemid))
-			{
-				RangeVar   *qualified;
-
-				if (systemid >= FirstNormalObjectId || !strncmp(rv->relname, "pg_dolt_", 8))
-					return NULL;
-				/* Stored view actions are context-bound during rewrite. */
-				if (get_rel_relkind(systemid) == RELKIND_VIEW)
-					return NULL;
-				/* Only supported versioned catalog families are redirected. */
-				if (!catalog_supported(systemid))
-					return NULL;
-				qualified = (RangeVar *) copyObject(rv);
-				qualified->schemaname = pstrdup("pg_catalog");
-				rv = qualified;
-			}
 			revision = pstrdup(dg_current_branch());
 			goto revision_selected;
 		}
@@ -198,15 +261,6 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cross-database versioned queries are not supported")));
 	}
 revision_selected:
-	/* AS OF and database/revision qualifiers also allow implicit pg_catalog. */
-	if (!rv->schemaname &&
-		catalog_supported(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
-	{
-		RangeVar   *qualified = (RangeVar *) copyObject(rv);
-
-		qualified->schemaname = pstrdup("pg_catalog");
-		rv = qualified;
-	}
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
 	GetUserIdAndSecContext(&user, &security);
@@ -228,18 +282,44 @@ revision_selected:
 	PG_TRY();
 	{
 		nest = begin_api();
-		working = !rv->dolt_revision && read_ref(psprintf("heads/%s", revision)).target != NULL;
-		db = working ? read_ref(psprintf("working/%s", revision)).target : NULL;
+		working = !rte->dolt_database && !rv->dolt_revision && read_ref(psprintf("heads/%s", revision)).target != NULL;
+		db = rte->dolt_database ? unhex(rte->dolt_database) :
+			(working ? read_ref(psprintf("working/%s", revision)).target : NULL);
 		if (!db)
 			db = child(resolve(revision), 1);
 		rte->dolt_database = hex(db);
-		if (rv->schemaname && !strcmp(rv->schemaname, "pg_catalog"))
+		{
+			Oid			native;
+			char	   *ns = catalog_resolve_name(db, rv, user, &native, resolution_path);
+			RangeVar   *resolved = copyObject(rv);
+
+			if (!ns)
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
+			if (OidIsValid(native) && isTempNamespace(get_rel_namespace(native)))
+			{
+				if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")))
+					unsupported("revision-qualified temporary relations");
+				goto binding_done;
+			}
+			resolved->schemaname = pstrdup(ns);
+			rv = resolved;
+			path = list_make1(resolved->schemaname);
+		}
+
+		if (rv->schemaname && (!strcmp(rv->schemaname, "pg_catalog") || !strcmp(rv->schemaname, "information_schema")))
 		{
 			Relation	catalog;
-			Oid			id = get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE);
+			Oid			id = get_relname_relid(rv->relname, get_namespace_oid(rv->schemaname, false));
 
-			provider_catalog_index(id); /* reject unsupported catalogs
-										 * explicitly */
+			if (!catalog_supported(id) && get_rel_relkind(id) != RELKIND_VIEW)
+			{
+				if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")))
+					provider_catalog_index(id);
+				goto binding_done;
+			}
+			if (get_rel_relkind(id) != RELKIND_VIEW)
+				provider_catalog_index(id); /* reject unsupported catalogs
+											 * explicitly */
 			(void) provider_view(db);
 			/* Stored-rule RTEs retain native checkAsUser permission entries. */
 			if (pstate && pg_class_aclcheck(id, user, ACL_SELECT) != ACLCHECK_OK)
@@ -247,6 +327,13 @@ revision_selected:
 			catalog = table_open(id, AccessShareLock);
 			result = CreateTupleDescCopy(RelationGetDescr(catalog));
 			rte->dolt_catalog = id;
+			if (get_rel_relkind(id) == RELKIND_VIEW)
+			{
+				if (id >= FirstNormalObjectId)
+					unsupported("revision-qualified user views");
+				rte->relkind = RELKIND_VIEW;
+				rte->relid = id;
+			}
 			rte->dolt_table = pstrdup("");
 			rte->dolt_rowtype = get_rel_type_id(id);
 			table_close(catalog, AccessShareLock);
@@ -317,6 +404,7 @@ revision_selected:
 			if (working && !OidIsValid(live))
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 		}
+binding_done:
 		end_api(nest);
 	} PG_FINALLY();
 	{
@@ -471,17 +559,11 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 	Oid			user;
 	int			security,
 				nest;
-	List	   *path = NIL;
-	ListCell   *lc;
 	bool		pushed = false;
+	bool		native_found = false;
 	char	   *search_path;
 
 	if (!dg_catalog_active())
-		return false;
-	if (rv->schemaname && (!strcmp(rv->schemaname, "pg_catalog") ||
-						   !strcmp(rv->schemaname, "information_schema")))
-		return false;
-	if (!rv->schemaname && OidIsValid(get_relname_relid(rv->relname, PG_CATALOG_NAMESPACE)))
 		return false;
 	if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 		return false;
@@ -489,10 +571,6 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		unsupported("revision-qualified native utility lookup");
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
 	GetUserIdAndSecContext(&user, &security);
-	if (rv->schemaname)
-		path = list_make1(rv->schemaname);
-	else if (!SplitIdentifierString(search_path, ',', &path))
-		elog(ERROR, "invalid search_path");
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -506,20 +584,18 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 
 		nest = begin_api();
 		db = read_ref(branch_ref("working")).target;
-		foreach(lc, path)
 		{
-			char	   *ns = (char *) lfirst(lc),
-					   *name;
+			Oid			native;
+			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path);
 
-			if (!strcmp(ns, "$user"))
-				ns = GetUserNameFromId(user, false);
-			name = quote_qualified_identifier(ns, rv->relname);
-			if (catalog_contains(db, name))
+			if (OidIsValid(native))
 			{
-				catalog_acl(catalog_namespace(db, ns), "USAGE", user);
-				*result = CatalogViewLookupObject(provider_view(db), RelationRelationId, name);
-				break;
+				native_found = true;
+				*result = native;
 			}
+			else if (ns)
+				*result = CatalogViewLookupObject(provider_view(db), RelationRelationId,
+												  quote_qualified_identifier(ns, rv->relname));
 		}
 		end_api(nest);
 	}
@@ -532,7 +608,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 	PG_END_TRY();
 	if (!OidIsValid(*result) && !missing_ok)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", rv->relname, dg_current_branch())));
-	return true;
+	return !native_found;
 }
 
 Relation
@@ -624,7 +700,7 @@ dg_catalog_rewrite_relation(RangeTblEntry *rte)
 	int			i;
 
 	if (rte->rtekind != RTE_RELATION || catalog_api_depth ||
-		rangevar_projection_hook || !dg_catalog_active())
+		rangevar_projection_hook || (!rte->dolt_database && !dg_catalog_active()))
 		return;
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 		if (rte->relid == provider_catalogs[i])
@@ -646,4 +722,59 @@ dg_catalog_rewrite_relation(RangeTblEntry *rte)
 		rte->colcollations = lappend_oid(rte->colcollations, att->attcollation);
 	}
 	FreeTupleDesc(desc);
+}
+
+/* Visibility is a name-resolution question in the object's own schema context,
+ * not membership of its synthetic namespace OID in a physical search path. */
+bool
+dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
+{
+	CatalogView *view = CatalogViewObjectContext(id);
+	DGProvider *provider;
+	char	   *database = NULL;
+	char	   *path;
+	RangeVar   *rv;
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+
+	if (catalog_api_depth || rangevar_projection_hook || (!view && !dg_catalog_active()))
+		return false;
+	for (provider = providers; provider; provider = provider->next)
+		if (provider->view == view)
+			database = provider->database;
+	if (view && !database)
+		return false;			/* non-production synthetic provider */
+	path = pstrdup(GetConfigOption("search_path", false, false));
+	rv = makeRangeVar(NULL, pstrdup(name), -1);
+	GetUserIdAndSecContext(&user, &security);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bytea	   *db;
+		Oid			native;
+		char	   *ns;
+
+		nest = begin_api();
+		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
+		ns = catalog_resolve_name(db, rv, user, &native, path);
+		*visible = ns && (OidIsValid(native) ? native == id :
+						  CatalogViewLookupObject(provider_view(db), RelationRelationId,
+												  quote_qualified_identifier(ns, name)) == id);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	return true;
 }

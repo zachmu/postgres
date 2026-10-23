@@ -84,3 +84,8 @@ gate passes 20 suites, 61 scenarios and 302 leaf assertions; the new 16-assertio
 branch introspection scenario also passes against Doltgres itself. An intermediate
 compatibility run collided with a local binary reinstall (Text file busy); the
 reported final run used an unchanged installation and completed successfully.
+
+Follow-up: [revision-qualified views and ordered relation resolution](revision-catalog-views.md)
+closes the historical bootstrap-view boundary above and expands search-path,
+visibility and serialization coverage. It records the remaining object-family
+and nested-execution audit boundaries.

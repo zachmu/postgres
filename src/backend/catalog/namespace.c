@@ -959,6 +959,12 @@ RelationIsVisibleExt(Oid relid, bool *is_missing)
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 	}
 	relform = (Form_pg_class) GETSTRUCT(reltup);
+	if (dg_catalog_relation_visible(relid, NameStr(relform->relname), &visible))
+	{
+		ReleaseSysCache(reltup);
+		return visible;
+	}
+
 
 	recomputeNamespacePath();
 
