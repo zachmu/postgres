@@ -296,38 +296,52 @@ PostgreSQL's own structures.
      non-transactional in-memory store. It uses pageinspect to prove probes
      leave hint bits unset.
 3. **Library changes:**
-   - bound node size below the inline limit, and represent large values in
-     chunks;
-   - give the prolly library a fetch-on-miss callback, so trees read through the
-     store and node cache.
-4. **AM integration.**
-   - Table and index content trees are written to and read from the chunk store.
-   - **Working roots live in a catalog, not relation files.** There is one row
-     per (ref, relation), table or index, keyed by ref name. Names are
-     authoritative, so a rename moves the rows. `pg_dolt_binding` is already
-     keyed by (branch, name), so it gains the root columns and becomes the single
-     record of working state.
-   - **Relation files hold only the heap-shaped handle map**, one set of handle
-     tuples per writable head
-     ([row-level tracking §2](ROW-LEVEL-TRACKING-PLAN.md)).
-   - **Load** finds a root, then walks the tree on demand through the store and
-     node cache.
-     - First it checks the transaction's own overlay: a per-backend stack of
-       (command ID, subtransaction, root) for each (ref, relation) written. That
-       gives command-ID visibility for its own writes.
-     - Otherwise it reads the committed root from the catalog under the caller's
-       snapshot.
-   - **Save** works in three stages.
-     - Edits build new nodes in backend memory.
-     - At the end of each statement, the nodes reachable from the latest root go
-       to the store in one batch, and the root is pushed onto the overlay. This is
-       the deferred flush.
-     - Just before commit, the transaction locks the catalog row and checks it
-       against its starting root. Today a mismatch raises a serialization
-       failure; later it triggers a three-way merge. Then it writes the final
-       root, so the row lock is held only until commit.
-   - Abort and subtransaction rollback pop the overlay.
-   - Table and index roots publish in the same commit.
+   - **A fetch-on-miss callback** so trees read through the store and node cache.
+     Nodes record whether they are already in the store, so flushing writes only
+     new ones.
+   - **A path-local apply.** It rebuilds from the first edited leaf until chunk
+     boundaries resynchronize, and appends untouched subtrees by reference
+     without fetching them. Today's apply visits every leaf.
+   - **A diff that skips identical subtrees at any level,** which makes merge
+     O(changes).
+   - **No node-size bound in the library.** The heap store instead splits
+     oversize chunks across several inline rows, keyed by (hash, part). That
+     replaces the earlier plan to bound nodes and chunk large values.
+4. **AM integration**, superseding the earlier per-head heap design (see
+   [row-level tracking §2](ROW-LEVEL-TRACKING-PLAN.md)).
+   - **Content, index, handle and key-to-handle trees** all live in the chunk
+     store.
+   - **Working roots** live in a roots catalog keyed by (storage resource, branch
+     name), not in `pg_dolt_binding`. Binding rows exist only for captured or
+     canonical relations, and they are rewritten when schemas change.
+   - **Relation files** no longer hold chunks or root records.
+   - **Load** finds a root, then walks the tree through the store.
+     - It checks the transaction overlay first: a per-backend stack of (command
+       ID, subtransaction, base roots, roots) per (resource, branch).
+     - Otherwise it reads the committed roots under the caller's snapshot.
+     - If an overlay entry's base differs from the snapshot's committed roots,
+       the view is the three-way merge of the two. This rebases Read Committed
+       statements onto newer commits.
+   - **Save** pushes roots onto the overlay; nothing is written then.
+   - **Publish** happens just before commit or PREPARE.
+     - In (resource, branch) order, lock or insert the root row, then merge the
+       transaction's changes onto the latest committed roots.
+     - Write the new nodes to the chunk store, then write the merged roots. The
+       row lock is held until commit.
+     - New nodes are also flushed early once their memory crosses a threshold.
+   - **Abort and subtransaction rollback** pop the overlay.
+   - **Snapshot correctness.** Each publisher merges onto its predecessor's root
+     under the root row lock. That lock is released only after the publisher is
+     visible to new snapshots. So any snapshot that sees a publisher also sees
+     every earlier publisher, and MVCC on the root row selects a root containing
+     exactly the visible transactions.
+   - **Row-level writes** replace the table-wide writer lock. Updates, deletes
+     and row locks lock the row's lock record and compare versions to decide
+     between proceeding, waiting, rechecking (Read Committed) or a serialization
+     error (Repeatable Read).
+   - **Indexes are maintained incrementally,** and index scans use key bounds
+     plus the key-to-handle tree. Both replace whole-index rebuilds and
+     nested-loop scans.
 5. **Deferred flush:**
    [write performance plan](WRITE-PERF-PLAN.md) step 3, required before the
    integrated write path is usable at volume.

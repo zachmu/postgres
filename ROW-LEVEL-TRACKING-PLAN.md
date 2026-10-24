@@ -69,42 +69,74 @@ The current policy rejecting non-portable identifiers in stored SQL values
 remains in force. Runtime identities used internally do not grant permission to
 serialize those identifiers into canonical row or index contents.
 
-### Decision: a heap-shaped handle map per writable head (2026-10-25)
+### Decision: prolly handle trees plus heap lock records (2026-10-25)
 
-The table above leaves the row-identity, version and lock components abstract.
-They are decided as follows.
+This supersedes an earlier same-day decision to store handles as heap tuples
+per head. Building those for every row made branch creation O(rows), and branch
+creation must be nearly free.
 
-- **The table AM's own relation storage is a heap of handle tuples.** That is
-  its primary function.
-  - Each tuple stands for one row occurrence and holds the row's canonical key in
-    the prolly content tree. It holds no column data.
-  - PostgreSQL's own heap machinery supplies the TID, xmin and xmax, ctid
-    successor chains, row locks, EvalPlanQual rechecks and visibility. This is
-    where the non-prolly metadata for rows lives.
-- **One mapping per row occurrence.**
-  - An update creates a new handle version through a heap update.
-  - A delete deletes the handle tuple.
-  - Identical rows in a keyless table get one handle tuple each.
-  - A TID therefore names a row version, and successors follow ctid.
-- **Handles are branch-aware, like the catalog.** Each writable head has its own
-  handle tuples for each relation. A row lock on branch A never blocks a
-  transaction on branch B.
-- **Read-only revisions need no handles.** Tags, commits and AS OF reads keep
-  using retained-tree scans.
-- **Index scans resolve canonical row keys to TIDs** through an index on the
-  handle tuples' key, instead of today's nested loop over the handle tree.
-- **Ref names are authoritative.** A ref has no identity beyond its name; it
-  points into the commit graph. A rename must move every piece of per-head state
-  to the new name in one transaction: the root catalog rows and the head's handle
-  tuples.
+State is split by lifetime.
 
-Open questions:
-- the physical layout of per-head handle tuples;
-- building them at branch creation, which costs O(rows), versus on first write;
-- reads driven by visible handle tuples, with row bytes resolved by key in the
-  visible content root.
+**Durable, branch-shareable, per (head, relation), all prolly trees in the
+chunk store:**
 
-See [the chunk store plan](CHUNK-STORE-PLAN.md), milestone 4.
+- **Content tree** (canonical): row digest → occurrence count + row bytes.
+  Index content trees work the same way.
+- **Handle tree** (runtime, never in history): handle → row digest. The handle
+  is the TID. It names a row *occurrence*, and it stays the same when the row is
+  updated: an update maps it to the new version's digest. Identical rows in a
+  keyless table get one handle each.
+- **Key-to-handle tree** (runtime): row digest + handle → present. Index scans
+  use it to turn index entries into TIDs, and sequential scans walk it in step
+  with the content tree.
+
+Branch creation copies the roots, so it is O(tables). It derives handles by
+diffing from the closest existing head's (content, handle) pair, so it is
+O(changes), never O(rows).
+
+**Working roots** live in a catalog, one row per (storage resource, branch name)
+holding the current roots. A snapshot selects roots from it under ordinary
+MVCC. The proof, in [the chunk store plan](CHUNK-STORE-PLAN.md) milestone 4,
+relies on publication holding the row lock until commit. Ref names are
+authoritative: a rename rewrites the rows' branch name.
+
+**Transient, never copied, also per (head, relation):** lock records. A catalog
+row (resource, branch, handle) is created only when a row is first locked,
+updated or deleted. PostgreSQL's heap tuple locking on that row provides:
+- the four row-lock strengths;
+- multixacts;
+- waits on transaction IDs and deadlock detection;
+- `NOWAIT` and `SKIP LOCKED`.
+
+A lock on branch A never blocks branch B, because their records differ.
+
+**Handle IDs** come from a per-resource, non-transactional counter in shared
+memory. IDs are never reused. After a restart the counter starts above the
+largest handle in any root row version, including prepared transactions.
+
+**Where PostgreSQL metadata goes:**
+
+| PostgreSQL concept | Location |
+|---|---|
+| TID | The handle, from the handle tree |
+| Row visibility (xmin and xmax) | Presence in the snapshot's handle root, chosen through catalog MVCC plus the transaction's own overlay |
+| cmin and cmax | Command IDs on the transaction overlay |
+| Row locks | The lock record's tuple header |
+| "Updated" or "deleted" by a concurrent transaction | Comparing the row's digest in the snapshot root with the latest committed root, after waiting on the lock |
+| Update chains and EvalPlanQual | The same TID: the latest version is read by handle from the latest committed root |
+
+**Isolation and recheck rules:**
+- **Read Committed:** after waiting on a lock record, the writer reads the
+  latest committed version by the same TID and re-evaluates (EvalPlanQual).
+- **Repeatable Read:** if the latest version differs from the snapshot's, the
+  writer raises a serialization error.
+
+Conflicting row edits are excluded by lock records. So publication's three-way
+merge only combines disjoint changes, plus additive multiset counts. Unique
+indexes reserve keys so concurrent equal inserts wait instead of merging.
+
+The acceptance gate is PostgreSQL's isolation suite run with prolly as the
+default table access method.
 
 ## 3. Read and mutation model
 
