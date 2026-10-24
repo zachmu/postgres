@@ -20,6 +20,7 @@ typedef struct PLNode
 	uint32_t	count;
 	uint32_t	key_bytes;
 	uint32_t	value_bytes;
+	bool		backed;			/* known to be in the backing store */
 	struct PLNode *next;
 } PLNode;
 
@@ -34,6 +35,8 @@ struct PLStore
 	bool		failed;
 	PLBeforeWriteFn before_write;
 	void	   *write_arg;
+	PLFetchFn	fetch;
+	void	   *fetch_arg;
 };
 
 PLStatus	pl_file_append(PLStore *store, PLHash hash, PLSlice bytes);
@@ -43,6 +46,7 @@ void		pl_write32(uint8_t *p, uint32_t v);
 void		pl_write64(uint8_t *p, uint64_t v);
 bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
+PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);
 PLSlice		pl_node_value(const PLNode *node, uint32_t index);
 uint64_t	pl_node_rows(const PLNode *node);
@@ -60,5 +64,7 @@ typedef struct PLCursor
 PLStatus	pl_cursor_init(PLCursor *cursor, const PLTree *tree, const PLSlice *lower);
 PLStatus	pl_cursor_next(PLCursor *cursor);
 PLStatus	pl_cursor_skip_leaf(PLCursor *cursor);
+bool		pl_cursor_at_subtree_start(const PLCursor *cursor, uint32_t depth);
+PLStatus	pl_cursor_skip_subtree(PLCursor *cursor, uint32_t depth);
 PLEntry		pl_cursor_entry(const PLCursor *cursor);
 #endif

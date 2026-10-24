@@ -136,8 +136,9 @@ pl_store_stats(const PLStore *store)
 	return store->stats;
 }
 
+/* Find a node already in this store, without consulting a backing store. */
 PLNode *
-pl_find(PLStore *store, PLHash hash)
+pl_find_local(PLStore *store, PLHash hash)
 {
 	PLNode	   *node;
 
@@ -148,6 +149,31 @@ pl_find(PLStore *store, PLHash hash)
 		if (pl_hash_equal(node->hash, hash))
 			return node;
 	return NULL;
+}
+
+static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, PLNode **out);
+
+PLNode *
+pl_find(PLStore *store, PLHash hash)
+{
+	PLNode	   *node = pl_find_local(store, hash);
+	PLSlice		bytes;
+
+	if (node || !store || !store->fetch)
+		return node;
+	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
+		store_buffer(store, hash, bytes.data, bytes.len, &node) != PL_OK)
+		return NULL;
+	node->backed = true;
+	store->stats.fetched++;
+	return node;
+}
+
+void
+pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
+{
+	store->fetch = fetch;
+	store->fetch_arg = arg;
 }
 
 PLSlice
@@ -242,7 +268,7 @@ parse_node(PLNode *node)
 static PLStatus
 store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, PLNode **out)
 {
-	PLNode	   *node = pl_find(store, hash);
+	PLNode	   *node = pl_find_local(store, hash);
 	size_t		bucket;
 
 	if (!store)

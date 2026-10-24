@@ -125,6 +125,31 @@ pl_cursor_skip_leaf(PLCursor *cursor)
 	return PL_OK;
 }
 
+/* Whether the cursor is at the first entry of the subtree rooted at path[depth]. */
+bool
+pl_cursor_at_subtree_start(const PLCursor *cursor, uint32_t depth)
+{
+	for (uint32_t k = depth; k < cursor->depth; k++)
+		if (cursor->index[k] != 0)
+			return false;
+	return true;
+}
+
+/* Move past the whole subtree rooted at path[depth]. */
+PLStatus
+pl_cursor_skip_subtree(PLCursor *cursor, uint32_t depth)
+{
+	if (!cursor->valid)
+		return PL_OK;
+	if (depth == 0)
+	{
+		cursor->valid = false;
+		return PL_OK;
+	}
+	cursor->depth = depth + 1;
+	return pl_cursor_skip_leaf(cursor);
+}
+
 PLStatus
 pl_cursor_next(PLCursor *cursor)
 {
@@ -256,13 +281,173 @@ pl_branch(const PLTree *tree)
 	return *tree;
 }
 
+/*
+ * Path-local edits.
+ *
+ * A stream builds every level of a tree at once. Each level holds the pending
+ * entries of the node it is building and flushes at the same content-defined
+ * boundaries pl_build uses, so the result is identical to rebuilding the whole
+ * tree from its entries.
+ *
+ * Applying edits streams only the region around them. Every node except the
+ * last at its level ends at a natural boundary, so an untouched node can be
+ * appended by reference, without fetching it, whenever every level at or below
+ * its own is empty: streaming its contents would rebuild exactly that node. The
+ * last node at a level ends only because the tree ended there, so it is reused
+ * by reference only once no edits remain to follow it.
+ */
+typedef struct PLLevel
+{
+	PLEntry		pending[PL_MAX_ENTRIES];
+	uint8_t		values[PL_MAX_ENTRIES][PL_CHILD_SIZE];
+	uint32_t	count;
+	size_t		bytes;
+	uint64_t	entries;		/* entries ever added at this level */
+	bool		reused;			/* an existing node was appended at this level */
+	PLHash		last;			/* the child most recently added here */
+} PLLevel;
+
+typedef struct PLStream
+{
+	PLStore    *store;
+	PLLevel	   *levels;			/* PL_MAX_DEPTH + 1 levels */
+} PLStream;
+
+static PLStatus stream_flush(PLStream *stream, uint32_t level);
+
+/* Add a child reference at |level| (one above the child's own level). */
+static PLStatus
+stream_child(PLStream *stream, uint32_t level, PLSlice key, PLHash hash, uint64_t rows, bool reused)
+{
+	PLLevel    *l;
+	uint8_t    *value;
+
+	if (level >= PL_MAX_DEPTH)
+		return PL_INVALID;
+	l = &stream->levels[level];
+	value = l->values[l->count];
+	memcpy(value, hash.bytes, PL_HASH_SIZE);
+	pl_write64(value + PL_HASH_SIZE, rows);
+	l->pending[l->count].key = key;
+	l->pending[l->count].value.data = value;
+	l->pending[l->count].value.len = PL_CHILD_SIZE;
+	l->count++;
+	l->bytes += 8 + key.len + PL_CHILD_SIZE;
+	l->entries++;
+	l->last = hash;
+	l->reused |= reused;
+	if (pl_boundary(level, l->count, l->bytes, key))
+		return stream_flush(stream, level);
+	return PL_OK;
+}
+
+static PLStatus
+stream_entry(PLStream *stream, PLEntry entry)
+{
+	PLLevel    *l = &stream->levels[0];
+
+	l->pending[l->count++] = entry;
+	l->bytes += 8 + entry.key.len + entry.value.len;
+	l->entries++;
+	if (pl_boundary(0, l->count, l->bytes, entry.key))
+		return stream_flush(stream, 0);
+	return PL_OK;
+}
+
+static PLStatus
+stream_flush(PLStream *stream, uint32_t level)
+{
+	PLLevel    *l = &stream->levels[level];
+	PLNode	   *node;
+	PLStatus	status = pl_save(stream->store, level, l->pending, l->count, &node);
+
+	if (status != PL_OK)
+		return status;
+	l->count = 0;
+	l->bytes = 0;
+	return stream_child(stream, level + 1, pl_node_key(node, node->count - 1), node->hash,
+						pl_node_rows(node), false);
+}
+
+/*
+ * Flush every level and find the root: the lowest level with exactly one node.
+ * A reused node hides its descendants, so a level only counts as having one
+ * node if no node from a higher level was reused.
+ */
+static PLStatus
+stream_finish(PLStream *stream, PLTree *out)
+{
+	PLNode	   *root = NULL;
+	uint32_t	level;
+	PLStatus	status = PL_OK;
+
+	if (!stream->levels[0].entries && !stream->levels[1].entries)
+	{
+		bool		empty = true;
+
+		for (level = 2; level < PL_MAX_DEPTH; level++)
+			empty &= stream->levels[level].entries == 0;
+		if (empty)
+		{
+			status = pl_save(stream->store, 0, NULL, 0, &root);
+			if (status == PL_OK)
+			{
+				out->store = stream->store;
+				out->root = root->hash;
+			}
+			return status;
+		}
+	}
+	for (level = 0; level + 1 < PL_MAX_DEPTH && status == PL_OK; level++)
+	{
+		bool		hidden = false;
+		uint32_t	above;
+
+		if (stream->levels[level].count)
+			status = stream_flush(stream, level);
+		if (status != PL_OK)
+			break;
+		for (above = level + 2; above < PL_MAX_DEPTH; above++)
+			hidden |= stream->levels[above].reused;
+		if (stream->levels[level + 1].entries == 1 && !hidden)
+		{
+			root = pl_find(stream->store, stream->levels[level + 1].last);
+			break;
+		}
+	}
+	if (status != PL_OK)
+		return status;
+	if (!root)
+		return PL_CORRUPT;
+
+	/* A reused internal node with one child is not a root pl_build would make. */
+	while (root->level && root->count == 1)
+	{
+		PLHash		child;
+
+		memcpy(child.bytes, pl_node_value(root, 0).data, PL_HASH_SIZE);
+		root = pl_find(stream->store, child);
+		if (!root)
+			return PL_CORRUPT;
+	}
+	out->store = stream->store;
+	out->root = root->hash;
+	return PL_OK;
+}
+
 PLStatus
 pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 {
-	PLCursor	cursor;
-	PLBuilder	builder = {0};
-	PLStatus	status;
+	PLStream	stream = {0};
+	PLNode	   *path[PL_MAX_DEPTH];
+	uint32_t	next[PL_MAX_DEPTH];
+	bool		right[PL_MAX_DEPTH];
+	uint32_t	depth = 0,
+				entry = 0;
+	PLNode	   *node;
+	PLStatus	status = PL_OK;
 	size_t		i;
+	bool		edge = true;
 
 	if (!tree || !out || (count && !edits))
 		return PL_INVALID;
@@ -270,65 +455,166 @@ pl_apply(const PLTree *tree, const PLEdit *edits, size_t count, PLTree *out)
 		if (!valid_slice(edits[i].key) || (edits[i].value.present && !valid_slice(edits[i].value.bytes)) ||
 			(i && pl_compare(edits[i - 1].key, edits[i].key) >= 0))
 			return PL_INVALID;
-	status = pl_cursor_init(&cursor, tree, NULL);
-	if (status != PL_OK)
-		return status;
+	node = pl_find(tree->store, tree->root);
+	if (!node)
+		return PL_CORRUPT;
 	if (!count)
 	{
 		*out = *tree;
 		return PL_OK;
 	}
-	builder.store = tree->store;
-	i = 0;
-	while (status == PL_OK && (cursor.valid || i < count))
+	stream.store = tree->store;
+	stream.levels = calloc(PL_MAX_DEPTH + 1, sizeof(PLLevel));
+	if (!stream.levels)
+		return PL_NOMEM;
+
+	/*
+	 * Descend to the leaf holding the first edit, reusing every subtree to
+	 * its left. Those subtrees precede the path, so all levels below them are
+	 * empty when each is appended.
+	 */
+	while (status == PL_OK)
 	{
-		PLEntry		entry = {{NULL, 0}, {NULL, 0}};
-		int			comparison;
+		uint32_t	c;
 
-		if (cursor.valid)
+		if (depth >= PL_MAX_DEPTH)
 		{
-			PLNode	   *leaf = cursor.path[cursor.depth - 1];
-			PLSlice		last = pl_node_key(leaf, leaf->count - 1);
+			status = PL_CORRUPT;
+			break;
+		}
+		path[depth] = node;
+		right[depth] = edge;
+		if (!node->level)
+		{
+			depth++;
+			break;
+		}
+		c = lower_bound(node, edits[0].key);
+		if (c >= node->count)
+			c = node->count - 1;
+		for (uint32_t j = 0; j < c && status == PL_OK; j++)
+		{
+			PLSlice		value = pl_node_value(node, j);
+			PLHash		hash;
 
-			/*
-			 * Copy whole untouched chunks once chunk boundaries
-			 * resynchronize.
-			 */
-			if (builder.count == 0 && cursor.index[cursor.depth - 1] == 0 &&
-				(i == count || pl_compare(edits[i].key, last) > 0) &&
-				(i == count || pl_boundary(0, leaf->count, leaf->size - PL_HEADER - 8, last)))
+			memcpy(hash.bytes, value.data, PL_HASH_SIZE);
+			status = stream_child(&stream, node->level, pl_node_key(node, j), hash,
+								  pl_read64(value.data + PL_HASH_SIZE), true);
+		}
+		next[depth++] = c + 1;
+		edge = edge && c == node->count - 1;
+		{
+			PLHash		hash;
+
+			memcpy(hash.bytes, pl_node_value(node, c).data, PL_HASH_SIZE);
+			node = pl_find(tree->store, hash);
+		}
+		if (!node || node->level + 1 != path[depth - 1]->level)
+			status = PL_CORRUPT;
+	}
+
+	i = 0;
+	while (status == PL_OK)
+	{
+		PLNode	   *leaf = path[depth - 1];
+
+		/* Merge this leaf's entries with the edits that fall inside it. */
+		while (status == PL_OK && entry < leaf->count)
+		{
+			PLEntry		current = {pl_node_key(leaf, entry), pl_node_value(leaf, entry)};
+			int			comparison = i == count ? -1 : pl_compare(current.key, edits[i].key);
+
+			if (comparison < 0)
 			{
-				status = append_node(&builder, leaf);
-				if (status == PL_OK)
-					status = pl_cursor_skip_leaf(&cursor);
-				builder.store->stats.skipped++;
+				status = stream_entry(&stream, current);
+				entry++;
+			}
+			else
+			{
+				if (edits[i].value.present)
+				{
+					PLEntry		edited = {edits[i].key, edits[i].value.bytes};
+
+					status = stream_entry(&stream, edited);
+				}
+				if (comparison == 0)
+					entry++;
+				i++;
+			}
+		}
+		if (status != PL_OK)
+			break;
+
+		/*
+		 * Move to the next leaf, appending whole untouched subtrees whenever
+		 * the levels at and below them are empty.
+		 */
+		depth--;
+		while (depth)
+		{
+			PLNode	   *parent = path[depth - 1];
+			uint32_t	c,
+						level;
+			bool		child_right,
+						skip;
+			PLSlice		last;
+			PLSlice		value;
+			PLHash		hash;
+
+			if (next[depth - 1] >= parent->count)
+			{
+				depth--;
 				continue;
 			}
-			entry = pl_cursor_entry(&cursor);
-		}
-		comparison = !cursor.valid ? 1 : i == count ? -1 : pl_compare(entry.key, edits[i].key);
-		if (comparison < 0)
-		{
-			status = add(&builder, entry, 0);
-			if (status == PL_OK)
-				status = pl_cursor_next(&cursor);
-		}
-		else
-		{
-			if (edits[i].value.present)
+			c = next[depth - 1]++;
+			level = parent->level - 1;
+			child_right = right[depth - 1] && c == parent->count - 1;
+			last = pl_node_key(parent, c);
+			value = pl_node_value(parent, c);
+			memcpy(hash.bytes, value.data, PL_HASH_SIZE);
+			skip = (i == count || pl_compare(edits[i].key, last) > 0) && (!child_right || i == count);
+			for (uint32_t k = 0; skip && k <= level; k++)
+				skip = stream.levels[k].count == 0;
+			if (skip)
 			{
-				entry.key = edits[i].key;
-				entry.value = edits[i].value.bytes;
-				status = add(&builder, entry, 0);
+				stream.store->stats.skipped++;
+				status = stream_child(&stream, parent->level, last, hash,
+									  pl_read64(value.data + PL_HASH_SIZE), true);
+				if (status != PL_OK)
+					break;
+				continue;
 			}
-			if (comparison == 0 && status == PL_OK)
-				status = pl_cursor_next(&cursor);
-			i++;
+			node = pl_find(stream.store, hash);
+			if (!node || node->level != level)
+			{
+				status = PL_CORRUPT;
+				break;
+			}
+			path[depth] = node;
+			right[depth] = child_right;
+			next[depth] = 0;
+			depth++;
+			if (!level)
+			{
+				entry = 0;
+				break;
+			}
 		}
+		if (status != PL_OK || !depth)
+			break;
 	}
+
+	/* Edits past the old last key extend the tree. */
+	for (; status == PL_OK && i < count; i++)
+		if (edits[i].value.present)
+		{
+			PLEntry		edited = {edits[i].key, edits[i].value.bytes};
+
+			status = stream_entry(&stream, edited);
+		}
 	if (status == PL_OK)
-		status = finish(&builder, out);
-	free(builder.nodes);
+		status = stream_finish(&stream, out);
+	free(stream.levels);
 	return status;
 }
 

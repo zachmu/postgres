@@ -57,6 +57,7 @@ typedef struct PLStats
 	uint64_t	writes;
 	uint64_t	reused;
 	uint64_t	skipped;
+	uint64_t	fetched;
 } PLStats;
 
 typedef PLStatus (*PLScanFn) (void *arg, PLSlice key, PLSlice value);
@@ -72,6 +73,12 @@ typedef PLStatus (*PLResolveFn) (void *arg, PLSlice key, PLValue base,
  */
 typedef PLStatus (*PLBeforeWriteFn) (void *arg, PLHash hash, PLSlice bytes);
 
+/* Called when a node is missing from a store, to load it from a backing store.
+ * On PL_OK, *bytes must hold the node's encoding until the callback's next call;
+ * the store copies them. Return PL_NOT_FOUND if the backing store lacks it.
+ */
+typedef PLStatus (*PLFetchFn) (void *arg, PLHash hash, PLSlice *bytes);
+
 /* File open loads all chunks, locks exclusively, and leaves out unchanged on error.
  * repair_tail permits truncating an incomplete final record for subsequent replay.
  * sync is explicit; free does not promise durability. Root refs are external.
@@ -83,6 +90,9 @@ PLStatus	pl_store_replay(PLStore *store, PLHash hash, PLSlice bytes);
 
 PLStore    *pl_store_create(void);
 void		pl_store_free(PLStore *store);
+
+/* Load missing nodes on demand. Fetched nodes are marked as backed. */
+void		pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg);
 PLStats		pl_store_stats(const PLStore *store);
 
 /* Exported bytes are immutable and borrowed until store_free. */
