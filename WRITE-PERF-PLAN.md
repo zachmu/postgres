@@ -1,7 +1,11 @@
 # Prolly write performance plan
 
-Status, 2026-10-24: deferred. The chunk index is the next focus, and it replaces
-step 1 below. Resume steps 2–4 once chunk storage and indexing are settled. The
+Status, 2026-10-25: deferred. The chunk index is the current focus, and it
+replaces step 1 below. Step 3, the statement-level deferred flush, is scheduled
+immediately after the chunk store is integrated into the AMs
+([chunk store plan](CHUNK-STORE-PLAN.md) milestone 5). The measured write curve
+makes per-row tree versions unaffordable there. Re-evaluate steps 2 and 4 after
+that. The
 evidence and reasoning here were gathered on the merge base at `d064539a616`.
 
 ## Motivation

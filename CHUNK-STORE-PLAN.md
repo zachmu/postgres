@@ -1,8 +1,10 @@
 # Chunk store plan
 
-Status, 2026-10-24: architecture agreed. Milestone 1, a minimal catalog with
-native access, a node cache and microbenchmarks, is in progress on branch
-`zachmu/chunk-index`. This plan supersedes step 1 of
+Status, 2026-10-25: milestone 1 is complete (commit `645794b3460` on branch
+`zachmu/chunk-index`): a minimal catalog with native access, a node cache and
+microbenchmarks. The heap design is accepted provisionally. We build on it only
+behind a standard store interface (below), so a different implementation can
+replace it later. Milestone 2, the interface, is next. This plan supersedes step 1 of
 [the write performance plan](WRITE-PERF-PLAN.md) and is the next focus of
 [PLAN.md](PLAN.md).
 
@@ -145,15 +147,95 @@ tuples read TOAST. Costs and mitigations:
 - **Scattered leaves on a cold cache.** Mitigated with read-ahead from interior
   nodes through read streams.
 
-### Expected limits
+### Measured limits (milestone 1)
 
-- Overhead is about 75 bytes per chunk, roughly 2–4% for 2–4 KB chunks.
-- Hash keys are random, so index inserts touch random leaf pages. While the
-  index fits in memory, the cost is WAL: a full-page image on the first change
-  to each page after a checkpoint, reduced by `wal_compression`.
-- Once the index outgrows memory, inserts also need random reads. At about
-  50 bytes per entry, that point is near 100 million chunks per 5 GB of index
-  memory.
+Full results are in the workspace report `reports/chunk-store-benchmarks.html`.
+Setup: an optimized build, 7 CPUs, 7.6 GB RAM, 2 GB shared_buffers.
+
+- **Space.** Overhead is about 75 bytes per chunk. Mixed sizes from 512 to 8,000
+  bytes pack into heap pages at about 90% efficiency.
+- **Writes are bound by WAL volume.** Each chunk writes its own size to WAL plus
+  about 5%.
+  - One session does about 46,000 mixed-size puts per second at first, slowing
+    to about 30,000 by 2 million chunks (9.5 GB) as heap write-back competes.
+  - Four sessions top out near 45,000 per second, at about 215 MB/s of WAL.
+- **The write curve bends at shared_buffers, not RAM.** With 128-byte chunks,
+  puts run at 130,000 to 200,000 per second until the btree passes
+  shared_buffers, at about 27 million chunks. They then fall steadily, to
+  22,000 per second at 68 million chunks and 4.9 GB of index. Random-key inserts
+  read and dirty random leaf pages. This curve is accepted for now.
+- **Reads.**
+  - A warm native lookup takes 1.5–3.4 µs, about 25% faster than SPI for mixed
+    sizes.
+  - A node-cache hit takes 0.06–0.1 µs.
+  - Reads that miss memory cost 30–150 µs on either path.
+- **Hint bits.** Data checksums are on by default in PostgreSQL 18. With them,
+  the first existence probe of newly committed chunks sets hint bits and logs
+  full-page images: about 850 MB of WAL per 200,000 probes. Plain reads skip
+  visibility checks and avoid it.
+  - Fix before AM integration: probe without setting hints, or freeze chunks
+    promptly.
+- **Write-path consequence for AM integration.** Without the statement-level
+  deferred flush, each inserted row writes its leaf and the path above it, about
+  14 KB of chunks. At about 200 MB/s of WAL, that caps inserts near 15,000 rows
+  per second. The deferred flush
+  ([write performance plan](WRITE-PERF-PLAN.md) step 3) therefore follows AM
+  integration immediately.
+
+## Store interface
+
+Every consumer goes through one interface. Implementations sit behind a function
+table, in the style of PostgreSQL's table AM routine. The heap catalog is the
+first implementation. A packed journal, or anything else, must be able to
+replace it without changing callers.
+
+### Contract callers may rely on
+
+- **Idempotent puts.** Putting a chunk that is already present is harmless.
+- **Reachable chunks are readable.** A chunk referenced by any root visible to
+  the caller's snapshot can be read.
+- **Durability by commit.** A chunk put in a transaction is durable once that
+  transaction commits.
+- **Content is fixed by hash.** The bytes returned for a hash are the bytes that
+  were put under it.
+
+### Not part of the contract
+
+Callers must not rely on these, even though the heap implementation shows them:
+
+- whether a put disappears on rollback;
+- whether a put waits for a concurrent inserter of the same hash;
+- whether chunks put by other running transactions are visible;
+- relation lock modes, catalog OIDs or snapshot types;
+- how long results remain valid without an explicit pin.
+
+### Interface shape
+
+- **Open and close by intent,** read or write, not by lock mode. A handle and
+  its pins last at most one transaction.
+- **Batch get.** Returns each found chunk *pinned*. Callers release pins
+  explicitly, and pins are dropped at transaction end. A single-chunk call is a
+  convenience wrapper.
+- **Batch existence check.**
+- **Batch put.** The implementation may reorder a batch, for example by hash for
+  index locality.
+- **Lifecycle operations:**
+  - enumerate and delete, for garbage collection;
+  - the maximum chunk size, reported by the implementation;
+  - store statistics.
+
+### Above the interface
+
+These layers wrap every implementation, so benchmarks compare stores rather
+than caches:
+
+- **The node cache.** Pinned entries are never evicted, and eviction uses only
+  unpinned entries.
+- **Optional hash verification** of puts and cache fills.
+- **Statistics.**
+
+Implementation selection is a single routine pointer. Tests can install another
+implementation to prove the boundary holds.
 
 ## Alternative: custom packed journal with a serialized index
 
@@ -190,30 +272,39 @@ PostgreSQL's own structures.
 
 ## Milestones
 
-1. **Minimal store (in progress):**
+1. **Minimal store (done, `645794b3460`):**
    - the catalog, insert-if-absent, lookup and existence check;
    - the node cache and `dolt_chunk_cache_size`;
    - correctness tests: dedup, abort, concurrent identical inserts, recovery, the
      size limit;
    - microbenchmarks of puts and gets with and without the cache at several
      scales, recording WAL bytes per chunk.
-2. **Library changes:**
+2. **Store interface (next):**
+   - the function table, contract and batch and pin API above;
+   - the cache, verification and statistics moved above it;
+   - the heap implementation behind it;
+   - a second, test-only implementation exercising the same contract tests;
+   - an existence probe that doesn't set hint bits.
+3. **Library changes:**
    - bound node size below the inline limit, and represent large values in
      chunks;
    - give the prolly library a fetch-on-miss callback, so trees read through the
      store and node cache.
-3. **AM integration.**
+4. **AM integration.**
    - Table and index content trees are written to and read from the chunk store.
    - Relation files keep only roots and runtime state.
    - Decide where root pointers and handle maps live.
-4. **History.**
+5. **Deferred flush:**
+   [write performance plan](WRITE-PERF-PLAN.md) step 3, required before the
+   integrated write path is usable at volume.
+6. **History.**
    - Commit and capture record roots without copying.
    - Rekey and dedupe `pg_dolt_object`.
    - Resolve the working-state duplication found in the audit, including branch
      rename losing uncommitted work.
-5. **Garbage collection.** Define the reachability and safepoint protocol, then
+7. **Garbage collection.** Define the reachability and safepoint protocol, then
    delete and VACUUM.
 
-After milestone 3, resume
-[the write performance plan](WRITE-PERF-PLAN.md) steps 2–4 against the new
-storage.
+After milestone 5, re-evaluate
+[the write performance plan](WRITE-PERF-PLAN.md) steps 2 and 4 against the new
+storage. Packed appends may no longer apply to chunks.

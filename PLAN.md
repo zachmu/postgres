@@ -969,7 +969,10 @@ startup scan and with a cache shared across sessions. Chunk storage and indexing
 the next focus. The selected design is a heap catalog `pg_dolt_chunk` with a
 unique btree on the node hash, with data inline and never TOASTed. It uses direct
 heap and index access and a per-backend node cache. A custom packed journal with
-sorted index runs is the recorded alternative. It will also address the
+sorted index runs is the recorded alternative. Microbenchmarks (2026-10-25)
+were good enough to build on provisionally, provided every consumer uses a
+standard store interface that allows replacing the implementation. The
+statement-level deferred flush follows AM integration directly. It will also address the
 redundancies found in the `pg_dolt*` catalog audit: chunks copied into
 `pg_dolt_object`, two hash namespaces, and three diverging records of a branch's
 working state.
