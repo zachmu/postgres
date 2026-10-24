@@ -69,6 +69,43 @@ The current policy rejecting non-portable identifiers in stored SQL values
 remains in force. Runtime identities used internally do not grant permission to
 serialize those identifiers into canonical row or index contents.
 
+### Decision: a heap-shaped handle map per writable head (2026-10-25)
+
+The table above leaves the row-identity, version and lock components abstract.
+They are decided as follows.
+
+- **The table AM's own relation storage is a heap of handle tuples.** That is
+  its primary function.
+  - Each tuple stands for one row occurrence and holds the row's canonical key in
+    the prolly content tree. It holds no column data.
+  - PostgreSQL's own heap machinery supplies the TID, xmin and xmax, ctid
+    successor chains, row locks, EvalPlanQual rechecks and visibility. This is
+    where the non-prolly metadata for rows lives.
+- **One mapping per row occurrence.**
+  - An update creates a new handle version through a heap update.
+  - A delete deletes the handle tuple.
+  - Identical rows in a keyless table get one handle tuple each.
+  - A TID therefore names a row version, and successors follow ctid.
+- **Handles are branch-aware, like the catalog.** Each writable head has its own
+  handle tuples for each relation. A row lock on branch A never blocks a
+  transaction on branch B.
+- **Read-only revisions need no handles.** Tags, commits and AS OF reads keep
+  using retained-tree scans.
+- **Index scans resolve canonical row keys to TIDs** through an index on the
+  handle tuples' key, instead of today's nested loop over the handle tree.
+- **Ref names are authoritative.** A ref has no identity beyond its name; it
+  points into the commit graph. A rename must move every piece of per-head state
+  to the new name in one transaction: the root catalog rows and the head's handle
+  tuples.
+
+Open questions:
+- the physical layout of per-head handle tuples;
+- building them at branch creation, which costs O(rows), versus on first write;
+- reads driven by visible handle tuples, with row bytes resolved by key in the
+  visible content root.
+
+See [the chunk store plan](CHUNK-STORE-PLAN.md), milestone 4.
+
 ## 3. Read and mutation model
 
 A statement reads its snapshot's committed contents plus its transaction's

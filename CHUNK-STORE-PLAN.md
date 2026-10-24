@@ -302,8 +302,32 @@ PostgreSQL's own structures.
      store and node cache.
 4. **AM integration.**
    - Table and index content trees are written to and read from the chunk store.
-   - Relation files keep only roots and runtime state.
-   - Decide where root pointers and handle maps live.
+   - **Working roots live in a catalog, not relation files.** There is one row
+     per (ref, relation), table or index, keyed by ref name. Names are
+     authoritative, so a rename moves the rows. `pg_dolt_binding` is already
+     keyed by (branch, name), so it gains the root columns and becomes the single
+     record of working state.
+   - **Relation files hold only the heap-shaped handle map**, one set of handle
+     tuples per writable head
+     ([row-level tracking §2](ROW-LEVEL-TRACKING-PLAN.md)).
+   - **Load** finds a root, then walks the tree on demand through the store and
+     node cache.
+     - First it checks the transaction's own overlay: a per-backend stack of
+       (command ID, subtransaction, root) for each (ref, relation) written. That
+       gives command-ID visibility for its own writes.
+     - Otherwise it reads the committed root from the catalog under the caller's
+       snapshot.
+   - **Save** works in three stages.
+     - Edits build new nodes in backend memory.
+     - At the end of each statement, the nodes reachable from the latest root go
+       to the store in one batch, and the root is pushed onto the overlay. This is
+       the deferred flush.
+     - Just before commit, the transaction locks the catalog row and checks it
+       against its starting root. Today a mismatch raises a serialization
+       failure; later it triggers a three-way merge. Then it writes the final
+       root, so the row lock is held only until commit.
+   - Abort and subtransaction rollback pop the overlay.
+   - Table and index roots publish in the same commit.
 5. **Deferred flush:**
    [write performance plan](WRITE-PERF-PLAN.md) step 3, required before the
    integrated write path is usable at volume.
