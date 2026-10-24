@@ -40,12 +40,14 @@ SELECT name, setting, unit FROM pg_settings
 -- One row per hash, however often it was put.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
 
--- The inline limit is exact: the largest chunk fits uncompressed.
-SELECT test_chunk_max_size();
-SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size()), 'hex') AS x) s;
-SELECT length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
-  FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('ab', test_chunk_max_size()), 'hex'));
+-- A chunk longer than one heap tuple spans parts, each inline and uncompressed.
+SELECT test_chunk_put(sha256(x), x) FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
+SELECT chunkpart, chunksize, length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
+  FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
+SELECT test_chunk_get(sha256(x)) = x AS multipart_roundtrip
+  FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
+SELECT test_chunk_delete(sha256(decode(repeat('cd', 20000), 'hex'))) AS multipart_deleted;
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex'));
 
 -- Puts are transactional here: own writes are visible, rollback removes them.
 BEGIN;

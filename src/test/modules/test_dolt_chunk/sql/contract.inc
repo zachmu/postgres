@@ -19,10 +19,12 @@ SELECT test_chunk_put_many(
 SELECT test_chunk_get_many(ARRAY[sha256('contract gamma'), sha256('contract missing'), sha256('contract beta')])
        = ARRAY['contract gamma', NULL, 'contract beta']::bytea[] AS batch_get;
 
--- Chunks larger than the implementation's limit are rejected.
-SELECT test_chunk_max_size() > 0 AS reports_limit;
-SELECT error_of($$SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s$$) LIKE '%exceeds the inline limit%' AS oversize_rejected;
+-- Large chunks round-trip whole; the store reports a limit well above them.
+SELECT test_chunk_max_size() >= 1048576 AS large_limit;
+SELECT test_chunk_put(sha256(x), x) AS large_put,
+       test_chunk_get(sha256(x)) = x AS large_roundtrip,
+       test_chunk_exists(sha256(x)) AS large_exists
+  FROM (SELECT decode(repeat(md5(g::text), 6250), 'hex') AS x FROM generate_series(1, 1) g) s;
 
 -- Deleting removes a chunk from existence checks; deleting again finds nothing.
 SELECT test_chunk_put(sha256('contract delta'), 'contract delta') AS put_delta;

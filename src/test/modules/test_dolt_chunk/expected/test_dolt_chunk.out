@@ -72,18 +72,20 @@ SELECT test_chunk_get_many(ARRAY[sha256('contract gamma'), sha256('contract miss
  t
 (1 row)
 
--- Chunks larger than the implementation's limit are rejected.
-SELECT test_chunk_max_size() > 0 AS reports_limit;
- reports_limit 
----------------
+-- Large chunks round-trip whole; the store reports a limit well above them.
+SELECT test_chunk_max_size() >= 1048576 AS large_limit;
+ large_limit 
+-------------
  t
 (1 row)
 
-SELECT error_of($$SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s$$) LIKE '%exceeds the inline limit%' AS oversize_rejected;
- oversize_rejected 
--------------------
- t
+SELECT test_chunk_put(sha256(x), x) AS large_put,
+       test_chunk_get(sha256(x)) = x AS large_roundtrip,
+       test_chunk_exists(sha256(x)) AS large_exists
+  FROM (SELECT decode(repeat(md5(g::text), 6250), 'hex') AS x FROM generate_series(1, 1) g) s;
+ large_put | large_roundtrip | large_exists 
+-----------+-----------------+--------------
+ t         | t               | t
 (1 row)
 
 -- Deleting removes a chunk from existence checks; deleting again finds nothing.
@@ -225,18 +227,20 @@ SELECT test_chunk_get_many(ARRAY[sha256('contract gamma'), sha256('contract miss
  t
 (1 row)
 
--- Chunks larger than the implementation's limit are rejected.
-SELECT test_chunk_max_size() > 0 AS reports_limit;
- reports_limit 
----------------
+-- Large chunks round-trip whole; the store reports a limit well above them.
+SELECT test_chunk_max_size() >= 1048576 AS large_limit;
+ large_limit 
+-------------
  t
 (1 row)
 
-SELECT error_of($$SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s$$) LIKE '%exceeds the inline limit%' AS oversize_rejected;
- oversize_rejected 
--------------------
- t
+SELECT test_chunk_put(sha256(x), x) AS large_put,
+       test_chunk_get(sha256(x)) = x AS large_roundtrip,
+       test_chunk_exists(sha256(x)) AS large_exists
+  FROM (SELECT decode(repeat(md5(g::text), 6250), 'hex') AS x FROM generate_series(1, 1) g) s;
+ large_put | large_roundtrip | large_exists 
+-----------+-----------------+--------------
+ t         | t               | t
 (1 row)
 
 -- Deleting removes a chunk from existence checks; deleting again finds nothing.
@@ -344,9 +348,11 @@ SELECT attname, attstorage FROM pg_attribute
   WHERE attrelid = 'pg_dolt_chunk'::regclass AND attnum > 0 ORDER BY attnum;
   attname  | attstorage 
 -----------+------------
+ chunkpart | p
+ chunksize | p
  chunkhash | p
  chunkdata | p
-(2 rows)
+(4 rows)
 
 SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
  no_toast 
@@ -375,25 +381,39 @@ SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
      1
 (1 row)
 
--- The inline limit is exact: the largest chunk fits uncompressed.
-SELECT test_chunk_max_size();
- test_chunk_max_size 
----------------------
-                8096
-(1 row)
-
-SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size()), 'hex') AS x) s;
+-- A chunk longer than one heap tuple spans parts, each inline and uncompressed.
+SELECT test_chunk_put(sha256(x), x) FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
  test_chunk_put 
 ----------------
  t
 (1 row)
 
-SELECT length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
-  FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('ab', test_chunk_max_size()), 'hex'));
- length | uncompressed 
---------+--------------
-   8096 | t
+SELECT chunkpart, chunksize, length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompressed
+  FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
+ chunkpart | chunksize | length | uncompressed 
+-----------+-----------+--------+--------------
+         0 |     20000 |   8088 | t
+         1 |     20000 |   8088 | t
+         2 |     20000 |   3824 | t
+(3 rows)
+
+SELECT test_chunk_get(sha256(x)) = x AS multipart_roundtrip
+  FROM (SELECT decode(repeat('cd', 20000), 'hex') AS x) s;
+ multipart_roundtrip 
+---------------------
+ t
+(1 row)
+
+SELECT test_chunk_delete(sha256(decode(repeat('cd', 20000), 'hex'))) AS multipart_deleted;
+ multipart_deleted 
+-------------------
+ t
+(1 row)
+
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex'));
+ count 
+-------
+     0
 (1 row)
 
 -- Puts are transactional here: own writes are visible, rollback removes them.
