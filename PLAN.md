@@ -21,6 +21,9 @@ for future detailed planning work.
 - [Database manifest and version-control publication](MANIFEST-PLAN.md) —
   heap-backed refs, immutable database states, transaction visibility and an
   early version-control slice coordinated with the row-level publication design.
+- [Prolly write performance](WRITE-PERF-PLAN.md) — measured insert costs, root
+  causes and a four-step plan (chunk cache, packed appends, statement-level
+  deferred flush, batched inserts). Deferred until the chunk index is designed.
 
 ### Planning record — 2026-10-22
 
@@ -948,3 +951,17 @@ old-snapshot/recreation authority remains deferred in KNOWN-ISSUES.md.
 Docs, stored tests and saved queries are public prolly tables reached through
 built-in aliases. The six administrative heap tables now use native catalog
 headers, C-collated text indexes and valid pg_proc argument metadata.
+
+### Storage write performance and chunk indexing (2026-10-24)
+
+Loading the PostgreSQL regression suite's setup data into prolly tables takes
+about an hour, because every insert re-reads the relation's entire chunk history.
+Measurements, root causes and the agreed four-step fix are in
+[WRITE-PERF-PLAN.md](WRITE-PERF-PLAN.md). That work is paused. Its first step, a
+chunk cache, depends on a decision made since: chunks must be locatable by hash,
+across all relations and history, through an index serialized to disk, with no
+startup scan and with a cache shared across sessions. Chunk storage and indexing
+(branch `zachmu/chunk-index`) is the next focus. It will also address the
+redundancies found in the `pg_dolt*` catalog audit: chunks copied into
+`pg_dolt_object`, two hash namespaces, and three diverging records of a branch's
+working state.
