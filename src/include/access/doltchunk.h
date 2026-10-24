@@ -1,10 +1,25 @@
 /*-------------------------------------------------------------------------
  *
  * doltchunk.h
- *	  Native access to the pg_dolt_chunk store and the per-backend node cache.
+ *	  The prolly chunk store interface.
  *
- * Callers supply the SHA-256 hash of each chunk; the store trusts it. Chunks
- * are immutable, so cached copies never need invalidation.
+ * Every consumer of prolly chunks goes through this API. Chunks are immutable
+ * byte strings addressed by the SHA-256 of their contents, so the bytes for a
+ * hash never change and cached copies never need invalidation.
+ *
+ * Callers may rely on:
+ *	- puts are idempotent;
+ *	- a chunk referenced by any root visible to the caller's snapshot can be
+ *	  read;
+ *	- a chunk put in a transaction is durable once that transaction commits;
+ *	- the bytes returned for a hash are the bytes that were put under it.
+ *
+ * Callers must not rely on whether a put disappears on rollback, whether a put
+ * waits for a concurrent inserter, whether other running transactions' puts are
+ * visible, or how a store locks or stores anything. Implementations differ in
+ * all of these.
+ *
+ * A store handle and the pins taken through it last at most one transaction.
  *
  * src/include/access/doltchunk.h
  *
@@ -13,11 +28,32 @@
 #ifndef DOLTCHUNK_H
 #define DOLTCHUNK_H
 
-#include "storage/lockdefs.h"
-
 #define DOLT_CHUNK_HASH_SIZE 32
 
+typedef enum DoltChunkIntent
+{
+	DOLT_CHUNK_READ,
+	DOLT_CHUNK_WRITE,
+} DoltChunkIntent;
+
 typedef struct DoltChunkStore DoltChunkStore;
+
+/* A chunk returned by a get. data is NULL if the store has no such chunk. */
+typedef struct DoltChunk
+{
+	const uint8 *data;
+	Size		length;
+	int			pin;			/* private to the store layer */
+} DoltChunk;
+
+/* Called once per chunk by a scan; return false to stop the scan. */
+typedef bool (*DoltChunkScanFn) (void *arg, const uint8 *hash, Size length);
+
+typedef struct DoltChunkStoreStats
+{
+	double		chunks;			/* estimate */
+	uint64		bytes;			/* storage used, including any index */
+} DoltChunkStoreStats;
 
 typedef struct DoltChunkCacheStats
 {
@@ -26,30 +62,74 @@ typedef struct DoltChunkCacheStats
 	uint64		evictions;
 	uint64		entries;
 	uint64		bytes;
+	uint64		pinned;
 } DoltChunkCacheStats;
 
 extern PGDLLIMPORT int dolt_chunk_cache_size;
+extern PGDLLIMPORT bool dolt_chunk_verify_hashes;
 
-/* Open with AccessShareLock to read, or RowExclusiveLock to also write. */
-extern DoltChunkStore *dolt_chunk_open(LOCKMODE lockmode);
+extern DoltChunkStore *dolt_chunk_open(DoltChunkIntent intent);
 extern void dolt_chunk_close(DoltChunkStore *store);
 
 /*
- * Returns the chunk's bytes, or NULL if no row has this hash. The result stays
- * valid until the next dolt_chunk_get or dolt_chunk_put call in this backend.
+ * Look up n chunks. Each found chunk is pinned: its bytes stay valid until
+ * dolt_chunk_release, dolt_chunk_close or transaction end, whichever is first.
  */
-extern const uint8 *dolt_chunk_get(DoltChunkStore *store, const uint8 *hash, Size *length);
+extern void dolt_chunk_get_many(DoltChunkStore *store, int n, const uint8 *hashes, DoltChunk *chunks);
+extern bool dolt_chunk_get(DoltChunkStore *store, const uint8 *hash, DoltChunk *chunk);
+extern void dolt_chunk_release(DoltChunkStore *store, DoltChunk *chunk);
 
-/* True if a committed, own or in-progress-then-committed row has this hash. */
+extern void dolt_chunk_exists_many(DoltChunkStore *store, int n, const uint8 *hashes, bool *found);
 extern bool dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash);
 
-/* Inserts the chunk unless present; returns true if this call inserted it. */
+/*
+ * Put n chunks, given hashes and contents; returns how many this call stored.
+ * The store may reorder the batch. Requires DOLT_CHUNK_WRITE.
+ */
+extern int	dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
+								const uint8 *const *data, const Size *lengths);
 extern bool dolt_chunk_put(DoltChunkStore *store, const uint8 *hash, const uint8 *data, Size length);
 
-/* Largest chunk that fits inline in one heap tuple. */
-extern Size dolt_chunk_max_size(void);
+/* Garbage-collection primitives. Deleting requires DOLT_CHUNK_WRITE. */
+extern void dolt_chunk_scan(DoltChunkStore *store, DoltChunkScanFn fn, void *arg);
+extern int	dolt_chunk_delete_many(DoltChunkStore *store, int n, const uint8 *hashes);
 
+extern Size dolt_chunk_max_size(void);
+extern void dolt_chunk_store_stats(DoltChunkStoreStats *stats);
 extern void dolt_chunk_cache_stats(DoltChunkCacheStats *stats);
 extern void dolt_chunk_cache_reset(void);
+
+/*
+ * Store implementations.
+ *
+ * The layer above an implementation supplies the node cache, pins, hash
+ * verification and size checks. An implementation only stores and finds bytes.
+ * Its get passes each found chunk's bytes to the callback, valid only during
+ * that call. Hashes are packed: hash i is at hashes + i * DOLT_CHUNK_HASH_SIZE.
+ */
+typedef void (*DoltChunkFoundFn) (void *arg, int index, const uint8 *data, Size length);
+
+typedef struct DoltChunkStoreRoutine
+{
+	const char *name;
+	Size		(*max_size) (void);
+	void	   *(*open) (DoltChunkIntent intent);
+	void		(*close) (void *state);
+	void		(*get) (void *state, int n, const uint8 *hashes, DoltChunkFoundFn found, void *arg);
+	void		(*exists) (void *state, int n, const uint8 *hashes, bool *found);
+	int			(*put) (void *state, int n, const uint8 *hashes, const uint8 *const *data, const Size *lengths);
+	void		(*scan) (void *state, DoltChunkScanFn fn, void *arg);
+	int			(*remove) (void *state, int n, const uint8 *hashes);
+	void		(*stats) (DoltChunkStoreStats *stats);
+} DoltChunkStoreRoutine;
+
+/* The built-in implementation: the pg_dolt_chunk heap catalog. */
+extern const DoltChunkStoreRoutine *dolt_chunk_heap_routine(void);
+
+/*
+ * Install an implementation for this backend, or NULL for the built-in one;
+ * returns the previous one. Resets the node cache. No store may be open.
+ */
+extern const DoltChunkStoreRoutine *dolt_chunk_set_routine(const DoltChunkStoreRoutine *routine);
 
 #endif							/* DOLTCHUNK_H */

@@ -1,4 +1,344 @@
 CREATE EXTENSION test_dolt_chunk;
+--
+-- Interface contract, against the built-in heap store and then a test-only,
+-- non-transactional in-memory store.
+--
+CREATE FUNCTION error_of(query text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE query;
+  RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLERRM;
+END
+$$;
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set contract :abs_srcdir '/sql/contract.inc'
+\i :contract
+-- Contract tests: behavior every chunk store implementation must provide.
+-- Included once per implementation by test_dolt_chunk.sql, which defines
+-- error_of(): expected errors are returned as text, since psql would prefix
+-- them with this file's absolute path.
+-- Puts are idempotent, and reads return the bytes put under a hash.
+SELECT test_chunk_put(sha256('contract alpha'), 'contract alpha') AS first_put;
+ first_put 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_put(sha256('contract alpha'), 'contract alpha') AS second_put;
+ second_put 
+------------
+ f
+(1 row)
+
+SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS roundtrip;
+ roundtrip 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_get(sha256('contract missing')) IS NULL AS missing_get;
+ missing_get 
+-------------
+ t
+(1 row)
+
+SELECT test_chunk_exists(sha256('contract alpha')) AS present,
+       test_chunk_exists(sha256('contract missing')) AS absent;
+ present | absent 
+---------+--------
+ t       | f
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_get('\x00')$$);
+          error_of           
+-----------------------------
+ chunk hash must be 32 bytes
+(1 row)
+
+-- Batches: a put may contain duplicates of each other and of stored chunks.
+SELECT test_chunk_put_many(
+         ARRAY[sha256('contract beta'), sha256('contract gamma'), sha256('contract beta'), sha256('contract alpha')],
+         ARRAY['contract beta', 'contract gamma', 'contract beta', 'contract alpha']::bytea[]) AS stored;
+ stored 
+--------
+      2
+(1 row)
+
+SELECT test_chunk_get_many(ARRAY[sha256('contract gamma'), sha256('contract missing'), sha256('contract beta')])
+       = ARRAY['contract gamma', NULL, 'contract beta']::bytea[] AS batch_get;
+ batch_get 
+-----------
+ t
+(1 row)
+
+-- Chunks larger than the implementation's limit are rejected.
+SELECT test_chunk_max_size() > 0 AS reports_limit;
+ reports_limit 
+---------------
+ t
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_put(sha256(x), x)
+  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s$$) LIKE '%exceeds the inline limit%' AS oversize_rejected;
+ oversize_rejected 
+-------------------
+ t
+(1 row)
+
+-- Deleting removes a chunk from existence checks; deleting again finds nothing.
+SELECT test_chunk_put(sha256('contract delta'), 'contract delta') AS put_delta;
+ put_delta 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_delete(sha256('contract delta')) AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT test_chunk_exists(sha256('contract delta')) AS exists_after_delete;
+ exists_after_delete 
+---------------------
+ f
+(1 row)
+
+SELECT test_chunk_delete(sha256('contract delta')) AS deleted_again;
+ deleted_again 
+---------------
+ f
+(1 row)
+
+-- Scans see stored chunks; statistics report something.
+SELECT test_chunk_scan_count() >= 3 AS scanned;
+ scanned 
+---------
+ t
+(1 row)
+
+SELECT chunks >= 0 AND bytes > 0 AS stats FROM test_chunk_store_stats();
+ stats 
+-------
+ t
+(1 row)
+
+-- Verification rejects content that does not match its hash.
+SET dolt_chunk_verify_hashes = on;
+SELECT test_chunk_put(sha256('contract epsilon'), 'contract epsilon') AS verified_put;
+ verified_put 
+--------------
+ t
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_put(sha256('contract zeta'), 'something else')$$);
+                  error_of                  
+--------------------------------------------
+ dolt chunk content does not match its hash
+(1 row)
+
+RESET dolt_chunk_verify_hashes;
+-- Pins keep a chunk's bytes valid while the cache evicts around them.
+SET dolt_chunk_cache_size = '64kB';
+SELECT test_chunk_cache_reset();
+ test_chunk_cache_reset 
+------------------------
+ 
+(1 row)
+
+SELECT test_chunk_pin_survives_eviction(sha256('contract alpha'), 40) AS pin_survives;
+ pin_survives 
+--------------
+ t
+(1 row)
+
+SELECT pinned FROM test_chunk_cache_stats();
+ pinned 
+--------
+      0
+(1 row)
+
+RESET dolt_chunk_cache_size;
+SELECT test_chunk_use_store('memory') AS previous_store;
+ previous_store 
+----------------
+ heap
+(1 row)
+
+\i :contract
+-- Contract tests: behavior every chunk store implementation must provide.
+-- Included once per implementation by test_dolt_chunk.sql, which defines
+-- error_of(): expected errors are returned as text, since psql would prefix
+-- them with this file's absolute path.
+-- Puts are idempotent, and reads return the bytes put under a hash.
+SELECT test_chunk_put(sha256('contract alpha'), 'contract alpha') AS first_put;
+ first_put 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_put(sha256('contract alpha'), 'contract alpha') AS second_put;
+ second_put 
+------------
+ f
+(1 row)
+
+SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS roundtrip;
+ roundtrip 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_get(sha256('contract missing')) IS NULL AS missing_get;
+ missing_get 
+-------------
+ t
+(1 row)
+
+SELECT test_chunk_exists(sha256('contract alpha')) AS present,
+       test_chunk_exists(sha256('contract missing')) AS absent;
+ present | absent 
+---------+--------
+ t       | f
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_get('\x00')$$);
+          error_of           
+-----------------------------
+ chunk hash must be 32 bytes
+(1 row)
+
+-- Batches: a put may contain duplicates of each other and of stored chunks.
+SELECT test_chunk_put_many(
+         ARRAY[sha256('contract beta'), sha256('contract gamma'), sha256('contract beta'), sha256('contract alpha')],
+         ARRAY['contract beta', 'contract gamma', 'contract beta', 'contract alpha']::bytea[]) AS stored;
+ stored 
+--------
+      2
+(1 row)
+
+SELECT test_chunk_get_many(ARRAY[sha256('contract gamma'), sha256('contract missing'), sha256('contract beta')])
+       = ARRAY['contract gamma', NULL, 'contract beta']::bytea[] AS batch_get;
+ batch_get 
+-----------
+ t
+(1 row)
+
+-- Chunks larger than the implementation's limit are rejected.
+SELECT test_chunk_max_size() > 0 AS reports_limit;
+ reports_limit 
+---------------
+ t
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_put(sha256(x), x)
+  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s$$) LIKE '%exceeds the inline limit%' AS oversize_rejected;
+ oversize_rejected 
+-------------------
+ t
+(1 row)
+
+-- Deleting removes a chunk from existence checks; deleting again finds nothing.
+SELECT test_chunk_put(sha256('contract delta'), 'contract delta') AS put_delta;
+ put_delta 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_delete(sha256('contract delta')) AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT test_chunk_exists(sha256('contract delta')) AS exists_after_delete;
+ exists_after_delete 
+---------------------
+ f
+(1 row)
+
+SELECT test_chunk_delete(sha256('contract delta')) AS deleted_again;
+ deleted_again 
+---------------
+ f
+(1 row)
+
+-- Scans see stored chunks; statistics report something.
+SELECT test_chunk_scan_count() >= 3 AS scanned;
+ scanned 
+---------
+ t
+(1 row)
+
+SELECT chunks >= 0 AND bytes > 0 AS stats FROM test_chunk_store_stats();
+ stats 
+-------
+ t
+(1 row)
+
+-- Verification rejects content that does not match its hash.
+SET dolt_chunk_verify_hashes = on;
+SELECT test_chunk_put(sha256('contract epsilon'), 'contract epsilon') AS verified_put;
+ verified_put 
+--------------
+ t
+(1 row)
+
+SELECT error_of($$SELECT test_chunk_put(sha256('contract zeta'), 'something else')$$);
+                  error_of                  
+--------------------------------------------
+ dolt chunk content does not match its hash
+(1 row)
+
+RESET dolt_chunk_verify_hashes;
+-- Pins keep a chunk's bytes valid while the cache evicts around them.
+SET dolt_chunk_cache_size = '64kB';
+SELECT test_chunk_cache_reset();
+ test_chunk_cache_reset 
+------------------------
+ 
+(1 row)
+
+SELECT test_chunk_pin_survives_eviction(sha256('contract alpha'), 40) AS pin_survives;
+ pin_survives 
+--------------
+ t
+(1 row)
+
+SELECT pinned FROM test_chunk_cache_stats();
+ pinned 
+--------
+      0
+(1 row)
+
+RESET dolt_chunk_cache_size;
+-- Rollback semantics are not part of the contract: this store keeps puts.
+BEGIN;
+SELECT test_chunk_put(sha256('memory rollback'), 'memory rollback');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT test_chunk_exists(sha256('memory rollback')) AS kept_after_rollback;
+ kept_after_rollback 
+---------------------
+ t
+(1 row)
+
+SELECT test_chunk_use_store('heap') AS previous_store;
+ previous_store 
+----------------
+ memory
+(1 row)
+
+SELECT test_chunk_use_store('bogus');
+ERROR:  unknown chunk store "bogus"
+--
+-- Heap implementation details.
+--
 -- Storage is inline and uncompressed, keyed by a unique hash index.
 SELECT attname, attstorage FROM pg_attribute
   WHERE attrelid = 'pg_dolt_chunk'::regclass AND attnum > 0 ORDER BY attnum;
@@ -20,52 +360,22 @@ SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk
  t           | t
 (1 row)
 
-SELECT name, setting, unit FROM pg_settings WHERE name = 'dolt_chunk_cache_size';
-         name          | setting | unit 
------------------------+---------+------
- dolt_chunk_cache_size | 262144  | kB
-(1 row)
+SELECT name, setting, unit FROM pg_settings
+  WHERE name IN ('dolt_chunk_cache_size', 'dolt_chunk_verify_hashes') ORDER BY name;
+           name           | setting | unit 
+--------------------------+---------+------
+ dolt_chunk_cache_size    | 262144  | kB
+ dolt_chunk_verify_hashes | off     | 
+(2 rows)
 
--- Put, deduplicate, get and test existence.
-SELECT test_chunk_put(sha256('alpha'), 'alpha');
- test_chunk_put 
-----------------
- t
-(1 row)
-
-SELECT test_chunk_put(sha256('alpha'), 'alpha');
- test_chunk_put 
-----------------
- f
-(1 row)
-
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('alpha');
+-- One row per hash, however often it was put.
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
  count 
 -------
      1
 (1 row)
 
-SELECT test_chunk_get(sha256('alpha')) = 'alpha' AS roundtrip;
- roundtrip 
------------
- t
-(1 row)
-
-SELECT test_chunk_get(sha256('missing')) IS NULL AS missing;
- missing 
----------
- t
-(1 row)
-
-SELECT test_chunk_exists(sha256('alpha')) AS alpha, test_chunk_exists(sha256('missing')) AS missing;
- alpha | missing 
--------+---------
- t     | f
-(1 row)
-
-SELECT test_chunk_get('\x00');
-ERROR:  chunk hash must be 32 bytes
--- The inline limit is exact: the largest chunk fits uncompressed, one more byte fails.
+-- The inline limit is exact: the largest chunk fits uncompressed.
 SELECT test_chunk_max_size();
  test_chunk_max_size 
 ---------------------
@@ -86,10 +396,7 @@ SELECT length(chunkdata), pg_column_compression(chunkdata) IS NULL AS uncompress
    8096 | t
 (1 row)
 
-SELECT test_chunk_put(sha256(x), x)
-  FROM (SELECT decode(repeat('ab', test_chunk_max_size() + 1), 'hex') AS x) s;
-ERROR:  dolt chunk of 8097 bytes exceeds the inline limit of 8096 bytes
--- Inserts are transactional: own writes are visible, rollback removes them.
+-- Puts are transactional here: own writes are visible, rollback removes them.
 BEGIN;
 SELECT test_chunk_put(sha256('beta'), 'beta');
  test_chunk_put 
@@ -138,12 +445,68 @@ SELECT test_chunk_exists(sha256('gamma')) AS after_savepoint_rollback;
 (1 row)
 
 COMMIT;
-SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash IN (sha256('alpha'), sha256('beta'), sha256('gamma'));
- count 
--------
-     2
+-- A deleted chunk can be put again.
+SELECT test_chunk_put(sha256('contract delta'), 'contract delta') AS reput_after_delete;
+ reput_after_delete 
+--------------------
+ t
 (1 row)
 
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract delta');
+ count 
+-------
+     1
+(1 row)
+
+-- Existence probes do not set hint bits on rows they examine. With data
+-- checksums, a hint on a page's first change after a checkpoint logs a
+-- full-page image. pageinspect reads the row without touching hints.
+CREATE EXTENSION pageinspect;
+CREATE FUNCTION chunk_xmin_hinted(hash bytea) RETURNS bool LANGUAGE sql AS $$
+  SELECT (t_infomask & 256) <> 0
+    FROM generate_series(0, pg_relation_size('pg_dolt_chunk') / 8192 - 1) AS b,
+         heap_page_items(get_raw_page('pg_dolt_chunk', b::int)) AS i
+   WHERE t_data IS NOT NULL AND position(hash IN t_data) > 0
+$$;
+SELECT test_chunk_put(sha256('hintless'), 'hintless');
+ test_chunk_put 
+----------------
+ t
+(1 row)
+
+SELECT test_chunk_exists(sha256('hintless')) AS exists;
+ exists 
+--------
+ t
+(1 row)
+
+SELECT test_chunk_put(sha256('hintless'), 'hintless') AS reput;
+ reput 
+-------
+ f
+(1 row)
+
+SELECT chunk_xmin_hinted(sha256('hintless')) AS hinted_after_probes;
+ hinted_after_probes 
+---------------------
+ f
+(1 row)
+
+-- Control: an ordinary MVCC read of the row sets the hint.
+SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('hintless');
+ count 
+-------
+     1
+(1 row)
+
+SELECT chunk_xmin_hinted(sha256('hintless')) AS hinted_after_select;
+ hinted_after_select 
+---------------------
+ t
+(1 row)
+
+DROP FUNCTION chunk_xmin_hinted(bytea);
+DROP EXTENSION pageinspect;
 -- Read-only transactions cannot write.
 BEGIN READ ONLY;
 SELECT test_chunk_put(sha256('delta'), 'delta');
@@ -157,13 +520,13 @@ SELECT test_chunk_cache_reset();
  
 (1 row)
 
-SELECT test_chunk_get(sha256('alpha')) = 'alpha' AS first_read;
+SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS first_read;
  first_read 
 ------------
  t
 (1 row)
 
-SELECT test_chunk_get(sha256('alpha')) = 'alpha' AS second_read;
+SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS second_read;
  second_read 
 -------------
  t
@@ -183,11 +546,12 @@ SELECT count(*) FILTER (WHERE test_chunk_put(sha256(x), x)) AS inserted
        20
 (1 row)
 
-SELECT evictions > 0 AS evicted, bytes <= 65536 AS within_budget, entries < 20 AS bounded
+SELECT evictions > 0 AS evicted, bytes <= 65536 AS within_budget, entries < 20 AS bounded,
+       pinned = 0 AS unpinned
   FROM test_chunk_cache_stats();
- evicted | within_budget | bounded 
----------+---------------+---------
- t       | t             | t
+ evicted | within_budget | bounded | unpinned 
+---------+---------------+---------+----------
+ t       | t             | t       | t
 (1 row)
 
 SELECT count(*) FILTER (WHERE test_chunk_get(sha256(x)) = x) AS all_readable
@@ -206,16 +570,16 @@ SELECT test_chunk_cache_reset();
  
 (1 row)
 
-SELECT test_chunk_get(sha256('alpha')) = 'alpha' AS uncached_read;
+SELECT test_chunk_get(sha256('contract alpha')) = 'contract alpha' AS uncached_read;
  uncached_read 
 ---------------
  t
 (1 row)
 
-SELECT hits, misses, entries, bytes FROM test_chunk_cache_stats();
- hits | misses | entries | bytes 
-------+--------+---------+-------
-    0 |      1 |       0 |     0
+SELECT hits, misses, entries, bytes, pinned FROM test_chunk_cache_stats();
+ hits | misses | entries | bytes | pinned 
+------+--------+---------+-------+--------
+    0 |      1 |       0 |     0 |      0
 (1 row)
 
 RESET dolt_chunk_cache_size;

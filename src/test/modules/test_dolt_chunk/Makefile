@@ -10,6 +10,7 @@ EXTENSION = test_dolt_chunk
 DATA = test_dolt_chunk--1.0.sql
 
 REGRESS = test_dolt_chunk
+EXTRA_INSTALL = contrib/pageinspect
 TAP_TESTS = 1
 
 ifdef USE_PGXS

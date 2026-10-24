@@ -803,6 +803,17 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 struct config_bool ConfigureNamesBool[] =
 {
 	{
+		{"dolt_chunk_verify_hashes", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Verifies that prolly chunk contents match their hashes."),
+			gettext_noop("Checks every chunk put and every chunk read into the node cache."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_chunk_verify_hashes,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"dolt_show_system_tables", PGC_USERSET, COMPAT_OPTIONS_OTHER,
 			gettext_noop("Lists generated Dolt system tables in catalog views."),
 			NULL

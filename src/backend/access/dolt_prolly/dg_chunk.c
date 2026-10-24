@@ -1,19 +1,18 @@
 /*-------------------------------------------------------------------------
  *
  * dg_chunk.c
- *	  Native access to pg_dolt_chunk and the per-backend node cache.
+ *	  The chunk store layer above every implementation: dispatch, the node
+ *	  cache, pins, hash verification and size checks.
  *
- * Reads probe the unique hash index with SnapshotAny: a chunk's bytes are fixed
- * by its hash, so any row carrying that hash has the right content, whoever
- * inserted it. Writers dedupe with a dirty-snapshot probe and insert with the
- * speculative insertion protocol INSERT ... ON CONFLICT DO NOTHING uses, so a
- * concurrent insert of the same chunk waits for its inserter instead of raising
- * a unique violation. Inserts are transactional; aborted rows become dead
- * tuples for VACUUM.
+ * The node cache maps hashes to copies of chunk bytes. Chunks are immutable, so
+ * entries never need invalidation. Unpinned entries sit on an LRU list and are
+ * evicted above dolt_chunk_cache_size; pinned entries sit on a separate list and
+ * are never evicted. When the cache cannot take a chunk, a get returns a private
+ * copy instead. Pins are tracked per store handle and dropped at transaction end,
+ * so an error or a forgotten release cannot pin the cache permanently.
  *
- * The node cache maps hashes to copies of chunk bytes, least recently used
- * entries evicted first above dolt_chunk_cache_size. Chunks are immutable, so
- * entries never need invalidation.
+ * Existence checks always ask the store: a cached copy proves only that the bytes
+ * for a hash are known, not that the store still holds them.
  *
  * src/backend/access/dolt_prolly/dg_chunk.c
  *
@@ -22,55 +21,62 @@
 #include "postgres.h"
 
 #include "access/doltchunk.h"
-#include "access/genam.h"
-#include "access/heapam.h"
-#include "access/htup_details.h"
-#include "access/relscan.h"
-#include "access/stratnum.h"
-#include "access/table.h"
-#include "access/tableam.h"
 #include "access/xact.h"
-#include "catalog/index.h"
-#include "catalog/pg_dolt_chunk.h"
-#include "executor/tuptable.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "lib/ilist.h"
-#include "storage/lmgr.h"
-#include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "utils/rel.h"
-#include "utils/snapmgr.h"
 
 int			dolt_chunk_cache_size = 256 * 1024; /* kB */
-
-struct DoltChunkStore
-{
-	Relation	heap;
-	Relation	index;
-	LOCKMODE	lockmode;
-	IndexInfo  *index_info;		/* built on first write */
-	TupleTableSlot *slot;
-	IndexScanDesc any_scan;		/* readers: content is fixed by the hash */
-	IndexScanDesc dirty_scan;	/* writers: sees in-progress inserts */
-	SnapshotData dirty;
-	bytea	   *key;			/* scan key datum: the probed hash */
-	uint8	   *scratch;		/* result buffer when a chunk is not cached */
-	Size		scratch_size;
-};
+bool		dolt_chunk_verify_hashes = false;
 
 typedef struct CacheEntry
 {
 	uint8		hash[DOLT_CHUNK_HASH_SIZE];
 	uint8	   *data;
 	Size		length;
-	dlist_node	lru;
+	int			pins;
+	dlist_node	node;			/* on cache_lru if unpinned, else cache_pinned */
 } CacheEntry;
+
+/* A pin held through a store handle: a cache entry, or a private copy. */
+typedef struct Pin
+{
+	CacheEntry *entry;
+	uint8	   *copy;
+	int			next_free;		/* free-list link while unused, 1-based */
+} Pin;
+
+struct DoltChunkStore
+{
+	const DoltChunkStoreRoutine *routine;
+	void	   *state;
+	DoltChunkIntent intent;
+	uint64		epoch;			/* transaction its pins belong to */
+	Pin		   *pins;
+	int			npins;
+	int			maxpins;
+	int			free_pin;		/* first reusable slot, 1-based; 0 if none */
+};
+
+static const DoltChunkStoreRoutine *current_routine;
+static int	open_stores;
 
 static MemoryContext cache_context;
 static HTAB *cache;
 static dlist_head cache_lru = DLIST_STATIC_INIT(cache_lru);
+static dlist_head cache_pinned = DLIST_STATIC_INIT(cache_pinned);
 static Size cache_bytes;
 static DoltChunkCacheStats cache_stats;
+static uint64 pin_epoch = 1;
+static bool xact_callback_registered;
+
+static const DoltChunkStoreRoutine *
+routine(void)
+{
+	return current_routine ? current_routine : dolt_chunk_heap_routine();
+}
 
 /* Bytes an entry is charged against dolt_chunk_cache_size. */
 static Size
@@ -79,11 +85,38 @@ entry_cost(Size length)
 	return length + sizeof(CacheEntry) + 64;
 }
 
+/* Pins never outlive a transaction; abandoned handles cannot leak them. */
+static void
+chunk_xact_callback(XactEvent event, void *arg)
+{
+	dlist_mutable_iter iter;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE && event != XACT_EVENT_PARALLEL_COMMIT &&
+		event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+	pin_epoch++;
+	open_stores = 0;
+	dlist_foreach_modify(iter, &cache_pinned)
+	{
+		CacheEntry *entry = dlist_container(CacheEntry, node, iter.cur);
+
+		entry->pins = 0;
+		dlist_delete(&entry->node);
+		dlist_push_head(&cache_lru, &entry->node);
+	}
+}
+
 static void
 cache_init(void)
 {
 	HASHCTL		ctl = {0};
 
+	if (!xact_callback_registered)
+	{
+		RegisterXactCallback(chunk_xact_callback, NULL);
+		xact_callback_registered = true;
+	}
 	if (cache)
 		return;
 	cache_context = AllocSetContextCreate(TopMemoryContext, "dolt chunk cache", ALLOCSET_DEFAULT_SIZES);
@@ -93,33 +126,43 @@ cache_init(void)
 	cache = hash_create("dolt chunk cache", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
-static CacheEntry *
-cache_lookup(const uint8 *hash)
-{
-	CacheEntry *entry;
-
-	cache_init();
-	entry = hash_search(cache, hash, HASH_FIND, NULL);
-	if (entry)
-		dlist_move_head(&cache_lru, &entry->lru);
-	return entry;
-}
-
 static void
 cache_evict(CacheEntry *entry)
 {
-	dlist_delete(&entry->lru);
+	Assert(entry->pins == 0);
+	dlist_delete(&entry->node);
 	cache_bytes -= entry_cost(entry->length);
 	pfree(entry->data);
 	hash_search(cache, entry->hash, HASH_REMOVE, NULL);
 	cache_stats.evictions++;
 }
 
+static void
+cache_pin(CacheEntry *entry)
+{
+	if (entry->pins++ == 0)
+	{
+		dlist_delete(&entry->node);
+		dlist_push_head(&cache_pinned, &entry->node);
+	}
+}
+
+static void
+cache_unpin(CacheEntry *entry)
+{
+	Assert(entry->pins > 0);
+	if (--entry->pins == 0)
+	{
+		dlist_delete(&entry->node);
+		dlist_push_head(&cache_lru, &entry->node);
+	}
+}
+
 /*
- * Copy a chunk into the cache, evicting least recently used entries to make
- * room. Returns the cached copy, or NULL if the chunk exceeds the whole budget.
+ * Copy a chunk into the cache, evicting least recently used unpinned entries
+ * to make room. Returns the entry, or NULL if the chunk cannot fit.
  */
-static const uint8 *
+static CacheEntry *
 cache_insert(const uint8 *hash, const uint8 *data, Size length)
 {
 	Size		limit = (Size) dolt_chunk_cache_size * 1024;
@@ -127,36 +170,316 @@ cache_insert(const uint8 *hash, const uint8 *data, Size length)
 	bool		found;
 
 	cache_init();
-	if (entry_cost(length) > limit)
-		return NULL;
+	entry = hash_search(cache, hash, HASH_FIND, NULL);
+	if (entry)
+		return entry;
 	while (cache_bytes + entry_cost(length) > limit && !dlist_is_empty(&cache_lru))
-		cache_evict(dlist_container(CacheEntry, lru, dlist_tail_node(&cache_lru)));
+		cache_evict(dlist_container(CacheEntry, node, dlist_tail_node(&cache_lru)));
+	if (cache_bytes + entry_cost(length) > limit)
+		return NULL;
 
 	entry = hash_search(cache, hash, HASH_ENTER, &found);
-	if (found)
-	{
-		dlist_move_head(&cache_lru, &entry->lru);
-		return entry->data;
-	}
 	entry->data = MemoryContextAlloc(cache_context, Max(length, 1));
 	memcpy(entry->data, data, length);
 	entry->length = length;
-	dlist_push_head(&cache_lru, &entry->lru);
+	entry->pins = 0;
+	dlist_push_head(&cache_lru, &entry->node);
 	cache_bytes += entry_cost(length);
-	return entry->data;
+	return entry;
+}
+
+static void
+verify(const uint8 *hash, const uint8 *data, Size length)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	uint8		actual[PG_SHA256_DIGEST_LENGTH];
+
+	if (pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, data, length) < 0 ||
+		pg_cryptohash_final(ctx, actual, sizeof(actual)) < 0)
+		elog(ERROR, "could not compute chunk hash: %s", pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+	if (memcmp(actual, hash, DOLT_CHUNK_HASH_SIZE) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("dolt chunk content does not match its hash")));
+}
+
+DoltChunkStore *
+dolt_chunk_open(DoltChunkIntent intent)
+{
+	DoltChunkStore *store = palloc0(sizeof(DoltChunkStore));
+
+	cache_init();
+	store->routine = routine();
+	store->intent = intent;
+	store->epoch = pin_epoch;
+	store->state = store->routine->open(intent);
+	open_stores++;
+	return store;
+}
+
+static void
+release_pin(DoltChunkStore *store, int slot)
+{
+	Pin		   *pin = &store->pins[slot];
+
+	if (pin->entry)
+		cache_unpin(pin->entry);
+	if (pin->copy)
+		pfree(pin->copy);
+	pin->entry = NULL;
+	pin->copy = NULL;
+	pin->next_free = store->free_pin;
+	store->free_pin = slot + 1;
+}
+
+void
+dolt_chunk_close(DoltChunkStore *store)
+{
+	if (store->epoch == pin_epoch)
+	{
+		for (int i = 0; i < store->npins; i++)
+			release_pin(store, i);
+		open_stores--;
+	}
+	store->routine->close(store->state);
+	if (store->pins)
+		pfree(store->pins);
+	pfree(store);
+}
+
+static int
+new_pin(DoltChunkStore *store, CacheEntry *entry, uint8 *copy)
+{
+	int			slot;
+
+	if (store->epoch != pin_epoch)
+		elog(ERROR, "dolt chunk store used after the transaction that opened it");
+	if (store->free_pin)
+	{
+		slot = store->free_pin - 1;
+		store->free_pin = store->pins[slot].next_free;
+	}
+	else
+	{
+		if (store->npins == store->maxpins)
+		{
+			store->maxpins = store->maxpins ? store->maxpins * 2 : 16;
+			store->pins = store->pins ?
+				repalloc(store->pins, store->maxpins * sizeof(Pin)) :
+				MemoryContextAlloc(GetMemoryChunkContext(store), store->maxpins * sizeof(Pin));
+		}
+		slot = store->npins++;
+	}
+	store->pins[slot].entry = entry;
+	store->pins[slot].copy = copy;
+	if (entry)
+		cache_pin(entry);
+	return slot + 1;			/* pin numbers start at 1; 0 means none */
+}
+
+void
+dolt_chunk_release(DoltChunkStore *store, DoltChunk *chunk)
+{
+	if (chunk->pin && store->epoch == pin_epoch)
+		release_pin(store, chunk->pin - 1);
+	chunk->pin = 0;
+	chunk->data = NULL;
+	chunk->length = 0;
+}
+
+typedef struct GetContext
+{
+	DoltChunkStore *store;
+	const uint8 *hashes;
+	DoltChunk  *chunks;
+	int		   *positions;		/* miss index -> caller index */
+} GetContext;
+
+static void
+store_found(void *arg, int index, const uint8 *data, Size length)
+{
+	GetContext *ctx = arg;
+	int			position = ctx->positions[index];
+	const uint8 *hash = ctx->hashes + (Size) position * DOLT_CHUNK_HASH_SIZE;
+	DoltChunk  *chunk = &ctx->chunks[position];
+	CacheEntry *entry;
+
+	if (dolt_chunk_verify_hashes)
+		verify(hash, data, length);
+	entry = cache_insert(hash, data, length);
+	if (entry)
+	{
+		chunk->pin = new_pin(ctx->store, entry, NULL);
+		chunk->data = entry->data;
+	}
+	else
+	{
+		uint8	   *copy = MemoryContextAlloc(GetMemoryChunkContext(ctx->store), Max(length, 1));
+
+		memcpy(copy, data, length);
+		chunk->pin = new_pin(ctx->store, NULL, copy);
+		chunk->data = copy;
+	}
+	chunk->length = length;
+}
+
+void
+dolt_chunk_get_many(DoltChunkStore *store, int n, const uint8 *hashes, DoltChunk *chunks)
+{
+	uint8	   *missing = NULL;
+	int		   *positions = NULL;
+	int			nmissing = 0;
+
+	cache_init();
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *hash = hashes + (Size) i * DOLT_CHUNK_HASH_SIZE;
+		CacheEntry *entry = hash_search(cache, hash, HASH_FIND, NULL);
+
+		chunks[i].data = NULL;
+		chunks[i].length = 0;
+		chunks[i].pin = 0;
+		if (entry)
+		{
+			cache_stats.hits++;
+			chunks[i].pin = new_pin(store, entry, NULL);
+			chunks[i].data = entry->data;
+			chunks[i].length = entry->length;
+			continue;
+		}
+		cache_stats.misses++;
+		if (!missing)
+		{
+			missing = palloc((Size) n * DOLT_CHUNK_HASH_SIZE);
+			positions = palloc(n * sizeof(int));
+		}
+		memcpy(missing + (Size) nmissing * DOLT_CHUNK_HASH_SIZE, hash, DOLT_CHUNK_HASH_SIZE);
+		positions[nmissing++] = i;
+	}
+	if (nmissing)
+	{
+		GetContext	ctx = {store, hashes, chunks, positions};
+
+		store->routine->get(store->state, nmissing, missing, store_found, &ctx);
+		pfree(missing);
+		pfree(positions);
+	}
+}
+
+bool
+dolt_chunk_get(DoltChunkStore *store, const uint8 *hash, DoltChunk *chunk)
+{
+	dolt_chunk_get_many(store, 1, hash, chunk);
+	return chunk->data != NULL;
+}
+
+void
+dolt_chunk_exists_many(DoltChunkStore *store, int n, const uint8 *hashes, bool *found)
+{
+	store->routine->exists(store->state, n, hashes, found);
+}
+
+bool
+dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash)
+{
+	bool		found;
+
+	dolt_chunk_exists_many(store, 1, hash, &found);
+	return found;
+}
+
+static void
+require_write(DoltChunkStore *store)
+{
+	if (store->intent != DOLT_CHUNK_WRITE)
+		elog(ERROR, "dolt chunk store opened read-only");
+	if (XactReadOnly)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot write dolt chunks in a read-only transaction")));
+}
+
+int
+dolt_chunk_put_many(DoltChunkStore *store, int n, const uint8 *hashes,
+					const uint8 *const *data, const Size *lengths)
+{
+	Size		max = store->routine->max_size();
+	int			stored;
+
+	require_write(store);
+	for (int i = 0; i < n; i++)
+	{
+		if (lengths[i] > max)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("dolt chunk of %zu bytes exceeds the inline limit of %zu bytes",
+							lengths[i], max)));
+		if (dolt_chunk_verify_hashes)
+			verify(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, data[i], lengths[i]);
+	}
+	stored = store->routine->put(store->state, n, hashes, data, lengths);
+
+	/* Newly written chunks are likely to be read soon. */
+	for (int i = 0; i < n; i++)
+		cache_insert(hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, data[i], lengths[i]);
+	return stored;
+}
+
+bool
+dolt_chunk_put(DoltChunkStore *store, const uint8 *hash, const uint8 *data, Size length)
+{
+	return dolt_chunk_put_many(store, 1, hash, &data, &length) > 0;
+}
+
+void
+dolt_chunk_scan(DoltChunkStore *store, DoltChunkScanFn fn, void *arg)
+{
+	store->routine->scan(store->state, fn, arg);
+}
+
+int
+dolt_chunk_delete_many(DoltChunkStore *store, int n, const uint8 *hashes)
+{
+	require_write(store);
+
+	/*
+	 * Cached copies stay valid: a hash's bytes never change, and a deleted
+	 * chunk is unreachable by definition.
+	 */
+	return store->routine->remove(store->state, n, hashes);
+}
+
+Size
+dolt_chunk_max_size(void)
+{
+	return routine()->max_size();
+}
+
+void
+dolt_chunk_store_stats(DoltChunkStoreStats *stats)
+{
+	routine()->stats(stats);
 }
 
 void
 dolt_chunk_cache_stats(DoltChunkCacheStats *stats)
 {
+	dlist_iter	iter;
+
 	*stats = cache_stats;
 	stats->entries = cache ? hash_get_num_entries(cache) : 0;
 	stats->bytes = cache_bytes;
+	stats->pinned = 0;
+	dlist_foreach(iter, &cache_pinned)
+		stats->pinned++;
 }
 
 void
 dolt_chunk_cache_reset(void)
 {
+	if (!dlist_is_empty(&cache_pinned))
+		elog(ERROR, "cannot reset the dolt chunk cache while chunks are pinned");
 	if (cache)
 	{
 		MemoryContextDelete(cache_context);
@@ -164,212 +487,19 @@ dolt_chunk_cache_reset(void)
 		cache_context = NULL;
 	}
 	dlist_init(&cache_lru);
+	dlist_init(&cache_pinned);
 	cache_bytes = 0;
 	memset(&cache_stats, 0, sizeof(cache_stats));
 }
 
-Size
-dolt_chunk_max_size(void)
+const DoltChunkStoreRoutine *
+dolt_chunk_set_routine(const DoltChunkStoreRoutine *replacement)
 {
-	/*
-	 * A heap tuple holds the header, the hash (short varlena header, padded
-	 * to chunkdata's int alignment) and the data with a 4-byte header.
-	 */
-	return MaxHeapTupleSize -
-		(MAXALIGN(SizeofHeapTupleHeader) + INTALIGN(1 + DOLT_CHUNK_HASH_SIZE) + VARHDRSZ);
-}
+	const DoltChunkStoreRoutine *previous = routine();
 
-DoltChunkStore *
-dolt_chunk_open(LOCKMODE lockmode)
-{
-	DoltChunkStore *store = palloc0(sizeof(DoltChunkStore));
-
-	Assert(lockmode == AccessShareLock || lockmode == RowExclusiveLock);
-	store->lockmode = lockmode;
-	store->heap = table_open(DoltChunkRelationId, lockmode);
-	store->index = index_open(DoltChunkHashIndexId, lockmode);
-	store->slot = table_slot_create(store->heap, NULL);
-	store->key = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	SET_VARSIZE(store->key, VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	return store;
-}
-
-void
-dolt_chunk_close(DoltChunkStore *store)
-{
-	if (store->any_scan)
-		index_endscan(store->any_scan);
-	if (store->dirty_scan)
-		index_endscan(store->dirty_scan);
-	ExecDropSingleTupleTableSlot(store->slot);
-	index_close(store->index, store->lockmode);
-	table_close(store->heap, store->lockmode);
-	if (store->scratch)
-		pfree(store->scratch);
-	pfree(store->key);
-	pfree(store);
-}
-
-/* Position a scan on the rows carrying |hash|. */
-static void
-probe(DoltChunkStore *store, IndexScanDesc scan, const uint8 *hash)
-{
-	ScanKeyData key;
-
-	memcpy(VARDATA(store->key), hash, DOLT_CHUNK_HASH_SIZE);
-	ScanKeyInit(&key, Anum_pg_dolt_chunk_chunkhash, BTEqualStrategyNumber, F_BYTEAEQ,
-				PointerGetDatum(store->key));
-	index_rescan(scan, &key, 1, NULL, 0);
-}
-
-const uint8 *
-dolt_chunk_get(DoltChunkStore *store, const uint8 *hash, Size *length)
-{
-	CacheEntry *entry = cache_lookup(hash);
-	const uint8 *result = NULL;
-
-	if (entry)
-	{
-		cache_stats.hits++;
-		*length = entry->length;
-		return entry->data;
-	}
-	cache_stats.misses++;
-	if (!store->any_scan)
-		store->any_scan = index_beginscan(store->heap, store->index, SnapshotAny, NULL, 1, 0);
-	probe(store, store->any_scan, hash);
-	if (index_getnext_slot(store->any_scan, ForwardScanDirection, store->slot))
-	{
-		bool		isnull;
-		struct varlena *value = (struct varlena *)
-			DatumGetPointer(slot_getattr(store->slot, Anum_pg_dolt_chunk_chunkdata, &isnull));
-
-		if (isnull || (VARATT_IS_EXTENDED(value) && !VARATT_IS_SHORT(value)))
-			elog(ERROR, "dolt chunk is not stored inline");
-		*length = VARSIZE_ANY_EXHDR(value);
-		result = cache_insert(hash, (const uint8 *) VARDATA_ANY(value), *length);
-		if (!result)
-		{
-			if (store->scratch_size < *length)
-			{
-				if (store->scratch)
-					pfree(store->scratch);
-				store->scratch = MemoryContextAlloc(GetMemoryChunkContext(store), *length);
-				store->scratch_size = *length;
-			}
-			memcpy(store->scratch, VARDATA_ANY(value), *length);
-			result = store->scratch;
-		}
-	}
-	ExecClearTuple(store->slot);
-	return result;
-}
-
-bool
-dolt_chunk_exists(DoltChunkStore *store, const uint8 *hash)
-{
-	for (;;)
-	{
-		TransactionId wait = InvalidTransactionId;
-		uint32		token = 0;
-		ItemPointerData tid;
-		bool		found = false;
-
-		InitDirtySnapshot(store->dirty);
-		if (!store->dirty_scan)
-			store->dirty_scan = index_beginscan(store->heap, store->index, &store->dirty, NULL, 1, 0);
-		probe(store, store->dirty_scan, hash);
-		if (index_getnext_slot(store->dirty_scan, ForwardScanDirection, store->slot))
-		{
-			found = true;
-			tid = store->slot->tts_tid;
-
-			/* An in-progress inserter or deleter decides whether the row lives. */
-			wait = TransactionIdIsValid(store->dirty.xmin) ? store->dirty.xmin : store->dirty.xmax;
-			token = store->dirty.speculativeToken;
-		}
-		ExecClearTuple(store->slot);
-		if (!TransactionIdIsValid(wait))
-			return found;
-
-		/* Never wait while the scan holds index buffer pins. */
-		index_endscan(store->dirty_scan);
-		store->dirty_scan = NULL;
-		if (token)
-			SpeculativeInsertionWait(wait, token);
-		else
-			XactLockTableWait(wait, store->heap, &tid, XLTW_InsertIndex);
-	}
-}
-
-bool
-dolt_chunk_put(DoltChunkStore *store, const uint8 *hash, const uint8 *data, Size length)
-{
-	Datum		values[Natts_pg_dolt_chunk];
-	bool		nulls[Natts_pg_dolt_chunk] = {false};
-	bytea	   *hashvalue;
-	bytea	   *datavalue;
-
-	if (store->lockmode != RowExclusiveLock)
-		elog(ERROR, "dolt chunk store opened read-only");
-	if (XactReadOnly)
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("cannot write dolt chunks in a read-only transaction")));
-	if (length > dolt_chunk_max_size())
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("dolt chunk of %zu bytes exceeds the inline limit of %zu bytes",
-						length, dolt_chunk_max_size())));
-	if (!store->index_info)
-		store->index_info = BuildIndexInfo(store->index);
-
-	hashvalue = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	SET_VARSIZE(hashvalue, VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	memcpy(VARDATA(hashvalue), hash, DOLT_CHUNK_HASH_SIZE);
-	datavalue = palloc(VARHDRSZ + length);
-	SET_VARSIZE(datavalue, VARHDRSZ + length);
-	memcpy(VARDATA(datavalue), data, length);
-	values[Anum_pg_dolt_chunk_chunkhash - 1] = PointerGetDatum(hashvalue);
-	values[Anum_pg_dolt_chunk_chunkdata - 1] = PointerGetDatum(datavalue);
-
-	for (;;)
-	{
-		HeapTuple	tuple;
-		uint32		token;
-		bool		inserted;
-
-		if (dolt_chunk_exists(store, hash))
-		{
-			pfree(hashvalue);
-			pfree(datavalue);
-			return false;
-		}
-
-		/*
-		 * Speculative insertion: concurrent probes wait on our token, and a
-		 * unique conflict found by the index cancels our row and retries.
-		 */
-		tuple = heap_form_tuple(RelationGetDescr(store->heap), values, nulls);
-		token = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
-		HeapTupleHeaderSetSpeculativeToken(tuple->t_data, token);
-		heap_insert(store->heap, tuple, GetCurrentCommandId(true), HEAP_INSERT_SPECULATIVE, NULL);
-		inserted = index_insert(store->index, &values[Anum_pg_dolt_chunk_chunkhash - 1], nulls,
-								&tuple->t_self, store->heap, UNIQUE_CHECK_PARTIAL, false,
-								store->index_info);
-		if (inserted)
-			heap_finish_speculative(store->heap, &tuple->t_self);
-		else
-			heap_abort_speculative(store->heap, &tuple->t_self);
-		SpeculativeInsertionLockRelease(GetCurrentTransactionId());
-		heap_freetuple(tuple);
-
-		if (inserted)
-		{
-			cache_insert(hash, data, length);
-			pfree(hashvalue);
-			pfree(datavalue);
-			return true;
-		}
-	}
+	if (open_stores > 0)
+		elog(ERROR, "cannot change the dolt chunk store while a store is open");
+	dolt_chunk_cache_reset();
+	current_routine = replacement;
+	return previous;
 }
