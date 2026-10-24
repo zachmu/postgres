@@ -21,6 +21,10 @@ for future detailed planning work.
 - [Database manifest and version-control publication](MANIFEST-PLAN.md) —
   heap-backed refs, immutable database states, transaction visibility and an
   early version-control slice coordinated with the row-level publication design.
+- [Chunk store](CHUNK-STORE-PLAN.md) — a database-wide store of prolly nodes
+  keyed by node hash: a heap catalog with a unique btree, native access and a
+  node cache. AMs keep only runtime state. Also records the packed-journal
+  alternative and milestones.
 - [Prolly write performance](WRITE-PERF-PLAN.md) — measured insert costs, root
   causes and a four-step plan (chunk cache, packed appends, statement-level
   deferred flush, batched inserts). Deferred until the chunk index is designed.
@@ -961,7 +965,11 @@ Measurements, root causes and the agreed four-step fix are in
 chunk cache, depends on a decision made since: chunks must be locatable by hash,
 across all relations and history, through an index serialized to disk, with no
 startup scan and with a cache shared across sessions. Chunk storage and indexing
-(branch `zachmu/chunk-index`) is the next focus. It will also address the
+(branch `zachmu/chunk-index`, [CHUNK-STORE-PLAN.md](CHUNK-STORE-PLAN.md)) is
+the next focus. The selected design is a heap catalog `pg_dolt_chunk` with a
+unique btree on the node hash, with data inline and never TOASTed. It uses direct
+heap and index access and a per-backend node cache. A custom packed journal with
+sorted index runs is the recorded alternative. It will also address the
 redundancies found in the `pg_dolt*` catalog audit: chunks copied into
 `pg_dolt_object`, two hash namespaces, and three diverging records of a branch's
 working state.

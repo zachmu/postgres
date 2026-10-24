@@ -72,6 +72,8 @@ Each step goes on its own branch, which is merged into an integration branch
 
 ### Step 1 — Chunk cache (superseded by the chunk index)
 
+Replaced by [the chunk store plan](CHUNK-STORE-PLAN.md).
+
 The original step was a per-session cache. It would mirror each relation file in
 memory, read only blocks appended since the last load, remember root records, and
 evict whole relations when over budget. The redirection was:
