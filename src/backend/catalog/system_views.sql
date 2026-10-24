@@ -1410,6 +1410,11 @@ GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;
 
 -- First version-control slice. History remains privileged until branch ACLs exist.
 -- Immutable manifest objects may have concurrent, byte-identical physical copies.
+-- Prolly chunks stay inline and uncompressed; the catalog has no TOAST table.
+ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkhash SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkdata SET STORAGE PLAIN;
+REVOKE ALL ON pg_catalog.pg_dolt_chunk FROM PUBLIC;
+
 CREATE VIEW pg_dolt_object_visible AS
  SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;
 REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;

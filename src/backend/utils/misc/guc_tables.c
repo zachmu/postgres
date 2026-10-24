@@ -37,6 +37,7 @@
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
+#include "access/doltchunk.h"
 #include "access/doltsystem.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -3642,6 +3643,16 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&catalog_view_cache_entries,
 		16, 1, 100000, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_chunk_cache_size", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the memory for prolly chunks cached per session."),
+			gettext_noop("Least recently used chunks are evicted above this size; 0 disables caching."),
+			GUC_UNIT_KB
+		},
+		&dolt_chunk_cache_size,
+		256 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{
