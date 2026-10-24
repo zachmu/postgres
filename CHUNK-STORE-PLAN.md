@@ -4,7 +4,8 @@ Status, 2026-10-25: milestone 1 is complete (commit `645794b3460` on branch
 `zachmu/chunk-index`): a minimal catalog with native access, a node cache and
 microbenchmarks. The heap design is accepted provisionally. We build on it only
 behind a standard store interface (below), so a different implementation can
-replace it later. Milestone 2, the interface, is next. This plan supersedes step 1 of
+replace it later. Milestone 2, the interface, is complete (`b8885f6124d`).
+Milestones 3 and 4, library changes and AM integration, are next. This plan supersedes step 1 of
 [the write performance plan](WRITE-PERF-PLAN.md) and is the next focus of
 [PLAN.md](PLAN.md).
 
@@ -279,12 +280,21 @@ PostgreSQL's own structures.
      size limit;
    - microbenchmarks of puts and gets with and without the cache at several
      scales, recording WAL bytes per chunk.
-2. **Store interface (next):**
+2. **Store interface (done, `b8885f6124d`):**
    - the function table, contract and batch and pin API above;
    - the cache, verification and statistics moved above it;
    - the heap implementation behind it;
    - a second, test-only implementation exercising the same contract tests;
    - an existence probe that doesn't set hint bits.
+
+   As built:
+   - `access/doltchunk.h` defines `DoltChunkStoreRoutine`, implemented in
+     `dg_chunk_heap.c`.
+   - `dg_chunk.c` holds the cache, pins, verification and dispatch.
+   - `dolt_chunk_verify_hashes` controls verification.
+   - `test_dolt_chunk` runs one contract file against the heap store and a
+     non-transactional in-memory store. It uses pageinspect to prove probes
+     leave hint bits unset.
 3. **Library changes:**
    - bound node size below the inline limit, and represent large values in
      chunks;
