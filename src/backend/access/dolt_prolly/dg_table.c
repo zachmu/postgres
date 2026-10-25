@@ -342,56 +342,66 @@ handle_digest(DGState *s, uint64 handle, PLHash *digest)
 }
 
 /*
- * Lock row version |handle| in |mode| and decide whether the caller may act on
- * it, as heap_lock_tuple and HeapTupleSatisfiesUpdate do for heap tuples.
- *
- * A row this transaction already updated or deleted is TM_SelfModified, with
- * the command that did it. Otherwise the row's lock record is locked, waiting
- * per |policy|. The version is current if the latest committed state, merged
- * with this transaction's changes, still has it. If not, a transaction that
- * committed after the caller's snapshot replaced it: TM_Updated with the
- * successor in tmfd->ctid if the lock record names one, else TM_Deleted.
+ * Whether this transaction already updated or deleted row version |handle|,
+ * and if so the result heap gives: TM_SelfModified for the current or a later
+ * command, TM_Invisible for an earlier one.
+ */
+static bool
+self_modified(Relation rel, uint64 handle, Snapshot snapshot, TM_FailureData *tmfd, TM_Result *result)
+{
+	CommandId	cid;
+
+	if (!dg_row_modified(rel, dg_relation_branch(rel), handle, &cid))
+		return false;
+	dg_tid(handle, &tmfd->ctid);
+	tmfd->xmax = GetTopTransactionIdIfAny();
+	tmfd->cmax = cid;
+	tmfd->traversed = false;
+	*result = snapshot && IsMVCCSnapshot(snapshot) && cid < snapshot->curcid ? TM_Invisible : TM_SelfModified;
+	return true;
+}
+
+/*
+ * After its lock record allowed a change, whether row version |handle| still
+ * exists. A history install (merge, reset) replaces rows without touching lock
+ * records, so a version can disappear without its record knowing.
  */
 static TM_Result
-lock_version(Relation rel, uint64 handle, Snapshot snapshot, LockTupleMode mode,
-			 LockWaitPolicy policy, TM_FailureData *tmfd)
+still_current(Relation rel, uint64 handle, TM_Result result, TM_FailureData *tmfd)
 {
-	const char *branch = dg_relation_branch(rel);
-	CommandId	cid;
-	int64		heir = 0;
 	DGState    *s;
 	PLHash		digest;
 	bool		present;
 
-	dg_tid(handle, &tmfd->ctid);
-	tmfd->xmax = InvalidTransactionId;
-	tmfd->cmax = InvalidCommandId;
-	tmfd->traversed = false;
-	if (dg_row_modified(rel, branch, handle, &cid))
-	{
-		tmfd->xmax = GetTopTransactionIdIfAny();
-		tmfd->cmax = cid;
-		if (snapshot && IsMVCCSnapshot(snapshot) && cid < snapshot->curcid)
-			return TM_Invisible;
-		return TM_SelfModified;
-	}
-	{
-		TM_Result	result = dg_lock_record(rel, branch, (int64) handle, mode, policy, &heir);
-
-		if (result != TM_Ok)
-			return result;
-	}
+	if (result != TM_Ok)
+		return result;
 	s = dg_load(rel, SnapshotSelf);
 	present = handle_digest(s, handle, &digest);
 	dg_release(s);
 	if (present)
 		return TM_Ok;
-	if (heir)
-	{
-		dg_tid((uint64) heir, &tmfd->ctid);
-		return TM_Updated;
-	}
+	dg_tid(handle, &tmfd->ctid);
 	return TM_Deleted;
+}
+
+/*
+ * Referential actions under Repeatable Read pass the transaction snapshot as a
+ * crosscheck: a row it cannot see was added after the snapshot, so changing
+ * it is a serialization failure, as in heap_delete.
+ */
+static bool
+crosscheck_visible(Relation rel, Snapshot crosscheck, uint64 handle)
+{
+	DGState    *s;
+	PLHash		digest;
+	bool		visible;
+
+	if (crosscheck == InvalidSnapshot)
+		return true;
+	s = dg_load(rel, crosscheck);
+	visible = handle_digest(s, handle, &digest);
+	dg_release(s);
+	return visible;
 }
 
 static TM_Result
@@ -402,17 +412,21 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	PLHash		digest;
 	PLSlice		row;
 	TM_Result	result;
+	int64		next;
 
 	writer(rel);
-	result = lock_version(rel, handle, snapshot, LockTupleExclusive,
-						  wait ? LockWaitBlock : LockWaitError, failure);
+	if (self_modified(rel, handle, snapshot, failure, &result))
+		return result;
+	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, failure, &next);
+	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
+		result = TM_Updated;
+	result = still_current(rel, handle, result, failure);
 	if (result != TM_Ok)
 		return result;
 	s = dg_load(rel, SnapshotSelf);
 	if (!handle_digest(s, handle, &digest))
 		elog(ERROR, "locked prolly row is missing");
-	row = row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE});
-	row = copy_slice(row);
+	row = copy_slice(row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}));
 	multiplicity(s, row, -1);
 	handle_edit(s, handle, digest, false);
 	dg_save(rel, s, cid);
@@ -465,6 +479,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	bool		key_change = true,
 				indexed_change = true;
 	TM_Result	result;
+	int64		next;
 
 	writer(rel);
 	new_row = dg_encode(rel, slot);
@@ -482,11 +497,16 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	}
 	dg_release(s);
 	*mode = key_change ? LockTupleExclusive : LockTupleNoKeyExclusive;
+	if (self_modified(rel, handle, snapshot, failure, &result))
+		return result;
 	successor = dg_allocate_handle(rel);
-	result = lock_version(rel, handle, snapshot, *mode, wait ? LockWaitBlock : LockWaitError, failure);
+	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, key_change,
+							  wait, failure, &next);
+	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
+		result = TM_Updated;
+	result = still_current(rel, handle, result, failure);
 	if (result != TM_Ok)
 		return result;
-	dg_lock_set_heir(rel, dg_relation_branch(rel), (int64) handle, (int64) successor);
 
 	/* The row may have changed between the first read and the lock. */
 	s = dg_load(rel, SnapshotSelf);
@@ -521,14 +541,16 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 {
 	TM_Result	result;
 	bool		traversed = false;
-	DGState    *s;
-	PLHash		digest;
+	int64		next;
 
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	for (;;)
 	{
-		result = lock_version(rel, dg_id(tid), snapshot, mode, policy, tmfd);
+		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))
+			break;
+		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), mode, policy,
+								(flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0, tmfd, &next);
 		if (result != TM_Updated || !(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
 			break;
 
@@ -539,11 +561,16 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 	tmfd->traversed = traversed;
 	if (result != TM_Ok)
 		return result;
-	s = dg_load(rel, SnapshotSelf);
-	if (!handle_digest(s, dg_id(tid), &digest))
-		elog(ERROR, "locked prolly row is missing");
-	dg_decode(rel, row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}), tid, slot);
-	dg_release(s);
+
+	/*
+	 * A key-share lock may hold a version a committed non-key update replaced,
+	 * as heap allows; fetch whichever version the TID names.
+	 */
+	if (!fetch(rel, tid, SnapshotAny, slot))
+	{
+		dg_tid(dg_id(tid), &tmfd->ctid);
+		return TM_Deleted;
+	}
 	return TM_Ok;
 }
 static Size

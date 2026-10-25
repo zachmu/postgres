@@ -90,6 +90,20 @@ blocked($bpid, 'share lock waits for an update');
 $a->query_safe('COMMIT');
 $b->query_safe('SELECT 1');
 
+# A key share lock carries over to the version a non-key update makes, so a
+# later delete of that version waits for the key share holder.
+my ($c, $cpid) = session();
+$a->query_safe('BEGIN; SELECT id FROM t WHERE id = 3 FOR KEY SHARE');
+$b->query_safe('BEGIN; UPDATE t SET v = 63 WHERE id = 3');
+$b->query_safe('COMMIT');
+start($c, 'DELETE FROM t WHERE id = 3;');
+blocked($cpid, 'delete of the new version waits for the propagated key share lock');
+$a->query_safe('COMMIT');
+$c->query_safe('SELECT 1');
+is(sql('SELECT count(*) FROM t WHERE id = 3'), '0', 'delete proceeds once the key share holder commits');
+$c->quit;
+sql('INSERT INTO t VALUES (3, 62)');
+
 # NOWAIT and SKIP LOCKED.
 $a->query_safe('BEGIN; SELECT * FROM t WHERE id = 1 FOR UPDATE');
 $b->query('SELECT * FROM t WHERE id = 1 FOR UPDATE NOWAIT');

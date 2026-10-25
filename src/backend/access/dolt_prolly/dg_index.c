@@ -468,11 +468,12 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 {
 	const char *branch = dg_relation_branch(table);
 	uint64		conflict;
-	int64		heir;
+	TM_FailureData failure;
+	int64		next;
 
-	dg_lock_record(index, dg_relation_branch(index),
+	dg_record_lock(index, dg_relation_branch(index),
 				   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
-				   LockTupleExclusive, LockWaitBlock, &heir);
+				   LockTupleExclusive, LockWaitBlock, false, &failure, &next);
 	while ((conflict = unique_conflict(table, index, self, key)) != 0)
 	{
 		CommandId	cid;
@@ -488,7 +489,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 		if (!dg_row_modified(table, branch, conflict, &cid))
 		{
-			dg_lock_record(table, branch, (int64) conflict, LockTupleKeyShare, LockWaitBlock, &heir);
+			dg_record_lock(table, branch, (int64) conflict, LockTupleKeyShare, LockWaitBlock, false, &failure, &next);
 			if (unique_conflict(table, index, self, key) != conflict)
 				continue;
 		}

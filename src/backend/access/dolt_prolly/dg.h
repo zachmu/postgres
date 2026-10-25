@@ -79,9 +79,12 @@ extern void dg_save(Relation rel, DGState *state, CommandId cid);
 extern uint64 dg_allocate_handle(Relation rel);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
-extern TM_Result dg_lock_record(Relation rel, const char *branch, int64 id, LockTupleMode mode,
-								LockWaitPolicy wait, int64 *heir);
-extern void dg_lock_set_heir(Relation rel, const char *branch, int64 id, int64 heir);
+extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode,
+								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
+extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id,
+								  bool key_change, bool wait, TM_FailureData *tmfd, int64 *next);
+extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bool wait,
+								  TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
 extern PLStore *dg_working_store(void);
 extern void dg_collect(void);

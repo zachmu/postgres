@@ -147,25 +147,29 @@ trees and heap lock records is unchanged.
   new handle, as a heap update makes a new tuple. With one TID per row, AFTER
   triggers, RETURNING and foreign key actions read the new row where they
   asked for the old one, because the executor fetches the old version by TID
-  after the update. The updater records the successor (the *heir*) on the old
-  version's lock record. A transaction that waited on that record follows the
-  heir under Read Committed, and gets a serialization error under Repeatable
-  Read. Heirs live only in per-branch lock records, which are never copied, so
-  branch creation still copies nothing.
-- **"Updated by another transaction" is presence, not digest comparison.** A
-  version is current if the latest committed roots, merged with the
-  transaction's own changes, still hold its handle. Otherwise the record's heir
-  says whether it was updated or deleted.
+  after the update.
+- **Lock records mirror row versions.** Locking a row locks its record with
+  `heap_lock_tuple`; updating the row `heap_update`s the record to name the new
+  handle; deleting the row `heap_delete`s it. Heap code then decides every
+  outcome: TM_Updated with the successor's TID, TM_Deleted, waits, NOWAIT and
+  SKIP LOCKED, following update chains for SELECT FOR ..., and carrying
+  key-share locks onto new versions. The record's primary key is its first
+  handle, which never changes, so these updates are never key updates; a
+  second index finds a record by its current handle. Records live only per
+  branch and are never copied, so branch creation still copies nothing.
 - **Lock records are inserted frozen.** A record inserted normally belongs to
   its uncommitted inserter, which would hold every row it first locks
   exclusively, even against compatible lockers. A frozen record is visible to
-  everyone at once and is only an anchor. The creator then takes an ordinary
-  lock on it. A short heavyweight lock stops two backends creating one record.
+  everyone at once and is only an anchor. A short heavyweight lock stops two
+  backends creating one record.
 - **Unique keys are reserved by lock records** keyed by the index storage and a
   64-bit hash of the key, held exclusively until commit. A conflicting row that
   a running transaction is deleting, or updating with a key change, is waited
   for by taking a key-share lock on it, as heap unique checks wait for the
   deleter.
+- **A version is current** if its record allows the operation and the latest
+  committed roots, merged with the transaction's changes, still hold it. The
+  second check catches history installs, which replace rows without records.
 
 Two supporting changes:
 - **Handles.** Rows of a branch with no roots of its own get handles derived
@@ -175,9 +179,12 @@ Two supporting changes:
   keyed by its transaction ID. Waiting on another transaction's in-progress
   copy could deadlock two publishers at commit.
 
-Canonical storage bindings keep their branch-level write authority, and the
-table AM checks their unique indexes itself, because their writers may bypass
-the executor's index insertion.
+Canonical storage bindings lock rows the same way, and the table AM checks
+their unique indexes itself, because their writers may bypass the executor's
+index insertion. Their writers share the branch resource lock, which merge
+takes exclusively. Reads of canonical bindings go through versioned scans that
+cannot take row locks yet, so explicit SELECT FOR ... is still rejected there,
+and their foreign key checks take the branch lock exclusively instead.
 
 ## 3. Read and mutation model
 
