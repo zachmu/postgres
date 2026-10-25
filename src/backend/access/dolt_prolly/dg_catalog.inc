@@ -342,6 +342,7 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	bool		working = false;
 	Oid			live = InvalidOid;
 	const char *context_branch = NULL;
+	Snapshot	outer;
 
 	if (rangevar_projection_hook || catalog_api_depth)
 		return NULL;
@@ -397,7 +398,11 @@ revision_selected:
 			elog(ERROR, "invalid search_path");
 	}
 
-	/* Names resolve against the latest schemas, as against catalogs. */
+	/*
+	 * Names resolve against the latest schemas, as against catalogs. A SQL
+	 * query of a catalog itself reads it under the query's snapshot.
+	 */
+	outer = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
 	if (!rte->dolt_database)
 	{
 		PushActiveSnapshot(GetLatestSnapshot());
@@ -480,7 +485,15 @@ revision_selected:
 
 			/* Catalog rows show a branch head's objects by durable OID. */
 			if (working)
+			{
 				rte->dolt_branch = pstrdup(revision);
+				if (pushed)
+				{
+					PushActiveSnapshot(outer);
+					rte->dolt_database = hex(read_ref(psprintf("working/%s", revision)).target);
+					PopActiveSnapshot();
+				}
+			}
 			table_close(catalog, AccessShareLock);
 		}
 		else

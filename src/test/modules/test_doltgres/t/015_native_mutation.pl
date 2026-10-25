@@ -10,11 +10,10 @@ sub sql {return $s->query_safe($_[0]);}
 sub rejects {my ($out,$failed)=$s->query($_[0]);is($failed,1,$_[1]);$s->{stderr}='';}
 sub attrs { return sql(q{SELECT attstattarget,attoptions FROM pg_attribute WHERE attrelid='t'::regclass AND attname='x'}); }
 sql(q{SET client_min_messages=warning;
-CREATE TABLE t(id int,x int,payload text) USING heap;
+CREATE TABLE t(id int,x int,payload text) USING dolt_prolly_table;
 INSERT INTO t VALUES(1,10);
 ALTER TABLE t ALTER COLUMN x SET STATISTICS 55;
 ALTER TABLE t ALTER COLUMN x SET (n_distinct=10);
-ALTER TABLE t SET ACCESS METHOD dolt_prolly_table;
 CREATE INDEX metadata_payload_idx ON t USING dolt_prolly_index(payload);
 SELECT dolt_commit('-Am','native attribute values');
 SELECT dolt_checkout('-b','other');});

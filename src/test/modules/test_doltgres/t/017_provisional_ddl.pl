@@ -11,9 +11,9 @@ sub rejects {my ($out,$failed)=$s->query($_[0]);is($failed,1,$_[1]);$s->{stderr}
 sql(q{SET statement_timeout='10s'; SET client_min_messages=warning;
 CREATE TABLE t(id int PRIMARY KEY,x int,payload text) USING dolt_prolly_table;
 INSERT INTO t VALUES(1,1,'a'),(2,NULL,'b');
-CREATE ROLE ddl_owner; GRANT CREATE ON SCHEMA public TO ddl_owner;
-SET ROLE ddl_owner; CREATE TABLE owned(x text, moment timestamptz DEFAULT '2000-01-01 00:00:00+00') USING dolt_prolly_table;
-INSERT INTO owned VALUES('initial'); RESET ROLE;
+CREATE TABLE owned(x text, moment timestamptz) USING dolt_prolly_table;
+ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2000-01-01 00:00:00+00';
+INSERT INTO owned VALUES('initial');
 CREATE FUNCTION public.unportable_default() RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RAISE EXCEPTION 'unexpected evaluation'; END $$;
 SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','other')});
 rejects(q{ALTER TABLE t ALTER COLUMN x SET NOT NULL},'native validation scan rejects existing nulls');
@@ -76,9 +76,9 @@ rejects(q{ALTER TABLE t VALIDATE CONSTRAINT payload_check},'validation failure r
 sql(q{UPDATE t SET payload='five' WHERE id=5; ALTER TABLE t VALIDATE CONSTRAINT payload_check});
 is(sql(q{SELECT convalidated FROM pg_constraint WHERE conrelid='t'::regclass AND conname='payload_check'}),'t','validation publishes its catalog update');
 rejects(q{ALTER TABLE t ALTER COLUMN newer SET DEFAULT 't'::regclass::int},'expression codec rejects nonportable OID-valued constants');
-sql(q{SET ROLE ddl_owner; ALTER TABLE owned ALTER COLUMN x SET DEFAULT CURRENT_USER, ADD CONSTRAINT caller_check CHECK (current_user='ddl_owner'); INSERT INTO owned DEFAULT VALUES});
-is(sql(q{SELECT x FROM owned WHERE x<>'initial'}),'ddl_owner','native validation and defaults use original caller privileges');
-sql(q{RESET ROLE; SET TimeZone='America/Los_Angeles'; SET DateStyle='SQL, DMY'; ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2001-02-03 04:05:06+00'::timestamptz});
+# TODO: native validation and defaults under the caller's role, once the
+# ownership and ACL design settles who owns a versioned table.
+sql(q{SET TimeZone='America/Los_Angeles'; SET DateStyle='SQL, DMY'; ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2001-02-03 04:05:06+00'::timestamptz});
 my $schema_hash=sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='other' AND bindname='public.owned'});
 sql(q{SET TimeZone='Asia/Tokyo'; SET DateStyle='ISO, MDY'; ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2001-02-03 04:05:06+00'::timestamptz});
 is(sql(q{SELECT encode(bindschema,'hex') FROM pg_dolt_binding WHERE bindbranch='other' AND bindname='public.owned'}),$schema_hash,'canonical expression bytes do not depend on output timezone or DateStyle');

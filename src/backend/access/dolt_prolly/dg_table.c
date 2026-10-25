@@ -620,6 +620,16 @@ new_storage(Relation rel, const RelFileLocator *loc, char persistence, Transacti
 {
 	if (persistence != RELPERSISTENCE_PERMANENT)
 		dg_unsupported("temporary/unlogged tables");
+
+	/*
+	 * Prolly tables live on branches: CREATE TABLE publishes them to the
+	 * branch's schema and allocates their storage there. Physical prolly
+	 * relations, from CREATE TABLE AS, SET ACCESS METHOD and the like, are
+	 * not supported yet.
+	 */
+	if (!rel->rd_catalogview)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("prolly tables can only be created with CREATE TABLE")));
 	dg_validate_descriptor(RelationGetDescr(rel));
 	GetHeapamTableAmRoutine()->relation_set_new_filelocator(rel, loc, persistence, xid, multi);
 }

@@ -897,7 +897,9 @@ BranchRelnameGetRelid(const char *relname, Oid nspid)
 	RangeVar   *qualified;
 	Oid			relid;
 
-	if (isTempOrTempToastNamespace(nspid) || IsCatalogNamespace(nspid))
+	/* Provisional DDL resolves names in its own view of the branch. */
+	if (isTempOrTempToastNamespace(nspid) || IsCatalogNamespace(nspid) ||
+		CatalogViewIsProvisional(CatalogViewCurrent()))
 		return InvalidOid;
 	qualified = makeRangeVar(get_namespace_name(nspid), pstrdup(relname), -1);
 	if (dg_catalog_lookup_relation(qualified, true, &relid))
@@ -1301,7 +1303,11 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 			{
 				FuncCandidateList next = native->next;
 
-				if (native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
+				FuncCandidateList seen = result;
+
+				while (seen && seen->oid != native->oid)
+					seen = seen->next;
+				if (!seen && native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
 				{
 					native->next = result;
 					result = native;
