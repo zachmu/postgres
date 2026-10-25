@@ -204,11 +204,22 @@ index_delete(Relation rel, TM_IndexDeleteOp *op)
  * publication merges disjoint changes. Canonical storage bindings still check
  * their write authority.
  */
+/* A revision is history: its rows can be neither changed nor locked. */
+static void
+read_only_revision(Relation rel)
+{
+	if (CatalogViewIsLeased(RelationGetRelid(rel)) && !dg_storage_bound(rel) &&
+		!CatalogViewIsProvisional(rel->rd_catalogview))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("relation \"%s\" is a revision, which is read-only", RelationGetRelationName(rel))));
+}
+
 static void
 writer(Relation rel)
 {
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
+	read_only_revision(rel);
 	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 }
@@ -555,6 +566,7 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
+	read_only_revision(rel);
 	for (;;)
 	{
 		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))

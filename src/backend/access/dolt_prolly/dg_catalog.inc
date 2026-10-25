@@ -711,7 +711,17 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		unsupported("revision-qualified native utility lookup");
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
 	GetUserIdAndSecContext(&user, &security);
-	if (!ActiveSnapshotSet())
+
+	/*
+	 * Names on the session's branch resolve against its latest committed
+	 * schema, as PostgreSQL resolves names against its catalogs.
+	 */
+	if (!catalog_current_database())
+	{
+		PushActiveSnapshot(GetLatestSnapshot());
+		pushed = true;
+	}
+	else if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
@@ -721,12 +731,12 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 	PG_TRY();
 	{
 		bytea	   *db;
+		const char *branch;
 
 		nest = begin_api();
-		const char *branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
-
+		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
-			read_ref(branch_ref("working")).target;
+			catalog_working_schema(branch);
 		{
 			Oid			native;
 			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, false, true);
@@ -946,7 +956,17 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		return false;
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
 	GetUserIdAndSecContext(&user, &security);
-	if (!ActiveSnapshotSet())
+
+	/*
+	 * Names on the session's branch resolve against its latest committed
+	 * schema, as PostgreSQL resolves names against its catalogs.
+	 */
+	if (!catalog_current_database())
+	{
+		PushActiveSnapshot(GetLatestSnapshot());
+		pushed = true;
+	}
+	else if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
@@ -956,12 +976,12 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 	PG_TRY();
 	{
 		bytea	   *db;
+		const char *branch;
 
 		nest = begin_api();
-		const char *branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
-
+		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
-			read_ref(branch_ref("working")).target;
+			catalog_working_schema(branch);
 		{
 			Oid			native;
 			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, true, temp_ok);

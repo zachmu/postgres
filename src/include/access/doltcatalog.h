@@ -50,6 +50,7 @@ extern struct CatalogView *dg_catalog_resolve_durable(Oid oid);
 extern Oid	dg_binding_identity(Relation binding, HeapTuple tuple);
 extern Oid	dg_identity_storage(Oid oid);
 extern bytea *dg_catalog_durable_content(Oid oid);
+extern bytea *dg_catalog_revision_content(Oid handle);
 extern bool dg_catalog_provides(Oid catalog);
 extern bool dg_storage_bound(Relation rel);
 #endif

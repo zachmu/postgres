@@ -2529,12 +2529,10 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		return NULL;
 
 	/*
-	 * A table on a branch head is an ordinary relation with a durable OID:
-	 * plan and execute it like any other table. Revisions keep the versioned
-	 * scan.
+	 * A table is an ordinary relation: on a branch head it has a durable OID,
+	 * in a revision a leased one. Plan and execute it like any other table.
 	 */
-	if (rte->dolt_branch && OidIsValid(rte->dolt_rowtype) && !rte->dolt_catalog &&
-		CatalogViewIsDurable(get_typ_typrelid(rte->dolt_rowtype)))
+	if (OidIsValid(rte->dolt_rowtype) && !rte->dolt_catalog && rte->relkind != RELKIND_VIEW)
 	{
 		Relation	rel = table_open(get_typ_typrelid(rte->dolt_rowtype), AccessShareLock);
 		ParseNamespaceItem *item;

@@ -21,15 +21,18 @@ sql('BEGIN; DROP TABLE t; ROLLBACK');
 is(sql('SELECT * FROM t'),'1|old','full abort restores branch membership');
 sql('BEGIN; SAVEPOINT s; DROP TABLE t; ROLLBACK TO s; COMMIT');
 is(sql('SELECT * FROM t'),'1|old','savepoint rollback restores membership');
-my $reader=$node->background_psql('postgres');
+my $reader=$node->background_psql('postgres',on_error_stop=>0);
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class');
 my $plan=$node->background_psql('postgres',on_error_stop=>0);
 $plan->query_safe('PREPARE p AS SELECT * FROM t WHERE false');
 $owner->query_safe('DROP TABLE t');
 is($owner->query_safe('SELECT current_user'), 'owner', 'privileged DROP capture restores caller and resists temporary catalog shadows');
 $owner->quit;
-is($reader->query_safe('SELECT * FROM t'),'1|old','old SQL snapshot retains branch membership and data');
-$reader->query_safe('COMMIT');$reader->quit;
+# Names resolve against the latest schema, as with catalogs: a snapshot that
+# never locked the table does not keep it alive.
+my ($gone,$goneerr)=$reader->query('SELECT * FROM t');
+like($reader->{stderr},qr/does not exist on branch/,'old SQL snapshot sees committed DROP, as for a native table');
+$reader->{stderr}='';$reader->query_safe('ROLLBACK');$reader->quit;
 my($out,$err)=$plan->query('EXECUTE p');is($err,1,'prepared empty-result query rebinds after DROP');$plan->quit;
 fails('SELECT * FROM t',qr/does not exist on branch/,'unqualified read respects dropped membership');
 fails('INSERT INTO t VALUES(2,\'new\')',qr/does not exist on branch/,'write cannot target retained physical object');

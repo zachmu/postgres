@@ -1057,10 +1057,49 @@ dg_catalog_durable_content(Oid oid)
 		return NULL;
 	GetUserIdAndSecContext(&user, &security);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PushActiveSnapshot(GetLatestSnapshot());
 	PG_TRY();
 	{
 		nest = begin_api();
 		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
+		if (SPI_processed == 1)
+			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
+ * The content of the table or index that leased OID |handle| names in its
+ * revision: immutable, so the relation needs no storage root.
+ */
+bytea *
+dg_catalog_revision_content(Oid handle)
+{
+	CatalogView *view = CatalogViewObjectContext(handle);
+	const char *name = CatalogViewObjectIdentity(handle, RelationRelationId);
+	DGProvider *entry;
+	bytea	   *result = NULL;
+	Oid			user;
+	int			security,
+				nest;
+
+	for (entry = providers; entry && entry->view != view; entry = entry->next)
+		;
+	if (!entry || !name)
+		return NULL;
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(unhex(entry->database)), CStringGetTextDatum(name)), NULL, true);
 		if (SPI_processed == 1)
 			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
 		end_api(nest);
@@ -1093,11 +1132,11 @@ dg_catalog_resolve_durable(Oid oid)
 	if (!IsTransactionState() || !dg_identity_describe(oid, &branch, &kind, &name))
 		return NULL;
 	previous = CatalogViewSwitch(NULL);
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed = true;
-	}
+
+	/* The schema is read as catalogs are: latest committed, not as of the
+	 * transaction's snapshot. */
+	PushActiveSnapshot(GetLatestSnapshot());
+	pushed = true;
 	GetUserIdAndSecContext(&user, &security);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
