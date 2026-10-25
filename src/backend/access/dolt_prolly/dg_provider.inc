@@ -979,6 +979,22 @@ provider_view(bytea *database)
 	return provider_lookup(NULL, database);
 }
 
+/*
+ * A view of schema |database| for questions about its definitions only, such
+ * as whether a name exists. Reuses a branch head's view of the same schema so
+ * one statement does not decode the schema twice.
+ */
+static CatalogView *
+provider_schema_view(bytea *database)
+{
+	char	   *key = hex(database);
+
+	for (DGProvider *entry = providers; entry; entry = entry->next)
+		if (entry->branch && !strcmp(entry->database, key))
+			return provider_lookup(entry->branch, database);
+	return provider_view(database);
+}
+
 /* The current schema of |branch|'s head, with its objects' durable OIDs. */
 static CatalogView *
 provider_branch_view(const char *branch, bytea *database)
@@ -987,8 +1003,79 @@ provider_branch_view(const char *branch, bytea *database)
 }
 
 /*
- * The current view for durable OID |oid|: its branch's working schema as this
- * transaction sees it. NULL if no branch defines the OID.
+ * The working schema of |branch| under a fresh catalog snapshot: the latest
+ * committed schema and this transaction's own changes, as PostgreSQL reads
+ * physical catalogs. NULL if the branch has no working set.
+ */
+static bytea *
+catalog_working_schema(const char *branch)
+{
+	Relation	catalog = table_open(DoltRefRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bytea	   *result = NULL;
+
+	InvalidateCatalogSnapshot();
+	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ,
+				CStringGetTextDatum(psprintf("working/%s", branch)));
+	scan = systable_beginscan(catalog, DoltRefKeyIndexId, true, NULL, 1, &key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		target = heap_getattr(tuple, Anum_pg_dolt_ref_reftarget, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			result = DatumGetByteaPCopy(target);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return result;
+}
+
+/*
+ * The committed content of durable relation |oid| in its branch's working
+ * schema: what the relation holds until the branch writes a root of its own.
+ */
+bytea *
+dg_catalog_durable_content(Oid oid)
+{
+	char	   *branch,
+			   *name;
+	char		kind;
+	bytea	   *working,
+			   *result = NULL;
+	Oid			user;
+	int			security,
+				nest;
+
+	if (!dg_identity_describe(oid, &branch, &kind, &name) || kind != DOLT_IDENTITY_RELATION)
+		return NULL;
+	working = catalog_working_schema(branch);
+	if (!working)
+		return NULL;
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
+		if (SPI_processed == 1)
+			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
+ * The current view for durable OID |oid|: its branch's working schema under
+ * the catalog snapshot. NULL if no branch defines the OID.
  */
 CatalogView *
 dg_catalog_resolve_durable(Oid oid)
@@ -1015,12 +1102,11 @@ dg_catalog_resolve_durable(Oid oid)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
-		VersionRef	working;
+		bytea	   *working = catalog_working_schema(branch);
 
 		nest = begin_api();
-		working = read_ref(psprintf("working/%s", branch));
-		if (working.target)
-			result = provider_branch_view(branch, working.target);
+		if (working)
+			result = provider_branch_view(branch, working);
 		end_api(nest);
 	}
 	PG_FINALLY();

@@ -17,12 +17,14 @@
  *-------------------------------------------------------------------------
  */
 #include "dg.h"
+#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalogview.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_dolt_binding.h"
 #include "catalog/pg_dolt_identity.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -203,6 +205,8 @@ branch_identities(const char *branch, bool remove)
 	SysScanDesc scan;
 	HeapTuple	tuple;
 
+	/* Include identities this transaction created since the catalog snapshot. */
+	InvalidateCatalogSnapshot();
 	ScanKeyInit(&key, Anum_pg_dolt_identity_identbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
 	scan = systable_beginscan(catalog, DoltIdentityNameIndexId, true, NULL, 1, &key);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
@@ -261,4 +265,46 @@ dg_identity_delete(const char *branch, const char *name)
 	}
 	table_close(catalog, RowExclusiveLock);
 	CommandCounterIncrement();
+}
+
+/* The durable OID of the relation a pg_dolt_binding row supplies storage for. */
+Oid
+dg_binding_identity(Relation binding, HeapTuple tuple)
+{
+	bool		isnull;
+	char	   *branch = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_binding_bindbranch, RelationGetDescr(binding), &isnull));
+	char	   *name = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_binding_bindname, RelationGetDescr(binding), &isnull));
+
+	return dg_identity_lookup(branch, DOLT_IDENTITY_RELATION, name);
+}
+
+/*
+ * The storage resource of durable relation |oid|, from its branch's binding
+ * under a fresh catalog snapshot; InvalidOid if it has none.
+ */
+Oid
+dg_identity_storage(Oid oid)
+{
+	char	   *branch,
+			   *name;
+	char		kind;
+	Relation	catalog;
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			storage = InvalidOid;
+
+	if (!dg_identity_describe(oid, &branch, &kind, &name) || kind != DOLT_IDENTITY_RELATION)
+		return InvalidOid;
+	catalog = table_open(DoltBindingRelationId, AccessShareLock);
+	InvalidateCatalogSnapshot();
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltBindingKeyIndexId, true, NULL, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+		storage = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return storage;
 }

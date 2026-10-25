@@ -114,11 +114,13 @@
 
 #include <limits.h>
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_dolt_binding.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/sinval.h"
@@ -1546,6 +1548,17 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		}
 		else
 			return;
+	}
+	else if (tupleRelId == DoltBindingRelationId)
+	{
+		/*
+		 * A storage binding supplies a branch-head prolly relation's file, as
+		 * relfilenode does for others.
+		 */
+		relationId = dg_binding_identity(relation, tuple);
+		if (!OidIsValid(relationId))
+			return;
+		databaseId = MyDatabaseId;
 	}
 	else
 		return;

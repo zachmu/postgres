@@ -1,6 +1,7 @@
 /* Read-only versioned catalog provider. No persistent projection objects. */
 #ifndef DOLT_CATALOG_H
 #define DOLT_CATALOG_H
+#include "access/htup.h"
 #include "access/tupdesc.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
@@ -46,6 +47,9 @@ extern const CustomScanMethods *dg_catalog_scan_methods(void);
 extern void dg_catalog_permission(const char *descriptor, Oid user);
 extern void dg_storage_locator(Oid resource, RelFileLocator *locator);
 extern struct CatalogView *dg_catalog_resolve_durable(Oid oid);
+extern Oid	dg_binding_identity(Relation binding, HeapTuple tuple);
+extern Oid	dg_identity_storage(Oid oid);
+extern bytea *dg_catalog_durable_content(Oid oid);
 extern bool dg_catalog_provides(Oid catalog);
 extern bool dg_storage_bound(Relation rel);
 #endif

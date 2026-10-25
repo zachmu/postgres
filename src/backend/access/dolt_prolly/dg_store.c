@@ -1278,13 +1278,34 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		dg_branch_base(rel, s);
 	return s;
 }
+/*
+ * A branch head's relation without a root of its own on the branch holds the
+ * committed content of its working schema member, as bound storage does.
+ */
+static DGState *
+durable_base(Relation rel, DGState *state)
+{
+	bytea	   *content;
+
+	if (state->has_root)
+		return state;
+	content = dg_catalog_durable_content(RelationGetRelid(rel));
+	if (content)
+	{
+		state->content = dg_history_import(state->store, content);
+		if (rel->rd_rel->relkind == RELKIND_RELATION)
+			dg_history_handles(state);
+	}
+	return state;
+}
+
 DGState *
 dg_load(Relation rel, Snapshot snap)
 {
 	if (dg_storage_bound(rel))
 		return dg_storage_am_load(rel, snap);
 	if (CatalogViewIsDurable(RelationGetRelid(rel)))
-		return load_state(rel, snap, NULL, dg_relation_branch(rel), false, true);
+		return durable_base(rel, load_state(rel, snap, NULL, dg_relation_branch(rel), false, true));
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load(rel, snap);
 
@@ -1304,7 +1325,7 @@ dg_load_tid(Relation rel, uint64 id)
 	if (dg_storage_bound(rel))
 		return dg_storage_am_load_tid(rel, id);
 	if (CatalogViewIsDurable(RelationGetRelid(rel)))
-		return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true);
+		return durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true));
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load_tid(rel, id);
 

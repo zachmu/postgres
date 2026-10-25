@@ -26,13 +26,19 @@ my $reader=$node->background_psql('postgres');
 $reader->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t});
 my $plan=$node->background_psql('postgres',on_error_stop=>0);
 $plan->query_safe(q{PREPARE p AS SELECT * FROM t; EXECUTE p});
-$a->query_safe(q{BEGIN; ALTER TABLE t DROP COLUMN discard});
+# DDL locks the branch's relation as PostgreSQL locks a native one: it waits
+# for readers of the same branch and never for sessions on another branch.
+my $apid=$a->query_safe('SELECT pg_backend_pid()');
+$a->query_until(qr/start_drop/,q{\echo start_drop
+BEGIN; ALTER TABLE t DROP COLUMN discard;
+});
+ok($node->poll_query_until('postgres',"SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$apid"),'main DROP waits for a reader of main');
 $b->query_safe(q{BEGIN; ALTER TABLE t DROP COLUMN extra; UPDATE t SET v=41 WHERE id=4; COMMIT});
 is($b->query_safe(q{SELECT * FROM t WHERE id=4}),'4|four|41','other DROP and write proceed during main DROP');
+is($reader->query_safe(q{SELECT discard FROM t WHERE id=1}),'old','reader keeps the pre-DROP layout and root until it ends');
+$reader->query_safe('COMMIT');$reader->quit;
 is($a->query_safe(q{SELECT * FROM t WHERE id=3}),'3|30|new','main DROP rewrites and compacts its own rows');
 $a->query_safe('COMMIT');
-is($reader->query_safe(q{SELECT discard FROM t WHERE id=1}),'old','old SQL snapshot preserves pre-DROP layout and root');
-$reader->query_safe('COMMIT');$reader->quit;
 my($output,$error)=$plan->query('EXECUTE p');is($error,1,'prepared SELECT star rejects changed result type');$plan->quit;
 is(sql(qq{SELECT * FROM t AS OF '$old' ORDER BY id}),"1|old|10\n2|two|20",'historical rows retain dropped values and old schema');
 is(sql(q{SELECT row_to_json(a),row_to_json(b) FROM "postgres/main".public.t a JOIN "postgres/other".public.t b USING(id) WHERE id=1}),'{"id":1,"v":10,"extra":null}|{"id":1,"discard":"old","v":10}','incompatible branch layouts coexist in one query');
@@ -45,7 +51,7 @@ sql(q{BEGIN; ALTER TABLE t DROP COLUMN extra; ROLLBACK});
 is(sql(q{SELECT extra FROM t WHERE id=5}),'five','rollback restores schema and row payload');
 sql(q{BEGIN; SAVEPOINT s; ALTER TABLE t ADD COLUMN gone int; ROLLBACK TO s; INSERT INTO t VALUES(6,60,'six'); COMMIT});
 is(sql(q{SELECT extra FROM t WHERE id=6}),'six','savepoint rollback restores writable schema');
-fails(q{SELECT * FROM t FOR UPDATE},qr/row locking/,'versioned read cannot silently ignore row locking');
+is(sql(q{SELECT count(*) FROM (SELECT id FROM t FOR UPDATE) l}),sql(q{SELECT count(*) FROM t}),'branch reads lock rows like any table');
 sql(q{BEGIN; ALTER TABLE t DROP COLUMN id; ROLLBACK});
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),$resources,'ADD and DROP reuse the original allocations');
 # Overlapping large writes exercise contiguous chunk framing in a shared file.

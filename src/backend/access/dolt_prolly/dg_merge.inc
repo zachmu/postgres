@@ -52,6 +52,18 @@ lock_workspace(void)
 			dg_storage_lock_branch(ids[i], dg_current_branch(), ExclusiveLock);
 		else
 			LockRelationOid(ids[i], AccessExclusiveLock);
+
+	/* Writers lock the branch's relations by durable OID; wait them out. */
+	if (canonical)
+	{
+		run("SELECT identoid FROM pg_dolt_identity WHERE identbranch=$1 AND identkind='r' ORDER BY identoid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
+		n = SPI_processed;
+		ids = palloc(sizeof(Oid) * Max(n, 1));
+		for (i = 0; i < n; i++)
+			ids[i] = DatumGetObjectId(cell(i, 1));
+		for (i = 0; i < n; i++)
+			LockRelationOid(ids[i], ExclusiveLock);
+	}
 	PopActiveSnapshot();
 	PushCopiedSnapshot(GetLatestSnapshot());
 }

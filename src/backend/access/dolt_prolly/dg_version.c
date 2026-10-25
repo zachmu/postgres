@@ -519,6 +519,7 @@ catalog_contains(bytea *db, const char *name)
 }
 
 static CatalogView *provider_view(bytea *database);
+static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static bytea *

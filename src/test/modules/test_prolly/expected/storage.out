@@ -187,9 +187,9 @@ ERROR:  prolly phase 2 does not support non-MVCC snapshots
 SELECT * FROM p FOR UPDATE;
  id |  value  | flag | payload 
 ----+---------+------+---------
-  2 | two     |      | 
-  2 | two     |      | 
-  3 | changed | t    | \x00ff
+ 3  | changed | t    | \x00ff
+ 2  | two     |      | 
+ 2  | two     |      | 
 (3 rows)
 
 DROP TABLE p,q,u,large_text;

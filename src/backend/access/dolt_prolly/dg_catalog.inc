@@ -223,7 +223,7 @@ catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native,
 			continue;
 		}
 		name = quote_qualified_identifier(ns, rv->relname);
-		if (type_lookup ? OidIsValid(CatalogViewFindObject(provider_view(db), TypeRelationId, name)) : catalog_contains(db, name))
+		if (type_lookup ? OidIsValid(CatalogViewFindObject(provider_schema_view(db), TypeRelationId, name)) : catalog_contains(db, name))
 		{
 			char	   *definition = catalog_namespace(db, ns);
 
@@ -413,7 +413,6 @@ revision_selected:
 			if (get_rel_relkind(id) != RELKIND_VIEW)
 				provider_catalog_index(id); /* reject unsupported catalogs
 											 * explicitly */
-			(void) provider_view(db);
 			/* Stored-rule RTEs retain native checkAsUser permission entries. */
 			if (pstate && pg_class_aclcheck(id, user, ACL_SELECT) != ACLCHECK_OK)
 				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);

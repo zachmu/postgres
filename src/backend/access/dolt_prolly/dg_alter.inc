@@ -242,7 +242,9 @@ dg_catalog_alter(Node *statement)
 			PopActiveSnapshot();
 		return false;
 	}
-	id = RangeVarGetRelid(rv, NoLock, missing);
+	/* Lock the branch's relation as PostgreSQL locks the native one. */
+	id = RangeVarGetRelid(rv, comment ? ShareUpdateExclusiveLock :
+						  AlterTableGetLockLevel(((AlterTableStmt *) statement)->cmds), missing);
 	if (!OidIsValid(id))
 	{
 		if (pushed)
@@ -283,7 +285,7 @@ dg_catalog_alter(Node *statement)
 		source = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 		if (RelationGetRelid(source) != id)
 			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical ALTER target changed; retry statement")));
-		resource = source->rd_lockInfo.lockRelId.relId;
+		resource = dg_storage_bound(source) ? source->rd_lockInfo.lockRelId.relId : dg_identity_storage(id);
 		state = dg_load(source, SnapshotSelf);
 		if (column)
 		{

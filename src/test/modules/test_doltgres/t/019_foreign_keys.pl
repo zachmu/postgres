@@ -82,7 +82,7 @@ $peer->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM 
 sql(q{DELETE FROM parent WHERE id=200});
 my ($rrout,$rrfailed)=$peer->query(q{INSERT INTO child VALUES(200,200)});
 is($rrfailed,1,'fixed snapshot cannot retain a concurrently deleted parent');
-like($peer->{stderr},qr/foreign key relation changed since transaction snapshot/,'fixed snapshot reports serialization failure');
+like($peer->{stderr},qr/could not serialize access due to concurrent update/,'fixed snapshot reports serialization failure as heap does');
 $peer->{stderr}='';$peer->query_safe(q{ROLLBACK});
 # A READ COMMITTED check waits for the parent writer and then checks fresh data.
 sql(q{INSERT INTO parent VALUES(201); BEGIN; DELETE FROM parent WHERE id=201});

@@ -31,7 +31,8 @@
  * Durable OIDs belong to a branch, not to one view: each schema version of
  * the branch is a different view binding the same OIDs. This backend keeps
  * the view it last resolved for each durable OID and asks the resolver again
- * after any relcache invalidation of a durable relation.
+ * after any relcache invalidation of a durable relation. Relcache forgets the
+ * views before it rebuilds open entries, so a rebuild sees the new schema.
  */
 typedef struct DurableContext
 {
@@ -570,13 +571,6 @@ CatalogViewForgetDurable(void)
 	}
 }
 
-static void
-durable_invalidate(Datum arg, Oid relid)
-{
-	if (!OidIsValid(relid) || CatalogViewIsDurable(relid))
-		CatalogViewForgetDurable();
-}
-
 /* The current view for a durable OID; NULL if no branch defines it. */
 static CatalogView *
 durable_context(Oid oid)
@@ -593,7 +587,6 @@ durable_context(Oid oid)
 		ctl.entrysize = sizeof(DurableContext);
 		ctl.hcxt = TopMemoryContext;
 		durable_contexts = hash_create("durable catalog contexts", 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		CacheRegisterRelcacheCallback(durable_invalidate, (Datum) 0);
 	}
 	entry = hash_search(durable_contexts, &oid, HASH_FIND, NULL);
 	if (entry)
