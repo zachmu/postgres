@@ -1035,7 +1035,7 @@ dg_catalog_resolve_durable(Oid oid)
 }
 
 CatalogView *
-dg_catalog_view(const char *database)
+dg_catalog_view(const char *database, const char *branch)
 {
 	Oid			user;
 	int			security,
@@ -1048,7 +1048,7 @@ dg_catalog_view(const char *database)
 	PG_TRY();
 	{
 		nest = begin_api();
-		result = provider_view(unhex(database));
+		result = provider_lookup(branch, unhex(database));
 		end_api(nest);
 	}
 	PG_FINALLY();

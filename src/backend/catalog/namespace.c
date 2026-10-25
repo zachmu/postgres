@@ -458,6 +458,25 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	{
 		if (callback)
 			callback(relation, relId, InvalidOid, callback_arg);
+
+		/* Branch-head relations have durable OIDs and lock like any other. */
+		if (CatalogViewIsDurable(relId) && lockmode != NoLock)
+		{
+			if (flags & (RVR_NOWAIT | RVR_SKIP_LOCKED))
+			{
+				if (!ConditionalLockRelationOid(relId, lockmode))
+				{
+					if (flags & RVR_SKIP_LOCKED)
+						return InvalidOid;
+					ereport(ERROR,
+							(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							 errmsg("could not obtain lock on relation \"%s\"",
+									relation->relname)));
+				}
+			}
+			else
+				LockRelationOid(relId, lockmode);
+		}
 		return relId;
 	}
 

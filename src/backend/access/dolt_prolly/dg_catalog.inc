@@ -429,6 +429,10 @@ revision_selected:
 			}
 			rte->dolt_table = pstrdup("");
 			rte->dolt_rowtype = get_rel_type_id(id);
+
+			/* Catalog rows show a branch head's objects by durable OID. */
+			if (working)
+				rte->dolt_branch = pstrdup(revision);
 			table_close(catalog, AccessShareLock);
 		}
 		else

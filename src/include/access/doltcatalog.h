@@ -30,7 +30,7 @@ extern Relation dg_catalog_copy_relation(Relation definition, bool from);
 extern Relation dg_catalog_executor_target(RangeTblEntry *rte, CmdType command);
 extern void dg_storage_close_relation(Relation rel);
 extern Relation dg_storage_index(Relation rel, Oid id);
-extern struct CatalogView *dg_catalog_view(const char *database);
+extern struct CatalogView *dg_catalog_view(const char *database, const char *branch);
 extern bool dg_catalog_creating_relation(Relation rel);
 extern void dg_catalog_create_scope(bool enter);
 extern void dg_catalog_created(Oid id);

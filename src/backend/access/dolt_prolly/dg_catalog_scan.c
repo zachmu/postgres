@@ -226,7 +226,8 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 
 	if (intVal(list_nth(plan->custom_private, 4)))
 	{
-		CatalogView *view = dg_catalog_view(strVal(list_nth(plan->custom_private, 3)));
+		const char *branch = strVal(lsecond(plan->custom_private));
+		CatalogView *view = dg_catalog_view(strVal(list_nth(plan->custom_private, 3)), *branch ? branch : NULL);
 		CatalogView *previous;
 
 		s->objects = table_open((Oid) intVal(list_nth(plan->custom_private, 4)), AccessShareLock);

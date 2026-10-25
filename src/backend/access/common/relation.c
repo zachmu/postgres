@@ -68,6 +68,7 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	 */
 	Assert(canonical || lockmode != NoLock ||
 		   IsBootstrapProcessingMode() ||
+		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
@@ -121,6 +122,7 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 
 	/* If we didn't get the lock ourselves, assert that caller holds one */
 	Assert(canonical || lockmode != NoLock ||
+		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
