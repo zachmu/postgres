@@ -343,16 +343,17 @@ ERROR:  unknown chunk store "bogus"
 --
 -- Heap implementation details.
 --
--- Storage is inline and uncompressed, keyed by a unique hash index.
+-- Storage is inline and uncompressed, keyed by hash, part and inserting transaction.
 SELECT attname, attstorage FROM pg_attribute
   WHERE attrelid = 'pg_dolt_chunk'::regclass AND attnum > 0 ORDER BY attnum;
   attname  | attstorage 
 -----------+------------
  chunkpart | p
  chunksize | p
+ chunkcopy | p
  chunkhash | p
  chunkdata | p
-(4 rows)
+(5 rows)
 
 SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
  no_toast 
@@ -374,7 +375,7 @@ SELECT name, setting, unit FROM pg_settings
  dolt_chunk_verify_hashes | off     | 
 (2 rows)
 
--- One row per hash, however often it was put.
+-- A put that finds a committed copy stores nothing, so repeated puts keep one row.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
  count 
 -------
@@ -392,9 +393,9 @@ SELECT chunkpart, chunksize, length(chunkdata), pg_column_compression(chunkdata)
   FROM pg_dolt_chunk WHERE chunkhash = sha256(decode(repeat('cd', 20000), 'hex')) ORDER BY chunkpart;
  chunkpart | chunksize | length | uncompressed 
 -----------+-----------+--------+--------------
-         0 |     20000 |   8088 | t
-         1 |     20000 |   8088 | t
-         2 |     20000 |   3824 | t
+         0 |     20000 |   8080 | t
+         1 |     20000 |   8080 | t
+         2 |     20000 |   3840 | t
 (3 rows)
 
 SELECT test_chunk_get(sha256(x)) = x AS multipart_roundtrip

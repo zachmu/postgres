@@ -351,8 +351,13 @@ dg_storage_lock_working(const char *branch, Snapshot snapshot)
 	table_close(catalog, NoLock);
 }
 
+/*
+ * Lock a resource on one branch. Writers take RowExclusiveLock, which they
+ * share with each other because rows are locked individually; operations that
+ * replace the whole branch state, such as merge, take ExclusiveLock.
+ */
 void
-dg_storage_lock_branch(Oid resource, const char *branch)
+dg_storage_lock_branch(Oid resource, const char *branch, LOCKMODE mode)
 {
 	PLHash		hash;
 	PLSlice		bytes = {(const uint8 *) branch, strlen(branch)};
@@ -360,7 +365,7 @@ dg_storage_lock_branch(Oid resource, const char *branch)
 	if (!pl_hash_bytes(bytes, &hash))
 		elog(ERROR, "branch hash failed");
 	/* Hash collisions conservatively serialize unrelated branches. */
-	LockDatabaseObject(DoltBindingRelationId, resource, pl_read32(hash.bytes), ExclusiveLock);
+	LockDatabaseObject(DoltBindingRelationId, resource, pl_read32(hash.bytes), mode);
 }
 
 Relation
@@ -383,7 +388,7 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	 * OID.
 	 */
 	LockRelationId(&rel->rd_lockInfo.lockRelId, RowExclusiveLock);
-	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch);
+	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch, RowExclusiveLock);
 	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	catalog = table_open(DoltBindingRelationId, RowShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));

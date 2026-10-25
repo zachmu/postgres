@@ -122,8 +122,8 @@ largest handle in any root row version, including prepared transactions.
 | Row visibility (xmin and xmax) | Presence in the snapshot's handle root, chosen through catalog MVCC plus the transaction's own overlay |
 | cmin and cmax | Command IDs on the transaction overlay |
 | Row locks | The lock record's tuple header |
-| "Updated" or "deleted" by a concurrent transaction | Comparing the row's digest in the snapshot root with the latest committed root, after waiting on the lock |
-| Update chains and EvalPlanQual | The same TID: the latest version is read by handle from the latest committed root |
+| "Updated" or "deleted" by a concurrent transaction | Comparing the row's digest in the snapshot root with the latest committed root, after waiting on the lock (amended below: handle presence plus the record's heir) |
+| Update chains and EvalPlanQual | The same TID: the latest version is read by handle from the latest committed root (amended below: a new TID per version, found through the heir) |
 
 **Isolation and recheck rules:**
 - **Read Committed:** after waiting on a lock record, the writer reads the
@@ -137,6 +137,47 @@ indexes reserve keys so concurrent equal inserts wait instead of merging.
 
 The acceptance gate is PostgreSQL's isolation suite run with prolly as the
 default table access method.
+
+### Implementation amendments (2026-10-24)
+
+Building the decision above changed four details. The split between prolly
+trees and heap lock records is unchanged.
+
+- **A TID names a row version, not a row.** An update gives the new version a
+  new handle, as a heap update makes a new tuple. With one TID per row, AFTER
+  triggers, RETURNING and foreign key actions read the new row where they
+  asked for the old one, because the executor fetches the old version by TID
+  after the update. The updater records the successor (the *heir*) on the old
+  version's lock record. A transaction that waited on that record follows the
+  heir under Read Committed, and gets a serialization error under Repeatable
+  Read. Heirs live only in per-branch lock records, which are never copied, so
+  branch creation still copies nothing.
+- **"Updated by another transaction" is presence, not digest comparison.** A
+  version is current if the latest committed roots, merged with the
+  transaction's own changes, still hold its handle. Otherwise the record's heir
+  says whether it was updated or deleted.
+- **Lock records are inserted frozen.** A record inserted normally belongs to
+  its uncommitted inserter, which would hold every row it first locks
+  exclusively, even against compatible lockers. A frozen record is visible to
+  everyone at once and is only an anchor. The creator then takes an ordinary
+  lock on it. A short heavyweight lock stops two backends creating one record.
+- **Unique keys are reserved by lock records** keyed by the index storage and a
+  64-bit hash of the key, held exclusively until commit. A conflicting row that
+  a running transaction is deleting, or updating with a key change, is waited
+  for by taking a key-share lock on it, as heap unique checks wait for the
+  deleter.
+
+Two supporting changes:
+- **Handles.** Rows of a branch with no roots of its own get handles derived
+  from content order, 1 to n, so every reader agrees on them. The shared
+  counter allocates above 2^40, so the two ranges never meet.
+- **Chunk puts never wait.** A put that finds no committed copy inserts its own,
+  keyed by its transaction ID. Waiting on another transaction's in-progress
+  copy could deadlock two publishers at commit.
+
+Canonical storage bindings keep their branch-level write authority, and the
+table AM checks their unique indexes itself, because their writers may bypass
+the executor's index insertion.
 
 ## 3. Read and mutation model
 

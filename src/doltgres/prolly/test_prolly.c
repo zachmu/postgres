@@ -379,6 +379,48 @@ test_random_history(void)
 	pl_store_free(store);
 }
 
+/* Retaining the current root frees the nodes earlier edits left behind. */
+static void
+test_retain(void)
+{
+	PLStore    *store = pl_store_create();
+	PLTree		tree,
+				rebuilt;
+	PLHash		root;
+	uint8_t		keys[2000][8];
+	uint8_t		value[16];
+	PLEntry    *entries = calloc(2000, sizeof(PLEntry));
+	size_t		before,
+				freed;
+
+	CHECK(store && entries);
+	CHECK(pl_build(store, NULL, 0, &tree) == PL_OK);
+	memset(value, 7, sizeof(value));
+	for (int i = 0; i < 2000; i++)
+	{
+		PLEdit		edit;
+
+		pl_key_int64(i, keys[i]);
+		edit.key = (PLSlice) {keys[i], 8};
+		edit.value.present = true;
+		edit.value.bytes = (PLSlice) {value, sizeof(value)};
+		CHECK(pl_apply(&tree, &edit, 1, &tree) == PL_OK);
+		entries[i].key = edit.key;
+		entries[i].value = edit.value.bytes;
+	}
+	before = pl_store_stats(store).chunks;
+	root = tree.root;
+	freed = pl_store_retain(store, &root, 1);
+	CHECK(freed > 0 && pl_store_stats(store).chunks == before - freed);
+	CHECK(pl_validate(&tree) == PL_OK && pl_count(&tree) == 2000);
+	CHECK(pl_build(store, entries, 2000, &rebuilt) == PL_OK && pl_hash_equal(rebuilt.root, tree.root));
+	CHECK(pl_store_retain(store, NULL, 0) == before - freed);
+	CHECK(pl_store_stats(store).chunks == 0 && pl_store_stats(store).bytes == 0);
+	printf("retain: freed %zu of %zu nodes\n", freed, before);
+	free(entries);
+	pl_store_free(store);
+}
+
 static void
 test_conflict_matrix(void)
 {
@@ -890,6 +932,7 @@ main(int argc, char **argv)
 	test_versions();
 	test_random_history();
 	test_apply_batches();
+	test_retain();
 	test_conflict_matrix();
 	test_ranges_and_shifted_boundaries();
 	test_import_and_malformed();

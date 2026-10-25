@@ -167,11 +167,28 @@ strcell(int row, int col)
 static int	catalog_api_depth;
 static SubTransactionId catalog_api_subids[64];
 static bool catalog_api_registered;
+/*
+ * Version-control calls in progress. Unlike catalog_api_depth, nested user SQL
+ * does not reset this, and an error that a savepoint catches leaves it raised
+ * until the transaction ends. While it is raised, working-store collection
+ * waits: these calls hold tree roots that no registered state names.
+ */
+static int	version_calls;
+
+bool
+dg_version_call_active(void)
+{
+	return version_calls > 0;
+}
+
 static void
 catalog_api_xact(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT || event == XACT_EVENT_PREPARE)
+	{
 		catalog_api_depth = 0;
+		version_calls = 0;
+	}
 }
 static void
 catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
@@ -217,6 +234,7 @@ begin_api(void)
 	if (catalog_api_depth == lengthof(catalog_api_subids))
 		elog(ERROR, "canonical catalog API nesting limit");
 	catalog_api_subids[catalog_api_depth++] = GetCurrentSubTransactionId();
+	version_calls++;
 	PushCopiedSnapshot(GetActiveSnapshot());
 	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
@@ -226,6 +244,8 @@ end_api(int nest)
 {
 	Assert(catalog_api_depth > 0);
 	catalog_api_depth--;
+	if (version_calls > 0)
+		version_calls--;
 	PopActiveSnapshot();
 	SPI_finish();
 	AtEOXact_GUC(true, nest);

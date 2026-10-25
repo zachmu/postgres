@@ -21,6 +21,7 @@ typedef struct PLNode
 	uint32_t	key_bytes;
 	uint32_t	value_bytes;
 	bool		backed;			/* known to be in the backing store */
+	bool		marked;			/* reachable, during pl_store_retain */
 	struct PLNode *next;
 } PLNode;
 

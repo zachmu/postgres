@@ -252,6 +252,17 @@ pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
  *
  * Check foreign key existence (combined for INSERT and UPDATE).
  */
+/*
+ * Canonical prolly bindings are read through versioned scans, which cannot
+ * take row locks yet; their checks lock the bound branch instead (see
+ * dg_catalog_foreign_lock). Native prolly tables lock rows like heap.
+ */
+static bool
+ri_unlockable(Relation rel)
+{
+	return rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID && rel->rd_catalogview != NULL;
+}
+
 static Datum
 RI_FKey_check(TriggerData *trigdata)
 {
@@ -429,7 +440,7 @@ RI_FKey_check(TriggerData *trigdata)
 			querysep = "AND";
 			queryoids[i] = fk_type;
 		}
-		if (pk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+		if (!ri_unlockable(pk_rel))
 			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 		if (riinfo->hasperiod)
 		{
@@ -599,7 +610,7 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 			querysep = "AND";
 			queryoids[i] = pk_type;
 		}
-		if (pk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+		if (!ri_unlockable(pk_rel))
 			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 		if (riinfo->hasperiod)
 		{
@@ -888,7 +899,7 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 			appendStringInfoString(&querybuf, ", false)");
 		}
 
-		if (fk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID)
+		if (!ri_unlockable(fk_rel))
 			appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
 
 		/* Prepare and save the plan */

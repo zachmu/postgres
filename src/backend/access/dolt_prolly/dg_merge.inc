@@ -49,7 +49,7 @@ lock_workspace(void)
 		ids[i] = DatumGetObjectId(cell(i, 1));
 	for (i = 0; i < n; i++)
 		if (canonical)
-			dg_storage_lock_branch(ids[i], dg_current_branch());
+			dg_storage_lock_branch(ids[i], dg_current_branch(), ExclusiveLock);
 		else
 			LockRelationOid(ids[i], AccessExclusiveLock);
 	PopActiveSnapshot();

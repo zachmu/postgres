@@ -95,6 +95,14 @@ void		pl_store_free(PLStore *store);
 void		pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg);
 PLStats		pl_store_stats(const PLStore *store);
 
+/*
+ * Free every node not reachable from |roots| through nodes in this store, and
+ * return how many were freed. Slices borrowed from freed nodes become invalid,
+ * so callers must name every root whose values they still hold. Nodes that a
+ * backing store holds can be fetched again later.
+ */
+size_t		pl_store_retain(PLStore *store, const PLHash *roots, size_t count);
+
 /* Exported bytes are immutable and borrowed until store_free. */
 PLStatus	pl_store_export(PLStore *store, PLHash hash, PLSlice *bytes);
 

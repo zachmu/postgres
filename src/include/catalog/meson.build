@@ -80,6 +80,8 @@ catalog_headers = [
   'pg_dolt_branch_control.h',
   'pg_dolt_branch_namespace_control.h',
   'pg_dolt_chunk.h',
+  'pg_dolt_root.h',
+  'pg_dolt_lock.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.

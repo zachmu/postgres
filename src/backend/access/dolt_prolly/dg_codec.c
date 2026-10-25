@@ -565,3 +565,10 @@ dg_decode_descriptor(TupleDesc desc, PLSlice bytes)
 	dg_validate_descriptor(desc);
 	return decode_fields(desc, bytes);
 }
+
+/* The canonical bytes of one value of |type|, as stored in rows. */
+PLSlice
+dg_encode_value(Oid type, Datum value)
+{
+	return encode_value(type, value);
+}

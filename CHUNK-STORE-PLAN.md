@@ -342,6 +342,17 @@ PostgreSQL's own structures.
    - **Indexes are maintained incrementally,** and index scans use key bounds
      plus the key-to-handle tree. Both replace whole-index rebuilds and
      nested-loop scans.
+   As built (2026-10-24):
+   - The roots catalog is `pg_dolt_root`, keyed by (tablespace, file number,
+     branch), so TRUNCATE's new file starts empty and its rollback restores the
+     old roots. Lock records are `pg_dolt_lock`.
+   - New nodes are written only at publication; the early flush threshold is
+     left to milestone 5.
+   - Index maintenance is incremental for row writes. History installs (merge,
+     reset, checkout) still rebuild each index in full.
+   - [Row-level tracking §2](ROW-LEVEL-TRACKING-PLAN.md) lists the
+     implementation amendments: a TID per row version, frozen lock records,
+     unique-key reservations and waitless chunk puts.
 5. **Deferred flush:**
    [write performance plan](WRITE-PERF-PLAN.md) step 3, required before the
    integrated write path is usable at volume.

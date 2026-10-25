@@ -136,6 +136,57 @@ pl_store_stats(const PLStore *store)
 	return store->stats;
 }
 
+static void
+mark_reachable(PLStore *store, PLHash hash)
+{
+	PLNode	   *node = pl_find_local(store, hash);
+
+	if (!node || node->marked)
+		return;
+	node->marked = true;
+	for (uint32_t i = 0; node->level && i < node->count; i++)
+	{
+		PLHash		child;
+
+		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		mark_reachable(store, child);
+	}
+}
+
+size_t
+pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
+{
+	size_t		freed = 0;
+
+	if (!store)
+		return 0;
+	for (size_t i = 0; i < count; i++)
+		mark_reachable(store, roots[i]);
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	  **link = &store->buckets[i];
+
+		while (*link)
+		{
+			PLNode	   *node = *link;
+
+			if (node->marked)
+			{
+				node->marked = false;
+				link = &node->next;
+				continue;
+			}
+			*link = node->next;
+			store->stats.chunks--;
+			store->stats.bytes -= node->size;
+			free(node->data);
+			free(node);
+			freed++;
+		}
+	}
+	return freed;
+}
+
 /* Find a node already in this store, without consulting a backing store. */
 PLNode *
 pl_find_local(PLStore *store, PLHash hash)

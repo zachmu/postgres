@@ -1,0 +1,183 @@
+# Row-level concurrency on prolly tables: writers lock rows, not tables, and
+# conflicts follow heap semantics. Lock records are per branch.
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+my $node = PostgreSQL::Test::Cluster->new('row_locks');
+$node->init(extra => [ '--encoding=UTF8', '--locale=C' ]);
+$node->append_conf('postgresql.conf',
+	"max_parallel_workers_per_gather=0\ndefault_table_access_method=dolt_prolly_table\n");
+$node->start;
+
+sub sql { return $node->safe_psql('postgres', $_[0]); }
+
+sub session
+{
+	my $s = $node->background_psql('postgres', on_error_stop => 0);
+	my $pid = $s->query_safe('SELECT pg_backend_pid()');
+	return ($s, $pid);
+}
+
+# Start |$query| in |$s| without waiting for it to finish.
+sub start
+{
+	my ($s, $query) = @_;
+	$s->query_until(qr/started/, "\\echo started\n$query\n");
+}
+
+sub blocked
+{
+	my ($pid, $label) = @_;
+	ok( $node->poll_query_until(
+			'postgres',
+			"SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $pid"),
+		$label);
+}
+
+sql(q{CREATE TABLE t(id int PRIMARY KEY, v int);
+INSERT INTO t SELECT g, g * 10 FROM generate_series(1, 4) g});
+my ($a, $apid) = session();
+my ($b, $bpid) = session();
+
+# Writers of different rows never wait for each other, and both publish.
+$a->query_safe('BEGIN; UPDATE t SET v = 11 WHERE id = 1');
+$b->query_safe('BEGIN; UPDATE t SET v = 21 WHERE id = 2');
+$b->query_safe('INSERT INTO t VALUES (5, 50)');
+$a->query_safe('COMMIT');
+$b->query_safe('COMMIT');
+is(sql(q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM t}),
+	'1:11,2:21,3:30,4:40,5:50', 'disjoint concurrent writers both publish');
+
+# A writer of the same row waits; under Read Committed it then re-evaluates
+# against the newer version.
+$a->query_safe('BEGIN; UPDATE t SET v = v + 1 WHERE id = 3');
+start($b, 'UPDATE t SET v = v * 2 WHERE id = 3 RETURNING v;');
+blocked($bpid, 'second writer of a row waits for the first');
+$a->query_safe('COMMIT');
+like($b->query_safe('SELECT 1'), qr/62/, 'read committed writer updates the newer version');
+is(sql('SELECT v FROM t WHERE id = 3'), '62', 'both updates of the row apply in order');
+
+# Under Repeatable Read the second writer fails instead.
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t');
+$a->query_safe('BEGIN; UPDATE t SET v = 0 WHERE id = 4');
+start($b, 'UPDATE t SET v = 1 WHERE id = 4;');
+blocked($bpid, 'repeatable read writer waits for the row lock');
+$a->query_safe('COMMIT');
+$b->query('SELECT 1');
+like($b->{stderr}, qr/could not serialize access due to concurrent update/,
+	'repeatable read writer of an updated row fails');
+$b->{stderr} = '';
+$b->query('ROLLBACK');
+
+# A deleted row is skipped by a waiting Read Committed writer.
+$a->query_safe('BEGIN; DELETE FROM t WHERE id = 5');
+start($b, 'UPDATE t SET v = 99 WHERE id = 5;');
+blocked($bpid, 'writer waits for a deleter');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT count(*) FROM t WHERE id = 5'), '0', 'waiting writer finds the row deleted');
+
+# Lock strengths: key share is compatible with a non-key update, share is not.
+$a->query_safe('BEGIN; UPDATE t SET v = 12 WHERE id = 1');
+is($b->query_safe('BEGIN; SELECT id FROM t WHERE id = 1 FOR KEY SHARE'),
+	'1', 'key share lock does not wait for a non-key update');
+$b->query_safe('ROLLBACK');
+start($b, 'SELECT id FROM t WHERE id = 1 FOR SHARE;');
+blocked($bpid, 'share lock waits for an update');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+
+# NOWAIT and SKIP LOCKED.
+$a->query_safe('BEGIN; SELECT * FROM t WHERE id = 1 FOR UPDATE');
+$b->query('SELECT * FROM t WHERE id = 1 FOR UPDATE NOWAIT');
+like($b->{stderr}, qr/could not obtain lock on row in relation "t"/, 'NOWAIT reports the locked row');
+$b->{stderr} = '';
+is($b->query_safe(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM (SELECT id FROM t ORDER BY id FOR UPDATE SKIP LOCKED) s}),
+	'2,3,4', 'SKIP LOCKED skips the locked row');
+$a->query_safe('COMMIT');
+
+# Concurrent inserts of one unique key: the second waits, then fails if the
+# first commits and succeeds if it aborts.
+$a->query_safe('BEGIN; INSERT INTO t VALUES (6, 60)');
+start($b, 'INSERT INTO t VALUES (6, 61);');
+blocked($bpid, 'second inserter of a key waits');
+$a->query_safe('COMMIT');
+$b->query('SELECT 1');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "t_pkey"/,
+	'second inserter fails after the first commits');
+$b->{stderr} = '';
+$a->query_safe('BEGIN; INSERT INTO t VALUES (7, 70)');
+start($b, 'INSERT INTO t VALUES (7, 71);');
+blocked($bpid, 'second inserter waits again');
+$a->query_safe('ROLLBACK');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 7'), '71', 'second inserter succeeds after the first aborts');
+
+# Re-inserting a key whose row a running transaction deletes waits for it.
+$a->query_safe('BEGIN; DELETE FROM t WHERE id = 7');
+start($b, 'INSERT INTO t VALUES (7, 72);');
+blocked($bpid, 'inserter waits for the deleter of a conflicting row');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 7'), '72', 'insert succeeds once the conflicting row is deleted');
+
+# AFTER triggers and RETURNING see the old version: each version has its own TID.
+sql(q{CREATE TABLE audit(old_v int, new_v int);
+CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql AS
+  $$BEGIN INSERT INTO audit VALUES (OLD.v, NEW.v); RETURN NULL; END$$;
+CREATE TRIGGER t_audit AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION audit_row()});
+my $before = sql('SELECT ctid FROM t WHERE id = 2');
+sql('UPDATE t SET v = 22 WHERE id = 2');
+is(sql(q{SELECT old_v || '->' || new_v FROM audit}), '21->22', 'AFTER trigger sees old and new versions');
+isnt(sql('SELECT ctid FROM t WHERE id = 2'), $before, 'an update gives the row a new TID');
+is(sql(q{UPDATE t SET v = 23 WHERE id = 2 RETURNING old.v || '->' || new.v}), '22->23',
+	'RETURNING old and new');
+sql('DROP TRIGGER t_audit ON t');
+
+# Handles are never reused across a restart.
+$a->quit;
+$b->quit;
+my $max = sql('SELECT max((ctid::text::point)[0] * 65535 + (ctid::text::point)[1]) FROM t');
+$node->restart;
+sql('INSERT INTO t VALUES (8, 80)');
+cmp_ok(sql('SELECT (ctid::text::point)[0] * 65535 + (ctid::text::point)[1] FROM t WHERE id = 8'),
+	'>', $max, 'handles allocated after a restart exceed every earlier one');
+($a, $apid) = session();
+($b, $bpid) = session();
+
+# Foreign keys: a key-share check does not block non-key updates of the parent.
+sql(q{CREATE TABLE child(id int PRIMARY KEY, parent int REFERENCES t(id))});
+$a->query_safe('BEGIN; UPDATE t SET v = 24 WHERE id = 2');
+is($b->query_safe('INSERT INTO child VALUES (1, 2); SELECT count(*) FROM child'), '1',
+	'child insert does not wait for a non-key parent update');
+$a->query_safe('COMMIT');
+
+# Locks are per branch: a lock on main does not block the same row elsewhere.
+sql(q{SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('other')});
+$b->query_safe(q{SELECT dolt_checkout('other')});
+$a->query_safe('BEGIN; UPDATE t SET v = 100 WHERE id = 1');
+is($b->query_safe('BEGIN; UPDATE t SET v = 200 WHERE id = 1; SELECT v FROM t WHERE id = 1'),
+	'200', 'a row lock on one branch does not block another branch');
+$b->query_safe('COMMIT');
+$a->query_safe('COMMIT');
+is(sql('SELECT v FROM t WHERE id = 1'), '100', 'main keeps its own update');
+is($b->query_safe('SELECT v FROM t WHERE id = 1'), '200', 'the other branch keeps its update');
+
+# Concurrent first publishers of a new table both commit.
+sql('CREATE TABLE fresh(id int)');
+$b->query_safe(q{SELECT dolt_checkout('main')});
+$a->query_safe('BEGIN; INSERT INTO fresh VALUES (1)');
+$b->query_safe('BEGIN; INSERT INTO fresh VALUES (2)');
+$a->query_safe('COMMIT');
+$b->query_safe('COMMIT');
+is(sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM fresh}), '1,2',
+	'concurrent first publishers both publish');
+
+$a->quit;
+$b->quit;
+
+$node->stop;
+done_testing();

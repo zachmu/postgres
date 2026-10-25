@@ -1413,7 +1413,13 @@ GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;
 -- Prolly chunks stay inline and uncompressed; the catalog has no TOAST table.
 ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkhash SET STORAGE PLAIN;
 ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkdata SET STORAGE PLAIN;
-REVOKE ALL ON pg_catalog.pg_dolt_chunk FROM PUBLIC;
+-- Roots and lock records are small and fixed in shape; they stay inline too.
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootbranch SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootcontent SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN roothandles SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootkeys SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_lock ALTER COLUMN lockbranch SET STORAGE PLAIN;
+REVOKE ALL ON pg_catalog.pg_dolt_chunk, pg_catalog.pg_dolt_root, pg_catalog.pg_dolt_lock FROM PUBLIC;
 
 CREATE VIEW pg_dolt_object_visible AS
  SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;

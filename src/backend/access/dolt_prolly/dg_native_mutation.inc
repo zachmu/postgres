@@ -138,6 +138,13 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 }
 
 
+/* Whether a native rewrite holds a destination state in the working store. */
+bool
+dg_native_rewrite_active(void)
+{
+	return native_mutation_destination != NULL;
+}
+
 bool
 dg_catalog_begin_rewrite(Relation definition)
 {
@@ -154,6 +161,7 @@ dg_catalog_begin_rewrite(Relation definition)
 	native_mutation_width = RelationGetDescr(definition)->natts;
 	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->content));
 	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->handles));
+	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->keys));
 	MemoryContextSwitchTo(old);
 	return true;
 }

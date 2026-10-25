@@ -29,7 +29,7 @@ SELECT test_chunk_use_store('bogus');
 -- Heap implementation details.
 --
 
--- Storage is inline and uncompressed, keyed by a unique hash index.
+-- Storage is inline and uncompressed, keyed by hash, part and inserting transaction.
 SELECT attname, attstorage FROM pg_attribute
   WHERE attrelid = 'pg_dolt_chunk'::regclass AND attnum > 0 ORDER BY attnum;
 SELECT reltoastrelid = 0 AS no_toast FROM pg_class WHERE oid = 'pg_dolt_chunk'::regclass;
@@ -37,7 +37,7 @@ SELECT indisunique, indisprimary FROM pg_index WHERE indexrelid = 'pg_dolt_chunk
 SELECT name, setting, unit FROM pg_settings
   WHERE name IN ('dolt_chunk_cache_size', 'dolt_chunk_verify_hashes') ORDER BY name;
 
--- One row per hash, however often it was put.
+-- A put that finds a committed copy stores nothing, so repeated puts keep one row.
 SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('contract alpha');
 
 -- A chunk longer than one heap tuple spans parts, each inline and uncompressed.

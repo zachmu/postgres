@@ -12,16 +12,17 @@
  * checksums, log a full-page image per page. A row whose inserter or deleter is
  * still running is waited on.
  *
- * Puts follow the speculative insertion protocol INSERT ... ON CONFLICT DO
- * NOTHING uses, so a concurrent insert of the same chunk waits for its inserter
- * instead of raising a unique violation. Puts are transactional here; aborted
- * rows become dead tuples for VACUUM. Callers must not depend on that.
+ * Puts never wait. A put that finds no committed copy of a chunk (or one of
+ * its own) inserts its own copy, keyed by its transaction ID, so concurrent
+ * puts of one chunk never conflict; they may leave duplicate copies. Waiting
+ * instead could deadlock two committing transactions that each wait for a
+ * chunk the other is inserting. Puts are transactional here; aborted rows
+ * become dead tuples for VACUUM. Callers must not depend on that.
  *
  * A chunk longer than one heap tuple holds is stored as consecutive parts of
- * DG_CHUNK_PART bytes. Part 0 decides whether a chunk exists, and its inserter
- * owns the remaining parts. Because a part's bytes follow from the chunk and
- * its number, every copy of a part is identical, including copies left behind
- * by aborted inserts.
+ * DG_CHUNK_PART bytes. Because a part's bytes follow from the chunk and its
+ * number, every copy of a part is identical, so a reader may assemble a chunk
+ * from parts of different copies.
  *
  * src/backend/access/dolt_prolly/dg_chunk_heap.c
  *
@@ -50,9 +51,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-/* The largest part: a heap tuple less its header, part, size and hash. */
+/* The largest part: a heap tuple less its header, part, size, copy and hash. */
 #define DG_CHUNK_PART \
-	(MaxHeapTupleSize - (MAXALIGN(SizeofHeapTupleHeader) + 2 * sizeof(int32) + \
+	(MaxHeapTupleSize - (MAXALIGN(SizeofHeapTupleHeader) + 2 * sizeof(int32) + sizeof(int64) + \
 						 INTALIGN(1 + DOLT_CHUNK_HASH_SIZE) + VARHDRSZ))
 
 typedef struct HeapChunkState
@@ -107,8 +108,14 @@ probe(HeapChunkState *state, const uint8 *hash, int part)
 {
 	ScanKeyData keys[2];
 
+	/* The scan lives as long as the store, not the caller's context. */
 	if (!state->scan)
+	{
+		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(state));
+
 		state->scan = index_beginscan(state->heap, state->index, SnapshotAny, NULL, 2, 0);
+		MemoryContextSwitchTo(old);
+	}
 	memcpy(VARDATA(state->key), hash, DOLT_CHUNK_HASH_SIZE);
 	ScanKeyInit(&keys[0], 1, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(state->key));
 	if (part < 0)
@@ -197,46 +204,36 @@ heap_get(void *arg, int n, const uint8 *hashes, DoltChunkFoundFn found, void *fo
 	}
 }
 
-typedef enum RowStatus
-{
-	ROW_LIVE,
-	ROW_DEAD,
-	ROW_WAIT,
-} RowStatus;
-
 /*
- * Classify the row in the slot from its transactions' status, without setting
- * hint bits. Sets *wait (and *token for a speculative insert) for ROW_WAIT.
+ * Whether the row in the slot is a usable copy: inserted by a committed
+ * transaction or this one, and not deleted by a committed one. Never waits
+ * and never sets hint bits. Another transaction's uncommitted copy is not
+ * usable, since that transaction may abort; a caller that needs the chunk
+ * inserts its own copy instead.
  */
-static RowStatus
-row_status(HeapChunkState *state, TransactionId *wait, uint32 *token)
+static bool
+row_live(HeapChunkState *state)
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) state->slot;
 	HeapTupleHeader tuple;
-	RowStatus	status = ROW_LIVE;
+	bool		live = true;
 
 	LockBuffer(bslot->buffer, BUFFER_LOCK_SHARE);
 	tuple = bslot->base.tuple->t_data;
-	*token = 0;
 	if (!HeapTupleHeaderXminCommitted(tuple))
 	{
 		TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple);
 
 		if (HeapTupleHeaderXminInvalid(tuple))
-			status = ROW_DEAD;
+			live = false;
 		else if (TransactionIdIsCurrentTransactionId(xmin))
-			status = ROW_LIVE;
+			live = true;
 		else if (TransactionIdIsInProgress(xmin))
-		{
-			status = ROW_WAIT;
-			*wait = xmin;
-			if (HeapTupleHeaderIsSpeculative(tuple))
-				*token = HeapTupleHeaderGetSpeculativeToken(tuple);
-		}
-		else if (!TransactionIdDidCommit(xmin))
-			status = ROW_DEAD;
+			live = false;
+		else
+			live = TransactionIdDidCommit(xmin);
 	}
-	if (status == ROW_LIVE && !(tuple->t_infomask & HEAP_XMAX_INVALID) &&
+	if (live && !(tuple->t_infomask & HEAP_XMAX_INVALID) &&
 		!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 	{
 		TransactionId xmax;
@@ -246,67 +243,27 @@ row_status(HeapChunkState *state, TransactionId *wait, uint32 *token)
 			elog(ERROR, "unexpected multixact on a dolt chunk row");
 		xmax = HeapTupleHeaderGetRawXmax(tuple);
 		if (tuple->t_infomask & HEAP_XMAX_COMMITTED)
-			status = ROW_DEAD;
+			live = false;
 		else if (TransactionIdIsCurrentTransactionId(xmax))
-			status = ROW_DEAD;
-		else if (TransactionIdIsInProgress(xmax))
-		{
-			status = ROW_WAIT;
-			*wait = xmax;
-		}
-		else if (TransactionIdDidCommit(xmax))
-			status = ROW_DEAD;
+			live = false;
+		else if (!TransactionIdIsInProgress(xmax))
+			live = !TransactionIdDidCommit(xmax);
 	}
 	LockBuffer(bslot->buffer, BUFFER_LOCK_UNLOCK);
-	return status;
+	return live;
 }
 
-/*
- * Find a live row for |hash|, waiting out in-progress inserters and deleters.
- * Leaves the row in the slot if found.
- */
+/* Whether a usable copy of part |part| of |hash| exists. */
 static bool
 find_live(HeapChunkState *state, const uint8 *hash, int part)
 {
-	for (;;)
-	{
-		TransactionId wait = InvalidTransactionId;
-		uint32		token = 0;
-		ItemPointerData tid;
-		bool		live = false;
+	bool		live = false;
 
-		probe(state, hash, part);
-		while (index_getnext_slot(state->scan, ForwardScanDirection, state->slot))
-		{
-			RowStatus	status = row_status(state, &wait, &token);
-
-			if (status == ROW_LIVE)
-			{
-				live = true;
-				break;
-			}
-			if (status == ROW_WAIT)
-			{
-				tid = state->slot->tts_tid;
-				break;
-			}
-		}
-		if (!TransactionIdIsValid(wait))
-		{
-			if (!live)
-				ExecClearTuple(state->slot);
-			return live;
-		}
-
-		/* Never wait while the scan holds index buffer pins. */
-		ExecClearTuple(state->slot);
-		index_endscan(state->scan);
-		state->scan = NULL;
-		if (token)
-			SpeculativeInsertionWait(wait, token);
-		else
-			XactLockTableWait(wait, state->heap, &tid, XLTW_InsertIndex);
-	}
+	probe(state, hash, part);
+	while (!live && index_getnext_slot(state->scan, ForwardScanDirection, state->slot))
+		live = row_live(state);
+	ExecClearTuple(state->slot);
+	return live;
 }
 
 static void
@@ -317,7 +274,6 @@ heap_exists(void *arg, int n, const uint8 *hashes, bool *found)
 	for (int i = 0; i < n; i++)
 	{
 		found[i] = find_live(state, hashes + (Size) i * DOLT_CHUNK_HASH_SIZE, 0);
-		ExecClearTuple(state->slot);
 	}
 }
 
@@ -337,66 +293,46 @@ form_part(HeapChunkState *state, bytea *hashvalue, const uint8 *data, Size lengt
 	memcpy(VARDATA(datavalue), data + offset, piece);
 	values[Anum_pg_dolt_chunk_chunkpart - 1] = Int32GetDatum(part);
 	values[Anum_pg_dolt_chunk_chunksize - 1] = Int32GetDatum((int32) length);
+	values[Anum_pg_dolt_chunk_chunkcopy - 1] =
+		Int64GetDatum((int64) U64FromFullTransactionId(GetTopFullTransactionId()));
 	values[Anum_pg_dolt_chunk_chunkhash - 1] = PointerGetDatum(hashvalue);
 	values[Anum_pg_dolt_chunk_chunkdata - 1] = PointerGetDatum(datavalue);
 	tuple = heap_form_tuple(RelationGetDescr(state->heap), values, nulls);
 	pfree(datavalue);
 	index_values[0] = PointerGetDatum(hashvalue);
 	index_values[1] = Int32GetDatum(part);
+	index_values[2] = values[Anum_pg_dolt_chunk_chunkcopy - 1];
 	return tuple;
 }
 
-/* Insert one chunk unless a live row has its hash; true if inserted. */
+/*
+ * Insert one chunk unless a usable copy exists; true if inserted. A copy is
+ * keyed by this transaction's ID, so it never conflicts with another's.
+ */
 static bool
 put_one(HeapChunkState *state, const uint8 *hash, const uint8 *data, Size length)
 {
-	bytea	   *hashvalue = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
-	Datum		index_values[2];
-	bool		index_nulls[2] = {false};
+	bytea	   *hashvalue;
+	Datum		index_values[3];
+	bool		index_nulls[3] = {false};
 	int32		parts = length ? (int32) ((length + DG_CHUNK_PART - 1) / DG_CHUNK_PART) : 1;
-	bool		inserted = false;
 
+	if (find_live(state, hash, 0))
+		return false;
+	hashvalue = palloc(VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
 	SET_VARSIZE(hashvalue, VARHDRSZ + DOLT_CHUNK_HASH_SIZE);
 	memcpy(VARDATA(hashvalue), hash, DOLT_CHUNK_HASH_SIZE);
-	while (!find_live(state, hash, 0))
-	{
-		HeapTuple	tuple;
-		uint32		token;
-
-		/*
-		 * Speculative insertion of part 0: concurrent probes wait on our
-		 * token, and a unique conflict found by the index cancels our row and
-		 * retries.
-		 */
-		tuple = form_part(state, hashvalue, data, length, 0, index_values);
-		token = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
-		HeapTupleHeaderSetSpeculativeToken(tuple->t_data, token);
-		heap_insert(state->heap, tuple, GetCurrentCommandId(true), HEAP_INSERT_SPECULATIVE, NULL);
-		inserted = index_insert(state->index, index_values, index_nulls, &tuple->t_self,
-								state->heap, UNIQUE_CHECK_PARTIAL, false, state->index_info);
-		if (inserted)
-			heap_finish_speculative(state->heap, &tuple->t_self);
-		else
-			heap_abort_speculative(state->heap, &tuple->t_self);
-		SpeculativeInsertionLockRelease(GetCurrentTransactionId());
-		heap_freetuple(tuple);
-		if (inserted)
-			break;
-	}
-	ExecClearTuple(state->slot);
-
-	/* Owning part 0 makes this transaction the only writer of the rest. */
-	for (int32 part = 1; inserted && part < parts; part++)
+	for (int32 part = 0; part < parts; part++)
 	{
 		HeapTuple	tuple = form_part(state, hashvalue, data, length, part, index_values);
 
 		heap_insert(state->heap, tuple, GetCurrentCommandId(true), 0, NULL);
 		index_insert(state->index, index_values, index_nulls, &tuple->t_self, state->heap,
-					 UNIQUE_CHECK_YES, false, state->index_info);
+					 UNIQUE_CHECK_NO, false, state->index_info);
 		heap_freetuple(tuple);
 	}
 	pfree(hashvalue);
-	return inserted;
+	return true;
 }
 
 static const uint8 *sort_hashes;
@@ -474,17 +410,13 @@ heap_remove(void *arg, int n, const uint8 *hashes)
 
 		if (!find_live(state, hash, 0))
 			continue;
-		ExecClearTuple(state->slot);
 
 		/* Delete every live part; dead copies are left to VACUUM. */
 		tids = palloc(maxtids * sizeof(ItemPointerData));
 		probe(state, hash, -1);
 		while (index_getnext_slot(state->scan, ForwardScanDirection, state->slot))
 		{
-			TransactionId wait;
-			uint32		token;
-
-			if (row_status(state, &wait, &token) != ROW_LIVE)
+			if (!row_live(state))
 				continue;
 			if (ntids == maxtids)
 			{

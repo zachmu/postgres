@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Concurrent inserts of the same chunk wait for the first inserter instead of
-# failing, and committed chunks survive crash recovery while uncommitted ones
-# do not.
+# Concurrent inserts of the same chunk never wait for each other: each
+# transaction that finds no committed copy stores its own. Committed chunks
+# survive crash recovery while uncommitted ones do not.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -21,7 +21,8 @@ sub rows
 		"SELECT count(*) FROM pg_dolt_chunk WHERE chunkhash = sha256('$data')");
 }
 
-# The second inserter waits until the first decides, for commit and for abort.
+# The second inserter neither waits for nor relies on the first. If both
+# commit there are two copies; if the first aborts, the second's copy remains.
 foreach my $outcome ('COMMIT', 'ROLLBACK')
 {
 	my $data = "shared-$outcome";
@@ -31,25 +32,21 @@ foreach my $outcome ('COMMIT', 'ROLLBACK')
 	$first->query_safe('BEGIN');
 	is($first->query_safe("SELECT test_chunk_put(sha256('$data'), '$data')"),
 		't', "first inserter inserts ($outcome)");
-	$second->query_until(qr/started/,
-		"\\echo started\nSELECT test_chunk_put(sha256('$data'), '$data');\n");
-	ok( $node->poll_query_until(
-			'postgres',
-			"SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%test_chunk_put%'"
-		),
-		"second inserter waits ($outcome)");
+	$second->query_safe('BEGIN');
+	is($second->query_safe("SELECT test_chunk_put(sha256('$data'), '$data')"),
+		't', "second inserter stores its own copy without waiting ($outcome)");
 	$first->query_safe($outcome);
-	ok( $node->poll_query_until(
-			'postgres',
-			"SELECT count(*) = 0 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%test_chunk_put%'"
-		),
-		"second inserter resumes ($outcome)");
+	$second->query_safe('COMMIT');
 	$second->quit;
 	$first->quit;
-	is(rows($data), '1', "exactly one row after $outcome");
+	is(rows($data), $outcome eq 'COMMIT' ? '2' : '1', "copies after $outcome");
+	is($node->safe_psql('postgres', "SELECT test_chunk_get(sha256('$data')) = '$data'"),
+		't', "chunk readable after $outcome");
+	is($node->safe_psql('postgres', "SELECT test_chunk_put(sha256('$data'), '$data')"),
+		'f', "later put finds a committed copy after $outcome");
 }
 
-# Overlapping concurrent loads insert each chunk once, with no errors.
+# Overlapping concurrent loads store every chunk with no errors or waits.
 my @sessions = map { $node->background_psql('postgres') } 1 .. 4;
 for my $i (0 .. $#sessions)
 {
@@ -60,14 +57,14 @@ for my $i (0 .. $#sessions)
 $_->quit for @sessions;
 is( $node->safe_psql(
 		'postgres',
-		"SELECT count(*) FROM pg_dolt_chunk WHERE length(chunkdata) = 512"),
+		"SELECT count(DISTINCT chunkhash) FROM pg_dolt_chunk WHERE length(chunkdata) = 512"),
 	'50000',
-	'overlapping loads store each chunk once');
+	'overlapping loads store every chunk');
 is( $node->safe_psql(
 		'postgres',
-		'SELECT count(*) = count(DISTINCT chunkhash) FROM pg_dolt_chunk'),
-	't',
-	'no duplicate hashes');
+		'SELECT count(*) FROM (SELECT chunkhash, chunkpart, chunkcopy FROM pg_dolt_chunk GROUP BY 1, 2, 3 HAVING count(*) > 1) d'),
+	'0',
+	'a transaction stores at most one copy of a chunk part');
 
 # Committed chunks survive a crash; an in-progress insert does not.
 $node->safe_psql('postgres', "SELECT test_chunk_put(sha256('durable'), 'durable')");

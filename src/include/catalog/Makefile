@@ -92,7 +92,9 @@ CATALOG_HEADERS := \
 	pg_dolt_backup.h \
 	pg_dolt_branch_control.h \
 	pg_dolt_branch_namespace_control.h \
-	pg_dolt_chunk.h
+	pg_dolt_chunk.h \
+	pg_dolt_root.h \
+	pg_dolt_lock.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 

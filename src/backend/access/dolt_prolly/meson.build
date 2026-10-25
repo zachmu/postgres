@@ -10,6 +10,7 @@ backend_sources += files(
   'dg_version.c',
   'dg_index.c',
   'dg_store.c',
+  'dg_lock.c',
   'dg_table.c',
   'pl_file.c',
   'pl_store.c',

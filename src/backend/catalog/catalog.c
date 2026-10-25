@@ -39,6 +39,8 @@
 #include "catalog/pg_dolt_branch_control.h"
 #include "catalog/pg_dolt_branch_namespace_control.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_lock.h"
+#include "catalog/pg_dolt_root.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_parameter_acl.h"
@@ -174,6 +176,8 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 		case DoltBranchNamespaceControlKeyIndexId:
 		case DoltRefKeyIndexId:
 		case DoltBindingKeyIndexId:
+		case DoltRootKeyIndexId:
+		case DoltLockKeyIndexId:
 		case ParameterAclParnameIndexId:
 		case ReplicationOriginNameIndex:
 		case SecLabelObjectIndexId:
