@@ -11,16 +11,32 @@
 #include "utils/memutils.h"
 #include "../../../doltgres/prolly/internal.h"
 
+/*
+ * A relation's trees as one caller sees them. States from dg_load share the
+ * transaction's working store, which loads missing nodes from the chunk store;
+ * other states own a private store. A table state has three trees: content
+ * (row digest -> count + row), handles (handle -> row digest) and keys
+ * (row digest + handle -> present). An index state uses only content.
+ */
 typedef struct DGState
 {
 	PLStore    *store;
 	bool		has_root;
 	PLTree		content;
 	PLTree		handles;
-	uint64		nextid;
-	HTAB	   *persisted;
+	PLTree		keys;
+	uint64		nextid;			/* next handle, for private states only */
+	bool		shared;			/* store is the transaction's working store */
+	bool		based;			/* derived from committed roots */
+	PLHash		base[3];		/* those committed content, handle, key roots */
 	MemoryContextCallback cleanup;
 } DGState;
+
+/* Size of a key-to-handle tree key: row digest followed by the handle. */
+#define DG_KEY_SIZE (PL_HASH_SIZE + 8)
+
+/* Handles below this are derived from content; the counter allocates above it. */
+#define DG_DERIVED_HANDLES (UINT64CONST(1) << 40)
 typedef struct DGRows
 {
 	PLEntry    *items;
@@ -34,7 +50,7 @@ extern void dg_storage_record(Relation source);
 extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);
 extern DGState *dg_storage_load(DGStorage *storage);
 extern void dg_storage_close(DGStorage *storage);
-extern void dg_storage_lock_branch(Oid resource, const char *branch);
+extern void dg_storage_lock_branch(Oid resource, const char *branch, LOCKMODE mode);
 extern void dg_storage_lock_working(const char *branch, Snapshot snapshot);
 extern Relation dg_catalog_write_table(const char *branch, const char *name, AclMode permission);
 extern Relation dg_storage_enable_read(DGStorage *storage, bytea *base);
@@ -52,21 +68,44 @@ extern DGState *dg_load_bound(Relation rel, Snapshot snapshot, const char *branc
 extern void dg_check(PLStatus status);
 extern PLHash dg_rowhash(PLSlice row);
 extern DGState *dg_load(Relation rel, Snapshot snapshot);
+extern DGState *dg_catalog_mutation_load(Relation rel, Snapshot snapshot);
+extern bool dg_catalog_begin_rewrite(Relation definition);
+extern void dg_catalog_finish_rewrite(Relation definition);
+extern DGState *dg_catalog_rewrite_state(Relation definition);
+extern void dg_decode_mutation(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot);
 extern DGState *dg_load_branch(Relation rel, Snapshot snapshot, const char *branch);
 extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
+extern uint64 dg_allocate_handle(Relation rel);
+extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
+extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
+extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode,
+								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
+extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id,
+								  bool key_change, bool wait, TM_FailureData *tmfd, int64 *next);
+extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bool wait,
+								  bool changing_part, TM_FailureData *tmfd, int64 *next);
+extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
+extern PLStore *dg_working_store(void);
+extern void dg_collect(void);
+extern bool dg_version_call_active(void);
+extern bool dg_native_rewrite_active(void);
 extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
 extern void dg_history_handles(DGState *state);
-extern bytea *dg_history_export_tree(const PLTree *tree);
+extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);
 extern DGRows dg_rows(const PLTree * tree);
 extern void dg_tid(uint64 id, ItemPointer tid);
 extern uint64 dg_id(ItemPointer tid);
 extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);
+extern PLSlice dg_encode_value(Oid type, Datum value);
+extern void dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle);
+extern void dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull);
+extern void dg_index_validate(Relation table, Relation index);
 extern HeapTuple dg_decode_descriptor(TupleDesc desc, PLSlice bytes);
 extern void dg_decode(Relation rel, PLSlice tuple, ItemPointer tid, TupleTableSlot *slot);
 extern void dg_validate_descriptor(TupleDesc desc);

@@ -12,7 +12,7 @@ sub fails {
  my($q,$pat,$label)=@_;my($status,$out,$err)=$node->psql('postgres',$q);
  isnt($status,0,$label);like($err,$pat,"$label diagnostic");
 }
-is(sql('SELECT count(*) FROM dolt_log()'),'0','no history before lazy initialization');
+is(sql('SELECT message FROM dolt_log()'),'Initialize data repository','repository initialized with the database');
 sql(q{CREATE SCHEMA empty_space; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Test Author <author@example.com>','--date','2020-01-02 03:04:05+00')});
 like($first,qr/^[0-9a-f]{64}$/,'commit returns native SHA256 hash');
@@ -49,7 +49,8 @@ my $empty=sql(q{SELECT dolt_commit('--allow-empty','-m','empty allowed')});
 isnt($empty,$third,'allow empty creates history node');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}),'0','empty commit has identical state');
 fails(q{BEGIN; SELECT dolt_commit('-Am','invalid'); COMMIT},qr/transaction block/,'commit rejects explicit transaction');
-fails(q{SELECT upper(dolt_commit('-Am','invalid'))},qr/standalone SELECT/,'nested commit expression rejected');
+is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'64','scalar-wrapped command accepted');
+fails(q{SELECT dolt_commit('-Am','invalid') WHERE (SELECT true)},qr/standalone SELECT/,'subquery-wrapped command rejected');
 fails(q{SELECT dolt_commit('-Am','invalid') FROM t},qr/standalone SELECT/,'per-row invocation rejected');
 fails(q{SELECT dolt_commit('--amend','-m','invalid')},qr/unsupported/,'unsupported flag explicit');
 fails(q{SELECT dolt_commit(VARIADIC ARRAY[NULL]::text[])},qr/cannot be null/,'null args rejected');
@@ -61,7 +62,8 @@ sql(q{CREATE TABLE heap_only(id int)});
 fails(q{SELECT dolt_commit('-Am','must fail')},qr/non-prolly/,'unsupported heap table is not silently omitted');
 sql('DROP TABLE heap_only');
 sql(q{CREATE TABLE with_default(id int DEFAULT 4) USING dolt_prolly_table});
-fails(q{SELECT dolt_commit('-Am','must fail')},qr/defaults/,'unsupported default rejected');
+sql(q{SELECT dolt_commit('-Am','captured default')});
+is(sql(q{SELECT count(*) FROM pg_attrdef WHERE adrelid='with_default'::regclass}),'1','portable default is captured');
 sql('DROP TABLE with_default');
 # Historical reads retain Repeatable Read views while HEAD advances.
 my $reader=$node->background_psql('postgres');
@@ -71,7 +73,7 @@ sql(q{SELECT dolt_commit('-Am','snapshot advancement')});
 is($reader->query_safe(q{SELECT commit_hash FROM dolt_log('-n','1')}),$oldhead,'history read retains snapshot');
 $reader->query_safe('COMMIT');$reader->quit;
 fails(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM dolt_diff_summary('HEAD','WORKING')},qr/Repeatable Read/,'live capture rejects unsupported historical schema snapshot');
-fails(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','missing')},qr/does not exist/,'unknown diff table rejected');
+fails(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','missing')},qr/table not found: public.missing/,'unknown diff table rejected');
 my $objects=sql('SELECT count(*) FROM pg_dolt_object');
 sql(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING')});
 is(sql('SELECT count(*) FROM pg_dolt_object'),$objects,'live diff does not persist objects');

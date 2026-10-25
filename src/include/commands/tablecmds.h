@@ -33,6 +33,8 @@ extern void RemoveRelations(DropStmt *drop);
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 
+extern HeapTuple CheckDropNotNullConstraint(Relation rel, AttrNumber attnum);
+
 extern void AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
 					   struct AlterTableUtilityContext *context);
 

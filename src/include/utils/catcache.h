@@ -198,6 +198,8 @@ extern CatCache *InitCatCache(int id, Oid reloid, Oid indexoid,
 							  int nkeys, const int *key,
 							  int nbuckets);
 extern void DestroyCatCache(CatCache *cache);
+extern bool TryDestroyCatCache(CatCache *cache);
+extern void ResetCatalogCache(CatCache *cache, bool debug_discard);
 extern void InitCatCachePhase2(CatCache *cache, bool touch_index);
 
 extern HeapTuple SearchCatCache(CatCache *cache,

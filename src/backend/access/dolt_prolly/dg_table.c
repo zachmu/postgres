@@ -1,4 +1,7 @@
 #include "dg.h"
+#include "access/doltbranch.h"
+#include "miscadmin.h"
+#include "catalog/catalogview.h"
 #include "miscadmin.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -13,6 +16,8 @@
 #include "utils/pg_locale.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
+#include "access/sysattr.h"
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
 
@@ -68,12 +73,15 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	dg_validate_descriptor(RelationGetDescr(rel));
+	/* ANALYZE opens its sample scan without a snapshot; read the live state. */
+	if (!snap && (flags & SO_TYPE_ANALYZE))
+		snap = GetActiveSnapshot();
 	scan->base.rs_rd = rel;
 	scan->base.rs_snapshot = snap;
 	scan->base.rs_flags = flags;
 	scan->context = AllocSetContextCreate(CurrentMemoryContext, "prolly scan", ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(scan->context);
-	scan->state = dg_load(rel, snap);
+	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
 	scan->rows = dg_rows(&scan->state->handles);
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
@@ -116,13 +124,18 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	}
 	entry = &scan->rows.items[scan->position];
 	dg_tid(pl_read64(entry->key.data), &tid);
-	dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+	if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
+		dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+	else
+		dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
 	return true;
 }
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 {
-	DGState    *s = snap == SnapshotAny ? dg_load_tid(rel, dg_id(tid)) : dg_load(rel, snap);
+	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
+		dg_catalog_mutation_load(rel, snap) :
+		(snap == SnapshotAny ? dg_load_tid(rel, dg_id(tid)) : dg_load(rel, snap));
 	uint8		key[8];
 	PLSlice		k = {key, 8};
 	PLValue		value;
@@ -174,7 +187,7 @@ tid_valid(TableScanDesc s, ItemPointer tid)
 static void
 latest(TableScanDesc s, ItemPointer tid)
 {
-	dg_unsupported("following updated row-version chains");
+	/* Successors are found by locking; an unlocked lookup keeps the TID. */
 }
 static bool
 satisfies(Relation rel, TupleTableSlot *slot, Snapshot snap)
@@ -186,6 +199,11 @@ index_delete(Relation rel, TM_IndexDeleteOp *op)
 {
 	dg_unsupported("physical index tuple deletion");
 }
+/*
+ * Writers take no table-level write lock: they lock the rows they change, and
+ * publication merges disjoint changes. Canonical storage bindings still check
+ * their write authority.
+ */
 static void
 writer(Relation rel)
 {
@@ -193,8 +211,6 @@ writer(Relation rel)
 		dg_unsupported("SERIALIZABLE isolation");
 	if (rel->rd_catalogview)
 		dg_storage_require_write(rel);
-	else
-		LockRelationId(&rel->rd_lockInfo.lockRelId, ExclusiveLock);
 }
 static void
 multiplicity(DGState *s, PLSlice row, int delta)
@@ -223,34 +239,65 @@ multiplicity(DGState *s, PLSlice row, int delta)
 	dg_check(pl_apply(&s->content, &edit, 1, &s->content));
 	pfree(bytes);
 }
+/* Map |handle| to |digest|, or remove that mapping, in the handle and key trees. */
+static void
+handle_edit(DGState *s, uint64 handle, PLHash digest, bool present)
+{
+	uint8		id[8];
+	uint8		key[DG_KEY_SIZE];
+	PLEdit		edit = {0};
+
+	pl_write64(id, handle);
+	edit.key.data = id;
+	edit.key.len = 8;
+	edit.value.present = present;
+	edit.value.bytes.data = digest.bytes;
+	edit.value.bytes.len = present ? PL_HASH_SIZE : 0;
+	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
+	dg_handle_key(digest, handle, key);
+	edit.key.data = key;
+	edit.key.len = DG_KEY_SIZE;
+	edit.value.bytes.data = present ? key : NULL;
+	edit.value.bytes.len = 0;
+	dg_check(pl_apply(&s->keys, &edit, 1, &s->keys));
+}
+
+static uint64
+next_handle(Relation rel, DGState *s)
+{
+	return s->nextid ? s->nextid++ : dg_allocate_handle(rel);
+}
 static void
 insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate)
 {
 	DGState    *s;
 	PLSlice		row;
-	PLHash		hash;
-	PLEdit		edit;
-	uint8		key[8];
+	uint64		handle;
+	bool		rewriting = CatalogViewIsProvisional(rel->rd_catalogview);
 
-	writer(rel);
-	s = dg_load(rel, SnapshotSelf);
+	if (rewriting)
+		s = dg_catalog_rewrite_state(rel);
+	else
+	{
+		writer(rel);
+		s = dg_load(rel, SnapshotSelf);
+	}
 	row = dg_encode(rel, slot);
 	multiplicity(s, row, 1);
-	pl_write64(key, s->nextid);
-	edit.key.data = key;
-	edit.key.len = 8;
-	edit.value.present = true;
-	hash = dg_rowhash(row);
-	edit.value.bytes.data = hash.bytes;
-	edit.value.bytes.len = PL_HASH_SIZE;
-	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
-	dg_tid(s->nextid++, &slot->tts_tid);
-	dg_save(rel, s, cid);
-	dg_release(s);
+	handle = next_handle(rel, s);
+	handle_edit(s, handle, dg_rowhash(row), true);
+	dg_tid(handle, &slot->tts_tid);
+	if (!rewriting)
+	{
+		dg_save(rel, s, cid);
+		dg_release(s);
+	}
+	if (!rewriting)
+		dg_index_apply(rel, row, 1, handle);
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
-	if (rel->rd_catalogview)
-		dg_rebuild_indexes(rel);
+	if (!rewriting)
+		dg_collect();
 }
 static void
 multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int opts, BulkInsertState state)
@@ -270,50 +317,276 @@ complete(Relation r, TupleTableSlot *s, uint32 token, bool succeeded)
 {
 	dg_unsupported("speculative insertion");
 }
+static PLSlice
+copy_slice(PLSlice bytes)
+{
+	uint8	   *copy = palloc(Max(bytes.len, 1));
+
+	memcpy(copy, bytes.data, bytes.len);
+	return (PLSlice) {copy, bytes.len};
+}
+
+/* The digest row |handle| maps to in |s|; false if the handle is absent. */
+static bool
+handle_digest(DGState *s, uint64 handle, PLHash *digest)
+{
+	uint8		key[8];
+	PLSlice		k = {key, 8};
+	PLValue		value;
+
+	pl_write64(key, handle);
+	dg_check(pl_get(&s->handles, k, &value));
+	if (value.present)
+		memcpy(digest->bytes, value.bytes.data, PL_HASH_SIZE);
+	return value.present;
+}
+
+/*
+ * Whether this transaction already updated or deleted row version |handle|,
+ * and if so the result heap gives: TM_SelfModified for the current or a later
+ * command, TM_Invisible for an earlier one.
+ */
+static bool
+self_modified(Relation rel, uint64 handle, Snapshot snapshot, TM_FailureData *tmfd, TM_Result *result)
+{
+	CommandId	cid;
+
+	if (!dg_row_modified(rel, dg_relation_branch(rel), handle, &cid))
+		return false;
+	dg_tid(handle, &tmfd->ctid);
+	tmfd->xmax = GetTopTransactionIdIfAny();
+	tmfd->cmax = cid;
+	tmfd->traversed = false;
+	*result = snapshot && IsMVCCSnapshot(snapshot) && cid < snapshot->curcid ? TM_Invisible : TM_SelfModified;
+	return true;
+}
+
+/*
+ * After its lock record allowed a change, whether row version |handle| still
+ * exists. A history install (merge, reset) replaces rows without touching lock
+ * records, so a version can disappear without its record knowing.
+ */
+static TM_Result
+still_current(Relation rel, uint64 handle, TM_Result result, TM_FailureData *tmfd)
+{
+	DGState    *s;
+	PLHash		digest;
+	bool		present;
+
+	if (result != TM_Ok)
+		return result;
+	s = dg_load(rel, SnapshotSelf);
+	present = handle_digest(s, handle, &digest);
+	dg_release(s);
+	if (present)
+		return TM_Ok;
+	dg_tid(handle, &tmfd->ctid);
+	return TM_Deleted;
+}
+
+/*
+ * Referential actions under Repeatable Read pass the transaction snapshot as a
+ * crosscheck: a row it cannot see was added after the snapshot, so changing
+ * it is a serialization failure, as in heap_delete.
+ */
+static bool
+crosscheck_visible(Relation rel, Snapshot crosscheck, uint64 handle)
+{
+	DGState    *s;
+	PLHash		digest;
+	bool		visible;
+
+	if (crosscheck == InvalidSnapshot)
+		return true;
+	s = dg_load(rel, crosscheck);
+	visible = handle_digest(s, handle, &digest);
+	dg_release(s);
+	return visible;
+}
+
 static TM_Result
 delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, bool changing)
 {
 	DGState    *s;
-	uint8		key[8];
-	PLEdit		edit;
-	PLValue		old;
-	PLStatus	status;
+	uint64		handle = dg_id(tid);
+	PLHash		digest;
+	PLSlice		row;
+	TM_Result	result;
+	int64		next;
 
 	writer(rel);
+	if (self_modified(rel, handle, snapshot, failure, &result))
+		return result;
+	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, changing, failure, &next);
+	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
+		result = TM_Updated;
+	result = still_current(rel, handle, result, failure);
+	if (result != TM_Ok)
+		return result;
 	s = dg_load(rel, SnapshotSelf);
-	pl_write64(key, dg_id(tid));
-	edit.key.data = key;
-	edit.key.len = 8;
-	status = pl_get(&s->handles, edit.key, &old);
-	if (status == PL_OK && !old.present)
-	{
-		dg_release(s);
-		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("prolly row changed; retry transaction")));
-	}
-	dg_check(status);
-	multiplicity(s, row_for_handle(s, old.bytes), -1);
-	edit.value.present = false;
-	edit.value.bytes.data = NULL;
-	edit.value.bytes.len = 0;
-	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
+	if (!handle_digest(s, handle, &digest))
+		elog(ERROR, "locked prolly row is missing");
+	row = copy_slice(row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}));
+	multiplicity(s, row, -1);
+	handle_edit(s, handle, digest, false);
 	dg_save(rel, s, cid);
 	dg_release(s);
-	dg_rebuild_indexes(rel);
+	dg_index_apply(rel, row, -1, handle);
+	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
+	dg_collect();
 	return TM_Ok;
 }
-static TM_Result
-update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, Snapshot snap, Snapshot cross, bool wait, TM_FailureData *failure, LockTupleMode *mode, TU_UpdateIndexes *indexes)
+
+/* Whether the old and new rows differ in any column of |attributes|. */
+static bool
+columns_differ(PLSlice old, PLSlice new, Bitmapset *attributes)
 {
-	delete_row(rel, tid, cid, snap, cross, wait, failure, false);
-	insert_row(rel, slot, cid, 0, NULL);
-	*mode = LockTupleExclusive;
-	*indexes = TU_All;
+	int			member = -1;
+
+	while ((member = bms_next_member(attributes, member)) >= 0)
+	{
+		int			attribute = member + FirstLowInvalidHeapAttributeNumber - 1;
+		PLValue		a,
+					b;
+
+		if (attribute < 0)
+			continue;
+		dg_check(pl_tuple_get(old, attribute, &a));
+		dg_check(pl_tuple_get(new, attribute, &b));
+		if (a.present != b.present ||
+			(a.present && (a.bytes.len != b.bytes.len || memcmp(a.bytes.data, b.bytes.data, a.bytes.len))))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Replace row version |tid| with the slot's row. The new version gets a new
+ * handle, as a heap update makes a new tuple, so AFTER triggers and RETURNING
+ * can still fetch the old version by its TID. The old version's lock record
+ * names the new one for transactions that waited on it.
+ */
+static TM_Result
+update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, LockTupleMode *mode, TU_UpdateIndexes *indexes)
+{
+	DGState    *s;
+	uint64		handle = dg_id(tid),
+				successor;
+	PLHash		old_digest,
+				new_digest;
+	PLSlice		old_row = {0},
+				new_row;
+	bool		key_change = true,
+				indexed_change = true;
+	TM_Result	result;
+	int64		next;
+
+	writer(rel);
+	new_row = dg_encode(rel, slot);
+	new_digest = dg_rowhash(new_row);
+	/*
+	 * Judge the key change from the version being updated. A concurrent
+	 * update may already have replaced it in the latest state; the caller's
+	 * snapshot still has it.
+	 */
+	s = dg_load(rel, SnapshotSelf);
+	if (!handle_digest(s, handle, &old_digest) && snapshot && IsMVCCSnapshot(snapshot))
+	{
+		dg_release(s);
+		s = dg_load(rel, snapshot);
+	}
+	if (handle_digest(s, handle, &old_digest))
+	{
+		PLSlice		row = row_for_handle(s, (PLSlice) {old_digest.bytes, PL_HASH_SIZE});
+		Bitmapset  *keys = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_KEY);
+		Bitmapset  *indexed = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_HOT_BLOCKING);
+
+		old_row = copy_slice(row);
+		key_change = columns_differ(old_row, new_row, keys);
+		indexed_change = columns_differ(old_row, new_row, indexed);
+	}
+	dg_release(s);
+	*mode = key_change ? LockTupleExclusive : LockTupleNoKeyExclusive;
+	if (self_modified(rel, handle, snapshot, failure, &result))
+		return result;
+	successor = dg_allocate_handle(rel);
+	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, key_change,
+							  wait, failure, &next);
+	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
+		result = TM_Updated;
+	result = still_current(rel, handle, result, failure);
+	if (result != TM_Ok)
+		return result;
+
+	/* The row may have changed between the first read and the lock. */
+	s = dg_load(rel, SnapshotSelf);
+	if (!handle_digest(s, handle, &old_digest))
+		elog(ERROR, "locked prolly row is missing");
+	{
+		PLSlice		row = row_for_handle(s, (PLSlice) {old_digest.bytes, PL_HASH_SIZE});
+
+		old_row = copy_slice(row);
+	}
+	multiplicity(s, old_row, -1);
+	multiplicity(s, new_row, 1);
+	handle_edit(s, handle, old_digest, false);
+	handle_edit(s, successor, new_digest, true);
+	dg_save(rel, s, cid);
+	dg_release(s);
+	if (!pl_hash_equal(old_digest, new_digest))
+	{
+		dg_index_apply(rel, old_row, -1, handle);
+		dg_index_apply(rel, new_row, 1, successor);
+	}
+	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
+	dg_tid(successor, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(rel);
+	*indexes = indexed_change ? TU_All : TU_None;
+	dg_collect();
 	return TM_Ok;
 }
+
 static TM_Result
-lock_row(Relation r, ItemPointer t, Snapshot s, TupleTableSlot *slot, CommandId cid, LockTupleMode mode, LockWaitPolicy policy, uint8 flags, TM_FailureData *f)
+lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, CommandId cid, LockTupleMode mode, LockWaitPolicy policy, uint8 flags, TM_FailureData *tmfd)
 {
-	dg_unsupported("row locking");
+	TM_Result	result;
+	bool		traversed = false;
+	int64		next;
+
+	if (IsolationIsSerializable())
+		dg_unsupported("SERIALIZABLE isolation");
+	for (;;)
+	{
+		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))
+			break;
+		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), mode, policy,
+								(flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0, tmfd, &next);
+		if (result == TM_Updated && (flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
+			ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
+		if (result != TM_Updated || !(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
+			break;
+
+		/* Read Committed: follow the update chain to the latest version. */
+		*tid = tmfd->ctid;
+		traversed = true;
+	}
+	tmfd->traversed = traversed;
+	if (result != TM_Ok)
+		return result;
+
+	/*
+	 * A key-share lock may hold a version a committed non-key update replaced,
+	 * as heap allows; fetch whichever version the TID names.
+	 */
+	if (!fetch(rel, tid, SnapshotAny, slot))
+	{
+		dg_tid(dg_id(tid), &tmfd->ctid);
+		return TM_Deleted;
+	}
+	return TM_Ok;
 }
 static Size
 parallel_estimate(Relation r)
@@ -343,20 +616,29 @@ cluster(Relation a, Relation b, Relation c, bool sort, TransactionId oldest, Tra
 {
 	dg_unsupported("CLUSTER/VACUUM FULL");
 }
+/*
+ * Prolly rows carry no transaction IDs to freeze, and replaced versions live
+ * in the chunk store, whose garbage collection is separate. VACUUM has
+ * nothing to do here.
+ */
 static void
 vacuum_rel(Relation rel, struct VacuumParams *p, BufferAccessStrategy s)
 {
-	dg_unsupported("VACUUM (version retention/freezing is not implemented)");
 }
+
+/*
+ * The relation file holds no blocks, so ANALYZE samples nothing; planning
+ * uses relation_estimate_size instead of sampled statistics.
+ */
 static bool
 analyze_block(TableScanDesc s, ReadStream *stream)
 {
-	dg_unsupported("ANALYZE");
+	return false;
 }
 static bool
 analyze_tuple(TableScanDesc s, TransactionId oldest, double *live, double *dead, TupleTableSlot *slot)
 {
-	dg_unsupported("ANALYZE");
+	return false;
 }
 static double
 build_range(Relation t, Relation i, IndexInfo *info, bool sync, bool any, bool progress, BlockNumber start, BlockNumber n, IndexBuildCallback cb, void *arg, TableScanDesc scan)
@@ -400,6 +682,12 @@ index_am(Relation rel, const char *requested)
 static void
 validate_alter(Relation rel, struct AlterTableCmd *cmd)
 {
+	if (CatalogViewIsProvisional(rel->rd_catalogview) &&
+		(cmd->subtype == AT_AlterConstraint || cmd->subtype == AT_SetStatistics || cmd->subtype == AT_SetOptions ||
+		 cmd->subtype == AT_ResetOptions || cmd->subtype == AT_SetStorage || cmd->subtype == AT_SetCompression ||
+		 cmd->subtype == AT_SetNotNull || cmd->subtype == AT_DropNotNull || cmd->subtype == AT_AddColumn || cmd->subtype == AT_DropColumn || cmd->subtype == AT_ColumnDefault || cmd->subtype == AT_AddConstraint || cmd->subtype == AT_DropConstraint || cmd->subtype == AT_ValidateConstraint || cmd->subtype == AT_AlterColumnType))
+		return;
+
 	/*
 	 * These operations do not alter the stored value layout. pg_dump emits
 	 * primary/unique constraints as ALTER TABLE after restoring the data.
@@ -410,6 +698,8 @@ validate_alter(Relation rel, struct AlterTableCmd *cmd)
 	{
 		Constraint *constraint = (Constraint *) cmd->def;
 
+		if (constraint->contype == CONSTR_FOREIGN)
+			return;
 		if ((constraint->contype == CONSTR_PRIMARY || constraint->contype == CONSTR_UNIQUE) &&
 			!constraint->deferrable)
 			return;
@@ -436,6 +726,8 @@ dg_table_routine(void)
 		methods = *GetHeapamTableAmRoutine();
 		methods.relation_index_am = index_am;
 		methods.relation_validate_alter = validate_alter;
+		methods.relation_begin_rewrite = dg_catalog_begin_rewrite;
+		methods.relation_finish_rewrite = dg_catalog_finish_rewrite;
 		methods.slot_callbacks = slots;
 		methods.scan_begin = begin;
 		methods.scan_end = end;
@@ -484,48 +776,160 @@ dolt_prolly_table_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(dg_table_routine());
 }
 
-/* Install a complete canonical state with fresh runtime occurrence handles.
- * Caller owns an AccessExclusiveLock; never reuse prior executor-visible TIDs. */
+/*
+ * Give every row occurrence in |state|'s content a derived handle, numbered
+ * 1..n in content order. The same content always derives the same handles, so
+ * readers of a branch that has no roots of its own agree on TIDs. Allocated
+ * handles start above DG_DERIVED_HANDLES, so the two never collide.
+ */
 void
 dg_history_handles(DGState *state)
 {
 	DGRows		rows = dg_rows(&state->content);
-	size_t		i;
+	PLEntry    *handles = NULL,
+			   *keys = NULL;
+	uint8	   *ids = NULL,
+			   *keybytes = NULL;
+	size_t		total = 0,
+				n = 0;
 
-	dg_check(pl_build(state->store, NULL, 0, &state->handles));
-	for (i = 0; i < rows.count; i++)
+	for (size_t i = 0; i < rows.count; i++)
+		total += pl_read64(rows.items[i].value.data);
+	if (total >= DG_DERIVED_HANDLES)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("too many prolly rows to derive handles")));
+	if (total)
 	{
-		uint64		count = pl_read64(rows.items[i].value.data),
-					j;
+		handles = palloc_array(PLEntry, total);
+		keys = palloc_array(PLEntry, total);
+		ids = palloc(total * 8);
+		keybytes = palloc(total * DG_KEY_SIZE);
+	}
+	for (size_t i = 0; i < rows.count; i++)
+	{
+		uint64		count = pl_read64(rows.items[i].value.data);
+		PLHash		digest;
 
 		CHECK_FOR_INTERRUPTS();
-		for (j = 0; j < count; j++)
+		memcpy(digest.bytes, rows.items[i].key.data, PL_HASH_SIZE);
+		for (uint64 j = 0; j < count; j++, n++)
 		{
-			uint8		key[8];
-			PLEdit		edit;
-			ItemPointerData tid;
-
-			CHECK_FOR_INTERRUPTS();
-			dg_tid(state->nextid, &tid);
-			pl_write64(key, state->nextid++);
-			edit.key = (PLSlice)
-			{
-				key, 8
-			};
-			edit.value.present = true;
-			edit.value.bytes = rows.items[i].key;
-			dg_check(pl_apply(&state->handles, &edit, 1, &state->handles));
+			pl_write64(ids + n * 8, n + 1);
+			handles[n].key = (PLSlice) {ids + n * 8, 8};
+			handles[n].value = rows.items[i].key;
+			dg_handle_key(digest, n + 1, keybytes + n * DG_KEY_SIZE);
+			keys[n].key = (PLSlice) {keybytes + n * DG_KEY_SIZE, DG_KEY_SIZE};
+			keys[n].value = (PLSlice) {keybytes, 0};
 		}
 	}
+	dg_check(pl_build(state->store, handles, total, &state->handles));
+	dg_check(pl_build(state->store, keys, total, &state->keys));
 }
+
+typedef struct HandleChange
+{
+	PLHash		digest;
+	int64		delta;
+} HandleChange;
+
+typedef struct HandleChanges
+{
+	HandleChange *items;
+	int			count;
+	int			capacity;
+} HandleChanges;
+
+static PLStatus
+collect_change(void *arg, PLSlice key, PLValue before, PLValue after)
+{
+	HandleChanges *changes = arg;
+	int64		delta = (after.present ? (int64) pl_read64(after.bytes.data) : 0) -
+		(before.present ? (int64) pl_read64(before.bytes.data) : 0);
+
+	if (!delta)
+		return PL_OK;
+	if (changes->count == changes->capacity)
+	{
+		changes->capacity = changes->capacity ? changes->capacity * 2 : 64;
+		changes->items = changes->items ? repalloc_array(changes->items, HandleChange, changes->capacity) :
+			palloc_array(HandleChange, changes->capacity);
+	}
+	memcpy(changes->items[changes->count].digest.bytes, key.data, PL_HASH_SIZE);
+	changes->items[changes->count++].delta = delta;
+	return PL_OK;
+}
+
+typedef struct FoundHandles
+{
+	uint64	   *handles;
+	int64		wanted;
+	int64		count;
+} FoundHandles;
+
+static PLStatus
+collect_handle(void *arg, PLSlice key, PLSlice value)
+{
+	FoundHandles *found = arg;
+
+	if (found->count == found->wanted)
+		return PL_CONFLICT;		/* stops the scan */
+	found->handles[found->count++] = pl_read64(key.data + PL_HASH_SIZE);
+	return PL_OK;
+}
+
+/*
+ * Replace |state|'s content with |contents|, keeping the handles of row
+ * occurrences present in both: only rows the diff adds or removes gain or lose
+ * handles. Cost is proportional to the difference, not the table.
+ */
+static void
+install_handles(Relation rel, DGState *state, PLTree contents)
+{
+	PLTree		before = state->content;
+	HandleChanges changes = {0};
+
+	dg_check(pl_diff(&before, &contents, collect_change, &changes));
+	for (int i = 0; i < changes.count; i++)
+	{
+		HandleChange *change = &changes.items[i];
+
+		CHECK_FOR_INTERRUPTS();
+		if (change->delta > 0)
+		{
+			for (int64 j = 0; j < change->delta; j++)
+				handle_edit(state, next_handle(rel, state), change->digest, true);
+		}
+		else
+		{
+			uint8		lower[DG_KEY_SIZE],
+						upper[DG_KEY_SIZE];
+			PLSlice		lo = {lower, DG_KEY_SIZE},
+						hi = {upper, DG_KEY_SIZE};
+			FoundHandles found = {.wanted = -change->delta};
+			PLStatus	status;
+
+			found.handles = palloc_array(uint64, found.wanted);
+			dg_handle_key(change->digest, 0, lower);
+			dg_handle_key(change->digest, PG_UINT64_MAX, upper);
+			status = pl_scan(&state->keys, &lo, &hi, collect_handle, &found);
+			if (status != PL_CONFLICT)
+				dg_check(status);
+			if (found.count != found.wanted)
+				elog(ERROR, "prolly key tree is missing row handles");
+			for (int64 j = 0; j < found.count; j++)
+				handle_edit(state, found.handles[j], change->digest, false);
+			pfree(found.handles);
+		}
+	}
+	state->content = contents;
+}
+
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
 	/* Bound resources retain their original snapshot during root publication. */
 	if (rel->rd_catalogview)
 		PushCopiedSnapshot(GetActiveSnapshot());
-	state->content = contents;
-	dg_history_handles(state);
+	install_handles(rel, state, contents);
 	dg_save(rel, state, GetCurrentCommandId(true));
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();

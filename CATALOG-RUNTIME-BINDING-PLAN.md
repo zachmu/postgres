@@ -194,3 +194,25 @@ precede enabling same-name writes; prove a narrow native CREATE/rollback path ea
 Branch isolation is the hard DDL requirement. Follow PostgreSQL command-specific
 transaction semantics, not Dolt's DDL semantics. Do not replace another branch's
 schema or impose a transaction-duration database-wide DDL freeze to achieve this.
+
+### Provisional DDL contexts (2026-10-23)
+
+The next mutation workstream is specified in
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md#provisional-native-catalog-mutation-workstream-2026-10-23).
+A private mutation context must expose command-visible intermediate native catalog
+tuples while keeping all existing revision handles immutable. Native cache
+refresh/reopen behavior is part of that interface, not a caller-specific workaround.
+Decoded row eviction now exists, but stable handle mappings and native type/relation
+caches remain session-lived. Parallel context transport and persistent reclamation
+are still outstanding; current revision-dependent plans execute in the leader.
+
+#### Implemented provisional context contract (2026-10-23)
+
+Private native ALTER contexts now own staged tuples and command-visible local cache
+refresh. Their runtime handles never become canonical schema payloads. Retirement
+reclaims decoded rows once borrowed scans release their pins; cached handle/type
+lifetimes remain a separate concern. Native rewrite destinations are private row
+streams over the existing chunk store, not persisted schema projections or new
+per-revision physical relations. The final schema and matching data roots share
+PostgreSQL's transaction outcome. See the implemented checkpoint in
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md).

@@ -43,6 +43,7 @@
 
 #include "postgres.h"
 #include "catalog/catalogview.h"
+#include "catalog/catalogview.h"
 
 #include "access/amapi.h"
 #include "access/relation.h"
@@ -178,13 +179,14 @@ void
 index_close(Relation relation, LOCKMODE lockmode)
 {
 	LockRelId	relid = relation->rd_lockInfo.lockRelId;
+	bool		canonical = CatalogViewObjectContext(RelationGetRelid(relation)) != NULL;
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* The relcache does the real work... */
 	RelationClose(relation);
 
-	if (lockmode != NoLock)
+	if (lockmode != NoLock && !canonical)
 		UnlockRelationId(&relid, lockmode);
 }
 

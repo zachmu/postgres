@@ -69,6 +69,123 @@ The current policy rejecting non-portable identifiers in stored SQL values
 remains in force. Runtime identities used internally do not grant permission to
 serialize those identifiers into canonical row or index contents.
 
+### Decision: prolly handle trees plus heap lock records (2026-10-25)
+
+This supersedes an earlier same-day decision to store handles as heap tuples
+per head. Building those for every row made branch creation O(rows), and branch
+creation must be nearly free.
+
+State is split by lifetime.
+
+**Durable, branch-shareable, per (head, relation), all prolly trees in the
+chunk store:**
+
+- **Content tree** (canonical): row digest → occurrence count + row bytes.
+  Index content trees work the same way.
+- **Handle tree** (runtime, never in history): handle → row digest. The handle
+  is the TID. It names a row *occurrence*, and it stays the same when the row is
+  updated: an update maps it to the new version's digest. Identical rows in a
+  keyless table get one handle each.
+- **Key-to-handle tree** (runtime): row digest + handle → present. Index scans
+  use it to turn index entries into TIDs, and sequential scans walk it in step
+  with the content tree.
+
+Branch creation copies the roots, so it is O(tables). It derives handles by
+diffing from the closest existing head's (content, handle) pair, so it is
+O(changes), never O(rows).
+
+**Working roots** live in a catalog, one row per (storage resource, branch name)
+holding the current roots. A snapshot selects roots from it under ordinary
+MVCC. The proof, in [the chunk store plan](CHUNK-STORE-PLAN.md) milestone 4,
+relies on publication holding the row lock until commit. Ref names are
+authoritative: a rename rewrites the rows' branch name.
+
+**Transient, never copied, also per (head, relation):** lock records. A catalog
+row (resource, branch, handle) is created only when a row is first locked,
+updated or deleted. PostgreSQL's heap tuple locking on that row provides:
+- the four row-lock strengths;
+- multixacts;
+- waits on transaction IDs and deadlock detection;
+- `NOWAIT` and `SKIP LOCKED`.
+
+A lock on branch A never blocks branch B, because their records differ.
+
+**Handle IDs** come from a per-resource, non-transactional counter in shared
+memory. IDs are never reused. After a restart the counter starts above the
+largest handle in any root row version, including prepared transactions.
+
+**Where PostgreSQL metadata goes:**
+
+| PostgreSQL concept | Location |
+|---|---|
+| TID | The handle, from the handle tree |
+| Row visibility (xmin and xmax) | Presence in the snapshot's handle root, chosen through catalog MVCC plus the transaction's own overlay |
+| cmin and cmax | Command IDs on the transaction overlay |
+| Row locks | The lock record's tuple header |
+| "Updated" or "deleted" by a concurrent transaction | Comparing the row's digest in the snapshot root with the latest committed root, after waiting on the lock (amended below: handle presence plus the record's heir) |
+| Update chains and EvalPlanQual | The same TID: the latest version is read by handle from the latest committed root (amended below: a new TID per version, found through the heir) |
+
+**Isolation and recheck rules:**
+- **Read Committed:** after waiting on a lock record, the writer reads the
+  latest committed version by the same TID and re-evaluates (EvalPlanQual).
+- **Repeatable Read:** if the latest version differs from the snapshot's, the
+  writer raises a serialization error.
+
+Conflicting row edits are excluded by lock records. So publication's three-way
+merge only combines disjoint changes, plus additive multiset counts. Unique
+indexes reserve keys so concurrent equal inserts wait instead of merging.
+
+The acceptance gate is PostgreSQL's isolation suite run with prolly as the
+default table access method.
+
+### Implementation amendments (2026-10-24)
+
+Building the decision above changed four details. The split between prolly
+trees and heap lock records is unchanged.
+
+- **A TID names a row version, not a row.** An update gives the new version a
+  new handle, as a heap update makes a new tuple. With one TID per row, AFTER
+  triggers, RETURNING and foreign key actions read the new row where they
+  asked for the old one, because the executor fetches the old version by TID
+  after the update.
+- **Lock records mirror row versions.** Locking a row locks its record with
+  `heap_lock_tuple`; updating the row `heap_update`s the record to name the new
+  handle; deleting the row `heap_delete`s it. Heap code then decides every
+  outcome: TM_Updated with the successor's TID, TM_Deleted, waits, NOWAIT and
+  SKIP LOCKED, following update chains for SELECT FOR ..., and carrying
+  key-share locks onto new versions. The record's primary key is its first
+  handle, which never changes, so these updates are never key updates; a
+  second index finds a record by its current handle. Records live only per
+  branch and are never copied, so branch creation still copies nothing.
+- **Lock records are inserted frozen.** A record inserted normally belongs to
+  its uncommitted inserter, which would hold every row it first locks
+  exclusively, even against compatible lockers. A frozen record is visible to
+  everyone at once and is only an anchor. A short heavyweight lock stops two
+  backends creating one record.
+- **Unique keys are reserved by lock records** keyed by the index storage and a
+  64-bit hash of the key, held exclusively until commit. A conflicting row that
+  a running transaction is deleting, or updating with a key change, is waited
+  for by taking a key-share lock on it, as heap unique checks wait for the
+  deleter.
+- **A version is current** if its record allows the operation and the latest
+  committed roots, merged with the transaction's changes, still hold it. The
+  second check catches history installs, which replace rows without records.
+
+Two supporting changes:
+- **Handles.** Rows of a branch with no roots of its own get handles derived
+  from content order, 1 to n, so every reader agrees on them. The shared
+  counter allocates above 2^40, so the two ranges never meet.
+- **Chunk puts never wait.** A put that finds no committed copy inserts its own,
+  keyed by its transaction ID. Waiting on another transaction's in-progress
+  copy could deadlock two publishers at commit.
+
+Canonical storage bindings lock rows the same way, and the table AM checks
+their unique indexes itself, because their writers may bypass the executor's
+index insertion. Their writers share the branch resource lock, which merge
+takes exclusively. Reads of canonical bindings go through versioned scans that
+cannot take row locks yet, so explicit SELECT FOR ... is still rejected there,
+and their foreign key checks take the branch lock exclusively instead.
+
 ## 3. Read and mutation model
 
 A statement reads its snapshot's committed contents plus its transaction's

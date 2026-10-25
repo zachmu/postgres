@@ -2226,6 +2226,12 @@ ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
 void
 RelationIncrementReferenceCount(Relation rel)
 {
+	/*
+	 * Private storage descriptors may die before resource-owner error
+	 * cleanup.
+	 */
+	if (rel->rd_refparent)
+		rel = rel->rd_refparent;
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 	rel->rd_refcnt += 1;
 	if (!IsBootstrapProcessingMode())
@@ -2239,6 +2245,8 @@ RelationIncrementReferenceCount(Relation rel)
 void
 RelationDecrementReferenceCount(Relation rel)
 {
+	if (rel->rd_refparent)
+		rel = rel->rd_refparent;
 	Assert(rel->rd_refcnt > 0);
 	rel->rd_refcnt -= 1;
 	if (!IsBootstrapProcessingMode())
@@ -3227,6 +3235,15 @@ AssertPendingSyncs_RelationCache(void)
 			LOCKTAG_RELATION)
 			continue;
 		relid = ObjectIdGetDatum(locallock->tag.lock.locktag_field2);
+
+		/*
+		 * Catalog-view handles describe logical definitions, not
+		 * independently allocated storage.  Their provisional contexts may
+		 * already be retired after DDL.  Check the backing physical relations
+		 * instead.
+		 */
+		if (CatalogViewObjectContext(relid))
+			continue;
 		r = RelationIdGetRelation(relid);
 		if (!RelationIsValid(r))
 			continue;
@@ -3240,7 +3257,8 @@ AssertPendingSyncs_RelationCache(void)
 
 	hash_seq_init(&status, RelationIdCache);
 	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
-		AssertPendingSyncConsistency(idhentry->reldesc);
+		if (!idhentry->reldesc->rd_catalogview)
+			AssertPendingSyncConsistency(idhentry->reldesc);
 
 	for (i = 0; i < nrels; i++)
 		RelationClose(rels[i]);
@@ -3622,6 +3640,9 @@ RelationBuildLocalRelation(const char *relname,
 	 * allocate a new relation descriptor and fill in basic state fields.
 	 */
 	rel = (Relation) palloc0(sizeof(RelationData));
+	rel->rd_catalogview = CatalogViewObjectContext(relid);
+	if (rel->rd_catalogview)
+		CatalogViewRetain(rel->rd_catalogview);
 
 	/* make sure relation is marked as having no open file yet */
 	rel->rd_smgr = NULL;

@@ -25,13 +25,22 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/pg_dolt_remote.h"
+#include "catalog/pg_dolt_reflog.h"
+#include "catalog/pg_dolt_rebase.h"
+#include "catalog/pg_dolt_backup.h"
+#include "catalog/pg_dolt_branch_control.h"
+#include "catalog/pg_dolt_branch_namespace_control.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_lock.h"
+#include "catalog/pg_dolt_root.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_parameter_acl.h"
@@ -159,8 +168,16 @@ IsCatalogTextUniqueIndexOid(Oid relid)
 {
 	switch (relid)
 	{
+		case DoltRemoteKeyIndexId:
+		case DoltReflogKeyIndexId:
+		case DoltRebaseKeyIndexId:
+		case DoltBackupKeyIndexId:
+		case DoltBranchControlKeyIndexId:
+		case DoltBranchNamespaceControlKeyIndexId:
 		case DoltRefKeyIndexId:
 		case DoltBindingKeyIndexId:
+		case DoltRootKeyIndexId:
+		case DoltLockKeyIndexId:
 		case ParameterAclParnameIndexId:
 		case ReplicationOriginNameIndex:
 		case SecLabelObjectIndexId:
@@ -457,6 +474,9 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	bool		collides;
 	uint64		retries = 0;
 	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
+
+	if (CatalogViewIsProvisional(CatalogViewCurrent()) && CatalogViewContains(CatalogViewCurrent(), RelationGetRelid(relation)))
+		return CatalogViewNewObject(RelationGetRelid(relation));
 
 	/* Only system relations are supported */
 	Assert(IsSystemRelation(relation));

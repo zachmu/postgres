@@ -91,7 +91,10 @@ typedef struct RangeVar
 	/* table alias & optional column aliases */
 	Alias	   *alias;
 
-	/* Retained revision expression for AS OF; never a runtime object identity. */
+	/*
+	 * Retained revision expression for AS OF; never a runtime object
+	 * identity.
+	 */
 	Node	   *dolt_revision;
 
 	/* token location, or -1 if unknown */
@@ -780,6 +783,9 @@ typedef struct FuncExpr
 	 * argument
 	 */
 	bool		funcvariadic pg_node_attr(query_jumble_ignore);
+
+	/* Canonical function selected through the mutable session working set. */
+	bool		dolt_working;
 	/* how to display this function call */
 	CoercionForm funcformat pg_node_attr(query_jumble_ignore);
 	/* OID of collation of result */

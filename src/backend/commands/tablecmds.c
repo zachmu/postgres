@@ -29,6 +29,8 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
+#include "catalog/catalogview.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -5884,6 +5886,29 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 		}
 
 		/*
+		 * A versioned AM can retain the input root and collect replacement
+		 * tuples without temporary heap relations or a file-locator swap.
+		 */
+		if (tab->rewrite > 0 || tab->newvals != NIL)
+		{
+			Relation	rel = table_open(tab->relid, NoLock);
+			bool		private_rewrite = rel->rd_tableam->relation_begin_rewrite &&
+				rel->rd_tableam->relation_begin_rewrite(rel);
+
+			table_close(rel, NoLock);
+			if (private_rewrite)
+			{
+				tab->rewrite |= AT_REWRITE_DEFAULT_VAL;
+				ATRewriteTable(tab, tab->relid);
+				rel = table_open(tab->relid, NoLock);
+				if (rel->rd_tableam->relation_finish_rewrite)
+					rel->rd_tableam->relation_finish_rewrite(rel);
+				table_close(rel, NoLock);
+				continue;
+			}
+		}
+
+		/*
 		 * We only need to rewrite the table if at least one column needs to
 		 * be recomputed, or we are changing its persistence or access method.
 		 *
@@ -6162,8 +6187,8 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 
 	if (OidIsValid(OIDNewHeap))
 	{
-		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock,
-										  false));
+		Assert((OIDNewHeap == tab->relid && oldrel->rd_catalogview) ||
+			   CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
 		newrel = table_open(OIDNewHeap, NoLock);
 	}
 	else
@@ -6304,7 +6329,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap)
 					(errmsg_internal("verifying table \"%s\"",
 									 RelationGetRelationName(oldrel))));
 
-		if (newrel)
+		if (newrel && !oldrel->rd_catalogview)
 		{
 			/*
 			 * All predicate locks on the tuples or pages are about to be made
@@ -10113,6 +10138,9 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	else
 		pkrel = table_openrv(fkconstraint->pktable, ShareRowExclusiveLock);
 
+	if (pkrel->rd_catalogview)
+		dg_catalog_foreign_lock(pkrel);
+
 	/*
 	 * Validity checks (permission checks wait till we have the column
 	 * numbers)
@@ -10923,8 +10951,8 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 	Oid			deleteTriggerOid = InvalidOid,
 				updateTriggerOid = InvalidOid;
 
-	Assert(CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
-	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(pkrel->rd_catalogview) || CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(rel->rd_catalogview) || CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
 
 	/*
 	 * Create action triggers to enforce the constraint, or skip them if the
@@ -11061,8 +11089,8 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 				updateTriggerOid = InvalidOid;
 
 	Assert(OidIsValid(parentConstr));
-	Assert(CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
-	Assert(CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(rel->rd_catalogview) || CheckRelationLockedByMe(rel, ShareRowExclusiveLock, true));
+	Assert(CatalogViewIsProvisional(pkrel->rd_catalogview) || CheckRelationLockedByMe(pkrel, ShareRowExclusiveLock, true));
 
 	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
@@ -14097,6 +14125,73 @@ ATExecDropConstraint(Relation rel, const char *constrName,
  *
  * Returns the address of the constraint being removed.
  */
+/* Validate native not-null removal before either physical or canonical writes.
+ * The caller owns the returned attribute tuple copy. */
+HeapTuple
+CheckDropNotNullConstraint(Relation rel, AttrNumber attnum)
+{
+	Bitmapset  *pkattrs;
+	Bitmapset  *irattrs;
+	HeapTuple	atttup;
+	Form_pg_attribute attForm;
+
+	/*
+	 * Disallow if it's in the primary key.  For partitioned tables we cannot
+	 * rely solely on RelationGetIndexAttrBitmap, because it'll return NULL if
+	 * the primary key is invalid; but we still need to protect not-null
+	 * constraints under such a constraint, so check the slow way.
+	 */
+	pkattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+
+	if (pkattrs == NULL &&
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		Oid			pkindex = RelationGetPrimaryKeyIndex(rel, true);
+
+		if (OidIsValid(pkindex))
+		{
+			Relation	pk = relation_open(pkindex, AccessShareLock);
+
+			pkattrs = NULL;
+			for (int i = 0; i < pk->rd_index->indnkeyatts; i++)
+				pkattrs = bms_add_member(pkattrs, pk->rd_index->indkey.values[i]);
+
+			relation_close(pk, AccessShareLock);
+		}
+	}
+
+	if (pkattrs &&
+		bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, pkattrs))
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				errmsg("column \"%s\" is in a primary key",
+					   get_attname(RelationGetRelid(rel), attnum, false)));
+
+	/* Disallow if it's in the replica identity */
+	irattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+	if (bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, irattrs))
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				errmsg("column \"%s\" is in index used as replica identity",
+					   get_attname(RelationGetRelid(rel), attnum, false)));
+
+	/* Disallow if it's a GENERATED AS IDENTITY column */
+	atttup = SearchSysCacheCopyAttNum(RelationGetRelid(rel), attnum);
+	if (!HeapTupleIsValid(atttup))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 attnum, RelationGetRelid(rel));
+	attForm = (Form_pg_attribute) GETSTRUCT(atttup);
+	if (attForm->attidentity != '\0')
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("column \"%s\" of relation \"%s\" is an identity column",
+					   get_attname(RelationGetRelid(rel), attnum,
+								   false),
+					   RelationGetRelationName(rel)));
+
+	return atttup;
+}
+
 static ObjectAddress
 dropconstraint_internal(Relation rel, HeapTuple constraintTup, DropBehavior behavior,
 						bool recurse, bool recursing, bool missing_ok,
@@ -14141,69 +14236,14 @@ dropconstraint_internal(Relation rel, HeapTuple constraintTup, DropBehavior beha
 	{
 		Relation	attrel = table_open(AttributeRelationId, RowExclusiveLock);
 		AttrNumber	attnum = extractNotNullColumn(constraintTup);
-		Bitmapset  *pkattrs;
-		Bitmapset  *irattrs;
 		HeapTuple	atttup;
 		Form_pg_attribute attForm;
 
 		/* save column name for recursion step */
 		colname = get_attname(RelationGetRelid(rel), attnum, false);
 
-		/*
-		 * Disallow if it's in the primary key.  For partitioned tables we
-		 * cannot rely solely on RelationGetIndexAttrBitmap, because it'll
-		 * return NULL if the primary key is invalid; but we still need to
-		 * protect not-null constraints under such a constraint, so check the
-		 * slow way.
-		 */
-		pkattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
-
-		if (pkattrs == NULL &&
-			rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-		{
-			Oid			pkindex = RelationGetPrimaryKeyIndex(rel, true);
-
-			if (OidIsValid(pkindex))
-			{
-				Relation	pk = relation_open(pkindex, AccessShareLock);
-
-				pkattrs = NULL;
-				for (int i = 0; i < pk->rd_index->indnkeyatts; i++)
-					pkattrs = bms_add_member(pkattrs, pk->rd_index->indkey.values[i]);
-
-				relation_close(pk, AccessShareLock);
-			}
-		}
-
-		if (pkattrs &&
-			bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, pkattrs))
-			ereport(ERROR,
-					errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					errmsg("column \"%s\" is in a primary key",
-						   get_attname(RelationGetRelid(rel), attnum, false)));
-
-		/* Disallow if it's in the replica identity */
-		irattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_IDENTITY_KEY);
-		if (bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, irattrs))
-			ereport(ERROR,
-					errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					errmsg("column \"%s\" is in index used as replica identity",
-						   get_attname(RelationGetRelid(rel), attnum, false)));
-
-		/* Disallow if it's a GENERATED AS IDENTITY column */
-		atttup = SearchSysCacheCopyAttNum(RelationGetRelid(rel), attnum);
-		if (!HeapTupleIsValid(atttup))
-			elog(ERROR, "cache lookup failed for attribute %d of relation %u",
-				 attnum, RelationGetRelid(rel));
+		atttup = CheckDropNotNullConstraint(rel, attnum);
 		attForm = (Form_pg_attribute) GETSTRUCT(atttup);
-		if (attForm->attidentity != '\0')
-			ereport(ERROR,
-					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					errmsg("column \"%s\" of relation \"%s\" is an identity column",
-						   get_attname(RelationGetRelid(rel), attnum,
-									   false),
-						   RelationGetRelationName(rel)));
-
 		/* All good -- reset attnotnull if needed */
 		if (attForm->attnotnull)
 		{
@@ -15930,6 +15970,12 @@ RebuildConstraintComment(AlteredTableInfo *tab, AlterTablePass pass, Oid objid,
 static void
 TryReuseIndex(Oid oldId, IndexStmt *stmt)
 {
+	/*
+	 * Retained branch roots are rebuilt by their publisher, never
+	 * file-swapped.
+	 */
+	if (CatalogViewObjectContext(oldId))
+		return;
 	if (CheckIndexCompatible(oldId,
 							 stmt->accessMethod,
 							 stmt->indexParams,

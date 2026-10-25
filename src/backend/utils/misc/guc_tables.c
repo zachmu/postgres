@@ -19,6 +19,7 @@
  *--------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #ifdef HAVE_COPYFILE_H
 #include <copyfile.h>
@@ -36,6 +37,8 @@
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
+#include "access/doltchunk.h"
+#include "access/doltsystem.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
@@ -799,6 +802,26 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 
 struct config_bool ConfigureNamesBool[] =
 {
+	{
+		{"dolt_chunk_verify_hashes", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Verifies that prolly chunk contents match their hashes."),
+			gettext_noop("Checks every chunk put and every chunk read into the node cache."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&dolt_chunk_verify_hashes,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_show_system_tables", PGC_USERSET, COMPAT_OPTIONS_OTHER,
+			gettext_noop("Lists generated Dolt system tables in catalog views."),
+			NULL
+		},
+		&dolt_show_system_tables,
+		false,
+		NULL, NULL, NULL
+	},
 	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
@@ -3622,6 +3645,25 @@ struct config_int ConfigureNamesInt[] =
 		&max_parallel_maintenance_workers,
 		2, 0, MAX_PARALLEL_WORKER_LIMIT,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_catalog_cache_entries", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the target number of decoded revision catalog views retained per session."),
+			gettext_noop("Active scans remain pinned; evicted rows reload using their original runtime handles.")
+		},
+		&catalog_view_cache_entries,
+		16, 1, 100000, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_chunk_cache_size", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the memory for prolly chunks cached per session."),
+			gettext_noop("Least recently used chunks are evicted above this size; 0 disables caching."),
+			GUC_UNIT_KB
+		},
+		&dolt_chunk_cache_size,
+		256 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{

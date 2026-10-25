@@ -29,17 +29,19 @@ for my $index ('t_pkey','t_v_key')
  sql("BEGIN; UPDATE pg_dolt_binding SET bindrelid=$id WHERE bindbranch='other' AND bindname='public.$index'; DELETE FROM pg_dolt_binding WHERE bindbranch='legacy' AND bindname='public.$index'; INSERT INTO pg_dolt_binding VALUES($id,'legacy','public.$index',decode('$index_schemas{$index}','hex')); COMMIT");
 }
 my $resources=sql(q{SELECT count(*) FROM pg_dolt_storage});
-is(sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['2','8'],0)}),'2','native insert imports old branch contents and allocates occurrence handle');
-is(sql(q{SET ROLE writer; SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'1','authorized non-owner writes through canonical definition');
+# Imported rows get derived handles 1..n; inserts allocate handles above every derived one.
+my $inserted=sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['2','8'],0)});
+cmp_ok($inserted,'>',1,'native insert imports old branch contents and allocates occurrence handle');
+cmp_ok(sql(q{SET ROLE writer; SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'>',$inserted,'authorized non-owner writes through canonical definition');
 is(sql(q{SELECT a.v,b.v FROM "postgres/legacy".public.t a JOIN "postgres/other".public.t b USING(id)}),'8|text','two incompatible writable schemas share a resource and preserve their roots');
 is(sql(q{SELECT active_branch()}),'main','explicit write binding does not switch session branch');
 is(sql(q{SELECT * FROM "postgres/main".public.t}),'1|main','writes leave another resource and branch untouched');
-is(sql(q{SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],1)}),'3','native update uses bound branch and replaces occurrence');
-is(sql(q{SELECT test_storage_write('legacy','public.t','delete',ARRAY[]::text[],2)}),'0','native delete uses bound branch');
+cmp_ok(sql(q{SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],1)}),'>',$inserted,'native update uses bound branch and gives the new version a new handle');
+is(sql("SELECT test_storage_write('legacy','public.t','delete',ARRAY[]::text[],$inserted)"),'0','native delete uses bound branch');
 is(sql(q{SELECT * FROM "postgres/legacy".public.t}),'1|9','updated branch has correct rows');
 is(sql(q{SELECT * FROM "postgres/other".public.t}),'2|text','other schema remains unchanged after update and delete');
-fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','different'],0)},qr/duplicate key violates unique constraint "t_pkey"/,'bound primary index rejects duplicate key');
-fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['3','text'],0)},qr/duplicate key violates unique constraint "t_v_key"/,'bound secondary unique index rejects duplicate value');
+fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','different'],0)},qr/duplicate key value violates unique constraint "t_pkey"/,'bound primary index rejects duplicate key');
+fails(q{SELECT test_storage_write('other','public.t','insert',ARRAY['3','text'],0)},qr/duplicate key value violates unique constraint "t_v_key"/,'bound secondary unique index rejects duplicate value');
 is(sql(q{SELECT * FROM "postgres/other".public.t}),'2|text','failed index updates roll back table root too');
 
 fails(q{SET ROLE outsider; SELECT test_storage_write('other','public.t','insert',ARRAY['3','denied'],0)},qr/permission denied/,'canonical grants reject unauthorized write');
@@ -64,8 +66,9 @@ $old->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM "postgre
 sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['5','11'],0)});
 $old->query_safe('\\set ON_ERROR_STOP 0');
 $old->query(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['6','12'],0)});
-# background_psql reports SQL errors in its captured stderr.
-like($old->{stderr},qr/prolly root advanced after snapshot/,'stale writer rejects a newer committed root');
+# background_psql reports SQL errors in its captured stderr. Publication
+# merges a stale writer's new rows with the newer committed root.
+is($old->{stderr},'','stale writer inserts onto a newer committed root');
 $old->{stderr}='';
 $old->query_safe('ROLLBACK');$old->quit;
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),$resources,'branch writes and revisions allocate no new storage resources');

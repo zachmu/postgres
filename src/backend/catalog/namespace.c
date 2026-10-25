@@ -18,7 +18,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 #include "access/doltcatalog.h"
+#include "access/doltsystem.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -551,6 +553,9 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 				relId = InvalidOid;
 			else
 				relId = get_relname_relid(relation->relname, namespaceId);
+			/* schema.dolt_<table> aliases the built-in system table. */
+			if (!OidIsValid(relId))
+				relId = dg_system_relation(relation);
 		}
 		else
 		{
@@ -910,7 +915,7 @@ RelnameGetRelid(const char *relname)
 
 	foreach(l, activeSearchPath)
 	{
-		Oid			namespaceId = lfirst_oid(l);
+		Oid			namespaceId = CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(l));
 
 		relid = get_relname_relid(relname, namespaceId);
 		if (OidIsValid(relid))
@@ -1222,10 +1227,34 @@ TypeIsVisibleExt(Oid typid, bool *is_missing)
  * schema-qualified with a schema that does not exist.  Likewise if no
  * candidate is found for other reasons.
  */
+static FuncCandidateList FuncnameGetCandidatesInContext(List *, int, List *, bool, bool, bool, bool);
+
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool expand_variadic, bool expand_defaults,
 					  bool include_out_arguments, bool missing_ok)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	FuncCandidateList result;
+
+	CatalogViewSwitch(dg_catalog_session_view());
+	PG_TRY();
+	{
+		result = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
+												expand_defaults, include_out_arguments, missing_ok);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static FuncCandidateList
+FuncnameGetCandidatesInContext(List *names, int nargs, List *argnames,
+							   bool expand_variadic, bool expand_defaults,
+							   bool include_out_arguments, bool missing_ok)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -1244,7 +1273,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		namespaceId = CatalogViewNamespace(CatalogViewCurrent(), LookupExplicitNamespace(schemaname, missing_ok));
 		if (!OidIsValid(namespaceId))
 			return NULL;
 	}
@@ -1288,7 +1317,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (procform->pronamespace == lfirst_oid(nsp) &&
+				if (procform->pronamespace == CatalogViewNamespace(CatalogViewCurrent(), lfirst_oid(nsp)) &&
 					procform->pronamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -1745,6 +1774,9 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	Form_pg_proc procform;
 	Oid			pronamespace;
 	bool		visible;
+	bool		inpath = false;
+	ListCell   *path;
+	CatalogView *view;
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))
@@ -1766,8 +1798,14 @@ FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	pronamespace = procform->pronamespace;
-	if (pronamespace != PG_CATALOG_NAMESPACE &&
-		!list_member_oid(activeSearchPath, pronamespace))
+	view = dg_catalog_session_view();
+	foreach(path, activeSearchPath)
+		if (CatalogViewNamespace(view, lfirst_oid(path)) == pronamespace)
+	{
+		inpath = true;
+		break;
+	}
+	if (pronamespace != PG_CATALOG_NAMESPACE && !inpath)
 		visible = false;
 	else
 	{
@@ -4332,8 +4370,26 @@ cachedNamespacePath(const char *searchPath, Oid roleid)
 /*
  * recomputeNamespacePath - recompute path derived variables if needed.
  */
+static void recomputeNamespacePathPhysical(void);
+
 static void
 recomputeNamespacePath(void)
+{
+	CatalogView *previous = CatalogViewSwitch(NULL);
+
+	PG_TRY();
+	{
+		recomputeNamespacePathPhysical();
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+}
+
+static void
+recomputeNamespacePathPhysical(void)
 {
 	Oid			roleid = GetUserId();
 	bool		pathChanged;

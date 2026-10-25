@@ -44,9 +44,7 @@ for my $function (qw(pg_relation_size pg_table_size pg_indexes_size pg_total_rel
  isnt($status,0,"$function rejects an unbound physical locator");
  like($err,qr/physical size is not defined for a revision-bound relation/,"$function fails explicitly");
 }
-my ($status,$out,$err)=$node->psql('postgres',"SELECT * FROM pg_catalog.pg_proc AS OF '$a'");
-isnt($status,0,'unimplemented revision catalog rejects');
-like($err,qr/revision-qualified catalog .* is not supported/,'unsupported catalog does not expose live rows');
+is(sql("SELECT count(*) FROM pg_catalog.pg_proc AS OF '$a' WHERE proname='revision_comments'"),'0','historical routine catalog does not expose a later physical helper');
 $node->stop('immediate');
 $node->start;
 is(sql("BEGIN READ ONLY; SELECT row_to_json(x) FROM t AS OF '$a' x; SELECT col_description(c.oid,2) FROM pg_catalog.pg_class AS OF '$b' c WHERE c.relname='t'; COMMIT"),"{\"id\":1,\"v\":7}\ntext revision",'canonical native descriptors reconstruct after restart without materialization');

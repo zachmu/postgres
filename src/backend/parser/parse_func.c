@@ -13,6 +13,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
@@ -86,9 +88,53 @@ static Oid	LookupFuncNameInternal(ObjectType objtype, List *funcname,
  *	name must resolve to a procedure name, not anything else.  This flag
  *	also specifies that the argument list includes any OUT-mode arguments.
  */
+static Node *ParseFuncOrColumnInContext(ParseState *pstate, List *funcname, List *fargs,
+										Node *last_srf, FuncCall *fn, bool proc_call, int location);
+
 Node *
 ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 				  Node *last_srf, FuncCall *fn, bool proc_call, int location)
+{
+	CatalogView *previous = CatalogViewCurrent();
+	CatalogView *selected = NULL;
+	ListCell   *lc;
+	Node	   *result;
+	bool		mixed = false;
+
+	/*
+	 * A composite argument from a retained revision must resolve a matching
+	 * signature in that revision, including during cached-plan reanalysis.
+	 * Live arguments retain working-set execution authority.
+	 */
+	if (!previous)
+	{
+		foreach(lc, fargs)
+		{
+			CatalogView *view = CatalogViewObjectContext(exprType(lfirst(lc)));
+
+			if (view && selected && view != selected)
+				mixed = true;
+			if (view)
+				selected = view;
+		}
+		if (!mixed && selected && selected != dg_catalog_session_view())
+			CatalogViewSwitch(selected);
+	}
+	PG_TRY();
+	{
+		result = ParseFuncOrColumnInContext(pstate, funcname, fargs, last_srf, fn, proc_call, location);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Node *
+ParseFuncOrColumnInContext(ParseState *pstate, List *funcname, List *fargs,
+						   Node *last_srf, FuncCall *fn, bool proc_call, int location)
 {
 	bool		is_column = (fn == NULL);
 	List	   *agg_order = (fn ? fn->agg_order : NIL);
@@ -774,6 +820,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		FuncExpr   *funcexpr = makeNode(FuncExpr);
 
 		funcexpr->funcid = funcid;
+		funcexpr->dolt_working = CatalogViewObjectContext(funcid) != NULL && CatalogViewCurrent() == NULL;
 		funcexpr->funcresulttype = rettype;
 		funcexpr->funcretset = retset;
 		funcexpr->funcvariadic = func_variadic;

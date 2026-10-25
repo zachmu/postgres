@@ -1,6 +1,6 @@
--- Native revision lookup requires a repository before the fixture is loaded.
+-- The initialized main branch has no accounts table before fixture loading.
 SELECT * FROM "contrib_regression/main".public.accounts;
-ERROR:  unknown revision: main
+ERROR:  relation accounts does not exist on branch main
 LOAD 'test_doltgres';
 CREATE SCHEMA dg_4_main_public;
 CREATE SCHEMA dg_3_dev_public;

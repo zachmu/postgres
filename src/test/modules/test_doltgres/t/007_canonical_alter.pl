@@ -46,7 +46,7 @@ is(sql(q{SELECT extra FROM t WHERE id=5}),'five','rollback restores schema and r
 sql(q{BEGIN; SAVEPOINT s; ALTER TABLE t ADD COLUMN gone int; ROLLBACK TO s; INSERT INTO t VALUES(6,60,'six'); COMMIT});
 is(sql(q{SELECT extra FROM t WHERE id=6}),'six','savepoint rollback restores writable schema');
 fails(q{SELECT * FROM t FOR UPDATE},qr/row locking/,'versioned read cannot silently ignore row locking');
-fails(q{ALTER TABLE t DROP COLUMN id},qr/indexed column/,'indexed DROP rejected before publication');
+sql(q{BEGIN; ALTER TABLE t DROP COLUMN id; ROLLBACK});
 is(sql(q{SELECT count(*) FROM pg_dolt_storage}),$resources,'ADD and DROP reuse the original allocations');
 # Overlapping large writes exercise contiguous chunk framing in a shared file.
 $a->query_until(qr/large_main/, "\\echo large_main\nBEGIN; UPDATE t SET extra=repeat('x',50000) WHERE id=1;\n");

@@ -1410,13 +1410,79 @@ GRANT EXECUTE ON FUNCTION pg_get_aios() TO pg_read_all_stats;
 
 -- First version-control slice. History remains privileged until branch ACLs exist.
 -- Immutable manifest objects may have concurrent, byte-identical physical copies.
+-- Prolly chunks stay inline and uncompressed; the catalog has no TOAST table.
+ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkhash SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkdata SET STORAGE PLAIN;
+-- Roots and lock records are small and fixed in shape; they stay inline too.
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootbranch SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootcontent SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN roothandles SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootkeys SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_lock ALTER COLUMN lockbranch SET STORAGE PLAIN;
+REVOKE ALL ON pg_catalog.pg_dolt_chunk, pg_catalog.pg_dolt_root, pg_catalog.pg_dolt_lock FROM PUBLIC;
+
 CREATE VIEW pg_dolt_object_visible AS
  SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;
 REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;
 
-CREATE VIEW dolt_log WITH (security_invoker=true) AS
+-- Dolt system tables live in the dolt schema (dolt.branches) and have
+-- dolt_-prefixed aliases in pg_catalog (dolt_branches, public.dolt_branches).
+-- Relation-level access remains privileged until branch ACLs exist.
+CREATE SCHEMA dolt;
+
+ALTER TABLE pg_catalog.pg_dolt_branch_control
+    ADD CONSTRAINT pg_dolt_branch_control_permissions_check
+    CHECK (permissions IN ('admin', 'write'));
+
+REVOKE ALL ON pg_catalog.pg_dolt_remote, pg_catalog.pg_dolt_reflog, pg_catalog.pg_dolt_rebase, pg_catalog.pg_dolt_backup, pg_catalog.pg_dolt_branch_control, pg_catalog.pg_dolt_branch_namespace_control FROM PUBLIC;
+
+-- Commits reachable from any branch, tag or remote-tracking ref.
+CREATE VIEW pg_dolt_commit_visible AS
+    WITH RECURSIVE walk(h) AS (
+        SELECT CASE WHEN o.objkind='tag' THEN o.objchildren[1] ELSE r.reftarget END
+        FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget
+        WHERE r.refname LIKE 'heads/%' OR r.refname LIKE 'tags/%' OR r.refname LIKE 'remotes/%'
+        UNION
+        SELECT unnest(o.objchildren[2:]) FROM walk w JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=w.h WHERE o.objkind='commit')
+    SELECT c.objhash, c.objchildren, convert_from(c.objpayload,'UTF8')::jsonb AS meta
+    FROM walk w JOIN pg_catalog.pg_dolt_object_visible c ON c.objhash=w.h WHERE c.objkind='commit';
+REVOKE ALL ON pg_dolt_commit_visible FROM PUBLIC;
+
+CREATE VIEW dolt.log WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_log();
-CREATE VIEW dolt_tags WITH (security_invoker=true) AS
+CREATE VIEW dolt.branches WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_branches();
+CREATE VIEW dolt.remote_branches WITH (security_invoker=true) AS
+    SELECT substr(r.refname,9) AS name,
+           encode(r.reftarget,'hex') AS hash,
+           o.meta->>'committer' AS latest_committer,
+           o.meta->>'email' AS latest_committer_email,
+           timestamp '2000-01-01' + (o.meta->>'date_us')::bigint * interval '1 microsecond' AS latest_commit_date,
+           o.meta->>'message' AS latest_commit_message,
+           o.meta->>'author' AS latest_author,
+           o.meta->>'author_email' AS latest_author_email,
+           timestamp '2000-01-01' + (o.meta->>'author_date_us')::bigint * interval '1 microsecond' AS latest_author_date
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_commit_visible o ON o.objhash=r.reftarget
+    WHERE r.refname LIKE 'remotes/%' ORDER BY 1;
+CREATE VIEW dolt.commits WITH (security_invoker=true) AS
+    SELECT encode(objhash,'hex') AS commit_hash,
+           meta->>'committer' AS committer,
+           meta->>'email' AS email,
+           timestamp '2000-01-01' + (meta->>'date_us')::bigint * interval '1 microsecond' AS date,
+           meta->>'message' AS message,
+           meta->>'author' AS author,
+           meta->>'author_email' AS author_email,
+           timestamp '2000-01-01' + (meta->>'author_date_us')::bigint * interval '1 microsecond' AS author_date
+    FROM pg_catalog.pg_dolt_commit_visible
+    ORDER BY (meta->>'height')::bigint DESC, (meta->>'date_us')::bigint DESC, objhash;
+CREATE VIEW dolt.commit_ancestors WITH (security_invoker=true) AS
+    SELECT encode(c.objhash,'hex') AS commit_hash,
+           encode(p.h,'hex') AS parent_hash,
+           coalesce(p.ord - 1, 0)::int AS parent_index
+    FROM pg_catalog.pg_dolt_commit_visible c
+         LEFT JOIN LATERAL unnest(c.objchildren[2:]) WITH ORDINALITY AS p(h, ord) ON true
+    ORDER BY (c.meta->>'height')::bigint DESC, (c.meta->>'date_us')::bigint DESC, c.objhash, p.ord;
+CREATE VIEW dolt.tags WITH (security_invoker=true) AS
     SELECT substr(r.refname,6) AS tag_name,
            encode(o.objchildren[1],'hex') AS tag_hash,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'tagger' AS tagger,
@@ -1424,15 +1490,134 @@ CREATE VIEW dolt_tags WITH (security_invoker=true) AS
            timestamp '2000-01-01' + ((convert_from(o.objpayload,'UTF8')::jsonb)->>'date_us')::bigint * interval '1 microsecond' AS date,
            (convert_from(o.objpayload,'UTF8')::jsonb)->>'message' AS message
     FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget
-    WHERE r.refname LIKE 'tags/%' AND o.objkind='tag';
-REVOKE ALL ON dolt_log, dolt_tags FROM PUBLIC;
+    WHERE r.refname LIKE 'tags/%' AND o.objkind='tag' ORDER BY 1;
+CREATE VIEW dolt.status WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_status();
+CREATE VIEW dolt.merge_status WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_merge_status();
+CREATE VIEW dolt.diff WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_diff_changes();
+CREATE VIEW dolt.column_diff WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_column_diff();
+CREATE VIEW dolt.conflicts WITH (security_invoker=true) AS
+    SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
+           count(*)::numeric AS num_conflicts
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
+    WHERE r.refname='merge/' || pg_catalog.active_branch()
+    GROUP BY 1 ORDER BY 1;
+CREATE VIEW dolt.constraint_violations WITH (security_invoker=true) AS
+    SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
+           count(*)::numeric AS num_violations
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(coalesce(convert_from(o.objpayload,'UTF8')::jsonb->'violations','[]'::jsonb)) v
+    WHERE r.refname='merge/' || pg_catalog.active_branch()
+    GROUP BY 1 ORDER BY 1;
+CREATE VIEW dolt.schema_conflicts WITH (security_invoker=true) AS
+    SELECT v->>'table' AS table_name,
+           v->>'base_schema' AS base_schema,
+           v->>'our_schema' AS our_schema,
+           v->>'their_schema' AS their_schema,
+           v->>'description' AS description
+    FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
+         LATERAL jsonb_array_elements(coalesce(convert_from(o.objpayload,'UTF8')::jsonb->'schema_conflicts','[]'::jsonb)) v
+    WHERE r.refname='merge/' || pg_catalog.active_branch();
+CREATE VIEW dolt.remotes WITH (security_invoker=true) AS
+    SELECT remotename AS name, remoteurl AS url, remotefetch AS fetch_specs, remoteparams AS params
+    FROM pg_catalog.pg_dolt_remote ORDER BY 1;
+CREATE VIEW dolt.docs WITH (security_invoker=true) AS
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_docs') AS t(doc_name text, doc_text text);
+CREATE VIEW dolt.rebase WITH (security_invoker=true) AS
+    SELECT rebase_order, action, commit_hash, commit_message FROM pg_catalog.pg_dolt_rebase
+    WHERE rebasebranch = pg_catalog.active_branch();
+CREATE VIEW dolt.stashes WITH (security_invoker=true) AS
+    SELECT name, 'stash@{' || (row_number() OVER (PARTITION BY name ORDER BY seq DESC) - 1) || '}' AS stash_id,
+           branch, hash, commit_message
+    FROM (SELECT split_part(r.refname, '/', 2) AS name, split_part(r.refname, '/', 3)::bigint AS seq,
+                 m->>'branch' AS branch, m->>'head' AS hash, m->>'message' AS commit_message
+          FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash = r.reftarget,
+               LATERAL (SELECT convert_from(o.objpayload, 'UTF8')::jsonb) AS j(m)
+          WHERE r.refname LIKE 'stash/%') s
+    ORDER BY name, seq DESC;
+CREATE VIEW dolt.help WITH (security_invoker=true) AS
+    SELECT * FROM pg_catalog.dolt_help();
+CREATE VIEW dolt.tests WITH (security_invoker=true) AS
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_tests') AS t(test_name text,test_group text,test_query text,assertion_type text,assertion_comparator text,assertion_value text);
+CREATE VIEW dolt.backups WITH (security_invoker=true) AS
+    SELECT backupname AS name, backupurl AS url FROM pg_catalog.pg_dolt_backup;
+CREATE VIEW dolt.query_catalog WITH (security_invoker=true) AS
+ SELECT * FROM pg_catalog.dolt_user_table('dolt_query_catalog') AS t(id text,display_order int4,name text,query text,description text);
+CREATE VIEW dolt.branch_control WITH (security_invoker=true) AS
+    SELECT database, branch, "user", host, permissions FROM pg_catalog.pg_dolt_branch_control;
+CREATE VIEW dolt.branch_namespace_control WITH (security_invoker=true) AS
+    SELECT database, branch, "user", host FROM pg_catalog.pg_dolt_branch_namespace_control;
+-- Dolt's histogram table approximated with one bucket per index from pg_statistic.
+CREATE VIEW dolt.statistics WITH (security_invoker=true) AS
+    SELECT current_database()::text AS database_name,
+           c.relname::text AS table_name,
+           CASE WHEN i.indisprimary THEN 'primary' ELSE ic.relname::text END AS index_name,
+           greatest(c.reltuples, 0)::numeric AS row_count,
+           CASE WHEN s.n_distinct IS NULL THEN greatest(c.reltuples, 0)::numeric
+                WHEN s.n_distinct < 0 THEN round((-s.n_distinct * greatest(c.reltuples, 0))::numeric)
+                ELSE s.n_distinct::numeric END AS distinct_count,
+           round((coalesce(s.null_frac, 0) * greatest(c.reltuples, 0))::numeric) AS null_count,
+           k.columns, k.types,
+           (s.histogram_bounds::text::text[])[array_length(s.histogram_bounds::text::text[], 1)] AS upper_bound,
+           CASE WHEN s.histogram_bounds IS NULL THEN NULL ELSE 1::numeric END AS upper_bound_cnt,
+           coalesce(st.last_analyze, st.last_autoanalyze) AS created_at,
+           (s.most_common_vals::text::text[])[1] AS mcv1,
+           (s.most_common_vals::text::text[])[2] AS mcv2,
+           (s.most_common_vals::text::text[])[3] AS mcv3,
+           (s.most_common_vals::text::text[])[4] AS mcv4,
+           (SELECT string_agg(round((f * greatest(c.reltuples, 0))::numeric)::text, ',')
+            FROM unnest(s.most_common_freqs[1:4]) f) AS mcv_counts
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_index i ON i.indrelid = c.oid
+    JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+    CROSS JOIN LATERAL (SELECT string_agg(a.attname, ',' ORDER BY x.ord) AS columns,
+                               string_agg(format_type(a.atttypid, a.atttypmod), ',' ORDER BY x.ord) AS types,
+                               min(a.attname::text) FILTER (WHERE x.ord = 1) AS first_column
+                        FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS x(attnum, ord)
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.attnum) k
+    LEFT JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = k.first_column
+    LEFT JOIN pg_catalog.pg_stat_all_tables st ON st.relid = c.oid
+    WHERE c.relkind = 'r' AND c.reltuples >= 0
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'dolt') AND n.nspname NOT LIKE 'pg\_%'
+    ORDER BY 2, 3;
+CREATE VIEW dolt.branch_activity WITH (security_invoker=true) AS
+    SELECT b.name AS branch, NULL::timestamptz AS last_read,
+           (SELECT max(r.reflogtime) FROM pg_catalog.pg_dolt_reflog r WHERE r.reflogname = 'heads/' || b.name) AS last_write,
+           0::int4 AS active_sessions, pg_catalog.pg_postmaster_start_time() AS system_start_time
+    FROM dolt.branches b;
 
-CREATE VIEW dolt_conflicts AS
- SELECT v->>'table' AS "table", count(*)::bigint AS num_conflicts
- FROM pg_dolt_ref r JOIN pg_dolt_object_visible o ON o.objhash=r.reftarget,
- LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
- WHERE r.refname='merge/' || active_branch()
- GROUP BY v->>'table';
-
-CREATE VIEW dolt_merge_status AS
- SELECT EXISTS (SELECT 1 FROM pg_dolt_ref WHERE refname='merge/' || active_branch()) AS is_merging;
+CREATE VIEW dolt_log WITH (security_invoker=true) AS SELECT * FROM dolt.log;
+CREATE VIEW dolt_branches WITH (security_invoker=true) AS SELECT * FROM dolt.branches;
+CREATE VIEW dolt_remote_branches WITH (security_invoker=true) AS SELECT * FROM dolt.remote_branches;
+CREATE VIEW dolt_commits WITH (security_invoker=true) AS SELECT * FROM dolt.commits;
+CREATE VIEW dolt_commit_ancestors WITH (security_invoker=true) AS SELECT * FROM dolt.commit_ancestors;
+CREATE VIEW dolt_tags WITH (security_invoker=true) AS SELECT * FROM dolt.tags;
+CREATE VIEW dolt_status WITH (security_invoker=true) AS SELECT * FROM dolt.status;
+CREATE VIEW dolt_merge_status WITH (security_invoker=true) AS SELECT * FROM dolt.merge_status;
+CREATE VIEW dolt_diff WITH (security_invoker=true) AS SELECT * FROM dolt.diff;
+CREATE VIEW dolt_column_diff WITH (security_invoker=true) AS SELECT * FROM dolt.column_diff;
+CREATE VIEW dolt_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.conflicts;
+CREATE VIEW dolt_constraint_violations WITH (security_invoker=true) AS SELECT * FROM dolt.constraint_violations;
+CREATE VIEW dolt_schema_conflicts WITH (security_invoker=true) AS SELECT * FROM dolt.schema_conflicts;
+CREATE VIEW dolt_remotes WITH (security_invoker=true) AS SELECT * FROM dolt.remotes;
+CREATE VIEW dolt_docs WITH (security_invoker=true) AS SELECT * FROM dolt.docs;
+CREATE VIEW dolt_rebase WITH (security_invoker=true) AS SELECT * FROM dolt.rebase;
+CREATE VIEW dolt_stashes WITH (security_invoker=true) AS SELECT * FROM dolt.stashes;
+CREATE VIEW dolt_help WITH (security_invoker=true) AS SELECT * FROM dolt.help;
+CREATE VIEW dolt_tests WITH (security_invoker=true) AS SELECT * FROM dolt.tests;
+CREATE VIEW dolt_backups WITH (security_invoker=true) AS SELECT * FROM dolt.backups;
+CREATE VIEW dolt_query_catalog WITH (security_invoker=true) AS SELECT * FROM dolt.query_catalog;
+CREATE VIEW dolt_branch_control WITH (security_invoker=true) AS SELECT * FROM dolt.branch_control;
+CREATE VIEW dolt_branch_namespace_control WITH (security_invoker=true) AS SELECT * FROM dolt.branch_namespace_control;
+CREATE VIEW dolt_statistics WITH (security_invoker=true) AS SELECT * FROM dolt.statistics;
+CREATE VIEW dolt_branch_activity WITH (security_invoker=true) AS SELECT * FROM dolt.branch_activity;
+REVOKE ALL ON ALL TABLES IN SCHEMA dolt FROM PUBLIC;
+REVOKE ALL ON dolt_log, dolt_branches, dolt_remote_branches, dolt_commits, dolt_commit_ancestors, dolt_tags,
+    dolt_status, dolt_merge_status, dolt_diff, dolt_column_diff, dolt_conflicts, dolt_constraint_violations,
+    dolt_schema_conflicts, dolt_remotes, dolt_docs, dolt_rebase, dolt_stashes, dolt_help, dolt_tests, dolt_backups,
+    dolt_query_catalog, dolt_branch_control, dolt_branch_namespace_control, dolt_statistics, dolt_branch_activity FROM PUBLIC;

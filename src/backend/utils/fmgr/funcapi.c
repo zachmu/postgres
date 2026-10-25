@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "catalog/catalogview.h"
 
 #include "access/htup_details.h"
 #include "access/relation.h"
@@ -441,7 +442,7 @@ internal_get_result_type(Oid funcid,
 	TupleDesc	tupdesc;
 
 	/* First fetch the function's pg_proc row to inspect its rettype */
-	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	tp = CatalogViewFunctionTuple(funcid);
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for function %u", funcid);
 	procform = (Form_pg_proc) GETSTRUCT(tp);
@@ -1619,7 +1620,7 @@ get_func_result_name(Oid functionId)
 	int			i;
 
 	/* First fetch the function's pg_proc row */
-	procTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionId));
+	procTuple = CatalogViewFunctionTuple(functionId);
 	if (!HeapTupleIsValid(procTuple))
 		elog(ERROR, "cache lookup failed for function %u", functionId);
 

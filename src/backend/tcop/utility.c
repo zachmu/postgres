@@ -21,7 +21,9 @@
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "access/doltsystem.h"
 #include "access/xlog.h"
+#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
@@ -572,6 +574,15 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		pstmt = copyObject(pstmt);
 	parsetree = pstmt->utilityStmt;
 
+	/*
+	 * Provisional native ALTER invokes its controller directly. Nested
+	 * utility work needs its own declared publication/storage effects before
+	 * admission.
+	 */
+	if (CatalogViewIsProvisional(CatalogViewCurrent()))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("nested utility commands during native catalog mutation are not supported")));
+
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
 	if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY &&
@@ -587,14 +598,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			PreventCommandDuringRecovery(GetCommandTagName(commandtag));
 	}
 
+	dg_system_check_ddl(parsetree);
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
 
-	if (dg_catalog_alter(parsetree))
+	if (dg_catalog_routine_ddl(pstate, parsetree))
 	{
-		if (qc)
-			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
 		free_parsestate(pstate);
 		CommandCounterIncrement();
 		return;
@@ -602,8 +612,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	if (dg_catalog_drop(parsetree))
 	{
 		if (qc)
-			SetQueryCompletion(qc, CMDTAG_DROP_TABLE, 0);
+			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
 		free_parsestate(pstate);
+		return;
+	}
+	if (dg_catalog_alter(parsetree))
+	{
+		if (qc)
+			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+		free_parsestate(pstate);
+		CommandCounterIncrement();
 		return;
 	}
 	if (dg_catalog_create(parsetree, queryString))

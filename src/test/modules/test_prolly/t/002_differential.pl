@@ -35,13 +35,26 @@ CREATE INDEX fresh_n ON fresh(n DESC NULLS LAST,v ASC) INCLUDE(id);
 });
 is($node->safe_psql('postgres',q{SELECT dolt_prolly_root('p')=dolt_prolly_root('fresh')}),'t','mixed histories produce fresh canonical table root');
 is($node->safe_psql('postgres',q{SELECT dolt_prolly_root('pn')=dolt_prolly_root('fresh_n')}),'t','mixed histories produce fresh canonical index root');
+# Writers lock rows, not tables: an older snapshot may still insert new keys,
+# and publication merges its rows with the newer commit.
 my $reader=$node->background_psql('postgres',on_error_stop=>0);
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM p');
 $node->safe_psql('postgres',q{INSERT INTO p VALUES(99,'new',1)});
 my ($out,$err)=$reader->query(q{INSERT INTO p VALUES(100,'stale',2)});
-is($err,1,'stale writer raises an error');
+is($err,0,'repeatable read writer inserts a new key after a concurrent commit');
+$reader->query_safe('COMMIT');
+is($node->safe_psql('postgres',q{SELECT string_agg(id::text,',' ORDER BY id) FROM p WHERE id>=99}),'99,100','publication merges concurrent inserts');
+
+# Updating a row another transaction changed after the snapshot is a
+# serialization failure under Repeatable Read.
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM p');
+$node->safe_psql('postgres',q{UPDATE p SET v='changed' WHERE id=99});
+($out,$err)=$reader->query(q{UPDATE p SET v='stale' WHERE id=99});
+is($err,1,'stale update of a changed row raises an error');
+like($reader->{stderr},qr/could not serialize access due to concurrent update/,'stale update reports a serialization failure');
+$reader->{stderr}='';
 $reader->query('ROLLBACK');
 $reader->quit;
-is($node->safe_psql('postgres',q{SELECT count(*) FROM p WHERE id=100}),'0','stale writer does not publish a root');
+is($node->safe_psql('postgres',q{SELECT v FROM p WHERE id=99}),'changed','stale writer does not publish its update');
 $node->stop;
 done_testing();

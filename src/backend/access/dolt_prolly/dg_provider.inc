@@ -11,8 +11,8 @@ typedef struct DGProvider
 static DGProvider *providers;
 
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, RelationRelationId, AttributeRelationId,
-	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId
+	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
+	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
 typedef struct DGProviderRows
@@ -126,6 +126,9 @@ provider_acl(const char *definition)
 		ACLITEM_SET_PRIVS_GOPTIONS(*item, mode, grant ? mode : 0);
 		items[i] = PointerGetDatum(item);
 	}
+	/* ACLs require a one-dimensional header even when there are no items. */
+	if (!n)
+		return (ArrayType *) make_empty_acl();
 	return construct_array(items, n, ACLITEMOID, sizeof(AclItem), false, TYPALIGN_INT);
 }
 
@@ -201,6 +204,19 @@ provider_columns(const char *definition)
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
+		{
+			char	   *storage,
+					   *compression;
+
+			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			storage = strcell(0, 1);
+			compression = strcell(0, 2);
+			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
+			if (storage)
+				TupleDescAttr(desc, i)->attstorage = storage[0];
+			if (compression)
+				TupleDescAttr(desc, i)->attcompression = compression[0];
+		}
 	}
 	dg_validate_descriptor(desc);
 	return desc;
@@ -215,6 +231,19 @@ provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc)
 	bool		isnull;
 	Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
 
+	if (catalog == SharedDependRelationId)
+	{
+		Form_pg_shdepend dep = (Form_pg_shdepend) GETSTRUCT(tuple);
+
+		return dep->dbid == InvalidOid ||
+			(dep->dbid == MyDatabaseId && dep->objid < FirstNormalObjectId);
+	}
+	if (catalog == ProcedureRelationId)
+	{
+		Oid			ns = ((Form_pg_proc) GETSTRUCT(tuple))->pronamespace;
+
+		return ns == PG_CATALOG_NAMESPACE || !strcmp(get_namespace_name(ns), "information_schema");
+	}
 	if (catalog == DependRelationId)
 		object = ((Form_pg_depend) GETSTRUCT(tuple))->objid;
 	if (catalog == NamespaceRelationId && object == PG_PUBLIC_NAMESPACE)
@@ -237,7 +266,49 @@ provider_attribute(TupleDesc desc, const char *name)
 }
 
 static void
-provider_constraints(DGProviderRows *rows, CatalogView *view, const char *definition)
+provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definition)
+{
+	char	   *name = json_value(definition, "name");
+	Oid			relation = CatalogViewLookupObject(view, RelationRelationId, name);
+	TupleDesc	desc = provider_columns(definition);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		char	   *sql;
+		List	   *parsed;
+		SelectStmt *select;
+		Node	   *raw,
+				   *expression;
+		FormData_pg_attrdef form = {0};
+		HeapTuple	tuple;
+		int			slot = provider_catalog_index(AttrDefaultRelationId);
+
+		if (!TupleDescAttr(desc, i)->atthasdef)
+			continue;
+		run("SELECT $1::jsonb->'columns'->$2->>'default'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+		sql = strcell(0, 1);
+		parsed = schema_expression_parse(psprintf("SELECT %s", sql));
+		if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+			elog(ERROR, "invalid canonical default expression");
+		select = castNode(SelectStmt, linitial_node(RawStmt, parsed)->stmt);
+		if (list_length(select->targetList) != 1 || select->fromClause)
+			elog(ERROR, "invalid canonical default SELECT");
+		raw = linitial_node(ResTarget, select->targetList)->val;
+		expression = schema_expression_bind(view, relation, name, desc, raw, i + 1);
+		form.oid = CatalogViewBindObject(view, AttrDefaultRelationId, psprintf("%s/%s", name, NameStr(TupleDescAttr(desc, i)->attname)), InvalidOid);
+		form.adrelid = relation;
+		form.adnum = i + 1;
+		tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_attrdef_adnum);
+		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_attrdef_adbin, CStringGetTextDatum(nodeToString(expression)));
+		rows->rows[slot] = lappend(rows->rows[slot], tuple);
+		provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation, i + 1, DEPENDENCY_AUTO);
+	}
+}
+
+#include "dg_foreign_provider.inc"
+
+static void
+provider_constraints(DGProviderRows *rows, CatalogView *view, const char *definition, int count, char **definitions, char **kinds)
 {
 	char	   *name = json_value(definition, "name");
 	List	   *parts = stringToQualifiedNameList(name, NULL);
@@ -245,25 +316,29 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	Oid			ns = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 	TupleDesc	desc = provider_columns(definition);
 	char	  **names,
-			  **defs;
+			  **defs,
+			  **metadata;
 	int			n,
 				i;
 
-	run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT v->>0,v->>1,(v->2)::text FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	n = SPI_processed;
 	names = palloc_array(char *, Max(n, 1));
 	defs = palloc_array(char *, Max(n, 1));
+	metadata = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		names[i] = strcell(i, 1);
 		defs[i] = strcell(i, 2);
+		metadata[i] = strcell(i, 3);
 	}
 	for (i = 0; i < n; i++)
 	{
-		List	   *parsed = raw_parser(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", quote_identifier(names[i]), defs[i]), RAW_PARSE_DEFAULT);
+		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", quote_identifier(names[i]), defs[i]));
 		Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
 		AlterTableStmt *alter;
 		Constraint *constraint;
+		Node	   *expression = NULL;
 		FormData_pg_constraint form = {0};
 		ListCell   *lc;
 		Datum	   *keys;
@@ -285,6 +360,14 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 			case CONSTR_UNIQUE:
 				form.contype = CONSTRAINT_UNIQUE;
 				break;
+			case CONSTR_FOREIGN:
+				form.contype = CONSTRAINT_FOREIGN;
+				constraint->keys = constraint->fk_attrs;
+				break;
+			case CONSTR_CHECK:
+				form.contype = CONSTRAINT_CHECK;
+				expression = schema_expression_bind(view, relid, strVal(lsecond(parts)), desc, constraint->raw_expr, 0);
+				break;
 			case CONSTR_NOTNULL:
 				form.contype = CONSTRAINT_NOTNULL;
 				break;
@@ -297,16 +380,34 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.conrelid = relid;
 		form.condeferrable = constraint->deferrable;
 		form.condeferred = constraint->initdeferred;
-		form.conenforced = true;
+		form.conenforced = form.contype == CONSTRAINT_CHECK ? constraint->is_enforced : true;
 		form.convalidated = !constraint->skip_validation;
 		form.conislocal = true;
-		form.connoinherit = constraint->is_no_inherit;
+		form.connoinherit = form.contype == CONSTRAINT_FOREIGN || constraint->is_no_inherit;
 		form.confupdtype = ' ';
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';
-		if (form.contype != CONSTRAINT_NOTNULL)
+		if (form.contype == CONSTRAINT_PRIMARY || form.contype == CONSTRAINT_UNIQUE)
 			form.conindid = CatalogViewLookupObject(view, RelationRelationId, quote_qualified_identifier(strVal(linitial(parts)), names[i]));
-		keys = palloc_array(Datum, Max(list_length(constraint->keys), 1));
+		keys = palloc_array(Datum, Max(desc->natts, 1));
+		if (expression)
+		{
+			Bitmapset  *attributes = NULL;
+			int			att = -1;
+
+			pull_varattnos(expression, 1, &attributes);
+			while ((att = bms_next_member(attributes, att)) >= 0)
+			{
+				int			number = att + FirstLowInvalidHeapAttributeNumber;
+
+				keys[k++] = Int16GetDatum(number);
+				provider_dependency(rows, ConstraintRelationId, form.oid, 0, RelationRelationId, relid, number, DEPENDENCY_AUTO);
+			}
+			bms_free(attributes);
+			/* Constant checks still depend on their owning relation. */
+			if (!k)
+				provider_dependency(rows, ConstraintRelationId, form.oid, 0, RelationRelationId, relid, 0, DEPENDENCY_AUTO);
+		}
 		foreach(lc, constraint->keys)
 		{
 			int			att = provider_attribute(desc, strVal(lfirst(lc)));
@@ -316,6 +417,10 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		}
 		tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_constraint_conperiod);
 		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conkey, PointerGetDatum(construct_array(keys, k, INT2OID, 2, true, TYPALIGN_SHORT)));
+		if (expression)
+			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conbin, CStringGetTextDatum(nodeToString(expression)));
+		if (form.contype == CONSTRAINT_FOREIGN)
+			tuple = provider_foreign(rows, view, tuple, constraint, desc, metadata[i], count, definitions, kinds);
 		rows->rows[slot] = lappend(rows->rows[slot], tuple);
 		if (form.conindid)
 			provider_dependency(rows, RelationRelationId, form.conindid, 0, ConstraintRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
@@ -374,7 +479,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT((HeapTuple) lfirst(lc));
 
-		if (con->conindid == form.indexrelid)
+		if (con->conindid == form.indexrelid && (con->contype == CONSTRAINT_PRIMARY || con->contype == CONSTRAINT_UNIQUE))
 		{
 			form.indisprimary = con->contype == CONSTRAINT_PRIMARY;
 			form.indimmediate = !con->condeferrable;
@@ -413,12 +518,86 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);
 }
 
-static CatalogView *
-provider_view(bytea *database)
+#include "dg_routine_provider.inc"
+
+/* Shared role references are derived from canonical owners and ACLs. They
+ * remain runtime catalog tuples; local role OIDs never enter schema payloads. */
+static void
+provider_role_dependency(DGProviderRows *rows, Oid catalog, Oid object,
+						 Oid role, char kind)
 {
-	char	   *key = hex(database);
-	DGProvider *entry;
-	CatalogView *view;
+	FormData_pg_shdepend dep = {0};
+
+	if (!OidIsValid(role))
+		return;					/* PUBLIC is not a role object */
+	dep.dbid = MyDatabaseId;
+	dep.classid = catalog;
+	dep.objid = object;
+	dep.refclassid = AuthIdRelationId;
+	dep.refobjid = role;
+	dep.deptype = kind;
+	provider_add(rows, SharedDependRelationId, &dep, sizeof(dep), Natts_pg_shdepend);
+}
+
+static void
+provider_role_dependencies(DGProviderRows *rows)
+{
+	const Oid	catalogs[] = {NamespaceRelationId, RelationRelationId, TypeRelationId, ProcedureRelationId};
+	const int	owners[] = {Anum_pg_namespace_nspowner, Anum_pg_class_relowner, Anum_pg_type_typowner, Anum_pg_proc_proowner};
+	const int	acls[] = {Anum_pg_namespace_nspacl, Anum_pg_class_relacl, Anum_pg_type_typacl, Anum_pg_proc_proacl};
+
+	for (int i = 0; i < lengthof(catalogs); i++)
+	{
+		int			slot = provider_catalog_index(catalogs[i]);
+		TupleDesc	desc = RelationGetDescr(rows->relations[slot]);
+		ListCell   *lc;
+
+		foreach(lc, rows->rows[slot])
+		{
+			HeapTuple	tuple = lfirst(lc);
+			bool		isnull;
+			Oid			object = DatumGetObjectId(heap_getattr(tuple, 1, desc, &isnull));
+			Oid			owner;
+			Datum		acl;
+
+			if (!CatalogViewObjectContext(object))
+				continue;
+			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
+			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
+			acl = heap_getattr(tuple, acls[i], desc, &isnull);
+			if (!isnull)
+			{
+				Oid		   *members;
+				int			count = aclmembers(DatumGetAclP(acl), &members);
+
+				for (int j = 0; j < count; j++)
+					if (members[j] != owner)
+						provider_role_dependency(rows, catalogs[i], object, members[j], SHARED_DEPENDENCY_ACL);
+				if (members)
+					pfree(members);
+			}
+		}
+	}
+}
+
+static bool
+provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, rows->rows[provider_catalog_index(TypeRelationId)])
+	{
+		Form_pg_type type = (Form_pg_type) GETSTRUCT((HeapTuple) lfirst(lc));
+
+		if (type->typnamespace == namespaceid && !strcmp(NameStr(type->typname), name))
+			return true;
+	}
+	return false;
+}
+
+static void
+provider_populate(CatalogView *view, bytea *database)
+{
 	DGProviderRows rows = {0};
 	bytea	  **addresses;
 	char	  **kinds,
@@ -427,159 +606,297 @@ provider_view(bytea *database)
 				i,
 				j;
 
+	for (i = 0; i < lengthof(provider_catalogs); i++)
+	{
+		TableScanDesc scan;
+		HeapTuple	tuple;
+
+		rows.relations[i] = table_open(provider_catalogs[i], AccessShareLock);
+		scan = table_beginscan_catalog(rows.relations[i], 0, NULL);
+		while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+			if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rows.relations[i])))
+				rows.rows[i] = lappend(rows.rows[i], heap_copytuple(tuple));
+		table_endscan(scan);
+	}
+	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	n = SPI_processed;
+	addresses = palloc_array(bytea *, Max(n, 1));
+	kinds = palloc_array(char *, Max(n, 1));
+	definitions = palloc_array(char *, Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		addresses[i] = DatumGetByteaPCopy(cell(i, 1));
+		kinds[i] = strcell(i, 2);
+	}
+	for (i = 0; i < n; i++)
+	{
+		if (!strcmp(kinds[i], "namespace"))
+			definitions[i] = metadata(addresses[i], "namespace");
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine"))
+			definitions[i] = metadata(child(addresses[i], 1), "schema");
+		else
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
+	}
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "namespace"))
+		{
+			FormData_pg_namespace form = {0};
+			int			slot = provider_catalog_index(NamespaceRelationId);
+			char	   *name = json_value(definitions[i], "name");
+			char	   *owner = json_value(definitions[i], "owner");
+			HeapTuple	tuple;
+
+			form.oid = CatalogViewBindObject(view, NamespaceRelationId, name, InvalidOid);
+			namestrcpy(&form.nspname, name);
+			form.nspowner = get_role_oid(owner, false);
+			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
+			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, PointerGetDatum(provider_acl(definitions[i])));
+			rows.rows[slot] = lappend(rows.rows[slot], tuple);
+			provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
+		}
+	/* Bind all class identities before resolving cross-object edges. */
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+			(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+		{
+			const char *definition = definitions[i];
+			char	   *name = json_value(definition, "name");
+			char	   *owner = json_value(definition, "owner");
+			List	   *parts = stringToQualifiedNameList(name, NULL);
+			FormData_pg_class form = {0};
+			TupleDesc	desc = provider_columns(definition);
+			bool		index = !strcmp(kinds[i], "index");
+			HeapTuple	tuple;
+			int			slot = provider_catalog_index(RelationRelationId);
+
+			if (list_length(parts) != 2)
+				elog(ERROR, "canonical relation name is not qualified");
+			form.oid = CatalogViewBindObject(view, RelationRelationId, name, InvalidOid);
+			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
+			namestrcpy(&form.relname, strVal(lsecond(parts)));
+			form.relowner = get_role_oid(owner, false);
+			form.reltype = index ? InvalidOid : CatalogViewBindObject(view, TypeRelationId, name, InvalidOid);
+			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
+			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
+			form.relpersistence = RELPERSISTENCE_PERMANENT;
+			form.relnatts = desc->natts;
+			run("SELECT count(*) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1 LIKE 'CHECK %'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+			form.relchecks = DatumGetInt64(cell(0, 1));
+			form.reltuples = -1;
+			form.relispopulated = true;
+			form.relreplident = REPLICA_IDENTITY_DEFAULT;
+			run("SELECT jsonb_array_length(COALESCE($1::jsonb->'indexes','[]'::jsonb))>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+			form.relhasindex = DatumGetBool(cell(0, 1));
+			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_class_relminmxid);
+			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_class_relacl, PointerGetDatum(provider_acl(definition)));
+			rows.rows[slot] = lappend(rows.rows[slot], tuple);
+			provider_description(&rows, form.oid, RelationRelationId, 0, json_value(definition, "comment"));
+			provider_dependency(&rows, RelationRelationId, form.oid, 0, NamespaceRelationId, form.relnamespace, 0, DEPENDENCY_NORMAL);
+			for (j = 0; j < desc->natts; j++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(desc, j);
+
+				int			aslot = provider_catalog_index(AttributeRelationId);
+				HeapTuple	atuple;
+				bool		nullvalue;
+				Datum		value;
+
+				attr->attrelid = form.oid;
+				atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
+				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM (SELECT $1::jsonb->'columns'->$2 v) s", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(j)), NULL, true);
+				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &nullvalue);
+				if (!nullvalue)
+					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, value);
+				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &nullvalue);
+				if (!nullvalue && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(value)), ARR_DIMS(DatumGetArrayTypeP(value))) > 0)
+					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, value);
+				rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
+				provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
+			}
+			if (!index)
+			{
+				FormData_pg_type type = {0};
+				int			attno;
+				char	   *arrayname = makeObjectName("", NameStr(form.relname), NULL);
+				int			arraypass = 0;
+				char	   *arrayidentity;
+				FormData_pg_type array = {0};
+
+				for (;;)
+				{
+					arrayidentity = quote_qualified_identifier(strVal(linitial(parts)), arrayname);
+					if (!catalog_contains(database, arrayidentity) &&
+						!provider_has_type(&rows, form.relnamespace, arrayname))
+						break;
+					pfree(arrayname);
+					arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
+				}
+				array.oid = CatalogViewBindObject(view, TypeRelationId, arrayidentity, InvalidOid);
+				type.typarray = array.oid;
+
+				type.oid = form.reltype;
+				type.typname = form.relname;
+				type.typnamespace = form.relnamespace;
+				type.typowner = form.relowner;
+				type.typlen = -1;
+				type.typtype = TYPTYPE_COMPOSITE;
+				type.typcategory = TYPCATEGORY_COMPOSITE;
+				type.typisdefined = true;
+				type.typdelim = ',';
+				type.typrelid = form.oid;
+				type.typinput = F_RECORD_IN;
+				type.typoutput = F_RECORD_OUT;
+				type.typreceive = F_RECORD_RECV;
+				type.typsend = F_RECORD_SEND;
+				type.typalign = TYPALIGN_DOUBLE;
+				type.typstorage = TYPSTORAGE_EXTENDED;
+				type.typtypmod = -1;
+				provider_add(&rows, TypeRelationId, &type, sizeof(type), Anum_pg_type_typcollation);
+				provider_dependency(&rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
+				namestrcpy(&array.typname, arrayname);
+				array.typnamespace = type.typnamespace;
+				array.typowner = type.typowner;
+				array.typlen = -1;
+				array.typtype = TYPTYPE_BASE;
+				array.typcategory = TYPCATEGORY_ARRAY;
+				array.typisdefined = true;
+				array.typdelim = ',';
+				array.typelem = type.oid;
+				array.typinput = F_ARRAY_IN;
+				array.typoutput = F_ARRAY_OUT;
+				array.typreceive = F_ARRAY_RECV;
+				array.typsend = F_ARRAY_SEND;
+				array.typanalyze = F_ARRAY_TYPANALYZE;
+				array.typsubscript = F_ARRAY_SUBSCRIPT_HANDLER;
+				array.typalign = TYPALIGN_DOUBLE;
+				array.typstorage = TYPSTORAGE_EXTENDED;
+				array.typtypmod = -1;
+				provider_add(&rows, TypeRelationId, &array, sizeof(array), Anum_pg_type_typcollation);
+				provider_dependency(&rows, TypeRelationId, array.oid, 0, TypeRelationId, type.oid, 0, DEPENDENCY_INTERNAL);
+
+				for (attno = -1; attno > FirstLowInvalidHeapAttributeNumber; attno--)
+				{
+					FormData_pg_attribute attr = *SystemAttributeDefinition(attno);
+
+					attr.attrelid = form.oid;
+					provider_add(&rows, AttributeRelationId, &attr, sizeof(attr), Anum_pg_attribute_attcollation);
+				}
+			}
+			run("SELECT ord::int,v->>'comment' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'comment' IS NOT NULL", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+			for (j = 0; j < SPI_processed; j++)
+				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
+		}
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+		{
+			provider_defaults(&rows, view, definitions[i]);
+			provider_constraints(&rows, view, definitions[i], n, definitions, kinds);
+		}
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "index"))
+			provider_index(&rows, view, definitions[i], n, definitions, kinds);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "routine"))
+			provider_routine(&rows, view, definitions[i]);
+	provider_role_dependencies(&rows);
+	for (i = 0; i < lengthof(provider_catalogs); i++)
+	{
+		CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);
+		table_close(rows.relations[i], AccessShareLock);
+	}
+	CatalogViewSeal(view);
+}
+
+static void
+provider_reload(CatalogView *view, void *arg)
+{
+	DGProvider *entry = arg;
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+	CatalogView *previous = CatalogViewSwitch(NULL);
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext scratch = AllocSetContextCreate(caller, "catalog reload", ALLOCSET_DEFAULT_SIZES);
+
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		bytea	   *database;
+
+		MemoryContextSwitchTo(scratch);
+		if (!ActiveSnapshotSet())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed = true;
+		}
+		nest = begin_api();
+		database = unhex(entry->database);
+		(void) metadata(database, "database");
+		provider_populate(view, database);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		if (pushed)
+			PopActiveSnapshot();
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(scratch);
+		SetUserIdAndSecContext(user, security);
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+}
+
+static TransactionId
+provider_creator(bytea *database)
+{
+	TransactionId creator = InvalidTransactionId;
+
+	run("SELECT xmin FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind='database'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	if (!SPI_processed)
+		elog(ERROR, "canonical catalog root disappeared");
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		TransactionId xid = DatumGetTransactionId(cell(i, 1));
+
+		if (!TransactionIdIsCurrentTransactionId(xid))
+			return InvalidTransactionId;
+		creator = xid;
+	}
+	return creator;
+}
+
+static CatalogView *
+provider_view(bytea *database)
+{
+	char	   *key = hex(database);
+	DGProvider *entry;
+	CatalogView *view;
+
 	/*
-	 * Validate visibility even on a cache hit; aborted objects cannot survive
-	 * via a backend cache. The canonical root is immutable once visible.
+	 * Visibility is required even on a cache hit: an aborted object must not
+	 * survive through a backend cache.
 	 */
 	(void) metadata(database, "database");
 	for (entry = providers; entry; entry = entry->next)
+	{
 		if (!strcmp(entry->database, key))
+		{
+			if (CatalogViewCreatorAborted(entry->view))
+				CatalogViewSetCreator(entry->view, provider_creator(database));
+			CatalogViewEnsureLoaded(entry->view);
 			return entry->view;
+		}
+	}
 	view = CatalogViewCreate(key);
 	PG_TRY();
 	{
-		for (i = 0; i < lengthof(provider_catalogs); i++)
-		{
-			TableScanDesc scan;
-			HeapTuple	tuple;
-
-			rows.relations[i] = table_open(provider_catalogs[i], AccessShareLock);
-			scan = table_beginscan_catalog(rows.relations[i], 0, NULL);
-			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
-				if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rows.relations[i])))
-					rows.rows[i] = lappend(rows.rows[i], heap_copytuple(tuple));
-			table_endscan(scan);
-		}
-		run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-		n = SPI_processed;
-		addresses = palloc_array(bytea *, Max(n, 1));
-		kinds = palloc_array(char *, Max(n, 1));
-		definitions = palloc_array(char *, Max(n, 1));
-		for (i = 0; i < n; i++)
-		{
-			addresses[i] = DatumGetByteaPCopy(cell(i, 1));
-			kinds[i] = strcell(i, 2);
-		}
-		for (i = 0; i < n; i++)
-		{
-			if (!strcmp(kinds[i], "namespace"))
-				definitions[i] = metadata(addresses[i], "namespace");
-			else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
-				definitions[i] = metadata(child(addresses[i], 1), "schema");
-			else
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
-		}
-		for (i = 0; i < n; i++)
-			if (!strcmp(kinds[i], "namespace"))
-			{
-				FormData_pg_namespace form = {0};
-				int			slot = provider_catalog_index(NamespaceRelationId);
-				char	   *name = json_value(definitions[i], "name");
-				char	   *owner = json_value(definitions[i], "owner");
-				HeapTuple	tuple;
-
-				form.oid = CatalogViewBindObject(view, NamespaceRelationId, name, InvalidOid);
-				namestrcpy(&form.nspname, name);
-				form.nspowner = get_role_oid(owner, false);
-				tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_namespace_nspowner);
-				tuple = provider_set(rows.relations[slot], tuple, Anum_pg_namespace_nspacl, PointerGetDatum(provider_acl(definitions[i])));
-				rows.rows[slot] = lappend(rows.rows[slot], tuple);
-				provider_description(&rows, form.oid, NamespaceRelationId, 0, json_value(definitions[i], "comment"));
-			}
-		/* Bind all class identities before resolving cross-object edges. */
-		for (i = 0; i < n; i++)
-			if (strcmp(kinds[i], "namespace"))
-				(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
-		for (i = 0; i < n; i++)
-			if (strcmp(kinds[i], "namespace"))
-			{
-				const char *definition = definitions[i];
-				char	   *name = json_value(definition, "name");
-				char	   *owner = json_value(definition, "owner");
-				List	   *parts = stringToQualifiedNameList(name, NULL);
-				FormData_pg_class form = {0};
-				TupleDesc	desc = provider_columns(definition);
-				bool		index = !strcmp(kinds[i], "index");
-				HeapTuple	tuple;
-				int			slot = provider_catalog_index(RelationRelationId);
-
-				if (list_length(parts) != 2)
-					elog(ERROR, "canonical relation name is not qualified");
-				form.oid = CatalogViewBindObject(view, RelationRelationId, name, InvalidOid);
-				form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
-				namestrcpy(&form.relname, strVal(lsecond(parts)));
-				form.relowner = get_role_oid(owner, false);
-				form.reltype = index ? InvalidOid : CatalogViewBindObject(view, TypeRelationId, name, InvalidOid);
-				form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
-				form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
-				form.relpersistence = RELPERSISTENCE_PERMANENT;
-				form.relnatts = desc->natts;
-				form.reltuples = -1;
-				form.relispopulated = true;
-				form.relreplident = REPLICA_IDENTITY_DEFAULT;
-				run("SELECT jsonb_array_length(COALESCE($1::jsonb->'indexes','[]'::jsonb))>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-				form.relhasindex = DatumGetBool(cell(0, 1));
-				tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_class_relminmxid);
-				tuple = provider_set(rows.relations[slot], tuple, Anum_pg_class_relacl, PointerGetDatum(provider_acl(definition)));
-				rows.rows[slot] = lappend(rows.rows[slot], tuple);
-				provider_description(&rows, form.oid, RelationRelationId, 0, json_value(definition, "comment"));
-				provider_dependency(&rows, RelationRelationId, form.oid, 0, NamespaceRelationId, form.relnamespace, 0, DEPENDENCY_NORMAL);
-				for (j = 0; j < desc->natts; j++)
-				{
-					Form_pg_attribute attr = TupleDescAttr(desc, j);
-
-					attr->attrelid = form.oid;
-					provider_add(&rows, AttributeRelationId, attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
-					provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
-				}
-				if (!index)
-				{
-					FormData_pg_type type = {0};
-					int			attno;
-
-					type.oid = form.reltype;
-					type.typname = form.relname;
-					type.typnamespace = form.relnamespace;
-					type.typowner = form.relowner;
-					type.typlen = -1;
-					type.typtype = TYPTYPE_COMPOSITE;
-					type.typcategory = TYPCATEGORY_COMPOSITE;
-					type.typisdefined = true;
-					type.typdelim = ',';
-					type.typrelid = form.oid;
-					type.typinput = F_RECORD_IN;
-					type.typoutput = F_RECORD_OUT;
-					type.typreceive = F_RECORD_RECV;
-					type.typsend = F_RECORD_SEND;
-					type.typalign = TYPALIGN_DOUBLE;
-					type.typstorage = TYPSTORAGE_EXTENDED;
-					type.typtypmod = -1;
-					provider_add(&rows, TypeRelationId, &type, sizeof(type), Anum_pg_type_typcollation);
-					provider_dependency(&rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
-					for (attno = -1; attno > FirstLowInvalidHeapAttributeNumber; attno--)
-					{
-						FormData_pg_attribute attr = *SystemAttributeDefinition(attno);
-
-						attr.attrelid = form.oid;
-						provider_add(&rows, AttributeRelationId, &attr, sizeof(attr), Anum_pg_attribute_attcollation);
-					}
-				}
-				run("SELECT ord::int,v->>'comment' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'comment' IS NOT NULL", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-				for (j = 0; j < SPI_processed; j++)
-					provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
-			}
-		for (i = 0; i < n; i++)
-			if (!strcmp(kinds[i], "table"))
-				provider_constraints(&rows, view, definitions[i]);
-		for (i = 0; i < n; i++)
-			if (!strcmp(kinds[i], "index"))
-				provider_index(&rows, view, definitions[i], n, definitions, kinds);
-		for (i = 0; i < lengthof(provider_catalogs); i++)
-		{
-			CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);
-			table_close(rows.relations[i], AccessShareLock);
-		}
-		CatalogViewSeal(view);
+		CatalogViewSetCreator(view, provider_creator(database));
+		provider_populate(view, database);
 	}
 	PG_CATCH();
 	{
@@ -592,6 +909,7 @@ provider_view(bytea *database)
 	entry->view = view;
 	entry->next = providers;
 	providers = entry;
+	CatalogViewSetLoader(view, provider_reload, entry);
 	return view;
 }
 

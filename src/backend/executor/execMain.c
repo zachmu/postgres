@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 #include "access/doltcatalog.h"
+#include "access/doltbranch.h"
 
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -1347,7 +1348,7 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
  * in es_trig_target_relations.
  */
 ResultRelInfo *
-ExecGetTriggerResultRel(EState *estate, Oid relid,
+ExecGetTriggerResultRel(EState *estate, Oid relid, const char *branch,
 						ResultRelInfo *rootRelInfo)
 {
 	ResultRelInfo *rInfo;
@@ -1368,7 +1369,8 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	{
 		rInfo = lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo)
+			rInfo->ri_RootResultRelInfo == rootRelInfo &&
+			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
 			return rInfo;
 	}
 
@@ -1380,7 +1382,8 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo)
+			rInfo->ri_RootResultRelInfo == rootRelInfo &&
+			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
 			return rInfo;
 	}
 
@@ -1389,7 +1392,8 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
 		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
-			rInfo->ri_RootResultRelInfo == rootRelInfo)
+			rInfo->ri_RootResultRelInfo == rootRelInfo &&
+			(!branch || !strcmp(dg_relation_branch(rInfo->ri_RelationDesc), branch)))
 			return rInfo;
 	}
 	/* Nope, so we need a new one */
@@ -1400,7 +1404,7 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	 * event got queued, so we need take no new lock here.  Also, we need not
 	 * recheck the relkind, so no need for CheckValidResultRel.
 	 */
-	rel = table_open(relid, NoLock);
+	rel = branch ? dg_catalog_trigger_relation(relid, branch) : table_open(relid, NoLock);
 
 	/*
 	 * Make the new entry in the right context.
@@ -1629,7 +1633,10 @@ ExecCloseResultRelations(EState *estate)
 		 */
 		Assert(resultRelInfo->ri_NumIndices == 0);
 
-		table_close(resultRelInfo->ri_RelationDesc, NoLock);
+		if (resultRelInfo->ri_RelationDesc->rd_refparent)
+			dg_storage_close_relation(resultRelInfo->ri_RelationDesc);
+		else
+			table_close(resultRelInfo->ri_RelationDesc, NoLock);
 	}
 }
 
@@ -1647,7 +1654,7 @@ ExecCloseRangeTableRelations(EState *estate)
 	{
 		if (estate->es_relations[i])
 		{
-			if (estate->es_relations[i]->rd_catalogview)
+			if (estate->es_relations[i]->rd_refparent)
 				dg_storage_close_relation(estate->es_relations[i]);
 			else
 				table_close(estate->es_relations[i], NoLock);

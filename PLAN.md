@@ -21,6 +21,13 @@ for future detailed planning work.
 - [Database manifest and version-control publication](MANIFEST-PLAN.md) —
   heap-backed refs, immutable database states, transaction visibility and an
   early version-control slice coordinated with the row-level publication design.
+- [Chunk store](CHUNK-STORE-PLAN.md) — a database-wide store of prolly nodes
+  keyed by node hash: a heap catalog with a unique btree, native access and a
+  node cache. AMs keep only runtime state. Also records the packed-journal
+  alternative and milestones.
+- [Prolly write performance](WRITE-PERF-PLAN.md) — measured insert costs, root
+  causes and a four-step plan (chunk cache, packed appends, statement-level
+  deferred flush, batched inserts). Deferred until the chunk index is designed.
 
 ### Planning record — 2026-10-22
 
@@ -879,3 +886,93 @@ The native catalog-view infrastructure is on an unmerged feature branch; its
 fixtures do not establish production catalog/DDL completeness. The preserved
 same-name Doltgres suite still fails. See also the updated
 [runtime identity contract](CATALOG-RUNTIME-BINDING-PLAN.md#current-runtime-contract--2026-10-22).
+
+### Branch-aware catalog completion direction (2026-10-23)
+
+The five catalog milestones through 3717fc07817 establish execution context,
+canonical routines, native dependency traversal, a native tuple proposal boundary,
+and decoded-view reclamation/recovery validation. They are architectural gates,
+not complete PostgreSQL catalog or DDL coverage. See
+[CATALOG-DDL-PLAN.md](CATALOG-DDL-PLAN.md) and the implementation notes under
+`doc/doltgres/catalog-*.md` for the bounded coverage and remaining restrictions.
+
+Remaining work is: (1) codecs and provider integration for additional schema
+objects and stored expressions; (2) general provisional catalog mutation state for
+native multi-pass DDL; (3) dependency/permission coverage including shared objects;
+(4) consumer audits and broader compatibility tests; (5) parallel context transport,
+further session-memory reclamation and persistent garbage collection; (6) prolonged
+concurrency, cancellation, savepoint and recovery tests, including investigation
+of the isolated nested-DDL timeout recorded in the lifecycle report. Row-level data
+write concurrency remains a related, separate storage workstream.
+
+Prioritize provisional catalog state next. Reuse native DDL validation and ordering
+against branch-local tuples, with command-visible intermediate definitions and
+one atomic schema/data/dependency publication. Do not extend this by accumulating
+independent SQL-command rewrites. User authorization includes broad core changes
+and broad native/Doltgres tests; unsupported paths must remain explicit rather
+than silently accessing a physical user definition.
+
+### Provisional catalog implementation checkpoint (2026-10-23)
+
+The provisional mutation infrastructure is implemented: native catalog tuple
+insert/update/delete staging, command-counter visibility, local cache refresh,
+savepoint rollback and immutable-reader isolation. Native multi-pass ALTER now
+uses this infrastructure, including column layout changes, scalar defaults/CHECKs
+and non-indexed ALTER TYPE USING. An optional table-AM rewrite callback lets the
+native executor produce private replacement rows without physical heap swaps.
+Canonical schema and matching data/index roots publish in the same PostgreSQL
+transaction. Independent branches can rewrite concurrently.
+
+This completes the common staging/rewrite mechanism, not all catalog codecs or
+DDL operations. The next integration boundary is index lifecycle publication
+(creation/deletion/replacement), followed by foreign keys, sequences/identity,
+generated expressions and additional schema object families. Existing CREATE/DROP
+adapters remain; they have not all been replaced by the provisional controller.
+Shared-role lifetime, worker transport, handle reclamation, history GC and row-level
+writer concurrency remain as listed above. See
+[implementation and limitations](doc/doltgres/catalog-native-mutation.md).
+
+### Dolt function integration decisions (2026-10-23)
+
+Follow func-review.txt: restore canonical schemas/dependencies with matching
+data/index roots; branch creation must replace working state, and deletion must
+invalidate it. Do not introduce branch incarnation identifiers for this repair.
+User SQL in helpers must re-enter branch-aware binding. Reserve relation and
+namespace names beginning with `dolt` for internal use. Documents, stored tests
+and saved queries belong in ordinary versioned prolly tables, not pg_catalog
+heap tables. Fix native catalog sanity invariants. Explicitly deferred defects
+are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Active-session deletion/write
+coordination may be deferred if necessary, but branch recreation must not retain
+old working roots.
+
+Integration implementation: canonical restore now publishes definitions and
+matching data/index roots together; hard reset restores dropped objects and
+whole-database dependencies. Branch create/copy overwrite working state and
+install fresh starting roots while reusing storage resources. This is currently
+O(tables + indexes), with chunk import, rather than manifest-only publication.
+Session locks deny ordinary deletion of an attached branch; forced-deletion
+old-snapshot/recreation authority remains deferred in KNOWN-ISSUES.md.
+Docs, stored tests and saved queries are public prolly tables reached through
+built-in aliases. The six administrative heap tables now use native catalog
+headers, C-collated text indexes and valid pg_proc argument metadata.
+
+### Storage write performance and chunk indexing (2026-10-24)
+
+Loading the PostgreSQL regression suite's setup data into prolly tables takes
+about an hour, because every insert re-reads the relation's entire chunk history.
+Measurements, root causes and the agreed four-step fix are in
+[WRITE-PERF-PLAN.md](WRITE-PERF-PLAN.md). That work is paused. Its first step, a
+chunk cache, depends on a decision made since: chunks must be locatable by hash,
+across all relations and history, through an index serialized to disk, with no
+startup scan and with a cache shared across sessions. Chunk storage and indexing
+(branch `zachmu/chunk-index`, [CHUNK-STORE-PLAN.md](CHUNK-STORE-PLAN.md)) is
+the next focus. The selected design is a heap catalog `pg_dolt_chunk` with a
+unique btree on the node hash, with data inline and never TOASTed. It uses direct
+heap and index access and a per-backend node cache. A custom packed journal with
+sorted index runs is the recorded alternative. Microbenchmarks (2026-10-25)
+were good enough to build on provisionally, provided every consumer uses a
+standard store interface that allows replacing the implementation. The
+statement-level deferred flush follows AM integration directly. It will also address the
+redundancies found in the `pg_dolt*` catalog audit: chunks copied into
+`pg_dolt_object`, two hash namespaces, and three diverging records of a branch's
+working state.

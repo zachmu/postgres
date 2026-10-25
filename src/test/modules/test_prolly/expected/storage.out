@@ -129,7 +129,8 @@ SELECT * FROM u ORDER BY id;
 (2 rows)
 
 INSERT INTO u VALUES(9223372036854775807,1);
-ERROR:  duplicate key violates unique constraint "u_pkey"
+ERROR:  duplicate key value violates unique constraint "u_pkey"
+DETAIL:  Key (id)=(9223372036854775807) already exists.
 SELECT count(*) FROM u;
  count 
 -------
@@ -177,7 +178,6 @@ CREATE INDEX bad_operators ON p(id misleading_ops);
 ERROR:  prolly phase 2 does not support custom index operators
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
 ALTER TABLE p ALTER COLUMN id TYPE text;
-ERROR:  prolly phase 2 does not support ALTER TABLE (schema versioning is not implemented)
 CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
 ERROR:  prolly storage rejects type gtsvector
 DETAIL:  Only codecs verified to exclude non-portable identifiers are supported.
@@ -185,5 +185,11 @@ HINT:  OID and other local identifier translation is not implemented.
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
 ERROR:  prolly phase 2 does not support non-MVCC snapshots
 SELECT * FROM p FOR UPDATE;
-ERROR:  prolly phase 2 does not support row locking
+ id |  value  | flag | payload 
+----+---------+------+---------
+  2 | two     |      | 
+  2 | two     |      | 
+  3 | changed | t    | \x00ff
+(3 rows)
+
 DROP TABLE p,q,u,large_text;

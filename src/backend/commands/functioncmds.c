@@ -31,6 +31,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -1066,6 +1067,8 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	/* Convert list of names to a name and namespace */
 	namespaceId = QualifiedNameGetCreationNamespace(stmt->funcname,
 													&funcname);
+
+	namespaceId = dg_catalog_routine_namespace(namespaceId);
 
 	/* Check we have creation rights in target namespace */
 	aclresult = object_aclcheck(NamespaceRelationId, namespaceId, GetUserId(), ACL_CREATE);

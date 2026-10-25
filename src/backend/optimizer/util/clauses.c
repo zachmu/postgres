@@ -836,6 +836,8 @@ max_parallel_hazard_test(char proparallel, max_parallel_hazard_context *context)
 static bool
 max_parallel_hazard_checker(Oid func_id, void *context)
 {
+	if (CatalogViewObjectContext(func_id))
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 	return max_parallel_hazard_test(func_parallel(func_id),
 									(max_parallel_hazard_context *) context);
 }
@@ -845,6 +847,47 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 {
 	if (node == NULL)
 		return false;
+
+	/*
+	 * Runtime handles are backend-local. Until workers can import a context
+	 * with a coordinated handle map, execute these plans in the leader.
+	 */
+	if (CatalogViewCurrent())
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+	switch (nodeTag(node))
+	{
+		case T_Var:
+		case T_Const:
+		case T_Param:
+		case T_FuncExpr:
+		case T_RowExpr:
+		case T_ArrayExpr:
+		case T_RelabelType:
+		case T_CoerceViaIO:
+		case T_ArrayCoerceExpr:
+
+			/*
+			 * An OID-producing cast/expression can reveal a runtime handle
+			 * only after constant folding. Do not ship it based on its input
+			 * type before folding. Literal shared OIDs remain safe.
+			 */
+			if (CatalogViewObjectContext(exprType(node)) ||
+				(!IsA(node, Const) && CatalogViewIsObjectIdType(exprType(node))))
+				return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+			break;
+		default:
+			break;
+	}
+	if (IsA(node, Const))
+	{
+		Const	   *value = (Const *) node;
+
+		if (!value->constisnull && CatalogViewIsObjectIdType(value->consttype) &&
+			CatalogViewObjectContext(DatumGetObjectId(value->constvalue)))
+			return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+	}
+	if (IsA(node, Param) && CatalogViewIsObjectIdType(((Param *) node)->paramtype))
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 
 	/* Check for hazardous functions in node itself */
 	if (check_functions_in_node(node, max_parallel_hazard_checker,
@@ -967,6 +1010,16 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 	else if (IsA(node, Query))
 	{
 		Query	   *query = (Query *) node;
+
+		ListCell   *lc;
+
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+			if (rte->dolt_database || CatalogViewObjectContext(rte->relid))
+				return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
+		}
 
 		/* SELECT FOR UPDATE/SHARE must be treated as unsafe */
 		if (query->rowMarks != NULL)
@@ -2641,6 +2694,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->funcresulttype = expr->funcresulttype;
 				newexpr->funcretset = expr->funcretset;
 				newexpr->funcvariadic = expr->funcvariadic;
+				newexpr->dolt_working = expr->dolt_working;
 				newexpr->funcformat = expr->funcformat;
 				newexpr->funccollid = expr->funccollid;
 				newexpr->inputcollid = expr->inputcollid;
@@ -4130,6 +4184,13 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		*args_p = args;
 	}
 
+	/* Preserve canonical call identity and working/immutable execution scope. */
+	if (CatalogViewObjectContext(funcid))
+	{
+		ReleaseSysCache(func_tuple);
+		return NULL;
+	}
+
 	/* Now attempt simplification of the function call proper. */
 
 	newexpr = evaluate_function(funcid, result_type, result_typmod,
@@ -4154,6 +4215,7 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		fexpr.funcresulttype = result_type;
 		fexpr.funcretset = func_form->proretset;
 		fexpr.funcvariadic = funcvariadic;
+		fexpr.dolt_working = false;
 		fexpr.funcformat = COERCE_EXPLICIT_CALL;
 		fexpr.funccollid = result_collid;
 		fexpr.inputcollid = input_collid;
@@ -4622,7 +4684,8 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * Forget it if the function is not SQL-language or has other showstopper
 	 * properties.  (The prokind and nargs checks are just paranoia.)
 	 */
-	if (funcform->prolang != SQLlanguageId ||
+	if (CatalogViewObjectContext(funcid) ||
+		funcform->prolang != SQLlanguageId ||
 		funcform->prokind != PROKIND_FUNCTION ||
 		funcform->prosecdef ||
 		funcform->proretset ||
@@ -5167,6 +5230,8 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	fexpr = (FuncExpr *) rtfunc->funcexpr;
 
 	func_oid = fexpr->funcid;
+	if (CatalogViewObjectContext(func_oid))
+		return NULL;
 
 	/*
 	 * The function must be declared to return a set, else inlining would

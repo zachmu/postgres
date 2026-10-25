@@ -1,11 +1,11 @@
 /* Branch-local metadata revisions and eager tuple-layout rewrites. */
 static PLTree
-alter_rows(DGState *state, int oldcount, int dropped)
+alter_rows(DGState *state, int oldcount, int count, int *mapping)
 {
 	DGRows		rows = dg_rows(&state->content);
 	PLEntry    *entries = palloc_array(PLEntry, Max(rows.count, 1));
 	size_t		used = 0;
-	int			count = oldcount + (dropped < 0 ? 1 : -1);
+
 
 	for (size_t i = 0; i < rows.count; i++)
 	{
@@ -16,11 +16,10 @@ alter_rows(DGState *state, int oldcount, int dropped)
 				   *key;
 		size_t		length;
 		PLHash		hash;
-		int			out = 0;
 
-		for (int j = 0; j < oldcount; j++)
-			if (j != dropped)
-				dg_check(pl_tuple_get(row, j, &fields[out++]));
+		for (int j = 0; j < count; j++)
+			if (mapping[j] < oldcount)
+				dg_check(pl_tuple_get(row, mapping[j], &fields[j]));
 		dg_check(pl_tuple_pack(fields, count, &packed, &length));
 		hash = dg_rowhash(DG_SLICE(packed, length));
 		key = palloc(PL_HASH_SIZE);
@@ -56,6 +55,8 @@ alter_rows(DGState *state, int oldcount, int dropped)
 		return result;
 	}
 }
+
+#include "dg_native_mutation.inc"
 
 /* Replace one descriptor, preserving every unrelated canonical member. */
 static bytea *
@@ -140,19 +141,38 @@ dg_catalog_alter(Node *statement)
 
 	if (rangevar_projection_hook || catalog_api_depth)
 		return false;
+	if (IsA(statement, IndexStmt) && dg_catalog_active())
+	{
+		IndexStmt  *index = copyObject((IndexStmt *) statement);
+		AlterTableStmt *alter = makeNode(AlterTableStmt);
+		AlterTableCmd *action = makeNode(AlterTableCmd);
+
+		alter->relation = index->relation;
+		alter->objtype = OBJECT_TABLE;
+		action->subtype = AT_AddIndex;
+		action->def = (Node *) index;
+		alter->cmds = list_make1(action);
+		statement = (Node *) alter;
+	}
 	if (!IsA(statement, AlterTableStmt) && !IsA(statement, CommentStmt))
 		return false;
-	if (!dg_catalog_active() && (!IsA(statement, AlterTableStmt) || ((AlterTableStmt *) statement)->objtype != OBJECT_TABLE || list_length(((AlterTableStmt *) statement)->cmds) != 1))
+	if (!dg_catalog_active() && (!IsA(statement, AlterTableStmt) || ((AlterTableStmt *) statement)->objtype != OBJECT_TABLE))
 		return false;
 	if (IsA(statement, AlterTableStmt))
 	{
 		AlterTableStmt *stmt = (AlterTableStmt *) statement;
 
-		if (stmt->objtype != OBJECT_TABLE || list_length(stmt->cmds) != 1)
-			unsupported("canonical ALTER requires one table action");
-		cmd = linitial_node(AlterTableCmd, stmt->cmds);
-		if (cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
+
+		if (stmt->objtype != OBJECT_TABLE)
 			return false;
+		cmd = linitial_node(AlterTableCmd, stmt->cmds);
+		/* Preserve native bootstrap/restore of primary and unique indexes. */
+		if (!dg_catalog_active() && cmd->subtype == AT_AddConstraint &&
+			castNode(Constraint, cmd->def)->contype != CONSTR_CHECK &&
+			castNode(Constraint, cmd->def)->contype != CONSTR_NOTNULL)
+			return false;
+
+
 		if (!dg_catalog_active())
 		{
 			Oid			nativeid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
@@ -167,7 +187,25 @@ dg_catalog_alter(Node *statement)
 			if (!prolly)
 				return false;
 		}
-		if (cmd->behavior != DROP_RESTRICT)
+		if (native_alter_action(cmd->subtype))
+		{
+			ListCell   *lc;
+
+			foreach(lc, stmt->cmds)
+			{
+				AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
+
+				if (!native_alter_action(action->subtype))
+					unsupported("native ALTER action lacks a portable catalog codec");
+
+			}
+		}
+		else if (list_length(stmt->cmds) != 1)
+			unsupported("canonical layout ALTER requires one action");
+		if (!native_alter_action(cmd->subtype) && cmd->subtype != AT_AddColumn && cmd->subtype != AT_DropColumn)
+			return false;
+
+		if (cmd->behavior != DROP_RESTRICT && cmd->subtype != AT_DropColumn)
 			unsupported("canonical column DROP CASCADE");
 		rv = stmt->relation;
 		missing = stmt->missing_ok;
@@ -225,23 +263,18 @@ dg_catalog_alter(Node *statement)
 	{
 		VersionRef	working;
 		Capture		current;
-		Relation	source,
-					target;
+		Relation	source;
 		DGState    *state;
 		bytea	   *descriptor,
 				   *schema,
 				   *content,
 				   *member,
-				   *database,
-				   *raw;
+				   *database;
 		char	   *json,
 				   *payload;
 		Oid			resource;
 		int			att = -1,
 					oldcount = RelationGetDescr(definition)->natts;
-		bool		rewrite = cmd != NULL,
-					skip = false;
-		PLTree		tree;
 
 		nest = begin_api();
 		run("SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D'", 0, NULL, NULL, NULL, true);
@@ -252,112 +285,48 @@ dg_catalog_alter(Node *statement)
 			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical ALTER target changed; retry statement")));
 		resource = source->rd_lockInfo.lockRelId.relId;
 		state = dg_load(source, SnapshotSelf);
-		tree = state->content;
-		if (cmd && cmd->subtype == AT_DropColumn)
-			column = cmd->name;
-		if (column || (cmd && cmd->subtype == AT_AddColumn))
+		if (column)
 		{
-			const char *wanted = column ? column : ((ColumnDef *) cmd->def)->colname;
-
 			for (int i = 0; i < oldcount; i++)
-				if (!strcmp(wanted, NameStr(TupleDescAttr(RelationGetDescr(source), i)->attname)))
+				if (!strcmp(column, NameStr(TupleDescAttr(RelationGetDescr(source), i)->attname)))
 					att = i;
-			if (column && att < 0)
-			{
-				if (cmd && cmd->missing_ok)
-					skip = true;
-				else
-					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_COLUMN), errmsg("column \"%s\" does not exist", wanted)));
-			}
-			if (!column && att >= 0)
-			{
-				if (cmd->missing_ok)
-					skip = true;
-				else
-					ereport(ERROR, (errcode(ERRCODE_DUPLICATE_COLUMN), errmsg("column \"%s\" already exists", wanted)));
-			}
-		}
-		if (cmd && cmd->subtype == AT_DropColumn && !skip)
-		{
-			ListCell   *lc;
-
-			foreach(lc, dg_storage_indexes(source))
-			{
-				Relation	index = lfirst(lc);
-
-				for (int i = 0; i < index->rd_index->indnatts; i++)
-					if (index->rd_index->indkey.values[i] == att + 1)
-						unsupported("dropping an indexed column");
-			}
+			if (att < 0)
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_COLUMN), errmsg("column \"%s\" does not exist", column)));
 		}
 		dg_storage_close_relation(source);
 		working = read_ref(branch_ref("working"));
 		current = capture(true);
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed != 1)
-			elog(ERROR, "canonical ALTER member missing");
-		descriptor = DatumGetByteaPCopy(cell(0, 1));
-		json = metadata(child(descriptor, 1), "schema");
-		if (!skip)
+		if (cmd && native_alter_action(cmd->subtype))
 		{
-			if (comment)
+			native_alter_publish(current, working, name, (AlterTableStmt *) statement, state, oldcount, user);
+			dg_release(state);
+			end_api(nest);
+		}
+		else
+		{
+			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
+			if (SPI_processed != 1)
+				elog(ERROR, "canonical ALTER member missing");
+			descriptor = DatumGetByteaPCopy(cell(0, 1));
+			json = metadata(child(descriptor, 1), "schema");
 			{
 				char	   *path = column ? psprintf("{columns,%d,comment}", att) : "{comment}";
 
 				run("SELECT jsonb_set($1::jsonb,$2::text[],coalesce(to_jsonb($3::text),'null'::jsonb))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(path), comment->comment ? CStringGetTextDatum(comment->comment) : (Datum) 0), comment->comment ? NULL : "  n", true);
 				json = strcell(0, 1);
 			}
-			else if (cmd->subtype == AT_AddColumn)
-			{
-				ColumnDef  *col = (ColumnDef *) cmd->def;
-				TupleDesc	desc;
-				Form_pg_attribute a;
-				char	   *added;
-
-				if (col->constraints || col->raw_default || col->cooked_default || col->identity || col->generated || col->collClause || col->storage || col->compression)
-					unsupported("canonical ADD COLUMN requires a plain nullable column");
-				if (oldcount >= MaxHeapAttributeNumber)
-					ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS), errmsg("tables can have at most %d columns", MaxHeapAttributeNumber)));
-				desc = BuildDescForRelation(list_make1(col));
-				dg_validate_descriptor(desc);
-				a = TupleDescAttr(desc, 0);
-				run("SELECT jsonb_build_object('name',$1::text,'comment',NULL,'type',t.typname,'typmod',$3::int,'notnull',false,'collation',CASE WHEN $4::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$4) END)::text FROM pg_type t WHERE t.oid=$2 AND t.typnamespace='pg_catalog'::regnamespace", 4, VC_TYPES(TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(col->colname), ObjectIdGetDatum(a->atttypid), Int32GetDatum(a->atttypmod), ObjectIdGetDatum(a->attcollation)), NULL, true);
-				if (SPI_processed != 1)
-					unsupported("canonical ADD COLUMN user-defined types");
-				added = strcell(0, 1);
-				run("SELECT jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')||jsonb_build_array($2::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(added)), NULL, true);
-				json = strcell(0, 1);
-				tree = alter_rows(state, oldcount, -1);
-			}
-			else
-			{
-				run("SELECT jsonb_set(jsonb_set($1::jsonb,'{columns}',($1::jsonb->'columns')-$2),'{constraints}',coalesce((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1<>$3),'[]'::jsonb))::text", 3, VC_TYPES(TEXTOID, INT4OID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), Int32GetDatum(att), CStringGetTextDatum(psprintf("NOT NULL %s", quote_identifier(column)))), NULL, true);
-				json = strcell(0, 1);
-				tree = alter_rows(state, oldcount, att);
-			}
 			schema = put("schema", json, NULL, 0);
-			content = dg_history_export_tree(&tree);
+			content = child(descriptor, 2);
 			payload = metadata(descriptor, "table");
-			raw = palloc(VARHDRSZ + PL_HASH_SIZE);
-			SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-			memcpy(VARDATA(raw), tree.root.bytes, PL_HASH_SIZE);
-			run("SELECT jsonb_set(jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex'))),'{content}',to_jsonb($3::text))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(json), CStringGetTextDatum(hex(raw))), NULL, true);
+			run("SELECT jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex')))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(json)), NULL, true);
 			member = put("table", strcell(0, 1), VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
 			database = alter_database(current, name, member);
 			binding_record(dg_current_branch(), name, schema, resource);
 			move_ref(branch_ref("working"), working, database);
 			advance_snapshot();
-			if (rewrite)
-			{
-				target = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
-				dg_history_install(target, state, tree);
-				dg_storage_close_relation(target);
-				UpdateActiveSnapshotCommandId();
-				move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
-			}
+			dg_release(state);
+			end_api(nest);
 		}
-		dg_release(state);
-		end_api(nest);
 	}
 	PG_FINALLY();
 	{

@@ -232,24 +232,33 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource properties do not match canonical definition")));
 
 	/*
-	 * Imported resources retain a physical allocation bridge. Only validate its
-	 * locator and AM: canonical ALTER can legitimately change the tuple layout
-	 * on one branch without changing that old physical schema. Independently
-	 * allocated resources have no physical schema row.
+	 * Imported resources retain a physical allocation bridge. Only validate
+	 * its locator and AM: canonical ALTER can legitimately change the tuple
+	 * layout on one branch without changing that old physical schema.
+	 * Independently allocated resources have no physical schema row.
 	 */
 	if (form.storageimported)
 	{
-		Relation	source = try_relation_open(resource, NoLock);
-		RelFileLocator locator = {form.storagespc, form.storagedb, form.storagefile};
-		bool		compatible;
+		CatalogView *previous = CatalogViewSwitch(NULL);
 
-		if (!source)
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
-		/* The physical bridge validates the allocation, never the schema. */
-		compatible = RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
-		relation_close(source, NoLock);
-		if (!compatible)
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("imported resource allocation changed")));
+		PG_TRY();
+		{
+			Relation	source = try_relation_open(resource, NoLock);
+			RelFileLocator locator = {form.storagespc, form.storagedb, form.storagefile};
+			bool		compatible;
+
+			if (!source)
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
+			compatible = RelFileLocatorEquals(source->rd_locator, locator) && source->rd_rel->relam == form.storageam;
+			relation_close(source, NoLock);
+			if (!compatible)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("imported resource allocation changed")));
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(previous);
+		}
+		PG_END_TRY();
 	}
 
 	/*
@@ -259,6 +268,7 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	if (storage->definition->rd_rel->relhasindex)
 		list_free(RelationGetIndexList(storage->definition));
 	storage->relation = *storage->definition;
+	storage->relation.rd_refparent = storage->definition;
 	storage->form = *storage->definition->rd_rel;
 	storage->relation.rd_rel = &storage->form;
 	storage->relation.rd_smgr = NULL;
@@ -341,8 +351,13 @@ dg_storage_lock_working(const char *branch, Snapshot snapshot)
 	table_close(catalog, NoLock);
 }
 
+/*
+ * Lock a resource on one branch. Writers take RowExclusiveLock, which they
+ * share with each other because rows are locked individually; operations that
+ * replace the whole branch state, such as merge, take ExclusiveLock.
+ */
 void
-dg_storage_lock_branch(Oid resource, const char *branch)
+dg_storage_lock_branch(Oid resource, const char *branch, LOCKMODE mode)
 {
 	PLHash		hash;
 	PLSlice		bytes = {(const uint8 *) branch, strlen(branch)};
@@ -350,7 +365,7 @@ dg_storage_lock_branch(Oid resource, const char *branch)
 	if (!pl_hash_bytes(bytes, &hash))
 		elog(ERROR, "branch hash failed");
 	/* Hash collisions conservatively serialize unrelated branches. */
-	LockDatabaseObject(DoltBindingRelationId, resource, pl_read32(hash.bytes), ExclusiveLock);
+	LockDatabaseObject(DoltBindingRelationId, resource, pl_read32(hash.bytes), mode);
 }
 
 Relation
@@ -373,7 +388,7 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	 * OID.
 	 */
 	LockRelationId(&rel->rd_lockInfo.lockRelId, RowExclusiveLock);
-	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch);
+	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch, RowExclusiveLock);
 	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	catalog = table_open(DoltBindingRelationId, RowShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));

@@ -131,15 +131,16 @@ test_tree(void)
 	before = pl_store_stats(store);
 	OK(pl_apply(&branch, &edit, 1, &branch));
 	after = pl_store_stats(store);
-	CHECK(after.skipped > before.skipped + 20);
-	CHECK(after.chunks - before.chunks < 20);
+	/* One edit rewrites one root-to-leaf path and reuses every other subtree. */
+	CHECK(after.skipped > before.skipped);
+	CHECK(after.chunks - before.chunks < 8);
 	OK(pl_get(&tree, edit.key, &value));
 	CHECK(pl_compare(value.bytes, entries[2500].value) == 0);
 	entries[2500].value = slice("changed");
 	OK(pl_build(store, entries, 5000, &fresh));
 	CHECK(pl_hash_equal(fresh.root, branch.root));
 	OK(pl_validate(&branch));
-	printf("localized edit: %zu new chunks; %" PRIu64 " skipped leaves\n",
+	printf("localized edit: %zu new chunks; %" PRIu64 " reused subtrees\n",
 		   after.chunks - before.chunks, after.skipped - before.skipped);
 	free(keys);
 	free(entries);
@@ -378,6 +379,48 @@ test_random_history(void)
 	pl_store_free(store);
 }
 
+/* Retaining the current root frees the nodes earlier edits left behind. */
+static void
+test_retain(void)
+{
+	PLStore    *store = pl_store_create();
+	PLTree		tree,
+				rebuilt;
+	PLHash		root;
+	uint8_t		keys[2000][8];
+	uint8_t		value[16];
+	PLEntry    *entries = calloc(2000, sizeof(PLEntry));
+	size_t		before,
+				freed;
+
+	CHECK(store && entries);
+	CHECK(pl_build(store, NULL, 0, &tree) == PL_OK);
+	memset(value, 7, sizeof(value));
+	for (int i = 0; i < 2000; i++)
+	{
+		PLEdit		edit;
+
+		pl_key_int64(i, keys[i]);
+		edit.key = (PLSlice) {keys[i], 8};
+		edit.value.present = true;
+		edit.value.bytes = (PLSlice) {value, sizeof(value)};
+		CHECK(pl_apply(&tree, &edit, 1, &tree) == PL_OK);
+		entries[i].key = edit.key;
+		entries[i].value = edit.value.bytes;
+	}
+	before = pl_store_stats(store).chunks;
+	root = tree.root;
+	freed = pl_store_retain(store, &root, 1);
+	CHECK(freed > 0 && pl_store_stats(store).chunks == before - freed);
+	CHECK(pl_validate(&tree) == PL_OK && pl_count(&tree) == 2000);
+	CHECK(pl_build(store, entries, 2000, &rebuilt) == PL_OK && pl_hash_equal(rebuilt.root, tree.root));
+	CHECK(pl_store_retain(store, NULL, 0) == before - freed);
+	CHECK(pl_store_stats(store).chunks == 0 && pl_store_stats(store).bytes == 0);
+	printf("retain: freed %zu of %zu nodes\n", freed, before);
+	free(entries);
+	pl_store_free(store);
+}
+
 static void
 test_conflict_matrix(void)
 {
@@ -489,6 +532,213 @@ test_ranges_and_shifted_boundaries(void)
 	count = 0;
 	OK(pl_scan(&before, &entries[200].key, &entries[100].key, scan_count, &count));
 	CHECK(count == 0);
+	pl_store_free(store);
+}
+
+
+/* A store that loads missing nodes from another store, counting each load. */
+typedef struct FetchSource
+{
+	PLStore    *source;
+	unsigned	fetches;
+} FetchSource;
+
+static PLStatus
+fetch_from_source(void *arg, PLHash hash, PLSlice *bytes)
+{
+	FetchSource *fetch = arg;
+
+	fetch->fetches++;
+	return pl_store_export(fetch->source, hash, bytes);
+}
+
+/*
+ * Batched edits on deep trees: every result must equal a fresh build of the
+ * same entries, and a small edit on a fetch-backed store must load only a
+ * small part of the tree.
+ */
+static void
+test_apply_batches(void)
+{
+	enum
+	{
+	SLOTS = 20000, ROUNDS = 60};
+	PLStore    *store = pl_store_create();
+	uint8_t		(*keys)[8] = calloc(SLOTS, 8);
+	uint8_t		(*values)[64] = calloc(SLOTS, 64);
+	int32_t    *expected = calloc(SLOTS, sizeof(int32_t));
+	PLEntry    *entries = calloc(SLOTS, sizeof(PLEntry));
+	PLEdit	   *edits = calloc(SLOTS, sizeof(PLEdit));
+	uint8_t		(*edit_values)[64] = calloc(SLOTS, 64);
+	uint32_t	rng = 0x5eed;
+	PLTree		tree;
+	unsigned	round;
+	size_t		i,
+				count;
+
+	CHECK(store && keys && values && expected && entries && edits && edit_values);
+	for (i = 0; i < SLOTS; i++)
+	{
+		pl_key_int64((int64_t) i, keys[i]);
+		expected[i] = i % 3 ? (int32_t) i : -1;
+	}
+
+	/* Values of 4 to 35 bytes exercise both count and byte boundaries. */
+#define VALUE_LEN(v) (4 + ((uint32_t) (v) * 2654435761u >> 27))
+	count = 0;
+	for (i = 0; i < SLOTS; i++)
+		if (expected[i] >= 0)
+		{
+			memset(values[i], (int) expected[i], 64);
+			pl_write32(values[i], (uint32_t) expected[i]);
+			entries[count++] = (PLEntry)
+			{
+				{
+					keys[i], 8
+				}, {
+					values[i], VALUE_LEN(expected[i])
+				}
+			};
+		}
+	OK(pl_build(store, entries, count, &tree));
+
+	for (round = 0; round < ROUNDS; round++)
+	{
+		unsigned	shape = round % 6;
+		size_t		nedits = 0,
+					first = random_value(&rng) % SLOTS,
+					span = 1 + random_value(&rng) % (shape == 3 ? 2000 : 200);
+		PLStore    *independent = pl_store_create();
+		PLTree		fresh;
+
+		CHECK(independent != NULL);
+		for (i = 0; i < SLOTS; i++)
+		{
+			bool		touched;
+			int32_t		value;
+
+			switch (shape)
+			{
+				case 0:			/* scattered */
+					touched = random_value(&rng) % 500 == 0;
+					break;
+				case 1:			/* clustered */
+					touched = i >= first && i < first + span;
+					break;
+				case 2:			/* append past the end, prepend at the start */
+					touched = i >= SLOTS - span || i < span / 4;
+					break;
+				case 3:			/* delete a range */
+					touched = i >= first && i < first + span;
+					break;
+				case 4:			/* one edit */
+					touched = i == first;
+					break;
+				default:		/* dense */
+					touched = random_value(&rng) % 7 == 0;
+					break;
+			}
+			if (!touched)
+				continue;
+			value = shape == 3 || random_value(&rng) % 5 == 0 ? -1 : (int32_t) (random_value(&rng) % 1000000);
+			expected[i] = value;
+			memset(edit_values[nedits], (int) value, 64);
+			pl_write32(edit_values[nedits], (uint32_t) value);
+			edits[nedits] = (PLEdit)
+			{
+				{
+					keys[i], 8
+				}, {
+					value >= 0, {
+						edit_values[nedits], VALUE_LEN(value)
+					}
+				}
+			};
+			nedits++;
+		}
+		OK(pl_apply(&tree, edits, nedits, &tree));
+		count = 0;
+		for (i = 0; i < SLOTS; i++)
+			if (expected[i] >= 0)
+			{
+				memset(values[i], (int) expected[i], 64);
+				pl_write32(values[i], (uint32_t) expected[i]);
+				entries[count++] = (PLEntry)
+				{
+					{
+						keys[i], 8
+					}, {
+						values[i], VALUE_LEN(expected[i])
+					}
+				};
+			}
+		OK(pl_build(independent, entries, count, &fresh));
+		CHECK(pl_hash_equal(tree.root, fresh.root));
+		CHECK(pl_count(&tree) == count);
+		pl_store_free(independent);
+	}
+	OK(pl_validate(&tree));
+
+	/* A one-key edit through a fetch-backed store loads only its path's region. */
+	{
+		FetchSource fetch = {store, 0};
+		PLStore    *backed = pl_store_create();
+		PLTree		remote = {backed, tree.root};
+		uint8_t		changed[4] = {1, 2, 3, 4};
+		PLEdit		edit = {{keys[SLOTS / 2], 8}, {true, {changed, 4}}};
+		PLStats		stats;
+
+		CHECK(backed != NULL);
+		pl_store_set_fetch(backed, fetch_from_source, &fetch);
+		OK(pl_apply(&remote, &edit, 1, &remote));
+		stats = pl_store_stats(store);
+		CHECK(fetch.fetches > 0 && fetch.fetches < 12);
+		CHECK(fetch.fetches * 20 < stats.chunks);
+		printf("fetch-backed edit: %u fetches of %zu chunks\n", fetch.fetches, stats.chunks);
+		pl_store_free(backed);
+	}
+
+	/* Diff and merge of small changes on a large tree also stay local. */
+	{
+		FetchSource fetch = {store, 0};
+		PLStore    *backed = pl_store_create();
+		uint8_t		one[4] = {9, 9, 9, 9},
+					two[4] = {8, 8, 8, 8};
+		PLEdit		left_edit = {{keys[100], 8}, {true, {one, 4}}};
+		PLEdit		right_edit = {{keys[SLOTS - 100], 8}, {true, {two, 4}}};
+		PLTree		left,
+					right,
+					merged,
+					expected_tree;
+		DiffResult	result = {0};
+
+		OK(pl_apply(&tree, &left_edit, 1, &left));
+		OK(pl_apply(&tree, &right_edit, 1, &right));
+		OK(pl_apply(&left, &right_edit, 1, &expected_tree));
+		CHECK(backed != NULL);
+		pl_store_set_fetch(backed, fetch_from_source, &fetch);
+		{
+			PLTree		base_remote = {backed, tree.root},
+						left_remote = {backed, left.root},
+						right_remote = {backed, right.root};
+
+			OK(pl_diff(&base_remote, &left_remote, count_diff, &result));
+			CHECK(result.updates + result.inserts == 1 && !result.removes);
+			CHECK(fetch.fetches < 12);
+			OK(pl_merge(&base_remote, &left_remote, &right_remote, NULL, NULL, &merged));
+			CHECK(pl_hash_equal(merged.root, expected_tree.root));
+			CHECK(fetch.fetches < 30);
+			printf("fetch-backed diff and merge: %u fetches\n", fetch.fetches);
+		}
+		pl_store_free(backed);
+	}
+#undef VALUE_LEN
+	free(keys);
+	free(values);
+	free(expected);
+	free(entries);
+	free(edits);
+	free(edit_values);
 	pl_store_free(store);
 }
 
@@ -681,6 +931,8 @@ main(int argc, char **argv)
 	test_tree();
 	test_versions();
 	test_random_history();
+	test_apply_batches();
+	test_retain();
 	test_conflict_matrix();
 	test_ranges_and_shifted_boundaries();
 	test_import_and_malformed();

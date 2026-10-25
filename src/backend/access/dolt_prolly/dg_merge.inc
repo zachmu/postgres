@@ -49,7 +49,7 @@ lock_workspace(void)
 		ids[i] = DatumGetObjectId(cell(i, 1));
 	for (i = 0; i < n; i++)
 		if (canonical)
-			dg_storage_lock_branch(ids[i], dg_current_branch());
+			dg_storage_lock_branch(ids[i], dg_current_branch(), ExclusiveLock);
 		else
 			LockRelationOid(ids[i], AccessExclusiveLock);
 	PopActiveSnapshot();
@@ -73,6 +73,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	VersionRef	ref;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
+	bool		already = false;
 
 	standalone(fcinfo, true);
 	nest = begin_api();
@@ -90,18 +91,35 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		move_ref(psprintf("working/%s", name), empty_ref, child(commit, 1));
 		move_ref(psprintf("staged/%s", name), empty_ref, child(commit, 1));
 		advance_snapshot();
+		replace_working(name, child(commit, 1), NIL);
 	}
-	else if (n == 1 && args[0][0] != '-')
+	else if (n >= 1 && args[0][0] != '-')
 	{
 		name = args[0];
 		ref = read_ref(psprintf("heads/%s", name));
 		commit = ref.target;
-		if (!commit)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("branch not found: %s", name)));
+		if (n == 1 && commit && !strcmp(name, dg_current_branch()))
+			already = true;
+		if (!commit || n > 1)
+		{
+			/*
+			 * Not a branch: a tag or commit would detach HEAD; otherwise
+			 * tables.
+			 */
+			if (n == 1 && !*name)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("error: cannot checkout empty string")));
+			if (n == 1 && (read_ref(psprintf("tags/%s", name)).target || (strlen(name) >= 8 && strspn(name, "0123456789abcdef") == strlen(name))))
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("dolt does not support a detached head state. To create a branch at this tag, run: dolt checkout %s -b {new_branch_name}", name)));
+			checkout_tables(args, n);
+			values[0] = Int64GetDatum(0);
+			values[1] = CStringGetTextDatum("");
+			end_api(nest);
+			return command_record(fcinfo, values, nulls);
+		}
 	}
 	else
 	{
-		unsupported("checkout supports branch or -b branch [start-point]");
+		unsupported("checkout supports branch, -b branch [start-point], or table names");
 		return 0;
 	}
 
@@ -120,7 +138,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		move_ref("views/enabled", ref, commit);
 	dg_select_branch(name);
 	values[0] = Int64GetDatum(0);
-	values[1] = CStringGetTextDatum(psprintf("Switched to branch '%s'", name));
+	values[1] = CStringGetTextDatum(psprintf(already ? "Already on branch '%s'" : "Switched to branch '%s'", name));
 	end_api(nest);
 	return command_record(fcinfo, values, nulls);
 }
@@ -134,9 +152,11 @@ merge_parent(void)
 	if (!pending.target)
 		return NULL;
 	json = metadata(pending.target, "merge");
-	run("SELECT jsonb_array_length($1::jsonb->'conflicts')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT jsonb_array_length($1::jsonb->'conflicts'),coalesce(jsonb_array_length($1::jsonb->'violations'),0)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	if (DatumGetInt32(cell(0, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unresolved merge conflicts")));
+	if (DatumGetInt32(cell(0, 2)))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unresolved constraint violations"), errhint("Delete the rows of dolt_constraint_violations_<table> after fixing them.")));
 	if (!strcmp(json_value(json, "squash") ? json_value(json, "squash") : "false", "true"))
 		return NULL;
 	return child(pending.target, 2);
@@ -552,8 +572,82 @@ unique_contents(Relation rel, const PLTree * contents)
 	return true;
 }
 
+/* Rows of |contents| that share a unique key, recorded as Dolt "unique index"
+ * constraint violations: {table, type, row, info:{Columns, Name}}. */
 static void
-install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
+unique_violations(Relation rel, const PLTree * contents, const char *name, StringInfo violations)
+{
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+	DGRows		rows = dg_rows(contents);
+
+	foreach(lc, indexes)
+	{
+		Relation	idx = rel->rd_catalogview ? dg_storage_index(rel, lfirst_oid(lc)) : index_open(lfirst_oid(lc), AccessShareLock);
+		int			n = idx->rd_index->indnkeyatts;
+		size_t		i,
+					j;
+		PLEntry    *keys;
+		StringInfoData info;
+
+		if (!idx->rd_index->indisunique)
+		{
+			if (!rel->rd_catalogview)
+				index_close(idx, AccessShareLock);
+			continue;
+		}
+		initStringInfo(&info);
+		appendStringInfoString(&info, "{\"Columns\":[");
+		for (j = 0; j < n; j++)
+		{
+			if (j)
+				appendStringInfoChar(&info, ',');
+			escape_json(&info, NameStr(TupleDescAttr(RelationGetDescr(rel), idx->rd_index->indkey.values[j] - 1)->attname));
+		}
+		appendStringInfoString(&info, "],\"Name\":");
+		escape_json(&info, RelationGetRelationName(idx));
+		appendStringInfoChar(&info, '}');
+		keys = palloc(sizeof(*keys) * Max(rows.count, 1));
+		for (i = 0; i < rows.count; i++)
+		{
+			PLValue    *fields = palloc(sizeof(*fields) * n);
+			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			bool		hasnull = false;
+
+			for (j = 0; j < n; j++)
+			{
+				dg_check(pl_tuple_get(row, idx->rd_index->indkey.values[j] - 1, &fields[j]));
+				if (!fields[j].present)
+					hasnull = true;
+			}
+			keys[i].key = (hasnull && !idx->rd_index->indnullsnotdistinct) ? DG_SLICE(NULL, 0) : pack_merge_fields(fields, n);
+			keys[i].value = row;
+		}
+		for (i = 0; i < rows.count; i++)
+		{
+			bool		duplicate = pl_read64(rows.items[i].value.data) > 1;
+
+			if (keys[i].key.data)
+				for (j = 0; j < rows.count && !duplicate; j++)
+					if (i != j && keys[j].key.data && !pl_compare(keys[i].key, keys[j].key))
+						duplicate = true;
+			if (!duplicate)
+				continue;
+			if (violations->len)
+				appendStringInfoChar(violations, ',');
+			appendStringInfoString(violations, "{\"table\":");
+			escape_json(violations, name);
+			appendStringInfoString(violations, ",\"type\":\"unique index\",\"row\":");
+			json_bytes(violations, DG_VALUE(true, keys[i].value));
+			appendStringInfo(violations, ",\"info\":%s}", info.data);
+		}
+		if (!rel->rd_catalogview)
+			index_close(idx, AccessShareLock);
+	}
+}
+
+static void
+install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations)
 {
 	char	  **names;
 	bool		canonical = (read_ref("views/enabled").target != NULL);
@@ -592,17 +686,15 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 				if (!unique_contents(rel, &result))
 				{
 					/*
-					 * Conservatively retain this entire table, with explicit
-					 * whole-table conflict evidence. Do not silently drop an
-					 * arbitrary unique row.
+					 * The merged rows violate a unique constraint. Record the
+					 * violating rows as Dolt constraint violations and keep
+					 * the destination table, since the storage engine cannot
+					 * hold duplicate unique keys.
 					 */
 					conflicts->len = before;
 					conflicts->data[before] = '\0';
-					if (before)
-						appendStringInfoChar(conflicts, ',');
-					appendStringInfoString(conflicts, "{\"whole_table\":true,\"table\":");
-					escape_json(conflicts, names[i]);
-					appendStringInfoChar(conflicts, '}');
+					if (violations)
+						unique_violations(rel, &result, names[i], violations);
 					result = left;
 				}
 			}
@@ -615,6 +707,8 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts)
 			relation_close(rel, NoLock);
 		UpdateActiveSnapshotCommandId();
 	}
+	if (base)
+		validate_working_foreign_keys(dg_current_branch());
 }
 
 Datum
@@ -641,6 +735,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *database,
 			   *commit = NULL;
 	StringInfoData conflicts,
+				violations,
 				json;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
@@ -684,7 +779,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		if (revision || !pending.target)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("no merge to abort")));
 		database = child(child(pending.target, 1), 1);
-		install_database(NULL, NULL, database, NULL);
+		install_database(NULL, NULL, database, NULL, NULL);
 		finish_merge();
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
@@ -708,11 +803,12 @@ dolt_merge(PG_FUNCTION_ARGS)
 	same_schema(metadata(oursdb, "database"), metadata(child(base, 1), "database"));
 	live = capture(true);
 	if (!same(live.hash, oursdb) || !same(read_ref(branch_ref("staged")).target, oursdb))
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("commit or discard working and staged changes before merge")));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
 	if (ffonly && !same(base, head.target))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);
-	install_database(same(base, head.target) ? NULL : child(base, 1), oursdb, their_db, &conflicts);
+	initStringInfo(&violations);
+	install_database(same(base, head.target) ? NULL : child(base, 1), oursdb, their_db, &conflicts, &violations);
 	database = capture(true).hash;
 
 	/*
@@ -727,12 +823,14 @@ dolt_merge(PG_FUNCTION_ARGS)
 		if (squash)
 			commit = theirs;
 	}
-	if (conflicts.len || nocommit)
+	if (conflicts.len || violations.len || nocommit)
 	{
 		initStringInfo(&json);
-		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", squash ? "true" : "false", conflicts.data);
+		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", squash ? "true" : "false");
+		escape_json(&json, revision);
+		appendStringInfo(&json, ",\"conflicts\":[%s],\"violations\":[%s]}", conflicts.data, violations.data);
 		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
-		conflicted = conflicts.len ? 1 : 0;
+		conflicted = (conflicts.len || violations.len) ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge successful";
 	}
 	else if (!squash)
@@ -867,8 +965,12 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			UpdateActiveSnapshotCommandId();
 		}
 	}
+	validate_working_foreign_keys(dg_current_branch());
 	initStringInfo(&updated);
-	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"conflicts\":[%s]}", json_value(json, "squash") ? json_value(json, "squash") : "false", remaining.data);
+	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", json_value(json, "squash") ? json_value(json, "squash") : "false");
+	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
+	run("SELECT coalesce(($1::jsonb->'violations')::text,'[]')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	appendStringInfo(&updated, ",\"conflicts\":[%s],\"violations\":%s}", remaining.data, strcell(0, 1));
 	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);

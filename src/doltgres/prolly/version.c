@@ -15,99 +15,137 @@ present(PLSlice value)
 	return result;
 }
 
-static PLStatus
-diff_cursors(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg)
+/*
+ * Diff two trees by comparing unexpanded subtree references. Each side is a
+ * stack of items in key order: a reference to a node not yet read, or a leaf
+ * entry. Equal references are skipped without reading them; a reference is
+ * read and replaced by its children only when it differs from the other side.
+ * Higher references expand first so both sides meet at the same level. The
+ * cost follows the changed region, not the tree size.
+ */
+typedef struct DiffItem
 {
-	PLCursor	a,
-				b;
-	PLStatus	status = pl_cursor_init(&a, before, NULL);
+	bool		entry;
+	uint32_t	level;			/* for references: the referenced node's level */
+	PLHash		hash;
+	PLSlice		key;
+	PLSlice		value;
+} DiffItem;
 
-	if (status == PL_OK)
-		status = pl_cursor_init(&b, after, NULL);
-	while (status == PL_OK && (a.valid || b.valid))
+typedef struct DiffStack
+{
+	PLStore    *store;
+	DiffItem   *items;
+	size_t		used;
+	size_t		capacity;
+} DiffStack;
+
+static PLStatus
+diff_push(DiffStack *stack, DiffItem item)
+{
+	if (stack->used == stack->capacity)
 	{
-		PLEntry		x = {{NULL, 0}, {NULL, 0}}, y = x;
-		PLValue		absent = {false, {NULL, 0}};
-		int			comparison;
+		size_t		capacity = stack->capacity ? stack->capacity * 2 : 64;
+		DiffItem   *items = realloc(stack->items, capacity * sizeof(DiffItem));
 
-		if (a.valid && b.valid && a.index[a.depth - 1] == 0 && b.index[b.depth - 1] == 0 &&
-			pl_hash_equal(a.path[a.depth - 1]->hash, b.path[b.depth - 1]->hash))
-		{
-			before->store->stats.skipped++;
-			status = pl_cursor_skip_leaf(&a);
-			if (status == PL_OK)
-				status = pl_cursor_skip_leaf(&b);
-			continue;
-		}
-		if (a.valid)
-			x = pl_cursor_entry(&a);
-		if (b.valid)
-			y = pl_cursor_entry(&b);
-		comparison = !a.valid ? 1 : !b.valid ? -1 : pl_compare(x.key, y.key);
-		if (comparison < 0)
-			status = callback(arg, x.key, present(x.value), absent);
-		else if (comparison > 0)
-			status = callback(arg, y.key, absent, present(y.value));
-		else if (pl_compare(x.value, y.value) != 0)
-			status = callback(arg, x.key, present(x.value), present(y.value));
-		if (status == PL_OK && comparison <= 0)
-			status = pl_cursor_next(&a);
-		if (status == PL_OK && comparison >= 0)
-			status = pl_cursor_next(&b);
+		if (!items)
+			return PL_NOMEM;
+		stack->items = items;
+		stack->capacity = capacity;
 	}
-	return status;
+	stack->items[stack->used++] = item;
+	return PL_OK;
 }
 
+/* Replace the reference on top with the node's children, first child on top. */
 static PLStatus
-diff_nodes(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg,
-		   unsigned depth)
+diff_expand(DiffStack *stack)
 {
-	PLNode	   *a = pl_find(before->store, before->root);
-	PLNode	   *b = pl_find(after->store, after->root);
-	uint32_t	i;
+	DiffItem	top = stack->items[--stack->used];
+	PLNode	   *node = pl_find(stack->store, top.hash);
+	PLStatus	status = PL_OK;
 
-	if (!a || !b || depth >= PL_MAX_DEPTH)
+	if (!node || node->level != top.level)
 		return PL_CORRUPT;
-	if (pl_hash_equal(a->hash, b->hash))
+	for (uint32_t i = node->count; i-- > 0 && status == PL_OK;)
 	{
-		before->store->stats.skipped++;
-		return PL_OK;
-	}
-	if (a->level && a->level == b->level && a->count == b->count)
-	{
-		for (i = 0; i < a->count; i++)
-			if (pl_compare(pl_node_key(a, i), pl_node_key(b, i)) != 0)
-				break;
-		if (i == a->count)
+		DiffItem	item = {0};
+
+		item.key = pl_node_key(node, i);
+		if (node->level)
 		{
-			for (i = 0; i < a->count; i++)
-			{
-				PLTree		left = {before->store, {{0}}}, right = {after->store, {{0}}};
-				PLStatus	status;
-
-				memcpy(left.root.bytes, pl_node_value(a, i).data, PL_HASH_SIZE);
-				memcpy(right.root.bytes, pl_node_value(b, i).data, PL_HASH_SIZE);
-				status = diff_nodes(&left, &right, callback, arg, depth + 1);
-				if (status != PL_OK)
-					return status;
-			}
-			return PL_OK;
+			item.level = node->level - 1;
+			memcpy(item.hash.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
 		}
+		else
+		{
+			item.entry = true;
+			item.value = pl_node_value(node, i);
+		}
+		status = diff_push(stack, item);
 	}
-
-	/*
-	 * A boundary shifted or height changed: reconcile ordered ranges by
-	 * cursor.
-	 */
-	return diff_cursors(before, after, callback, arg);
+	return status;
 }
 
 PLStatus
 pl_diff(const PLTree *before, const PLTree *after, PLDiffFn callback, void *arg)
 {
+	DiffStack	a = {0},
+				b = {0};
+	PLStatus	status;
+	PLNode	   *ra,
+			   *rb;
+
 	if (!before || !after || !before->store || !after->store || !callback)
 		return PL_INVALID;
-	return diff_nodes(before, after, callback, arg, 0);
+	ra = pl_find(before->store, before->root);
+	rb = pl_find(after->store, after->root);
+	if (!ra || !rb)
+		return PL_CORRUPT;
+	a.store = before->store;
+	b.store = after->store;
+	status = diff_push(&a, (DiffItem) {.level = ra->level,.hash = ra->hash});
+	if (status == PL_OK)
+		status = diff_push(&b, (DiffItem) {.level = rb->level,.hash = rb->hash});
+	while (status == PL_OK && (a.used || b.used))
+	{
+		DiffItem   *x = a.used ? &a.items[a.used - 1] : NULL;
+		DiffItem   *y = b.used ? &b.items[b.used - 1] : NULL;
+		PLValue		absent = {false, {NULL, 0}};
+		int			comparison;
+
+		if (x && y && !x->entry && !y->entry && pl_hash_equal(x->hash, y->hash))
+		{
+			before->store->stats.skipped++;
+			a.used--;
+			b.used--;
+			continue;
+		}
+		if (x && !x->entry && (!y || y->entry || x->level >= y->level))
+		{
+			status = diff_expand(&a);
+			continue;
+		}
+		if (y && !y->entry)
+		{
+			status = diff_expand(&b);
+			continue;
+		}
+		comparison = !x ? 1 : !y ? -1 : pl_compare(x->key, y->key);
+		if (comparison < 0)
+			status = callback(arg, x->key, present(x->value), absent);
+		else if (comparison > 0)
+			status = callback(arg, y->key, absent, present(y->value));
+		else if (pl_compare(x->value, y->value) != 0)
+			status = callback(arg, x->key, present(x->value), present(y->value));
+		if (comparison <= 0)
+			a.used--;
+		if (comparison >= 0)
+			b.used--;
+	}
+	free(a.items);
+	free(b.items);
+	return status;
 }
 
 typedef struct PLChanges

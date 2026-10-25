@@ -1,12 +1,20 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parse_relation.h"
+#include "utils/ruleutils.h"
+#include "tcop/utility.h"
+#include "tcop/tcopprot.h"
 #include "access/doltcatalog.h"
 #include "catalog/namespace.h"
 #include "catalog/catalogview.h"
 #include "catalog/heap.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_shdepend.h"
+#include "catalog/pg_seclabel.h"
+#include "catalog/pg_init_privs.h"
 #include "catalog/pg_cast.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_type.h"
@@ -26,11 +34,13 @@
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "commands/defrem.h"
+#include "commands/proclang.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "optimizer/optimizer.h"
 #include "access/xact.h"
 #include "access/doltbranch.h"
+#include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -45,6 +55,9 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_language.h"
+#include "parser/parse_type.h"
+#include "parser/parse_func.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_publication_rel.h"
@@ -55,6 +68,7 @@
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
 #include "commands/tablecmds.h"
+#include "commands/trigger.h"
 #include "parser/parse_utilcmd.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_attrdef.h"
@@ -62,6 +76,7 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "libpq/libpq-be.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -74,7 +89,8 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
-#define USER_NAMESPACE "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'"
+#define NAMESPACE_DEFINITIONS_SQL "SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\""
+#define USER_NAMESPACE "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' AND n.nspname <> 'dolt'"
 
 typedef struct VersionRef
 {
@@ -105,6 +121,17 @@ branch_ref(const char *prefix)
 }
 static bytea *merge_parent(void);
 static void finish_merge(void);
+static bool canonical_drop(Node *statement);
+static void stage_tables(List *tables);
+static void replace_working(const char *branch, bytea *database, List *tables);
+static bytea *staged_capture(Capture *full);
+static bool branch_management(char **args, int n);
+static void checkout_tables(char **args, int n);
+static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
+static char *staged_state(void);
+static char *working_state(void);
+static TupleDesc conflict_layout(const char *table, const char *from, const char *to);
+static TupleDesc violation_layout(const char *table);
 static void binding_record(const char *branch, const char *name, bytea *schema, Oid relid);
 static Oid	binding_relation(const char *branch, const char *name, bytea *schema);
 static void binding_prepare(const char *branch, bytea *database, bool required);
@@ -140,11 +167,28 @@ strcell(int row, int col)
 static int	catalog_api_depth;
 static SubTransactionId catalog_api_subids[64];
 static bool catalog_api_registered;
+/*
+ * Version-control calls in progress. Unlike catalog_api_depth, nested user SQL
+ * does not reset this, and an error that a savepoint catches leaves it raised
+ * until the transaction ends. While it is raised, working-store collection
+ * waits: these calls hold tree roots that no registered state names.
+ */
+static int	version_calls;
+
+bool
+dg_version_call_active(void)
+{
+	return version_calls > 0;
+}
+
 static void
 catalog_api_xact(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT || event == XACT_EVENT_PREPARE)
+	{
 		catalog_api_depth = 0;
+		version_calls = 0;
+	}
 }
 static void
 catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId parent, void *arg)
@@ -158,11 +202,23 @@ catalog_api_subxact(SubXactEvent event, SubTransactionId id, SubTransactionId pa
 				catalog_api_subids[i] = parent;
 }
 
+/* The caller's search_path, captured before the API scope replaces it. */
+static char *api_search_path;
+
 static int
 begin_api(void)
 {
 	MemoryContext c = CurrentMemoryContext;
 	int			nest = NewGUCNestLevel();
+
+	if (catalog_api_depth == 0)
+	{
+		const char *path = GetConfigOption("search_path", true, false);
+
+		if (api_search_path)
+			pfree(api_search_path);
+		api_search_path = MemoryContextStrdup(TopMemoryContext, path ? path : "public");
+	}
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("version-control prototype requires superuser")));
@@ -178,6 +234,7 @@ begin_api(void)
 	if (catalog_api_depth == lengthof(catalog_api_subids))
 		elog(ERROR, "canonical catalog API nesting limit");
 	catalog_api_subids[catalog_api_depth++] = GetCurrentSubTransactionId();
+	version_calls++;
 	PushCopiedSnapshot(GetActiveSnapshot());
 	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
@@ -187,10 +244,70 @@ end_api(int nest)
 {
 	Assert(catalog_api_depth > 0);
 	catalog_api_depth--;
+	if (version_calls > 0)
+		version_calls--;
 	PopActiveSnapshot();
 	SPI_finish();
 	AtEOXact_GUC(true, nest);
 }
+
+/* User SQL must not inherit the internal manifest lookup bypass. Nested
+ * provider calls may enter begin_api again, so preserve the caller path. */
+static void
+run_context(const char *sql, int nargs, Oid *types, Datum *args,
+			const char *nulls, bool readonly)
+{
+	int			depth = catalog_api_depth;
+	int			nest = NewGUCNestLevel();
+	char	   *path = pstrdup(api_search_path ? api_search_path : "public");
+	SubTransactionId subids[64];
+	CatalogView *previous = CatalogViewSwitch(NULL);
+
+	memcpy(subids, catalog_api_subids, sizeof(subids));
+
+	PG_TRY();
+	{
+		catalog_api_depth = 0;
+		set_config_option("search_path", path, PGC_USERSET, PGC_S_SESSION,
+						  GUC_ACTION_SAVE, true, 0, false);
+		run(sql, nargs, types, args, nulls, readonly);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		catalog_api_depth = depth;
+		memcpy(catalog_api_subids, subids, sizeof(subids));
+		AtEOXact_GUC(true, nest);
+	}
+	PG_END_TRY();
+}
+
+typedef struct StandaloneCall
+{
+	Oid			funcid;
+	FuncExpr   *call;
+	int			count;
+}			StandaloneCall;
+
+static bool
+standalone_walker(Node *node, StandaloneCall * found)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid == found->funcid)
+	{
+		found->call = (FuncExpr *) node;
+		found->count++;
+		return false;
+	}
+	if (IsA(node, SubPlan) || IsA(node, SubLink) || IsA(node, Var))
+	{
+		found->count += 2;		/* disqualify */
+		return true;
+	}
+	return expression_tree_walker(node, standalone_walker, found);
+}
+
 static void
 standalone(FunctionCallInfo fcinfo, bool commits)
 {
@@ -209,9 +326,12 @@ standalone(FunctionCallInfo fcinfo, bool commits)
 	if (IsA(plan, Result) && list_length(plan->targetlist) == 1)
 	{
 		Node	   *expr = (Node *) linitial_node(TargetEntry, plan->targetlist)->expr;
+		StandaloneCall found = {fcinfo->flinfo->fn_oid, NULL, 0};
 
-		if (IsA(expr, FuncExpr))
-			call = (FuncExpr *) expr;
+		/* The call may be wrapped in scalar expressions (casts, substring). */
+		standalone_walker(expr, &found);
+		if (found.count == 1)
+			call = found.call;
 	}
 	else if (IsA(plan, FunctionScan) && list_length(((FunctionScan *) plan)->functions) == 1)
 	{
@@ -409,13 +529,39 @@ canonical_database(const char *json, Datum *members, int count)
 	bool	   *nulls;
 	int			n;
 
-	run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT jsonb_set($1::jsonb || jsonb_build_object('encoding',current_setting('server_encoding')),'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	normalized = strcell(0, 1);
 	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	array = DatumGetArrayTypeP(cell(0, 1));
 	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	return put("database", normalized, values, n);
 }
+
+#include "dg_expression_codec.inc"
+#include "dg_foreign_codec.inc"
+#include "dg_routine_codec.inc"
+
+/* Capture and working-tree diff must use exactly the same portable schema codec. */
+static char *
+native_schema_definition(Oid relid)
+{
+	int			nest = NewGUCNestLevel();
+	char	   *definition;
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) || jsonb_strip_nulls(jsonb_build_object('default',(SELECT pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum),'storage',CASE WHEN a.attstorage<>t.typstorage THEN a.attstorage::text END,'compression',nullif(a.attcompression::text,''),'statistics',a.attstattarget,'options',(SELECT jsonb_agg(v ORDER BY v COLLATE \"C\") FROM unnest(a.attoptions) v))) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, VC_TYPES(OIDOID), VC_ARGS(ObjectIdGetDatum(relid)), NULL, true);
+		definition = foreign_capture_definition(strcell(0, 1), relid);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+	}
+	PG_END_TRY();
+	return definition;
+}
+
 
 /* Capture canonical membership and schema, selecting only data from local roots.
  * Physical pg_class enumeration cannot describe branch-only objects. */
@@ -452,6 +598,8 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
+		else if (!strcmp(kinds[i], "routine"))
+			appendStringInfoString(&json, payload);
 		else
 		{
 			char	   *name = json_value(payload, "name");
@@ -541,16 +689,16 @@ capture_inner(bool persist, bool all_catalogs)
 	PopActiveSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 	/* Reject unsupported definitions instead of producing incomplete commits. */
-	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
+	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("database capture containing non-prolly relations, routines, custom types or unsupported relation properties");
 	run("SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE " USER_NAMESPACE, 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
 		unsupported("capture of custom collations or operators");
-	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attoptions IS NOT NULL OR a.atthasdef OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n')", 0, NULL, NULL, NULL, true);
+	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND NOT (t.tgisinternal AND EXISTS (SELECT 1 FROM pg_constraint f WHERE f.oid=t.tgconstraint AND f.contype='f')) UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n','c','f')", 0, NULL, NULL, NULL, true);
 	if (SPI_processed)
-		unsupported("capture of defaults, generated/dropped columns, user types, triggers or non-unique constraints");
-	run("SELECT jsonb_build_object('format','DGNS1','name',n.nspname,'owner',pg_get_userbyid(n.nspowner),'comment',obj_description(n.oid,'pg_namespace'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) x),'[]'::jsonb))::text FROM pg_catalog.pg_namespace n WHERE " USER_NAMESPACE " ORDER BY n.nspname COLLATE \"C\"", 0, NULL, NULL, NULL, true);
+		unsupported("capture of generated/dropped columns, user types, triggers or unsupported constraints");
+	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
 	nns = SPI_processed;
 	namespaces = palloc(sizeof(char *) * Max(nns, 1));
 	for (i = 0; i < nns; i++)
@@ -586,8 +734,10 @@ capture_inner(bool persist, bool all_catalogs)
 		run("SELECT format('%I.%I',n.nspname,c.relname),CASE WHEN c.relkind='r' THEN 'table' ELSE 'index' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
 		name = strcell(0, 1);
 		kind = strcell(0, 2);
-		run("SELECT jsonb_build_object('format','DGTABLE1','name',format('%I.%I',n.nspname,c.relname),'owner',pg_get_userbyid(c.relowner),'comment',obj_description(c.oid,'pg_class'),'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) x),'[]'::jsonb),'columns',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',a.attname,'comment',col_description(c.oid,a.attnum),'type',t.typname,'typmod',a.atttypmod,'notnull',a.attnotnull,'collation',CASE WHEN a.attcollation=0 THEN NULL ELSE (SELECT jsonb_build_array(cn.nspname,co.collname,co.collprovider,co.collisdeterministic,co.collcollate,co.collctype,co.colllocale,co.collversion) FROM pg_collation co JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE co.oid=a.attcollation) END) ORDER BY a.attnum) FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb),'indexes',COALESCE((SELECT jsonb_agg(pg_get_indexdef(x.indexrelid) ORDER BY ic.relname COLLATE \"C\") FROM pg_index x JOIN pg_class ic ON ic.oid=x.indexrelid WHERE x.indrelid=c.oid),'[]'::jsonb),'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(conname,pg_get_constraintdef(oid)) ORDER BY conname COLLATE \"C\") FROM pg_constraint WHERE conrelid=c.oid),'[]'::jsonb),'index_definition',CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) ELSE NULL END)::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
-		schema = strcell(0, 1);
+		run("SELECT adbin FROM pg_attrdef WHERE adrelid=$1 UNION ALL SELECT conbin FROM pg_constraint WHERE conrelid=$1 AND conbin IS NOT NULL", 1, types, args, NULL, true);
+		for (uint64 row = 0; row < SPI_processed; row++)
+			(void) schema_expression_check(stringToNode(strcell(row, 1)), NULL);
+		schema = native_schema_definition(relations[i]);
 		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
 		schemahash = strcell(0, 1);
 		rel = relation_open(relations[i], NoLock);
@@ -629,6 +779,31 @@ capture_inner(bool persist, bool all_catalogs)
 			appendStringInfoChar(&json, ',');
 		appendStringInfoString(&json, member.data);
 		used++;
+	}
+	run("SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " ORDER BY p.oid", 0, NULL, NULL, NULL, true);
+	{
+		int			nroutines = SPI_processed;
+		Oid		   *ids = palloc_array(Oid, Max(nroutines, 1));
+
+		for (i = 0; i < nroutines; i++)
+			ids[i] = DatumGetObjectId(cell(i, 1));
+		members = repalloc(members, sizeof(Datum) * Max(used + nroutines, 1));
+		for (i = 0; i < nroutines; i++)
+		{
+			HeapTuple	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(ids[i]));
+			Relation	catalog = table_open(ProcedureRelationId, AccessShareLock);
+			char	   *definition = routine_encode(tuple, RelationGetDescr(catalog));
+			char	   *payload = routine_payload(definition);
+
+			ReleaseSysCache(tuple);
+			table_close(catalog, AccessShareLock);
+			if (used)
+				appendStringInfoChar(&json, ',');
+			appendStringInfoString(&json, payload);
+			if (persist)
+				members[used] = PointerGetDatum(routine_member(definition));
+			used++;
+		}
 	}
 	appendStringInfoString(&json, "]}");
 	/* Sort members by symbolic identity, never relation OID / creation order. */
@@ -695,13 +870,43 @@ json_value(const char *json, const char *key)
 	run("SELECT $1::jsonb->>$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(key)), NULL, true);
 	return strcell(0, 1);
 }
+
+/* Doltgres derives the default committer email from the role and the client
+ * address; local (socket or bootstrap) sessions use localhost. */
+static char *
+default_email(const char *name)
+{
+	const char *host = "localhost";
+
+	if (MyProcPort && MyProcPort->remote_host && *MyProcPort->remote_host &&
+		MyProcPort->raddr.addr.ss_family != AF_UNIX)
+		host = MyProcPort->remote_host;
+	return psprintf("%s@%s", name, host);
+}
+
+/* An explicit --committer overrides the author-derived committer identity. */
+static char *commit_committer_name;
+static char *commit_committer_email;
+
 static bytea *
 commit_object(bytea *database, bytea *parent, bytea *second, const char *message, const char *author, const char *author_email, TimestampTz author_date)
 {
 	StringInfoData json;
 	const char *name = GetUserNameFromId(GetUserId(), false);
-	char	   *email = psprintf("%s@localhost", name);
+	char	   *email = default_email(name);
 	int64		height = 1;
+
+	/* Dolt treats --author as the committer too unless --committer is given. */
+	if (commit_committer_name)
+	{
+		name = commit_committer_name;
+		email = commit_committer_email;
+	}
+	else if (author)
+	{
+		name = author;
+		email = (char *) author_email;
+	}
 
 	if (parent)
 	{
@@ -734,7 +939,32 @@ ensure_repository(void)
 
 	if (head.target)
 		return;
-	db = put("database", "{\"format\":\"DGDB1\",\"members\":[]}", NULL, 0);
+
+	/*
+	 * The initial state records the namespaces that exist at initialization
+	 * (public for a fresh database), mirroring Doltgres's database creation.
+	 */
+	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
+	{
+		int			n = SPI_processed,
+					i;
+		char	  **definitions = palloc(sizeof(char *) * Max(n, 1));
+		Datum	   *members = palloc(sizeof(Datum) * Max(n, 1));
+		StringInfoData json;
+
+		for (i = 0; i < n; i++)
+			definitions[i] = strcell(i, 1);
+		initStringInfo(&json);
+		appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+		for (i = 0; i < n; i++)
+		{
+			appendStringInfo(&json, "%s{\"kind\":\"namespace\",\"definition\":%s}", i ? "," : "", definitions[i]);
+			members[i] = PointerGetDatum(put("namespace", definitions[i], NULL, 0));
+		}
+		appendStringInfoString(&json, "]}");
+		run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
+		db = canonical_database(strcell(0, 1), members, n);
+	}
 	commit = commit_object(db, NULL, NULL, "Initialize data repository", NULL, NULL, GetCurrentTimestamp());
 	move_ref("heads/main", head, commit);
 	move_ref("staged/main", read_ref("staged/main"), db);
@@ -753,6 +983,14 @@ valid_name(const char *s)
 	for (p = s; *p; p++)
 		if ((unsigned char) *p <= 32 || (unsigned char) *p == 127 || strchr("~^:?*[\\", *p))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid branch or tag name: %s", s)));
+}
+static int
+parent_count(bytea *commit)
+{
+	run("SELECT coalesce(array_length(objchildren,1),1)-1 FROM pg_dolt_object_visible WHERE objhash=$1 AND objkind='commit'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(commit)), NULL, true);
+	if (!SPI_processed)
+		return 0;
+	return DatumGetInt32(cell(0, 1));
 }
 static bytea *
 resolve(const char *revision)
@@ -806,6 +1044,8 @@ resolve(const char *revision)
 			unsupported("ancestor count outside supported range");
 		if (*orig == '^')
 		{
+			if (n && n > parent_count(hash))
+				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid ancestor spec: %s", revision)));
 			if (n)
 				hash = child(hash, n + 1);
 		}
@@ -813,6 +1053,8 @@ resolve(const char *revision)
 			for (i = 0; i < n; i++)
 			{
 				CHECK_FOR_INTERRUPTS();
+				if (parent_count(hash) < 1)
+					ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid ancestor spec: %s", revision)));
 				hash = child(hash, 2);
 			}
 	}
@@ -832,6 +1074,18 @@ author_option(char *value, char **name, char **email)
 	*email = pnstrdup(lt + 1, gt - lt - 1);
 }
 
+/* Initialize the version-control repository of the current database. initdb
+ * runs this for template1, so every database starts with a main branch. */
+Datum
+dolt_init(PG_FUNCTION_ARGS)
+{
+	int			nest = begin_api();
+
+	ensure_repository();
+	end_api(nest);
+	PG_RETURN_INT64(0);
+}
+
 Datum
 dolt_add(PG_FUNCTION_ARGS)
 {
@@ -844,13 +1098,30 @@ dolt_add(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, false);
 	nest = begin_api();
-	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
-		unsupported("dolt_add currently requires '.', '-A' or '--all'");
 	ensure_repository();
+	if (n == 0)
+		unsupported("dolt_add requires '.', '-A' or table names");
+	if (n != 1 || (strcmp(args[0], ".") && strcmp(args[0], "-A") && strcmp(args[0], "--all")))
+	{
+		/* Stage only the named tables. */
+		List	   *tables = NIL;
+		int			i;
+		char	   *stagedjson = staged_state(),
+				   *workingjson = working_state();
+
+		for (i = 0; i < n; i++)
+		{
+			if (args[i][0] == '-')
+				unsupported(args[i]);
+			tables = lappend(tables, resolve_table_argument(args[i], stagedjson, workingjson, true));
+		}
+		stage_tables(tables);
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
-	current = capture(true);
-	move_ref(branch_ref("staged"), staged, current.hash);
+	move_ref(branch_ref("staged"), staged, staged_capture(&current));
 	move_ref(branch_ref("working"), working, current.hash);
 	end_api(nest);
 	PG_RETURN_INT64(0);
@@ -863,7 +1134,9 @@ dolt_commit(PG_FUNCTION_ARGS)
 	char	  **args = arguments(fcinfo, &n),
 			   *message = NULL,
 			   *author = NULL,
-			   *email = NULL;
+			   *email = NULL,
+			   *committer = NULL,
+			   *committer_email = NULL;
 	bool		all = false,
 				allow_empty = false,
 				skip_empty = false;
@@ -871,6 +1144,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	VersionRef	head,
 				staged,
 				working;
+	Capture		full;
 	bytea	   *database,
 			   *parentdb,
 			   *commit;
@@ -901,6 +1175,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 				unsupported("missing author");
 			author_option(args[i], &author, &email);
 		}
+		else if (!strcmp(args[i], "--committer"))
+		{
+			if (++i == n)
+				unsupported("missing committer");
+			author_option(args[i], &committer, &committer_email);
+		}
 		else if (!strcmp(args[i], "--date"))
 		{
 			if (++i == n)
@@ -919,7 +1199,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));
 	parentdb = child(head.target, 1);
-	database = all ? capture(true).hash : staged.target;
+	database = all ? staged_capture(&full) : staged.target;
 	if (!database)
 		database = parentdb;
 	if (same(database, parentdb) && !allow_empty && !merge_parent())
@@ -931,11 +1211,15 @@ dolt_commit(PG_FUNCTION_ARGS)
 		}
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("nothing to commit")));
 	}
+	commit_committer_name = committer;
+	commit_committer_email = committer_email;
 	commit = commit_object(database, head.target, merge_parent(), message, author, email, author_date);
+	commit_committer_name = NULL;
+	commit_committer_email = NULL;
 	move_ref(branch_ref("heads"), head, commit);
 	move_ref(branch_ref("staged"), staged, database);
 	if (all)
-		move_ref(branch_ref("working"), working, database);
+		move_ref(branch_ref("working"), working, full.hash);
 	finish_merge();
 	answer = hex(commit);
 	end_api(nest);
@@ -952,6 +1236,11 @@ dolt_branch(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
+	if (branch_management(args, n))
+	{
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	if (n < 1 || n > 2 || args[0][0] == '-')
 		unsupported("dolt_branch supports creation: name [start-point]");
 	valid_name(args[0]);
@@ -963,7 +1252,7 @@ dolt_branch(PG_FUNCTION_ARGS)
 	move_ref(psprintf("heads/%s", args[0]), ref, commit);
 	move_ref(psprintf("working/%s", args[0]), empty_ref, child(commit, 1));
 	move_ref(psprintf("staged/%s", args[0]), empty_ref, child(commit, 1));
-	binding_prepare(args[0], child(commit, 1), false);
+	replace_working(args[0], child(commit, 1), NIL);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
@@ -986,6 +1275,16 @@ dolt_tag(PG_FUNCTION_ARGS)
 
 	standalone(fcinfo, true);
 	nest = begin_api();
+	if (n == 2 && (!strcmp(args[0], "-d") || !strcmp(args[0], "--delete")))
+	{
+		VersionRef	existing = read_ref(psprintf("tags/%s", args[1]));
+
+		if (!existing.target)
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("tag not found: %s", args[1])));
+		move_ref(psprintf("tags/%s", args[1]), existing, NULL);
+		end_api(nest);
+		PG_RETURN_INT64(0);
+	}
 	for (i = 0; i < n; i++)
 	{
 		if (!strcmp(args[i], "-m") || !strcmp(args[i], "--message"))
@@ -1016,7 +1315,7 @@ dolt_tag(PG_FUNCTION_ARGS)
 	if (!author)
 	{
 		author = GetUserNameFromId(GetUserId(), false);
-		email = psprintf("%s@localhost", author);
+		email = default_email(author);
 	}
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '{');
@@ -1124,14 +1423,7 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 2)
 		table = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	if (table)
-	{
-		run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) SELECT DISTINCT v->>'name' FROM members WHERE v->>'kind'='table' AND (v->>'name'=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(v->>'name'))[2]=(parse_ident($3))[1]))", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), CStringGetTextDatum(table)), NULL, true);
-		if (!SPI_processed)
-			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table does not exist in either revision: %s", table)));
-		if (SPI_processed > 1)
-			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
-		table = strcell(0, 1);
-	}
+		table = resolve_table_argument(table, from, to, true);
 
 	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table'),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table'),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,(av->>'content') IS DISTINCT FROM (bv->>'content'),(av->>'schema') IS DISTINCT FROM (bv->>'schema') FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3 OR (array_length(parse_ident($3),1)=1 AND (parse_ident(coalesce(av->>'name',bv->>'name')))[2]=(parse_ident($3))[1])) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
@@ -1180,14 +1472,28 @@ dolt_diff_summary_table(PG_FUNCTION_ARGS)
 
 #include "dg_binding.inc"
 
+static void validate_working_foreign_keys(const char *branch);
+
 #include "dg_merge.inc"
 
 
 
 #include "dg_provider.inc"
 #include "dg_catalog.inc"
+#include "dg_foreign_validate.inc"
 
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
+#include "dg_routine_ddl.inc"
 
 #include "dg_alter.inc"
+#include "dg_dependency.inc"
+#include "dg_tables.inc"
+#include "dg_diff.inc"
+#include "dg_patch.inc"
+#include "dg_workspace.inc"
+#include "dg_conflicts.inc"
+#include "dg_schemas.inc"
+#include "dg_rebase.inc"
+#include "dg_tools.inc"
+#include "dg_compat.inc"

@@ -55,7 +55,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 				nest;
 	bool		pushed = false;
 
-	if (!IsUnderPostmaster || catalog_new_member(RelationGetRelid(rel)))
+	if (!IsUnderPostmaster || CatalogViewIsProvisional(rel->rd_catalogview) || catalog_new_member(RelationGetRelid(rel)))
 		return;
 	GetUserIdAndSecContext(&user, &security);
 	if (!ActiveSnapshotSet() || (snapshot && IsMVCCSnapshot(snapshot)))
@@ -98,134 +98,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 bool
 dg_catalog_drop(Node *statement)
 {
-	DropStmt   *drop;
-	Oid			user;
-	int			security,
-				nest;
-	bool		pushed = false;
-	bool		handled = false;
-	char	   *search_path = pstrdup(GetConfigOption("search_path", false, false));
-
-	if (!IsUnderPostmaster || !IsA(statement, DropStmt))
-		return false;
-	drop = (DropStmt *) statement;
-	if (drop->removeType != OBJECT_TABLE)
-		return false;
-	GetUserIdAndSecContext(&user, &security);
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed = true;
-	}
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		nest = begin_api();
-		if (read_ref("views/enabled").target)
-		{
-			ListCell   *lc;
-			List	   *removed = NIL;
-			VersionRef	working;
-			Capture		current;
-			Datum	   *names;
-			int			i = 0;
-			bytea	   *database;
-			char	   *json;
-			Datum	   *children;
-			int			nchildren;
-
-			handled = true;
-			if (drop->behavior != DROP_RESTRICT || drop->concurrent)
-				unsupported("branch DROP supports RESTRICT only");
-			dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
-			working = read_ref(branch_ref("working"));
-			foreach(lc, drop->objects)
-			{
-				RangeVar   *rv = makeRangeVarFromNameList(lfirst(lc));
-				Oid			id;
-				Relation	rel;
-				char	   *name;
-				ListCell   *index;
-
-				List	   *path = NIL;
-				ListCell   *part;
-				CatalogView *view = provider_view(working.target);
-
-				id = InvalidOid;
-				if (rv->catalogname || rv->dolt_revision)
-					unsupported("qualified revision DROP");
-				if (rv->schemaname)
-					path = list_make1(rv->schemaname);
-				else if (!SplitIdentifierString(pstrdup(search_path), ',', &path))
-					elog(ERROR, "invalid search_path");
-				foreach(part, path)
-				{
-					char	   *ns = (char *) lfirst(part);
-
-					if (!strcmp(ns, "$user"))
-						ns = GetUserNameFromId(user, false);
-					name = quote_qualified_identifier(ns, rv->relname);
-					if (catalog_contains(working.target, name))
-					{
-						catalog_acl(catalog_namespace(working.target, ns), "USAGE", user);
-						id = CatalogViewLookupObject(view, RelationRelationId, name);
-						break;
-					}
-				}
-				if (!OidIsValid(id) && !drop->missing_ok)
-					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", rv->relname, dg_current_branch())));
-				if (!OidIsValid(id))
-					continue;
-				rel = table_open(id, NoLock);
-				name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
-				if (!catalog_contains(working.target, name))
-				{
-					table_close(rel, NoLock);
-					if (drop->missing_ok)
-						continue;
-					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, dg_current_branch())));
-				}
-				if (rel->rd_tableam != dg_table_routine())
-					unsupported("branch DROP of non-prolly tables");
-				if (!object_ownercheck(RelationRelationId, id, user) && !object_ownercheck(NamespaceRelationId, RelationGetNamespace(rel), user))
-					aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, RelationGetRelationName(rel));
-				removed = lappend(removed, name);
-				foreach(index, RelationGetIndexList(rel))
-				{
-					Oid			indexid = lfirst_oid(index);
-
-					removed = lappend(removed, quote_qualified_identifier(get_namespace_name(get_rel_namespace(indexid)), get_rel_name(indexid)));
-				}
-				table_close(rel, NoLock);
-			}
-			current = capture(true);
-			names = palloc(sizeof(Datum) * Max(list_length(removed), 1));
-			foreach(lc, removed)
-				names[i++] = CStringGetTextDatum((char *) lfirst(lc));
-			{
-				ArrayType  *array = i ? construct_array(names, i, TEXTOID, -1, false, TYPALIGN_INT) : construct_empty_array(TEXTOID);
-
-				run("SELECT jsonb_set($1::jsonb,'{members}',coalesce((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",coalesce(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (coalesce(v->>'name','')=ANY($2))),'[]'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTARRAYOID), VC_ARGS(CStringGetTextDatum(current.json), PointerGetDatum(array)), NULL, true);
-				json = strcell(0, 1);
-				run("SELECT ch FROM pg_dolt_object_visible db CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE db.objhash=$1 AND CASE WHEN o.objkind IN ('table','index') THEN NOT (convert_from(o.objpayload,'UTF8')::jsonb->>'name'=ANY($2)) ELSE true END ORDER BY ch", 2, VC_TYPES(BYTEAOID, TEXTARRAYOID), VC_ARGS(PointerGetDatum(current.hash), PointerGetDatum(array)), NULL, true);
-			}
-			nchildren = SPI_processed;
-			children = palloc(sizeof(Datum) * Max(nchildren, 1));
-			for (i = 0; i < nchildren; i++)
-				children[i] = cell(i, 1);
-			database = put("database", json, children, nchildren);
-			move_ref(branch_ref("working"), working, database);
-		}
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
-	}
-	PG_END_TRY();
-	return handled;
+	return canonical_drop(statement);
 }
 
 /* Validate and serialize before running ordinary CREATE as the caller. */

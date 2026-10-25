@@ -744,7 +744,7 @@ CreateCacheMemoryContext(void)
  * resetting in-progress build entries in that case, or we'd never make any
  * progress.
  */
-static void
+void
 ResetCatalogCache(CatCache *cache, bool debug_discard)
 {
 	dlist_mutable_iter iter;
@@ -2503,9 +2503,16 @@ ResOwnerPrintCatCacheList(Datum res)
 void
 DestroyCatCache(CatCache *cache)
 {
+	if (!TryDestroyCatCache(cache))
+		elog(ERROR, "catalog view still has referenced cache entries");
+}
+
+bool
+TryDestroyCatCache(CatCache *cache)
+{
 	ResetCatalogCache(cache, false);
 	if (cache->cc_ntup || cache->cc_nlist)
-		elog(ERROR, "catalog view still has referenced cache entries");
+		return false;
 	slist_delete(&CacheHdr->ch_caches, &cache->cc_next);
 	if (cache->cc_tupdesc)
 	{
@@ -2517,4 +2524,5 @@ DestroyCatCache(CatCache *cache)
 	pfree(cache->cc_bucket);
 
 	pfree(cache);
+	return true;
 }
