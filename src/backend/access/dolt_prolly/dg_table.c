@@ -574,20 +574,29 @@ cluster(Relation a, Relation b, Relation c, bool sort, TransactionId oldest, Tra
 {
 	dg_unsupported("CLUSTER/VACUUM FULL");
 }
+/*
+ * Prolly rows carry no transaction IDs to freeze, and replaced versions live
+ * in the chunk store, whose garbage collection is separate. VACUUM has
+ * nothing to do here.
+ */
 static void
 vacuum_rel(Relation rel, struct VacuumParams *p, BufferAccessStrategy s)
 {
-	dg_unsupported("VACUUM (version retention/freezing is not implemented)");
 }
+
+/*
+ * The relation file holds no blocks, so ANALYZE samples nothing; planning
+ * uses relation_estimate_size instead of sampled statistics.
+ */
 static bool
 analyze_block(TableScanDesc s, ReadStream *stream)
 {
-	dg_unsupported("ANALYZE");
+	return false;
 }
 static bool
 analyze_tuple(TableScanDesc s, TransactionId oldest, double *live, double *dead, TupleTableSlot *slot)
 {
-	dg_unsupported("ANALYZE");
+	return false;
 }
 static double
 build_range(Relation t, Relation i, IndexInfo *info, bool sync, bool any, bool progress, BlockNumber start, BlockNumber n, IndexBuildCallback cb, void *arg, TableScanDesc scan)

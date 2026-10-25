@@ -741,8 +741,25 @@ store_xact(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
-			publish_all();
-			working_close(true);
+			{
+				/*
+				 * Commands such as DETACH PARTITION CONCURRENTLY commit while
+				 * their portal runs; publish under the transaction's owner.
+				 */
+				ResourceOwner owner = CurrentResourceOwner;
+
+				CurrentResourceOwner = TopTransactionResourceOwner;
+				PG_TRY();
+				{
+					publish_all();
+					working_close(true);
+				}
+				PG_FINALLY();
+				{
+					CurrentResourceOwner = owner;
+				}
+				PG_END_TRY();
+			}
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:

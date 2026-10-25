@@ -13,11 +13,13 @@ sub fails {
  isnt($status,0,$label);like($err,$pat,"$label diagnostic");
 }
 # ---- statistics over ANALYZE ----
-# The prolly access method rejects ANALYZE, so prolly tables never have rows here;
-# the view itself is exercised with heap tables.
+# ANALYZE and VACUUM accept prolly tables but sample and reclaim nothing, so
+# prolly tables never have rows here; the view is exercised with heap tables.
 sql(q{CREATE TABLE p(pk int PRIMARY KEY, c1 int) USING dolt_prolly_table; INSERT INTO p SELECT i, i % 7 FROM generate_series(1,100) g(i)});
-fails(q{ANALYZE p},qr/does not support ANALYZE/,'prolly tables reject ANALYZE');
-is(sql(q{SELECT dolt_stats_once() LIKE 'statistics refresh unavailable: %does not support ANALYZE%'}),'t','refresh reports the unsupported ANALYZE');
+sql(q{ANALYZE p; VACUUM p});
+is(sql(q{SELECT count(*) FROM p}),'100','ANALYZE and VACUUM leave prolly rows intact');
+is(sql(q{SELECT count(*) FROM pg_stats WHERE tablename='p'}),'0','ANALYZE samples no prolly rows');
+is(sql(q{SELECT dolt_stats_once()}),'statistics refreshed with ANALYZE','refresh succeeds with prolly tables');
 sql(q{DROP TABLE p});
 sql(q{CREATE TABLE t(pk int PRIMARY KEY, c1 int) USING heap; INSERT INTO t SELECT i, i % 7 FROM generate_series(1,100) g(i)});
 sql(q{CREATE TABLE t2(pk int PRIMARY KEY, c1 int) USING heap; CREATE INDEX t2_c1_idx ON t2(c1); INSERT INTO t2 SELECT i, i % 3 FROM generate_series(1,60) g(i)});
