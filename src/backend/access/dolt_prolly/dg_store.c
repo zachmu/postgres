@@ -274,9 +274,14 @@ working_close(bool commit)
 	{
 		if (commit)
 		{
+			ResourceOwner owner = CurrentResourceOwner;
+
+			/* The handle and its pins belong to the top transaction. */
+			CurrentResourceOwner = TopTransactionResourceOwner;
 			if (working_fetched.pin)
 				dolt_chunk_release(working_chunks, &working_fetched);
 			dolt_chunk_close(working_chunks);
+			CurrentResourceOwner = owner;
 		}
 		working_chunks = NULL;
 	}
@@ -766,7 +771,13 @@ store_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			working_close(false);
+
+			/*
+			 * Later pre-commit work, and parallel workers, which publish
+			 * nothing, may still have read chunks; close cleanly unless
+			 * aborting, when resource owners clean up instead.
+			 */
+			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
 			overlays = NULL;	/* in TopTransactionContext */
 			modified = NULL;
 			live_states = NULL;

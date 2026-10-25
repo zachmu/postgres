@@ -417,7 +417,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	writer(rel);
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
-	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, failure, &next);
+	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, changing, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
 		result = TM_Updated;
 	result = still_current(rel, handle, result, failure);
@@ -484,7 +484,17 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	writer(rel);
 	new_row = dg_encode(rel, slot);
 	new_digest = dg_rowhash(new_row);
+	/*
+	 * Judge the key change from the version being updated. A concurrent
+	 * update may already have replaced it in the latest state; the caller's
+	 * snapshot still has it.
+	 */
 	s = dg_load(rel, SnapshotSelf);
+	if (!handle_digest(s, handle, &old_digest) && snapshot && IsMVCCSnapshot(snapshot))
+	{
+		dg_release(s);
+		s = dg_load(rel, snapshot);
+	}
 	if (handle_digest(s, handle, &old_digest))
 	{
 		PLSlice		row = row_for_handle(s, (PLSlice) {old_digest.bytes, PL_HASH_SIZE});
@@ -551,6 +561,11 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 			break;
 		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), mode, policy,
 								(flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0, tmfd, &next);
+		if (result == TM_Updated && (flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
+			ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("tuple to be locked was already moved to another partition due to concurrent update")));
 		if (result != TM_Updated || !(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
 			break;
 

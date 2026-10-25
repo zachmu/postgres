@@ -84,7 +84,7 @@ extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, Lock
 extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id,
 								  bool key_change, bool wait, TM_FailureData *tmfd, int64 *next);
 extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bool wait,
-								  TM_FailureData *tmfd, int64 *next);
+								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
 extern PLStore *dg_working_store(void);
 extern void dg_collect(void);

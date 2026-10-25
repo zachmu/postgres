@@ -193,6 +193,8 @@ successor(Records *r, TM_Result result, TM_FailureData *tmfd, int64 id, int64 *n
 	*next = 0;
 	if (result == TM_Ok || result == TM_WouldBlock)
 		return;					/* no conflicting version; ids may be key hashes */
+	if (result == TM_Updated && ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
+		return;					/* the executor reports the move */
 	if (result == TM_Updated)
 		*next = record_handle(r, &tmfd->ctid);
 	dg_tid((uint64) (*next ? *next : id), &tmfd->ctid);
@@ -279,16 +281,20 @@ dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, bool
 	return result;
 }
 
-/* Delete row version |id|, as heap_delete deletes a tuple. */
+/*
+ * Delete row version |id|, as heap_delete deletes a tuple. |changing_part|
+ * marks a row moving to another partition, so waiters learn of the move.
+ */
 TM_Result
-dg_record_delete(Relation rel, const char *branch, int64 id, bool wait, TM_FailureData *tmfd, int64 *next)
+dg_record_delete(Relation rel, const char *branch, int64 id, bool wait, bool changing_part,
+				 TM_FailureData *tmfd, int64 *next)
 {
 	Records		r = records_open();
 	ItemPointerData tid;
 	TM_Result	result;
 
 	record_for(&r, &rel->rd_locator, branch, id, &tid);
-	result = heap_delete(r.heap, &tid, GetCurrentCommandId(true), InvalidSnapshot, wait, tmfd, false);
+	result = heap_delete(r.heap, &tid, GetCurrentCommandId(true), InvalidSnapshot, wait, tmfd, changing_part);
 	successor(&r, result, tmfd, id, next);
 	records_close(&r);
 	return result;
