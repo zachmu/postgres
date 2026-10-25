@@ -308,6 +308,13 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		manifest_execute("INSERT INTO pg_catalog.pg_dolt_reflog(reflogname,reflogtime,reflogtarget) VALUES($1,clock_timestamp(),$3)", 4, types, args, nulls, false, 0);
 	/* Named revision bindings must be reanalyzed after ref publication. */
 	CacheInvalidateRelcacheByRelid(DoltRefRelationId);
+
+	/*
+	 * A working set names the branch's schema: rebuild descriptors of the
+	 * branch's objects everywhere, including on standbys.
+	 */
+	if (strncmp(text_to_cstring(name), "working/", 8) == 0)
+		dg_identity_invalidate_branch(text_to_cstring(name) + 8);
 	SPI_finish();
 	if (PG_ARGISNULL(2))
 		PG_RETURN_NULL();

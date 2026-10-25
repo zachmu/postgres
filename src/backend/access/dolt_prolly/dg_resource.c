@@ -226,7 +226,7 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	form = *(Form_pg_dolt_storage) GETSTRUCT(tuple);
 	systable_endscan(scan);
 	table_close(catalog, AccessShareLock);
-	storage->definition = relation_open(definition, NoLock);
+	storage->definition = relation_open(definition, CatalogViewIsDurable(definition) ? AccessShareLock : NoLock);
 	if (form.storagedb != MyDatabaseId || !OidIsValid(form.storagespc) || !RelFileNumberIsValid(form.storagefile) ||
 		form.storageam != storage->definition->rd_rel->relam || form.storagekind != storage->definition->rd_rel->relkind)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource properties do not match canonical definition")));
@@ -388,6 +388,8 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	 * OID.
 	 */
 	LockRelationId(&rel->rd_lockInfo.lockRelId, RowExclusiveLock);
+	if (CatalogViewIsDurable(RelationGetRelid(storage->definition)))
+		LockRelationOid(RelationGetRelid(storage->definition), RowExclusiveLock);
 	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch, RowExclusiveLock);
 	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	catalog = table_open(DoltBindingRelationId, RowShareLock);
@@ -403,6 +405,15 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
 	storage->writable = true;
 	return rel;
+}
+
+/* Whether |rel| is a private descriptor over a storage resource. */
+bool
+dg_storage_bound(Relation rel)
+{
+	DGStorage  *storage = rel->rd_amcache;
+
+	return rel->rd_catalogview && storage && &storage->relation == rel && storage->definition;
 }
 
 static DGStorage *
@@ -530,4 +541,31 @@ dg_storage_enable_read(DGStorage *storage, bytea *base)
 {
 	storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
 	return &storage->relation;
+}
+
+/*
+ * The file locator of storage resource |resource|, for the relcache entry of
+ * a branch head's relation. Read under the catalog snapshot, as relcache
+ * builds read pg_class.
+ */
+void
+dg_storage_locator(Oid resource, RelFileLocator *locator)
+{
+	Relation	catalog = table_open(DoltStorageRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Form_pg_dolt_storage form;
+
+	ScanKeyInit(&key, Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
+	scan = systable_beginscan(catalog, DoltStorageKeyIndexId, true, NULL, 1, &key);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is unavailable", resource)));
+	form = (Form_pg_dolt_storage) GETSTRUCT(tuple);
+	locator->spcOid = form->storagespc;
+	locator->dbOid = form->storagedb;
+	locator->relNumber = form->storagefile;
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
 }

@@ -22,6 +22,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/pg_db_role_setting_d.h"
 #include "catalog/pg_depend_d.h"
 #include "catalog/pg_description_d.h"
@@ -214,7 +215,9 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 	int			i;
 
 	for (i = 0; i < nkeys; i++)
-		if ((keys[i] <= UINT32_MAX || (int64) keys[i] < 0) && DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId)
+		if ((keys[i] <= UINT32_MAX || (int64) keys[i] < 0) &&
+			(DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId ||
+			 (CatalogViewIsDurable(DatumGetObjectId(keys[i])) && dg_catalog_provides(cache->cc_reloid))))
 			bound = true;
 	if (bound)
 	{

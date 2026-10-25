@@ -55,6 +55,8 @@ extern void CacheInvalidateRelcacheByTuple(HeapTuple classTuple);
 
 extern void CacheInvalidateRelcacheByRelid(Oid relid);
 
+extern void CacheInvalidateRelcacheInDatabase(Oid relid);
+
 extern void CacheInvalidateRelSync(Oid relid);
 
 extern void CacheInvalidateRelSyncAll(void);

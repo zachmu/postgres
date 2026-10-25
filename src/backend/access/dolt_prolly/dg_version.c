@@ -23,6 +23,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_identity.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"

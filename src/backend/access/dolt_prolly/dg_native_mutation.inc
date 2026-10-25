@@ -423,7 +423,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		ListCell   *lc;
 		List	   *commands = statement->cmds;
 
-		provider_populate(view, current.hash);
+		provider_populate(view, current.hash, NULL);
 		CatalogViewBeginMutation(view);
 		CatalogViewSetMutationValidator(view, mutation_validate_tuple);
 		CatalogViewSetStorageHandler(view, mutation_storage);

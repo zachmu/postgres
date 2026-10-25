@@ -598,7 +598,7 @@ GetNewObjectId(void)
 	}
 
 	/* Keep backend-local catalog handles disjoint from persisted object IDs. */
-	if (TransamVariables->nextOid >= FirstCatalogViewObjectId)
+	if (TransamVariables->nextOid >= FirstDurableObjectId)
 	{
 		TransamVariables->nextOid = FirstNormalObjectId;
 		TransamVariables->oidCount = 0;

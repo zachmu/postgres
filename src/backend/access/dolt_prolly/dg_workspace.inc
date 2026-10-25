@@ -552,6 +552,7 @@ delete_branch_refs(const char *name)
 			move_ref(psprintf("%s/%s", prefixes[i], name), r, NULL);
 	}
 	run("DELETE FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, false);
+	dg_identity_delete_branch(name);
 }
 
 static void

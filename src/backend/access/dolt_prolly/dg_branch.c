@@ -1,4 +1,6 @@
 #include "dg.h"
+#include "catalog/catalogview.h"
+#include "utils/inval.h"
 #include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 #include "access/xact.h"
@@ -99,11 +101,69 @@ dg_branch_cache_id(void)
 	return id;
 }
 
-/* Keep the AM's binding entrypoint relation-specific for future qualified RTEs. */
+/*
+ * The branch whose roots |rel| reads and writes: a private storage descriptor's
+ * own branch, a branch head relation's branch, or else the session's.
+ */
+static HTAB *durable_branches;
+
+typedef struct DurableBranch
+{
+	Oid			oid;
+	char		branch[NAMEDATALEN * 2];
+} DurableBranch;
+
+static void
+durable_branches_reset(Datum arg, Oid relid)
+{
+	if (durable_branches && (!OidIsValid(relid) || CatalogViewIsDurable(relid)))
+	{
+		hash_destroy(durable_branches);
+		durable_branches = NULL;
+	}
+}
+
 const char *
 dg_relation_branch(Relation rel)
 {
-	return rel->rd_catalogview ? dg_storage_branch(rel) : dg_current_branch();
+	Oid			relid = RelationGetRelid(rel);
+	DurableBranch *entry;
+	bool		found;
+
+	if (dg_storage_bound(rel))
+		return dg_storage_branch(rel);
+	if (!CatalogViewIsDurable(relid))
+		return dg_current_branch();
+	if (!durable_branches)
+	{
+		HASHCTL		ctl = {0};
+		static bool registered = false;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DurableBranch);
+		ctl.hcxt = TopMemoryContext;
+		durable_branches = hash_create("durable relation branches", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		if (!registered)
+		{
+			CacheRegisterRelcacheCallback(durable_branches_reset, (Datum) 0);
+			registered = true;
+		}
+	}
+	entry = hash_search(durable_branches, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		char	   *branch,
+				   *name;
+		char		kind;
+
+		if (!dg_identity_describe(relid, &branch, &kind, &name))
+		{
+			hash_search(durable_branches, &relid, HASH_REMOVE, NULL);
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("relation %u no longer belongs to a branch", relid)));
+		}
+		strlcpy(entry->branch, branch, sizeof(entry->branch));
+	}
+	return entry->branch;
 }
 
 static void

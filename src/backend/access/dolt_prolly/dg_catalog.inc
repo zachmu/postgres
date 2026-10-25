@@ -13,6 +13,28 @@ catalog_current_database(void)
 	return NULL;
 }
 
+/* The branch head whose schema the current context view shows, if any. */
+static const char *
+catalog_current_branch(void)
+{
+	DGProvider *entry;
+	CatalogView *view = CatalogViewCurrent();
+
+	if (!view || dg_execution_branch())
+		return NULL;
+	for (entry = providers; entry; entry = entry->next)
+		if (entry->view == view)
+			return entry->branch;
+	return NULL;
+}
+
+/* Names resolve on |branch|'s head when given, else in revision |db|. */
+static CatalogView *
+context_view(bytea *db, const char *branch)
+{
+	return branch ? provider_branch_view(branch, db) : provider_view(db);
+}
+
 /* All SQL entry paths use the provider's complete catalog family set. */
 static bool
 catalog_supported(Oid id)
@@ -285,13 +307,17 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	bool		pushed = false;
 	bool		working = false;
 	Oid			live = InvalidOid;
+	const char *context_branch = NULL;
 
 	if (rangevar_projection_hook || catalog_api_depth)
 		return NULL;
 	rv = system_alias(rv);
 	if (!rte->dolt_database && !rv->dolt_revision &&
 		!(rv->catalogname && strpbrk(rv->catalogname, "@/")) && catalog_current_database())
+	{
 		rte->dolt_database = pstrdup(catalog_current_database());
+		context_branch = catalog_current_branch();
+	}
 	if (!rv->dolt_revision)
 	{
 		if (!rv->catalogname || !(sep = strpbrk(rv->catalogname, "@/")))
@@ -300,7 +326,7 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 				return NULL;
 			if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 				return NULL;
-			revision = pstrdup(dg_current_branch());
+			revision = pstrdup(context_branch ? context_branch : dg_current_branch());
 			goto revision_selected;
 		}
 		dbname = pnstrdup(rv->catalogname, sep - rv->catalogname);
@@ -345,7 +371,8 @@ revision_selected:
 	PG_TRY();
 	{
 		nest = begin_api();
-		working = !rte->dolt_database && !rv->dolt_revision && read_ref(psprintf("heads/%s", revision)).target != NULL;
+		working = (!rte->dolt_database || context_branch) && !rv->dolt_revision &&
+			read_ref(psprintf("heads/%s", revision)).target != NULL;
 		db = rte->dolt_database ? unhex(rte->dolt_database) :
 			(working ? read_ref(psprintf("working/%s", revision)).target : NULL);
 		if (!db)
@@ -452,7 +479,7 @@ revision_selected:
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
 			rte->dolt_table = hex(descriptor);
 			{
-				CatalogView *view = provider_view(db);
+				CatalogView *view = working ? provider_branch_view(revision, db) : provider_view(db);
 				Oid			handle = CatalogViewLookupObject(view, RelationRelationId, logical);
 				Relation	rel = relation_open(handle, AccessShareLock);
 
@@ -541,7 +568,7 @@ catalog_open_table(const char *branch, const char *name, AclMode permission)
 		resource = binding_relation(branch, name, schema);
 		if (!OidIsValid(resource))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, branch)));
-		handle = CatalogViewLookupObject(provider_view(db), RelationRelationId, name);
+		handle = CatalogViewLookupObject(provider_branch_view(branch, db), RelationRelationId, name);
 		storage = dg_storage_open(handle, branch, name, schema, resource, GetActiveSnapshot());
 		result = permission == ACL_SELECT ? dg_storage_enable_read(storage, child(descriptor, 2)) : dg_storage_enable_write(storage, child(descriptor, 2));
 		if (permission != ACL_SELECT)
@@ -598,7 +625,22 @@ dg_catalog_target(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 		return NULL;
 	if (!rte->dolt_branch || rte->dolt_catalog)
 		unsupported("non-working canonical write target");
-	return table_open(get_typ_typrelid(rte->dolt_rowtype), NoLock);
+
+	/*
+	 * A branch head's table is an ordinary relation with a durable OID; the
+	 * executor opens and locks it like any other.
+	 */
+	{
+		Oid			relid = get_typ_typrelid(rte->dolt_rowtype);
+
+		if (CatalogViewIsDurable(relid))
+		{
+			rte->dolt_branch = NULL;
+			rte->dolt_relid = InvalidOid;
+			return table_open(relid, RowExclusiveLock);
+		}
+		return table_open(relid, NoLock);
+	}
 }
 
 Relation
@@ -678,6 +720,8 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		bytea	   *db;
 
 		nest = begin_api();
+		const char *branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
+
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			read_ref(branch_ref("working")).target;
 		{
@@ -690,7 +734,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(provider_view(db), RelationRelationId,
+				*result = CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
 												  quote_qualified_identifier(ns, rv->relname));
 		}
 		end_api(nest);
@@ -736,7 +780,7 @@ dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait)
 				nest;
 	bool		pushed = false;
 
-	if (!CatalogViewObjectContext(id))
+	if (!CatalogViewIsLeased(id))
 		return false;
 	definition = relation_open(id, NoLock);
 	if (!definition->rd_catalogview)
@@ -828,6 +872,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 	CatalogView *view = CatalogViewObjectContext(id);
 	DGProvider *provider;
 	char	   *database = NULL;
+	const char *branch = NULL;
 	char	   *path;
 	RangeVar   *rv;
 	Oid			user;
@@ -841,9 +886,14 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 		return false;
 	for (provider = providers; provider; provider = provider->next)
 		if (provider->view == view)
+		{
 			database = provider->database;
+			branch = provider->branch;
+		}
 	if (view && !database)
 		return false;			/* non-production synthetic provider */
+	if (!view)
+		branch = dg_current_branch();
 	path = pstrdup(GetConfigOption("search_path", false, false));
 	rv = makeRangeVar(NULL, pstrdup(name), -1);
 	GetUserIdAndSecContext(&user, &security);
@@ -863,7 +913,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
 		ns = catalog_resolve_name(db, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
-						  CatalogViewLookupObject(provider_view(db), RelationRelationId,
+						  CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
 												  quote_qualified_identifier(ns, name)) == id);
 		end_api(nest);
 	}
@@ -905,6 +955,8 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		bytea	   *db;
 
 		nest = begin_api();
+		const char *branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
+
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			read_ref(branch_ref("working")).target;
 		{
@@ -916,7 +968,7 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(provider_view(db), TypeRelationId,
+				*result = CatalogViewLookupObject(context_view(db, branch), TypeRelationId,
 												  quote_qualified_identifier(ns, rv->relname));
 		}
 		end_api(nest);
@@ -970,7 +1022,7 @@ dg_catalog_session_view(void)
 	PG_TRY();
 	{
 		nest = begin_api();
-		result = provider_view(read_ref(branch_ref("working")).target);
+		result = provider_branch_view(dg_current_branch(), read_ref(branch_ref("working")).target);
 		end_api(nest);
 	}
 	PG_FINALLY();
@@ -1018,7 +1070,7 @@ dg_catalog_foreign_lock(Relation definition)
 	Relation	bound;
 	const char *name;
 
-	if (!definition->rd_catalogview)
+	if (!definition->rd_catalogview || CatalogViewIsDurable(RelationGetRelid(definition)))
 		return;
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
 	GetUserIdAndSecContext(&user, &security);

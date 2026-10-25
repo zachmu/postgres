@@ -1700,6 +1700,18 @@ CacheInvalidateRelcacheByRelid(Oid relid)
 }
 
 /*
+ * CacheInvalidateRelcacheInDatabase
+ *		As CacheInvalidateRelcacheByRelid, for a relation of this database whose
+ *		pg_class row need not be readable, such as a branch head's relation
+ *		while its branch's schema is being replaced.
+ */
+void
+CacheInvalidateRelcacheInDatabase(Oid relid)
+{
+	RegisterRelcacheInvalidation(PrepareInvalidationState(), MyDatabaseId, relid);
+}
+
+/*
  * CacheInvalidateRelSync
  *		Register invalidation of the cache in logical decoding output plugin
  *		for a database.

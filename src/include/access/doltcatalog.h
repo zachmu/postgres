@@ -7,6 +7,7 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pathnodes.h"
 #include "nodes/extensible.h"
+#include "storage/relfilelocator.h"
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
@@ -43,4 +44,8 @@ extern TupleDesc dg_catalog_bind(struct ParseState *pstate, const RangeVar *rv, 
 extern void dg_catalog_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
 extern const CustomScanMethods *dg_catalog_scan_methods(void);
 extern void dg_catalog_permission(const char *descriptor, Oid user);
+extern void dg_storage_locator(Oid resource, RelFileLocator *locator);
+extern struct CatalogView *dg_catalog_resolve_durable(Oid oid);
+extern bool dg_catalog_provides(Oid catalog);
+extern bool dg_storage_bound(Relation rel);
 #endif

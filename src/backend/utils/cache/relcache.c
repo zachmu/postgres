@@ -26,6 +26,7 @@
  */
 #include "postgres.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 
 #include <sys/file.h>
 #include <fcntl.h>
@@ -1350,6 +1351,12 @@ RelationInitPhysicalAddr(Relation relation)
 	 * Canonical definitions are not mapped physical relations. Storage access
 	 * must use an explicitly bound resource; retained metadata has no file.
 	 */
+	if (CatalogViewIsDurable(RelationGetRelid(relation)))
+	{
+		/* A branch head's relation uses its storage resource's file. */
+		dg_storage_locator(CatalogViewObjectStorage(RelationGetRelid(relation)), &relation->rd_locator);
+		return;
+	}
 	if (CatalogViewObjectContext(RelationGetRelid(relation)))
 	{
 		MemSet(&relation->rd_locator, 0, sizeof(relation->rd_locator));
@@ -3242,7 +3249,7 @@ AssertPendingSyncs_RelationCache(void)
 		 * already be retired after DDL.  Check the backing physical relations
 		 * instead.
 		 */
-		if (CatalogViewObjectContext(relid))
+		if (CatalogViewIsLeased(relid))
 			continue;
 		r = RelationIdGetRelation(relid);
 		if (!RelationIsValid(r))

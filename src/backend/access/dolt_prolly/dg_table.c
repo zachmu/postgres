@@ -209,7 +209,7 @@ writer(Relation rel)
 {
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
-	if (rel->rd_catalogview)
+	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 }
 static void

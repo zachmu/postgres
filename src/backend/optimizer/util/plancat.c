@@ -219,7 +219,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	if ((inhparent && relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		|| (IgnoreSystemIndexes && IsSystemRelation(relation))
 		|| CatalogViewContains(CatalogViewCurrent(), relationObjectId)
-		|| relation->rd_catalogview)
+		|| (relation->rd_catalogview && !CatalogViewIsDurable(relationObjectId)))
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;

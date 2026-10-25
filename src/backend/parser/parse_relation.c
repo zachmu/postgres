@@ -35,6 +35,7 @@
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "catalog/catalogview.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -2526,6 +2527,23 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 
 	if (!desc)
 		return NULL;
+
+	/*
+	 * A table on a branch head is an ordinary relation with a durable OID:
+	 * plan and execute it like any other table. Revisions keep the versioned
+	 * scan.
+	 */
+	if (rte->dolt_branch && OidIsValid(rte->dolt_rowtype) && !rte->dolt_catalog &&
+		CatalogViewIsDurable(get_typ_typrelid(rte->dolt_rowtype)))
+	{
+		Relation	rel = table_open(get_typ_typrelid(rte->dolt_rowtype), AccessShareLock);
+		ParseNamespaceItem *item;
+
+		item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
+		table_close(rel, NoLock);
+		FreeTupleDesc(desc);
+		return item;
+	}
 	if (rte->relkind == RELKIND_VIEW)
 	{
 		RangeVar   *native = copyObject(rv);

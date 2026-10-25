@@ -4,6 +4,7 @@
  */
 typedef struct DGProvider
 {
+	char	   *branch;			/* branch head; NULL for a revision */
 	char	   *database;
 	CatalogView *view;
 	struct DGProvider *next;
@@ -14,6 +15,16 @@ static const Oid provider_catalogs[] = {
 	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
 	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
+
+/* Whether branch and revision views supply rows of |catalog|. */
+bool
+dg_catalog_provides(Oid catalog)
+{
+	for (int i = 0; i < lengthof(provider_catalogs); i++)
+		if (provider_catalogs[i] == catalog)
+			return true;
+	return false;
+}
 
 typedef struct DGProviderRows
 {
@@ -560,8 +571,8 @@ provider_role_dependencies(DGProviderRows *rows)
 			Oid			owner;
 			Datum		acl;
 
-			if (!CatalogViewObjectContext(object))
-				continue;
+			if (object < FirstDurableObjectId)
+				continue;		/* bootstrap objects are shared */
 			owner = DatumGetObjectId(heap_getattr(tuple, owners[i], desc, &isnull));
 			provider_role_dependency(rows, catalogs[i], object, owner, SHARED_DEPENDENCY_OWNER);
 			acl = heap_getattr(tuple, acls[i], desc, &isnull);
@@ -595,8 +606,39 @@ provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
 	return false;
 }
 
+/*
+ * Bind a table, index or row type. On a branch head it takes the object's
+ * durable OID and, for relations, its storage resource; a revision's objects
+ * take backend-local handles.
+ */
+static Oid
+provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
+			  const char *name, const char *identity)
+{
+	Oid			existing = CatalogViewFindObject(view, objectclass, identity);
+	Oid			oid;
+	Oid			storage = InvalidOid;
+
+	if (OidIsValid(existing))
+		return existing;
+	if (branch && OidIsValid(oid = dg_identity_lookup(branch, kind, name)))
+	{
+		if (kind == DOLT_IDENTITY_RELATION)
+		{
+			run("SELECT bindrelid FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1 AND bindname=$2", 2,
+				VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name)), NULL, true);
+			if (SPI_processed != 1)
+				elog(ERROR, "branch object %s on %s has no storage binding", name, branch);
+			storage = DatumGetObjectId(cell(0, 1));
+		}
+		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
+		return oid;
+	}
+	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
+}
+
 static void
-provider_populate(CatalogView *view, bytea *database)
+provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
 	bytea	  **addresses;
@@ -657,7 +699,8 @@ provider_populate(CatalogView *view, bytea *database)
 	/* Bind all class identities before resolving cross-object edges. */
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
-			(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
+			(void) provider_bind(view, branch, RelationRelationId, DOLT_IDENTITY_RELATION,
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 		{
@@ -673,11 +716,11 @@ provider_populate(CatalogView *view, bytea *database)
 
 			if (list_length(parts) != 2)
 				elog(ERROR, "canonical relation name is not qualified");
-			form.oid = CatalogViewBindObject(view, RelationRelationId, name, InvalidOid);
+			form.oid = CatalogViewFindObject(view, RelationRelationId, name);
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
 			form.relowner = get_role_oid(owner, false);
-			form.reltype = index ? InvalidOid : CatalogViewBindObject(view, TypeRelationId, name, InvalidOid);
+			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
@@ -733,7 +776,7 @@ provider_populate(CatalogView *view, bytea *database)
 					pfree(arrayname);
 					arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
 				}
-				array.oid = CatalogViewBindObject(view, TypeRelationId, arrayidentity, InvalidOid);
+				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity);
 				type.typarray = array.oid;
 
 				type.oid = form.reltype;
@@ -836,7 +879,7 @@ provider_reload(CatalogView *view, void *arg)
 		nest = begin_api();
 		database = unhex(entry->database);
 		(void) metadata(database, "database");
-		provider_populate(view, database);
+		provider_populate(view, database, entry->branch);
 		end_api(nest);
 	}
 	PG_FINALLY();
@@ -870,8 +913,13 @@ provider_creator(bytea *database)
 	return creator;
 }
 
+/*
+ * The catalog view of schema |database|: as a branch head's working schema
+ * when |branch| is given, else as a read-only revision. The two differ only
+ * in object identity, so one schema can be cached under both.
+ */
 static CatalogView *
-provider_view(bytea *database)
+provider_lookup(const char *branch, bytea *database)
 {
 	char	   *key = hex(database);
 	DGProvider *entry;
@@ -884,7 +932,8 @@ provider_view(bytea *database)
 	(void) metadata(database, "database");
 	for (entry = providers; entry; entry = entry->next)
 	{
-		if (!strcmp(entry->database, key))
+		if (!strcmp(entry->database, key) &&
+			(branch ? entry->branch && !strcmp(entry->branch, branch) : !entry->branch))
 		{
 			if (CatalogViewCreatorAborted(entry->view))
 				CatalogViewSetCreator(entry->view, provider_creator(database));
@@ -892,25 +941,97 @@ provider_view(bytea *database)
 			return entry->view;
 		}
 	}
-	view = CatalogViewCreate(key);
+	view = CatalogViewCreate(branch ? psprintf("%s@%s", key, branch) : key);
+
+	/*
+	 * Register before populating, so lookups made while building the view,
+	 * including of its own durable objects, find it rather than recurse.
+	 */
+	entry = MemoryContextAlloc(TopMemoryContext, sizeof(*entry));
+	entry->database = MemoryContextStrdup(TopMemoryContext, key);
+	entry->branch = branch ? MemoryContextStrdup(TopMemoryContext, branch) : NULL;
+	entry->view = view;
+	entry->next = providers;
+	providers = entry;
 	PG_TRY();
 	{
 		CatalogViewSetCreator(view, provider_creator(database));
-		provider_populate(view, database);
+		provider_populate(view, database, branch);
 	}
 	PG_CATCH();
 	{
+		providers = entry->next;
+		pfree(entry->database);
+		if (entry->branch)
+			pfree(entry->branch);
+		pfree(entry);
 		CatalogViewRelease(view);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	entry = MemoryContextAlloc(TopMemoryContext, sizeof(*entry));
-	entry->database = MemoryContextStrdup(TopMemoryContext, key);
-	entry->view = view;
-	entry->next = providers;
-	providers = entry;
 	CatalogViewSetLoader(view, provider_reload, entry);
 	return view;
+}
+
+static CatalogView *
+provider_view(bytea *database)
+{
+	return provider_lookup(NULL, database);
+}
+
+/* The current schema of |branch|'s head, with its objects' durable OIDs. */
+static CatalogView *
+provider_branch_view(const char *branch, bytea *database)
+{
+	return provider_lookup(branch, database);
+}
+
+/*
+ * The current view for durable OID |oid|: its branch's working schema as this
+ * transaction sees it. NULL if no branch defines the OID.
+ */
+CatalogView *
+dg_catalog_resolve_durable(Oid oid)
+{
+	char	   *branch,
+			   *name;
+	char		kind;
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+	CatalogView *result = NULL;
+	CatalogView *previous;
+
+	if (!IsTransactionState() || !dg_identity_describe(oid, &branch, &kind, &name))
+		return NULL;
+	previous = CatalogViewSwitch(NULL);
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		VersionRef	working;
+
+		nest = begin_api();
+		working = read_ref(psprintf("working/%s", branch));
+		if (working.target)
+			result = provider_branch_view(branch, working.target);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 CatalogView *

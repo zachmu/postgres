@@ -1281,6 +1281,10 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 DGState *
 dg_load(Relation rel, Snapshot snap)
 {
+	if (dg_storage_bound(rel))
+		return dg_storage_am_load(rel, snap);
+	if (CatalogViewIsDurable(RelationGetRelid(rel)))
+		return load_state(rel, snap, NULL, dg_relation_branch(rel), false, true);
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load(rel, snap);
 
@@ -1297,6 +1301,10 @@ dg_load_branch(Relation rel, Snapshot snap, const char *branch)
 DGState *
 dg_load_tid(Relation rel, uint64 id)
 {
+	if (dg_storage_bound(rel))
+		return dg_storage_am_load_tid(rel, id);
+	if (CatalogViewIsDurable(RelationGetRelid(rel)))
+		return load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true);
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load_tid(rel, id);
 
@@ -1307,7 +1315,6 @@ dg_load_tid(Relation rel, uint64 id)
 DGState *
 dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 {
-	Assert(CatalogViewObjectContext(RelationGetRelid(rel)));
 	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
 	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
 	return load_state(rel, snap, NULL, branch, false, true);
@@ -1349,7 +1356,7 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 void
 dg_save(Relation rel, DGState *s, CommandId cid)
 {
-	if (CatalogViewObjectContext(RelationGetRelid(rel)))
+	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 	save_state(rel, s, cid, dg_relation_branch(rel));
 }

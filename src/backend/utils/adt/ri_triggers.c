@@ -260,7 +260,8 @@ pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 static bool
 ri_unlockable(Relation rel)
 {
-	return rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID && rel->rd_catalogview != NULL;
+	return rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID && rel->rd_catalogview != NULL &&
+		CatalogViewIsLeased(RelationGetRelid(rel));
 }
 
 static Datum

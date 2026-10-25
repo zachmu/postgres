@@ -15,6 +15,7 @@
 #include "access/genam.h"
 #include "access/nbtree.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "executor/tuptable.h"
 #include "utils/catcache.h"
 #include "utils/rel.h"
@@ -25,6 +26,19 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_class_d.h"
 #include "utils/inval.h"
+
+/*
+ * Durable OIDs belong to a branch, not to one view: each schema version of
+ * the branch is a different view binding the same OIDs. This backend keeps
+ * the view it last resolved for each durable OID and asks the resolver again
+ * after any relcache invalidation of a durable relation.
+ */
+typedef struct DurableContext
+{
+	Oid			oid;
+	CatalogView *view;
+} DurableContext;
+static HTAB *durable_contexts;
 
 typedef struct CatalogViewRows
 {
@@ -59,6 +73,7 @@ struct CatalogView
 	List	   *catalogs;
 	List	   *caches;
 	List	   *handles;
+	List	   *durable;		/* CatalogViewObjects bound to durable OIDs */
 	dlist_node	link;
 };
 typedef struct CatalogViewPin
@@ -317,7 +332,8 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 	{
 		int			attr = keys[i].sk_attno;
 
-		if (!(keys[i].sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_ROW_HEADER)) && attr > 0 && TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID)
+		if (!(keys[i].sk_flags & (SK_ISNULL | SK_SEARCHARRAY | SK_ROW_HEADER)) && attr > 0 && TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID &&
+			(!CatalogViewIsDurable(DatumGetObjectId(keys[i].sk_argument)) || dg_catalog_provides(RelationGetRelid(relation))))
 		{
 			CatalogView *bound = CatalogViewObjectContext(DatumGetObjectId(keys[i].sk_argument));
 
@@ -493,9 +509,124 @@ CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, 
 }
 
 static CatalogViewObject *
+view_durable(CatalogView *view, Oid oid)
+{
+	ListCell   *lc;
+
+	foreach(lc, view->durable)
+	{
+		CatalogViewObject *object = lfirst(lc);
+
+		if (object->handle == oid)
+			return object;
+	}
+	return NULL;
+}
+
+void
+CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage)
+{
+	CatalogViewObject *object;
+	MemoryContext previous;
+	ListCell   *lc;
+
+	Assert(CatalogViewIsDurable(oid));
+	foreach(lc, view->durable)
+	{
+		object = lfirst(lc);
+		if (object->handle == oid || (object->objectclass == objectclass && !strcmp(object->identity, identity)))
+		{
+			if (object->handle != oid || object->objectclass != objectclass || strcmp(object->identity, identity) || object->storage != storage)
+				elog(ERROR, "durable object %u is bound twice in one catalog context", oid);
+			return;
+		}
+	}
+	previous = MemoryContextSwitchTo(view->memory);
+	object = palloc0(sizeof(*object));
+	object->handle = oid;
+	object->objectclass = objectclass;
+	object->storage = storage;
+	object->view = view;
+	object->identity = pstrdup(identity);
+	view->durable = lappend(view->durable, object);
+	MemoryContextSwitchTo(previous);
+}
+
+void
+CatalogViewForgetDurable(void)
+{
+	HASH_SEQ_STATUS status;
+	DurableContext *entry;
+
+	if (!durable_contexts)
+		return;
+	hash_seq_init(&status, durable_contexts);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		CatalogView *view = entry->view;
+
+		hash_search(durable_contexts, &entry->oid, HASH_REMOVE, NULL);
+		CatalogViewRelease(view);
+	}
+}
+
+static void
+durable_invalidate(Datum arg, Oid relid)
+{
+	if (!OidIsValid(relid) || CatalogViewIsDurable(relid))
+		CatalogViewForgetDurable();
+}
+
+/* The current view for a durable OID; NULL if no branch defines it. */
+static CatalogView *
+durable_context(Oid oid)
+{
+	DurableContext *entry;
+	CatalogView *view;
+	bool		found;
+
+	if (!durable_contexts)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DurableContext);
+		ctl.hcxt = TopMemoryContext;
+		durable_contexts = hash_create("durable catalog contexts", 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		CacheRegisterRelcacheCallback(durable_invalidate, (Datum) 0);
+	}
+	entry = hash_search(durable_contexts, &oid, HASH_FIND, NULL);
+	if (entry)
+		return entry->view;
+	if (IsParallelWorker())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("branch catalog objects cannot be resolved in parallel workers")));
+	view = dg_catalog_resolve_durable(oid);
+	if (!view || !view->sealed)
+		return NULL;			/* unknown, or the view is still being built */
+	if (!view_durable(view, oid))
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("object %u does not exist in its branch's current schema", oid)));
+	entry = hash_search(durable_contexts, &oid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->view = view;
+		CatalogViewRetain(view);
+	}
+	return entry->view;
+}
+
+static CatalogViewObject *
 lookup_object(Oid handle)
 {
 	CatalogViewObject *object;
+
+	if (CatalogViewIsDurable(handle))
+	{
+		CatalogView *view = durable_context(handle);
+
+		return view ? view_durable(view, handle) : NULL;
+	}
 
 	if (handle >= FirstCatalogViewObjectId && IsParallelWorker())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -645,6 +776,14 @@ Oid
 CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity)
 {
 	ListCell   *lc;
+
+	foreach(lc, view->durable)
+	{
+		CatalogViewObject *object = lfirst(lc);
+
+		if (object->objectclass == objectclass && !strcmp(object->identity, identity))
+			return object->handle;
+	}
 
 	foreach(lc, view->handles)
 	{
