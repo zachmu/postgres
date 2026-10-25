@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/attmap.h"
+#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/gist.h"
 #include "access/heapam.h"
@@ -2199,6 +2200,16 @@ ExecuteTruncateGuts(List *explicit_rels,
 			 * foreign table belongs to.
 			 */
 			ft_info->rels = lappend(ft_info->rels, rel);
+			continue;
+		}
+
+		/*
+		 * A prolly table on a branch keeps its storage, shared with other
+		 * branches; truncation installs an empty root for this branch.
+		 */
+		if (CatalogViewIsDurable(RelationGetRelid(rel)))
+		{
+			dg_truncate(rel);
 			continue;
 		}
 

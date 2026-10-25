@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('lifecycle');
-$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");
 $node->append_conf('postgresql.conf',"dolt_catalog_cache_entries=2\nmax_parallel_workers_per_gather=2\n");
 $node->start;
 like($node->safe_psql('postgres',q{SET debug_parallel_query=on; EXPLAIN (ANALYZE,COSTS OFF,TIMING OFF) SELECT sum(i) FROM generate_series(1,100) i}),qr/Gather/,'ordinary native query still executes through a parallel plan');

@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('catalog_context');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sql(q{CREATE ROLE catalog_reader; CREATE TABLE t(id int PRIMARY KEY, value text) USING dolt_prolly_table; INSERT INTO t VALUES(1,'one'); SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','other'); ALTER TABLE t ADD COLUMN extra int; CREATE TABLE only_other(x int); SELECT dolt_commit('-Am','other schema')});
 my $s=$node->background_psql('postgres');

@@ -230,8 +230,6 @@ replace_working(const char *branch, bytea *database, List *tables)
 		relation_close(definition, NoLock);
 	}
 	move_ref(psprintf("working/%s", branch), working, database);
-	if (!strcmp(branch, dg_current_branch()) && !read_ref("views/enabled").target)
-		move_ref("views/enabled", empty_ref, read_ref(psprintf("heads/%s", branch)).target);
 	advance_snapshot();
 	for (int i = 0; i < count; i++)
 	{

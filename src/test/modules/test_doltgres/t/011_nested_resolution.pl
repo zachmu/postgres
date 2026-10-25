@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('nested_resolution');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 # Shared bootstrap helpers test SQL execution; user routines are not versioned yet.
 sql(q{

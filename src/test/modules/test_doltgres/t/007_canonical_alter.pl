@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('canonical_alter');
-$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sub fails {my($q,$re,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$re,"$label diagnostic");}
 sql(q{CREATE ROLE denied; CREATE TABLE t(id int PRIMARY KEY,discard text,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,'old',10),(2,'two',20); CREATE TABLE bag(a int,b text) USING dolt_prolly_table; INSERT INTO bag VALUES(1,'a'),(1,'b'),(1,'b'); SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other'); SELECT dolt_checkout('other')});

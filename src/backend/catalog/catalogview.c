@@ -178,7 +178,7 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 		 * Catcache lists need a tuple identity; it is local to this
 		 * catalog/view.
 		 */
-		ItemPointerSet(&tuple->t_self, ordinal / MaxOffsetNumber + 1, ordinal % MaxOffsetNumber + 1);
+		ItemPointerSet(&tuple->t_self, CatalogViewFirstBlock + ordinal / MaxOffsetNumber, ordinal % MaxOffsetNumber + 1);
 		ordinal++;
 		rows->tuples = lappend(rows->tuples, tuple);
 	}
@@ -765,6 +765,35 @@ CatalogViewRejectPhysicalAccess(Relation relation)
 						errmsg("physical access to revision-bound catalog %s is not supported", RelationGetRelationName(relation))));
 }
 
+/*
+ * Native DDL writes physical catalogs. It must never change a row it read
+ * from a branch's schema, nor make a physical row refer to a branch's object:
+ * those objects change only through their branch's canonical schema.
+ */
+void
+CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple)
+{
+	TupleDesc	desc = RelationGetDescr(relation);
+
+	if (tid && ItemPointerGetBlockNumberNoCheck(tid) >= CatalogViewFirstBlock)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("this command cannot change a versioned object")));
+	if (!tuple || strncmp(RelationGetRelationName(relation), "pg_dolt_", 8) == 0)
+		return;
+	for (int i = 0; i < desc->natts; i++)
+	{
+		bool		isnull;
+		Datum		value;
+
+		if (TupleDescAttr(desc, i)->atttypid != OIDOID)
+			continue;
+		value = heap_getattr(tuple, i + 1, desc, &isnull);
+		if (!isnull && DatumGetObjectId(value) >= FirstDurableObjectId)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("this command cannot make an unversioned object depend on a versioned one")));
+	}
+}
+
 Oid
 CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity)
 {
@@ -1230,7 +1259,7 @@ stage_tuple(Relation relation, ItemPointer tid, HeapTuple tuple)
 	{
 		uint64		ordinal = view->next_tuple++;
 
-		ItemPointerSet(&change->tid, ordinal / MaxOffsetNumber + 1, ordinal % MaxOffsetNumber + 1);
+		ItemPointerSet(&change->tid, CatalogViewFirstBlock + ordinal / MaxOffsetNumber, ordinal % MaxOffsetNumber + 1);
 		tuple->t_self = change->tid;
 	}
 	change->tuple = tuple ? heap_copytuple(tuple) : NULL;

@@ -19,13 +19,38 @@ dg_catalog_routine_namespace(Oid namespaceid)
 	return namespaceid;
 }
 
+/*
+ * Whether CREATE FUNCTION makes a versioned routine: SQL or PL/pgSQL in a user
+ * schema. Others, such as C functions, stay native and unversioned.
+ */
+static bool
+creates_versioned_routine(CreateFunctionStmt *stmt)
+{
+	char	   *name;
+	Oid			namespace = QualifiedNameGetCreationNamespace(stmt->funcname, &name);
+	const char *language = "sql";
+	ListCell   *lc;
+
+	if (isAnyTempNamespace(namespace) || dg_system_namespace(get_namespace_name(namespace)))
+		return false;
+	foreach(lc, stmt->options)
+	{
+		DefElem    *option = lfirst_node(DefElem, lc);
+
+		if (!strcmp(option->defname, "language"))
+			language = strVal(option->arg);
+	}
+	return !strcmp(language, "sql") || !strcmp(language, "plpgsql");
+}
+
 bool
 dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 {
 	CatalogView *previous;
 	bool		pushed = false;
 
-	if (!IsA(statement, CreateFunctionStmt) || !dg_catalog_active())
+	if (!IsA(statement, CreateFunctionStmt) || !dg_catalog_active() ||
+		!creates_versioned_routine((CreateFunctionStmt *) statement))
 		return false;
 	if (!ActiveSnapshotSet())
 	{

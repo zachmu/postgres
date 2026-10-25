@@ -232,7 +232,7 @@ dg_branch_base(Relation rel, DGState *state)
 	bytea	   *address = NULL;
 	bool		isnull;
 
-	if (dg_catalog_creating_relation(rel) || !strcmp(dg_relation_branch(rel), "main"))
+	if (!strcmp(dg_relation_branch(rel), "main"))
 		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect branch SPI");
@@ -249,43 +249,3 @@ dg_branch_base(Relation rel, DGState *state)
 		dg_history_handles(state);
 }
 
-/* Catalogs are shared until branch-aware schema binding is implemented. Freeze
- * schema once a second branch exists, rather than silently changing other views. */
-void
-dg_guard_branch_ddl(Node *statement)
-{
-	bool		guard,
-				found = false;
-	Relation	refs;
-	TableScanDesc scan;
-	HeapTuple	tuple;
-
-	if (!IsUnderPostmaster)
-		return;
-	guard = GetCommandLogLevel(statement) == LOGSTMT_DDL || IsA(statement, TruncateStmt);
-	if (!guard)
-		return;
-	/* Creating a schema that exists fails the same way on every branch. */
-	if (IsA(statement, CreateSchemaStmt) && ((CreateSchemaStmt *) statement)->schemaname &&
-		OidIsValid(get_namespace_oid(((CreateSchemaStmt *) statement)->schemaname, true)))
-		return;
-	LockDatabaseObject(DoltRefRelationId, 0, 0, ShareLock);
-	refs = table_open(DoltRefRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(refs, 0, NULL);
-	while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
-	{
-		bool		isnull;
-		Datum		value = heap_getattr(tuple, Anum_pg_dolt_ref_refname, RelationGetDescr(refs), &isnull);
-		char	   *name = TextDatumGetCString(value);
-
-		if (!strncmp(name, "views/", 6))
-			found = true;
-		pfree(name);
-		if (found)
-			break;
-	}
-	table_endscan(scan);
-	table_close(refs, NoLock);
-	if (found)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("schema changes with multiple branches are not supported yet"), errhint("This slice shares schema catalogs and supports data-only branch changes.")));
-}

@@ -7,6 +7,7 @@
  * allocates resources without a physical schema row.
  */
 #include "dg.h"
+#include "access/doltcatalog.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"

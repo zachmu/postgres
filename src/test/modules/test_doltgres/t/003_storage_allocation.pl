@@ -5,7 +5,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('storage_allocation');
-$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT});
 # Retain an incompatible definition before activating branch views. Its physical

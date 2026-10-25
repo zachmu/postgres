@@ -238,6 +238,7 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 	if (CatalogViewCaptureInsert(heapRel, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
+	CatalogViewRejectBranchWrite(heapRel, NULL, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -263,6 +264,7 @@ CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 	if (CatalogViewCaptureInsert(heapRel, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
+	CatalogViewRejectBranchWrite(heapRel, NULL, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_insert(heapRel, tup);
@@ -305,6 +307,15 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
+	for (int i = 0; i < ntuples; i++)
+	{
+		bool		should_free;
+		HeapTuple	tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
+
+		CatalogViewRejectBranchWrite(heapRel, NULL, tuple);
+		if (should_free)
+			heap_freetuple(tuple);
+	}
 
 	heap_multi_insert(heapRel, slot, ntuples,
 					  GetCurrentCommandId(true), 0, NULL);
@@ -347,6 +358,7 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
+	CatalogViewRejectBranchWrite(heapRel, otid, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -374,6 +386,7 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 	if (CatalogViewCaptureUpdate(heapRel, otid, tup))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
+	CatalogViewRejectBranchWrite(heapRel, otid, tup);
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
@@ -402,5 +415,6 @@ CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 	if (CatalogViewCaptureDelete(heapRel, tid))
 		return;
 	CatalogViewRejectPhysicalAccess(heapRel);
+	CatalogViewRejectBranchWrite(heapRel, tid, NULL);
 	simple_heap_delete(heapRel, tid);
 }

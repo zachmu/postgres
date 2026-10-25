@@ -951,3 +951,17 @@ dg_history_install(Relation rel, DGState *state, PLTree contents)
 	if (rel->rd_catalogview)
 		PopActiveSnapshot();
 }
+
+/* TRUNCATE of a branch's table: an empty root for the branch, and its indexes. */
+void
+dg_truncate(Relation rel)
+{
+	DGState    *state;
+	PLTree		empty;
+
+	writer(rel);
+	state = dg_load(rel, SnapshotSelf);
+	dg_check(pl_build(state->store, NULL, 0, &empty));
+	dg_history_install(rel, state, empty);
+	dg_release(state);
+}

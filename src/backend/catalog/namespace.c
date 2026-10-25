@@ -823,6 +823,10 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 		else
 			relid = InvalidOid;
 
+		/* A native relation must not shadow a table on the session's branch. */
+		if (existing_relation_id != NULL && !OidIsValid(relid))
+			relid = BranchRelnameGetRelid(relation->relname, nspid);
+
 		/*
 		 * In bootstrap processing mode, we don't bother with permissions or
 		 * locking.  Permissions might not be working yet, and locking is
@@ -879,6 +883,26 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 	if (existing_relation_id != NULL)
 		*existing_relation_id = relid;
 	return nspid;
+}
+
+/*
+ * BranchRelnameGetRelid
+ *		The OID of the table or index |relname| in namespace |nspid| on the
+ *		session's branch, or InvalidOid. Native relations must not take a
+ *		name the branch uses.
+ */
+Oid
+BranchRelnameGetRelid(const char *relname, Oid nspid)
+{
+	RangeVar   *qualified;
+	Oid			relid;
+
+	if (isTempOrTempToastNamespace(nspid) || IsCatalogNamespace(nspid))
+		return InvalidOid;
+	qualified = makeRangeVar(get_namespace_name(nspid), pstrdup(relname), -1);
+	if (dg_catalog_lookup_relation(qualified, true, &relid))
+		return relid;
+	return InvalidOid;
 }
 
 /*
@@ -1254,13 +1278,37 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool include_out_arguments, bool missing_ok)
 {
 	CatalogView *previous = CatalogViewCurrent();
-	FuncCandidateList result;
+	CatalogView *session = dg_catalog_session_view();
+	FuncCandidateList result,
+				native;
 
-	CatalogViewSwitch(dg_catalog_session_view());
+	CatalogViewSwitch(session);
 	PG_TRY();
 	{
 		result = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
 												expand_defaults, include_out_arguments, missing_ok);
+
+		/*
+		 * The branch's view holds built-in and versioned routines; native
+		 * user routines, unversioned, are only in the physical catalogs.
+		 */
+		if (session)
+		{
+			CatalogViewSwitch(NULL);
+			native = FuncnameGetCandidatesInContext(names, nargs, argnames, expand_variadic,
+													expand_defaults, include_out_arguments, true);
+			while (native)
+			{
+				FuncCandidateList next = native->next;
+
+				if (native->oid >= FirstNormalObjectId && native->oid < FirstDurableObjectId)
+				{
+					native->next = result;
+					result = native;
+				}
+				native = next;
+			}
+		}
 	}
 	PG_FINALLY();
 	{

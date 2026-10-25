@@ -21,6 +21,9 @@
 #define FirstCatalogViewObjectId ((Oid) 0xC0000000U)
 #define CatalogViewIsDurable(oid) ((oid) >= FirstDurableObjectId && (oid) < FirstCatalogViewObjectId)
 #define CatalogViewIsLeased(oid) ((oid) >= FirstCatalogViewObjectId)
+
+/* View rows have TIDs from a block range no physical catalog reaches. */
+#define CatalogViewFirstBlock ((BlockNumber) 0xF0000000U)
 struct catcache;
 typedef struct CatalogView CatalogView;
 typedef struct CatalogViewScan CatalogViewScan;
@@ -57,6 +60,7 @@ extern bool CatalogViewContains(CatalogView *view, Oid catalog);
 extern struct catcache *CatalogViewCache(CatalogView *view, struct catcache *base);
 extern void CatalogViewInvalidateCache(int cacheid, uint32 hashvalue);
 extern void CatalogViewRejectPhysicalAccess(Relation relation);
+extern void CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple);
 
 /* Private command-visible catalog mutation state for native DDL. */
 extern bool CatalogViewCaptureUpdate(Relation relation, ItemPointer tid, HeapTuple tuple);

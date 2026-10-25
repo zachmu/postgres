@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('routines');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 $node->safe_psql('postgres','CREATE DATABASE empty_routines');
 my $s=$node->background_psql('postgres',on_error_stop=>0);
 sub sql {return $s->query_safe($_[0]);}

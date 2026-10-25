@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('foreign_keys');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 $node->safe_psql('postgres',q{CREATE DATABASE fk_capture});
 $node->safe_psql('postgres',q{CREATE DATABASE fk_acl});
 $node->safe_psql('postgres',q{CREATE ROLE fk_owner});

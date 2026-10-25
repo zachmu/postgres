@@ -99,6 +99,7 @@ extern Oid	RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 												 LOCKMODE lockmode,
 												 Oid *existing_relation_id);
 extern void RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid);
+extern Oid	BranchRelnameGetRelid(const char *relname, Oid nspid);
 extern Oid	RelnameGetRelid(const char *relname);
 extern bool RelationIsVisible(Oid relid);
 

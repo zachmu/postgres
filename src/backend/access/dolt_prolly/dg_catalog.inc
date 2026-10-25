@@ -109,8 +109,9 @@ dg_catalog_permission(const char *descriptor, Oid user)
 }
 
 /* Namespace descriptions are decoded through the same canonical provider. */
+/* The definition of namespace |name| in schema |db|, or NULL. */
 static char *
-catalog_namespace(bytea *db, const char *name)
+catalog_namespace_find(bytea *db, const char *name)
 {
 	bytea	  **addresses;
 	int			n,
@@ -129,8 +130,17 @@ catalog_namespace(bytea *db, const char *name)
 		if (candidate && !strcmp(candidate, name))
 			return definition;
 	}
-	elog(ERROR, "missing retained namespace");
 	return NULL;
+}
+
+static char *
+catalog_namespace(bytea *db, const char *name)
+{
+	char	   *definition = catalog_namespace_find(db, name);
+
+	if (!definition)
+		elog(ERROR, "missing retained namespace");
+	return definition;
 }
 
 /* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
@@ -235,35 +245,59 @@ catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native,
 			}
 			return ns;
 		}
+
+		/* Unversioned native objects live beside the branch's objects. */
+		namespace = get_namespace_oid(ns, true);
+		if (OidIsValid(namespace))
+		{
+			Oid			physical = type_lookup ?
+				GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(rv->relname), ObjectIdGetDatum(namespace)) :
+				get_relname_relid(rv->relname, namespace);
+
+			if (!OidIsValid(physical))
+				continue;
+			if (object_aclcheck(NamespaceRelationId, namespace, user, ACL_USAGE) != ACLCHECK_OK)
+			{
+				if (explicit)
+					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
+				continue;
+			}
+			*native = physical;
+			return ns;
+		}
 	}
 	return NULL;
 }
 
+/*
+ * Whether the database is a repository: from its first prolly object onward,
+ * every prolly reference resolves through a branch's canonical schema.
+ */
 bool
 dg_catalog_active(void)
 {
 	Relation	refs;
 	SysScanDesc scan;
 	ScanKeyData key;
-	bool		active;
-	bool		pushed = false;
+	HeapTuple	tuple;
+	bool		active = false;
 
 	if (!IsUnderPostmaster || catalog_api_depth || rangevar_projection_hook)
 		return false;
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed = true;
-	}
 	refs = table_open(DoltRefRelationId, AccessShareLock);
-	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum("views/enabled"));
-	scan = systable_beginscan(refs, DoltRefKeyIndexId, true,
-							  GetActiveSnapshot(), 1, &key);
-	active = HeapTupleIsValid(systable_getnext(scan));
+	ScanKeyEntryInitialize(&key, 0, Anum_pg_dolt_ref_refname, BTGreaterEqualStrategyNumber, InvalidOid,
+						   C_COLLATION_OID, F_TEXT_GE, CStringGetTextDatum("heads/"));
+	scan = systable_beginscan(refs, DoltRefKeyIndexId, true, NULL, 1, &key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		char	   *name = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_ref_refname, RelationGetDescr(refs), &isnull));
+
+		active = strncmp(name, "heads/", 6) == 0;
+	}
 	systable_endscan(scan);
 	table_close(refs, AccessShareLock);
-	if (pushed)
-		PopActiveSnapshot();
 	return active;
 }
 
@@ -362,7 +396,14 @@ revision_selected:
 		if (!SplitIdentifierString(raw, ',', &path))
 			elog(ERROR, "invalid search_path");
 	}
-	if (!ActiveSnapshotSet())
+
+	/* Names resolve against the latest schemas, as against catalogs. */
+	if (!rte->dolt_database)
+	{
+		PushActiveSnapshot(GetLatestSnapshot());
+		pushed = true;
+	}
+	else if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
@@ -374,7 +415,7 @@ revision_selected:
 		working = (!rte->dolt_database || context_branch) && !rv->dolt_revision &&
 			read_ref(psprintf("heads/%s", revision)).target != NULL;
 		db = rte->dolt_database ? unhex(rte->dolt_database) :
-			(working ? read_ref(psprintf("working/%s", revision)).target : NULL);
+			(working ? catalog_working_schema(revision) : NULL);
 		if (!db)
 			db = child(resolve(revision), 1);
 		rte->dolt_database = hex(db);
@@ -389,6 +430,14 @@ revision_selected:
 			{
 				if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")))
 					unsupported("revision-qualified temporary relations");
+				goto binding_done;
+			}
+
+			/* An unversioned native relation exists only on the live database. */
+			if (OidIsValid(native) && !dg_system_namespace(ns))
+			{
+				if (!working)
+					ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in revision %s", rv->relname, revision)));
 				goto binding_done;
 			}
 			resolved->schemaname = pstrdup(ns);
