@@ -343,27 +343,23 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	Oid			live = InvalidOid;
 	const char *context_branch = NULL;
 	Snapshot	outer;
+	bool		session_name;
 
 	/*
 	 * In a provisional copy of a branch's catalogs, names resolve in the copy,
 	 * as ordinary relations: what DDL there analyzes must refer to the copy.
 	 */
-	if (rangevar_projection_hook || catalog_api_depth || CatalogViewIsProvisional(CatalogViewCurrent()))
+	if (rangevar_projection_hook || catalog_api_depth)
 		return NULL;
-	rv = system_alias(rv);
-
-	/*
-	 * A versioned view on the session's branch is an ordinary relation of its
-	 * catalog view, which the rewriter expands.
-	 */
-	if (!rv->dolt_revision && !rv->catalogname && !rte->dolt_database)
+	if (CatalogViewIsProvisional(CatalogViewCurrent()))
 	{
-		Oid			relid;
-
-		if (dg_catalog_lookup_relation(rv, true, &relid) && OidIsValid(relid) &&
-			get_rel_relkind(relid) == RELKIND_VIEW && CatalogViewObjectContext(relid))
-			return NULL;
+		/* What a schema object stores names what it uses unqualified by revision. */
+		if (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/")))
+			unsupported("revision-qualified references in versioned schema objects");
+		return NULL;
 	}
+	rv = system_alias(rv);
+	session_name = !rv->dolt_revision && !rv->catalogname && !rte->dolt_database;
 	if (!rte->dolt_database && !rv->dolt_revision &&
 		!(rv->catalogname && strpbrk(rv->catalogname, "@/")) && catalog_current_database())
 	{
@@ -562,8 +558,18 @@ revision_selected:
 				run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='view' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
 				if (SPI_processed)
 				{
-					CatalogView *view = working ? provider_branch_view(revision, db) : provider_view(db);
+					CatalogView *view;
 
+					/*
+					 * A versioned view on the session's branch is an ordinary
+					 * relation of its catalog view, which the rewriter expands.
+					 */
+					if (session_name && working)
+					{
+						rte->dolt_database = NULL;
+						goto binding_done;
+					}
+					view = working ? provider_branch_view(revision, db) : provider_view(db);
 					if (target)
 						unsupported("writes through a revision's view");
 

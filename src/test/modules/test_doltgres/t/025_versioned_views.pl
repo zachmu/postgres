@@ -69,6 +69,9 @@ sql(q{INSERT INTO src VALUES (3,'z'); REFRESH MATERIALIZED VIEW mv; REFRESH MATE
 is(sql(q{SELECT count(*) FROM mv}).':'.sql(q{SELECT one FROM lazy}),'3:1','REFRESH MATERIALIZED VIEW');
 sql(q{COMMENT ON MATERIALIZED VIEW mv IS 'materialized'});
 is(sql(q{SELECT obj_description('mv'::regclass, 'pg_class')}),'materialized','COMMENT ON MATERIALIZED VIEW');
+fails(q{CREATE VIEW old_src AS SELECT * FROM src AS OF 'HEAD'},qr/revision-qualified references in versioned schema objects/,'a view cannot name a revision');
+fails(q{CREATE MATERIALIZED VIEW old_mv AS SELECT * FROM "postgres/other".public.base},qr/revision-qualified references in versioned schema objects/,'nor can a materialized view');
+is(sql(q{CREATE MATERIALIZED VIEW heap_mv USING heap AS SELECT now() IS NOT NULL AS one; SELECT one FROM heap_mv}),'t','a heap materialized view stays native');
 sql(q{ALTER TABLE src RENAME TO src2; ALTER TABLE src2 RENAME COLUMN b TO bb; ALTER MATERIALIZED VIEW mv RENAME TO mv2});
 is(sql(q{SELECT pg_get_viewdef('mv2'::regclass)})," SELECT a,\n    bb AS b\n   FROM src2\n  WHERE (a > 0);",'renames rewrite a materialized view\'s query');
 sql(q{SELECT dolt_commit('-Am','materialized')});

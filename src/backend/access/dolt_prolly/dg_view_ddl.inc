@@ -436,10 +436,21 @@ query_dependencies_walker(Node *node, QueryDependencies *found)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) node;
 
+		/* As find_expr_references_walker. */
+		if (rte->rtekind == RTE_NAMEDTUPLESTORE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("transition table \"%s\" cannot be referenced in a persistent object",
+							rte->eref->aliasname)));
 		if (rte->rtekind == RTE_RELATION)
 			query_dependency(found, RelationRelationId, rte->relid);
 		else if (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_rowtype))
+		{
+			/* What it uses is on its own branch: the query names no revision. */
+			if (!rte->dolt_branch || strcmp(rte->dolt_branch, dg_current_branch()))
+				unsupported("revision-qualified references in versioned schema objects");
 			query_dependency(found, RelationRelationId, get_typ_typrelid(rte->dolt_rowtype));
+		}
 		return false;
 	}
 	if (IsA(node, FuncExpr))
@@ -558,6 +569,9 @@ dg_catalog_create_matview(CreateStmt *create, Query *query)
 	int			nest = NewGUCNestLevel();
 	bool		result;
 
+	if (!IsUnderPostmaster || rangevar_projection_hook || catalog_api_depth || !creates_prolly(create))
+		return false;
+	(void) query_dependencies_walker((Node *) query, &found);
 	PG_TRY();
 	{
 		schema_expression_gucs();
@@ -568,7 +582,6 @@ dg_catalog_create_matview(CreateStmt *create, Query *query)
 		AtEOXact_GUC(true, nest);
 	}
 	PG_END_TRY();
-	(void) query_dependencies_walker((Node *) query, &found);
 	list_sort(found.entries, view_entry_compare);
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '{');

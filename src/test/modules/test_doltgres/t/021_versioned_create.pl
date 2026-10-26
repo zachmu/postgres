@@ -72,7 +72,6 @@ like($notice,qr/already exists, skipping/,'IF NOT EXISTS skips an existing versi
 sql(q{SELECT dolt_checkout('other'); CREATE TABLE ct_other AS SELECT g AS n FROM generate_series(1,3) g});
 is(sql(q{SELECT sum(n) FROM "postgres/other".public.ct_other}),'6','CREATE TABLE AS on another branch');
 is(sql(q{SELECT count(*) FROM pg_class WHERE relname='ct_other'}),'0','main does not see the other branch\'s table');
-fails(q{CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a},qr/prolly tables can only be created with CREATE TABLE/,'materialized views are rejected');
 
 # ---- schemas created before the first versioned table ----
 my $fresh='fresh';
