@@ -388,7 +388,7 @@ mutation_index_list(const char *definition, List *indexes)
 		escape_json(&json, item->sql);
 	}
 	appendStringInfoChar(&json, ']');
-	run("SELECT jsonb_set($1::jsonb,'{indexes}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
+	run("SELECT jsonb_set($1::jsonb,'{indexes}',(SELECT coalesce(jsonb_agg(v ORDER BY v #>> '{}' COLLATE \"C\"),'[]'::jsonb) FROM jsonb_array_elements($2::jsonb) v))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
 	return strcell(0, 1);
 }
 

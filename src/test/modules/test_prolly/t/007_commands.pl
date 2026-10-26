@@ -73,7 +73,7 @@ my $oldhead=$reader->query_safe(q{SELECT commit_hash FROM dolt_log('-n','1')});
 sql(q{SELECT dolt_commit('-Am','snapshot advancement')});
 is($reader->query_safe(q{SELECT commit_hash FROM dolt_log('-n','1')}),$oldhead,'history read retains snapshot');
 $reader->query_safe('COMMIT');$reader->quit;
-fails(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM dolt_diff_summary('HEAD','WORKING')},qr/Repeatable Read/,'live capture rejects unsupported historical schema snapshot');
+is(sql(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING'); COMMIT}),'0','live capture reads the working schema under Repeatable Read');
 fails(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','missing')},qr/table not found: public.missing/,'unknown diff table rejected');
 my $objects=sql('SELECT count(*) FROM pg_dolt_object');
 sql(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING')});
@@ -97,8 +97,10 @@ my $stager=$node->background_psql('postgres');
 $stager->query_safe(q{BEGIN; SELECT dolt_add('.')});
 sql(q{SET lock_timeout='1s'; UPDATE t SET v='writer after stage' WHERE id=1});
 pass('data writer proceeds while staged transaction remains open');
-sql(q{SET lock_timeout='1s'; CREATE SCHEMA after_capture; DROP SCHEMA after_capture});
-pass('DDL proceeds after capture while staged transaction remains open');
+# Versioned DDL on this branch waits for the staging transaction, which holds
+# the branch's working set; unversioned DDL must not.
+sql(q{SET lock_timeout='1s'; CREATE TABLE after_capture(id int) USING heap; DROP TABLE after_capture});
+pass('unversioned DDL proceeds after capture while staged transaction remains open');
 $stager->query_safe('ROLLBACK');$stager->quit;
 
 # Old immutable history survives dropping source storage and crash restart.

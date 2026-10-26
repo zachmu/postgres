@@ -970,6 +970,8 @@ provider_lookup(const char *branch, bytea *database)
 		}
 	}
 	view = CatalogViewCreate(branch ? psprintf("%s@%s", key, branch) : key);
+	if (branch)
+		CatalogViewMarkBranchHead(view);
 
 	/*
 	 * Register before populating, so lookups made while building the view,

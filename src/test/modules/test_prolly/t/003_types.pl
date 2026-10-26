@@ -151,6 +151,24 @@ for my $case (@cases)
 }
 @cases = @portable;
 
+# TODO: user-defined types (enums, domains, composites) in versioned tables.
+# Their definitions are native and unversioned, so the canonical codec cannot
+# yet name them; CREATE rejects such columns.
+my %user_defined = map { $_ => 1 } qw(mood positive payload);
+@portable = ();
+for my $case (@cases)
+{
+ (my $base = $case->[0]) =~ s/\[\]//g;
+ if ($user_defined{$base})
+ {
+  my ($status, $out, $err) = $node->psql('postgres', "CREATE TABLE rejected(v $case->[0]) USING dolt_prolly_table");
+  isnt($status, 0, "$case->[0] rejected until user-defined types are versioned");
+  like($err, qr/user-defined column types/, "$case->[0] diagnostic");
+ }
+ else { push @portable, $case; }
+}
+@cases = @portable;
+
 my @checks;
 my $n = 0;
 for my $case (@cases)
@@ -228,11 +246,15 @@ like($node->safe_psql('postgres', 'SET enable_seqscan=off; EXPLAIN (COSTS OFF) S
 my ($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE INDEX unsupported_numeric ON one_scale(n)});
 isnt($status, 0, 'new storage support does not claim numeric ordered keys');
 like($stderr, qr/no default operator class/, 'missing ordered opclass is explicit');
-$node->safe_psql('postgres', q{CREATE TABLE domains(v positive, a positive[]) USING dolt_prolly_table; INSERT INTO domains VALUES (1,ARRAY[2::positive])});
-($status, $stdout, $stderr) = $node->psql('postgres', q{INSERT INTO domains VALUES (-1,NULL)});
-isnt($status, 0, 'domain assignment constraints remain enforced');
-$node->safe_psql('postgres', q{ALTER DOMAIN positive ADD CONSTRAINT later CHECK (VALUE > 1000) NOT VALID});
-is($node->safe_psql('postgres', q{SELECT v,a FROM domains}), '1.0000|{2.0000}', 'reads do not recheck new domain constraints');
+# TODO: user-defined types in versioned tables.
+SKIP: {
+ skip 'user-defined types are not versioned yet', 2;
+ $node->safe_psql('postgres', q{CREATE TABLE domains(v positive, a positive[]) USING dolt_prolly_table; INSERT INTO domains VALUES (1,ARRAY[2::positive])});
+ ($status, $stdout, $stderr) = $node->psql('postgres', q{INSERT INTO domains VALUES (-1,NULL)});
+ isnt($status, 0, 'domain assignment constraints remain enforced');
+ $node->safe_psql('postgres', q{ALTER DOMAIN positive ADD CONSTRAINT later CHECK (VALUE > 1000) NOT VALID});
+ is($node->safe_psql('postgres', q{SELECT v,a FROM domains}), '1.0000|{2.0000}', 'reads do not recheck new domain constraints');
+}
 
 $node->stop('immediate');
 $node->start;

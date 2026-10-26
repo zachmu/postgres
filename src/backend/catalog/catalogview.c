@@ -52,6 +52,7 @@ struct CatalogView
 	MemoryContext memory;
 	MemoryContext rows_memory;
 	bool		provisional;
+	bool		branch_head;	/* a branch's working schema, not a revision */
 	bool		retired;
 	List	   *baseline;
 	List	   *changes;
@@ -653,6 +654,12 @@ CatalogViewIsObjectIdType(Oid type)
 	}
 }
 
+void
+CatalogViewMarkBranchHead(CatalogView *view)
+{
+	view->branch_head = true;
+}
+
 CatalogView *
 CatalogViewObjectContext(Oid handle)
 {
@@ -847,9 +854,14 @@ CatalogViewCallContext(FunctionCallInfo fcinfo)
 	if (fcinfo->flinfo->fn_expr && IsA(fcinfo->flinfo->fn_expr, FuncExpr) &&
 		((FuncExpr *) fcinfo->flinfo->fn_expr)->dolt_working)
 		return NULL;
+	/*
+	 * A routine from a revision runs in that revision's catalogs. One on a
+	 * branch head runs like any routine, bound by its arguments.
+	 */
 	view = CatalogViewObjectContext(fcinfo->flinfo->fn_oid);
-	if (view)
+	if (view && !view->branch_head)
 		return view;
+	view = NULL;
 
 	for (i = 0; i < fcinfo->nargs; i++)
 	{
