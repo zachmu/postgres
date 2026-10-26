@@ -55,6 +55,8 @@
 #include "access/doltbranch.h"
 #include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/pg_dolt_object.h"
+#include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "access/relation.h"
@@ -423,20 +425,96 @@ same(bytea *a, bytea *b)
 {
 	return a && b && VARSIZE_ANY_EXHDR(a) == VARSIZE_ANY_EXHDR(b) && !memcmp(VARDATA_ANY(a), VARDATA_ANY(b), VARSIZE_ANY_EXHDR(a));
 }
+/*
+ * Refs and retained objects are read natively, under the snapshot internal
+ * SQL would use: the active one. Only the callers that need them pay for
+ * payloads, which may be large.
+ */
+static Snapshot
+api_snapshot(void)
+{
+	return ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+}
+
 static VersionRef
 read_ref(const char *name)
 {
 	VersionRef	r = {0};
-	Oid			types[] = {TEXTOID};
-	Datum		args[] = {CStringGetTextDatum(name)};
+	Relation	catalog = table_open(DoltRefRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
 
-	run("SELECT reftarget,reftoken FROM pg_catalog.pg_dolt_ref WHERE refname=$1", 1, types, args, NULL, true);
-	if (SPI_processed)
+	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltRefKeyIndexId, true, api_snapshot(), 1, &key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
 	{
-		r.target = (bytea *) DatumGetPointer(cell(0, 1));
-		r.token = (bytea *) DatumGetPointer(cell(0, 2));
+		bool		isnull;
+		Datum		value = heap_getattr(tuple, Anum_pg_dolt_ref_reftarget, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			r.target = DatumGetByteaPCopy(value);
+		value = heap_getattr(tuple, Anum_pg_dolt_ref_reftoken, RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+			r.token = DatumGetByteaPCopy(value);
 	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
 	return r;
+}
+
+/*
+ * The retained object |hash| of |kind| (any kind if NULL) visible under the
+ * active snapshot. Identical objects may have several rows; any one serves.
+ * Returns false if there is none; fills only the requested parts.
+ */
+static bool
+object_read(bytea *hash, const char *kind, char **actual, bytea **payload, ArrayType **children)
+{
+	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+
+	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
+	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
+	while (!found && HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
+
+		if (kind && strcmp(objkind, kind))
+			continue;
+		found = true;
+		if (actual)
+			*actual = objkind;
+		if (payload)
+			*payload = DatumGetByteaPCopy(heap_getattr(tuple, Anum_pg_dolt_object_objpayload, RelationGetDescr(catalog), &isnull));
+		if (children)
+			*children = DatumGetArrayTypePCopy(heap_getattr(tuple, Anum_pg_dolt_object_objchildren, RelationGetDescr(catalog), &isnull));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return found;
+}
+
+/* The |index|th (from 1) child of object |hash|, or NULL. */
+static bytea *
+object_child(bytea *hash, int index)
+{
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	if (!object_read(hash, NULL, NULL, NULL, &children))
+		return NULL;
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	if (index < 1 || index > n || nulls[index - 1])
+		return NULL;
+	return DatumGetByteaPCopy(values[index - 1]);
 }
 static void
 move_ref(const char *name, VersionRef old, bytea *target)
@@ -478,27 +556,24 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 static char *
 metadata(bytea *hash, const char *kind)
 {
-	Oid			types[] = {BYTEAOID, TEXTOID};
-	Datum		args[] = {PointerGetDatum(hash), CStringGetTextDatum(kind)};
+	bytea	   *payload;
+	char	   *text;
 
 	if (!strcmp(kind, "schema") || !strcmp(kind, "namespace"))
 		return dg_schema_read(hash, kind);
-
-	run("SELECT convert_from(objpayload,'UTF8') FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true);
-	if (!SPI_processed)
+	if (!object_read(hash, kind, NULL, &payload, NULL))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
-	return strcell(0, 1);
+	text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+	return pg_any_to_server(text, strlen(text), PG_UTF8);
 }
 static bytea *
 child(bytea *hash, int index)
 {
-	Oid			types[] = {BYTEAOID, INT4OID};
-	Datum		args[] = {PointerGetDatum(hash), Int32GetDatum(index)};
+	bytea	   *result = object_child(hash, index);
 
-	run("SELECT objchildren[$2] FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 2, types, args, NULL, true);
-	if (!SPI_processed || !cell(0, 1))
+	if (!result)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision has no requested ancestor or state")));
-	return (bytea *) DatumGetPointer(cell(0, 1));
+	return result;
 }
 static void
 json_field(StringInfo b, const char *key, const char *value, bool comma)
@@ -542,7 +617,6 @@ catalog_contains(bytea *db, const char *name)
 }
 
 static CatalogView *provider_view(bytea *database);
-static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static char *database_dependents(const char *json, Datum *members, int count);
@@ -826,10 +900,13 @@ valid_name(const char *s)
 static int
 parent_count(bytea *commit)
 {
-	run("SELECT coalesce(array_length(objchildren,1),1)-1 FROM pg_dolt_object_visible WHERE objhash=$1 AND objkind='commit'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(commit)), NULL, true);
-	if (!SPI_processed)
+	ArrayType  *children;
+	int			n;
+
+	if (!object_read(commit, "commit", NULL, NULL, &children))
 		return 0;
-	return DatumGetInt32(cell(0, 1));
+	n = ArrayGetNItems(ARR_NDIM(children), ARR_DIMS(children));
+	return Max(n, 1) - 1;
 }
 static bytea *
 resolve(const char *revision)
@@ -853,8 +930,9 @@ resolve(const char *revision)
 			hash = ref.target;
 			if (hash)
 			{
-				run("SELECT objkind FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(hash)), NULL, true);
-				if (SPI_processed && !strcmp(strcell(0, 1), "tag"))
+				char	   *kind;
+
+				if (object_read(hash, NULL, &kind, NULL, NULL) && !strcmp(kind, "tag"))
 					hash = child(hash, 1);
 			}
 		}

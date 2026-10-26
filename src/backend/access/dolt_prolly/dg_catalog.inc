@@ -293,15 +293,24 @@ catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid 
 bool
 dg_catalog_active(void)
 {
+	static bool active_committed;
 	Relation	bindings;
 	SysScanDesc scan;
+	HeapTuple	tuple;
 	bool		active;
 
 	if (!IsUnderPostmaster || catalog_api_depth || rangevar_projection_hook)
 		return false;
+	if (active_committed)
+		return true;
 	bindings = table_open(DoltBindingRelationId, AccessShareLock);
 	scan = systable_beginscan(bindings, InvalidOid, false, NULL, 0, NULL);
-	active = HeapTupleIsValid(systable_getnext(scan));
+	tuple = systable_getnext(scan);
+	active = HeapTupleIsValid(tuple);
+
+	/* A committed binding is permanent; one of this transaction's may abort. */
+	if (active && !TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
+		active_committed = true;
 	systable_endscan(scan);
 	table_close(bindings, AccessShareLock);
 	return active;

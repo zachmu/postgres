@@ -1174,7 +1174,8 @@ provider_lookup(const char *branch, bytea *database)
 	 * Visibility is required even on a cache hit: an aborted object must not
 	 * survive through a backend cache.
 	 */
-	(void) metadata(database, "database");
+	if (!object_read(database, "database", NULL, NULL, NULL))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 	if (!identity_callback)
 	{
 		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);
@@ -1229,22 +1230,6 @@ static CatalogView *
 provider_view(bytea *database)
 {
 	return provider_lookup(NULL, database);
-}
-
-/*
- * A view of schema |database| for questions about its definitions only, such
- * as whether a name exists. Reuses a branch head's view of the same schema so
- * one statement does not decode the schema twice.
- */
-static CatalogView *
-provider_schema_view(bytea *database)
-{
-	char	   *key = hex(database);
-
-	for (DGProvider *entry = providers; entry; entry = entry->next)
-		if (entry->branch && !strcmp(entry->database, key) && provider_current(entry, entry->branch))
-			return provider_lookup(entry->branch, database);
-	return provider_view(database);
 }
 
 /* The current schema of |branch|'s head, with its objects' durable OIDs. */
