@@ -141,7 +141,13 @@ dg_catalog_store_routine(HeapTuple tuple, TupleDesc desc)
 		database = canonical_database(json, members, n);
 		move_ref(branch_ref("working"), working, database);
 		advance_snapshot();
-		result = CatalogViewLookupObject(provider_view(database), ProcedureRelationId, name);
+
+		/*
+		 * The routine belongs to the branch head, whose view its validator
+		 * and callers use; a revision view would make its tables read-only.
+		 */
+		result = CatalogViewLookupObject(provider_branch_view(dg_current_branch(), database),
+										 ProcedureRelationId, name);
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
 	}

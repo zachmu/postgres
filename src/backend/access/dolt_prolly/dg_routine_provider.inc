@@ -97,11 +97,31 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 					values[i] = i + 1 == Anum_pg_proc_proargtypes ? PointerGetDatum(buildoidvector(ids, n)) : PointerGetDatum(construct_array(items, n, OIDOID, sizeof(Oid), true, TYPALIGN_INT));
 					break;
 				}
+			case Anum_pg_proc_proargdefaults:
+				/* Bound below, once the argument types are known. */
+				break;
 			default:
 				getTypeInputInfo(attr->atttypid, &input, &param);
 				values[i] = OidInputFunctionCall(input, encoded, param, -1);
 				break;
 		}
+	}
+	if (!nulls[Anum_pg_proc_proargdefaults - 1])
+	{
+		/* Defaults belong to the last input arguments, as in CreateFunction. */
+		oidvector  *args = (oidvector *) DatumGetPointer(values[Anum_pg_proc_proargtypes - 1]);
+		ArrayType  *array = DatumGetArrayTypeP(OidInputFunctionCall(F_ARRAY_IN, json_value(definition, "proargdefaults"), TEXTOID, -1));
+		Datum	   *sql;
+		bool	   *missing;
+		int			n;
+		List	   *defaults = NIL;
+
+		deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT, &sql, &missing, &n);
+		for (int j = 0; j < n; j++)
+			defaults = lappend(defaults,
+							   schema_expression_bind_default(schema_expression_raw(TextDatumGetCString(sql[j])),
+															  args->values[args->dim1 - n + j]));
+		values[Anum_pg_proc_proargdefaults - 1] = CStringGetTextDatum(nodeToString(defaults));
 	}
 	tuple = heap_form_tuple(desc, values, nulls);
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);

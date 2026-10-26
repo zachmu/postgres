@@ -36,8 +36,8 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	ReleaseSysCache(language);
 	if (strcmp(lang, "sql") && strcmp(lang, "plpgsql"))
 		unsupported("canonical routines require SQL or PL/pgSQL");
-	if (proc->prokind != PROKIND_FUNCTION || proc->prosupport || proc->pronargdefaults)
-		unsupported("canonical routine kind, support function or parameter defaults");
+	if ((proc->prokind != PROKIND_FUNCTION && proc->prokind != PROKIND_PROCEDURE) || proc->prosupport)
+		unsupported("canonical routine kind or support function");
 	initStringInfo(&identity);
 	appendStringInfo(&identity, "%s(", dg_qualified_name(get_namespace_name(proc->pronamespace), NameStr(proc->proname)));
 	for (i = 0; i < proc->pronargs; i++)
@@ -107,10 +107,21 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 					encoded = OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(construct_array(names, n, TEXTOID, -1, false, TYPALIGN_INT)));
 					break;
 				}
+			case Anum_pg_proc_proargdefaults:
+				{
+					/* Defaults are portable SQL, rebound when the view is built. */
+					List	   *defaults = castNode(List, stringToNode(TextDatumGetCString(value)));
+					Datum	   *sql = palloc_array(Datum, Max(list_length(defaults), 1));
+					int			n = 0;
+
+					foreach_ptr(Node, expression, defaults)
+						sql[n++] = CStringGetTextDatum(schema_expression_sql(expression, InvalidOid));
+					encoded = OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(construct_array(sql, n, TEXTOID, -1, false, TYPALIGN_INT)));
+					break;
+				}
 			case Anum_pg_proc_protrftypes:
 			case Anum_pg_proc_prosqlbody:
-			case Anum_pg_proc_proargdefaults:
-				unsupported("canonical routine parsed bodies, transforms or defaults");
+				unsupported("canonical routine parsed bodies or transforms");
 				pg_unreachable();
 			default:
 				getTypeOutputInfo(attr->atttypid, &output, &varlena);

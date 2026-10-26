@@ -319,8 +319,6 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 	for (int i = 0; i < desc->natts; i++)
 	{
 		char	   *sql;
-		List	   *parsed;
-		SelectStmt *select;
 		Node	   *raw,
 				   *expression;
 		FormData_pg_attrdef form = {0};
@@ -345,13 +343,7 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 			continue;
 		run("SELECT $1::jsonb->'columns'->$2->>'default'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
 		sql = strcell(0, 1);
-		parsed = schema_expression_parse(psprintf("SELECT %s", sql));
-		if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
-			elog(ERROR, "invalid canonical default expression");
-		select = castNode(SelectStmt, linitial_node(RawStmt, parsed)->stmt);
-		if (list_length(select->targetList) != 1 || select->fromClause)
-			elog(ERROR, "invalid canonical default SELECT");
-		raw = linitial_node(ResTarget, select->targetList)->val;
+		raw = schema_expression_raw(sql);
 		expression = schema_expression_bind(view, relation, name, desc, raw, i + 1);
 		form.oid = CatalogViewBindObject(view, AttrDefaultRelationId, psprintf("%s/%s", name, NameStr(TupleDescAttr(desc, i)->attname)), InvalidOid);
 		form.adrelid = relation;

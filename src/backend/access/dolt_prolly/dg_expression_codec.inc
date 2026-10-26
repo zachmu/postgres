@@ -102,6 +102,21 @@ schema_expression_parse(const char *sql)
 	return result;
 }
 
+/* The raw parse tree of one stored expression. */
+static Node *
+schema_expression_raw(const char *sql)
+{
+	List	   *parsed = schema_expression_parse(psprintf("SELECT %s", sql));
+	SelectStmt *select;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+		elog(ERROR, "invalid canonical expression");
+	select = castNode(SelectStmt, linitial_node(RawStmt, parsed)->stmt);
+	if (list_length(select->targetList) != 1 || select->fromClause)
+		elog(ERROR, "invalid canonical expression SELECT");
+	return linitial_node(ResTarget, select->targetList)->val;
+}
+
 static char *
 schema_expression_sql(Node *expression, Oid relation)
 {
@@ -112,7 +127,9 @@ schema_expression_sql(Node *expression, Oid relation)
 	PG_TRY();
 	{
 		schema_expression_gucs();
-		result = deparse_expression(expression, deparse_context_for(get_rel_name(relation), relation), false, false);
+		result = deparse_expression(expression,
+									OidIsValid(relation) ? deparse_context_for(get_rel_name(relation), relation) : NIL,
+									false, false);
 	}
 	PG_FINALLY();
 	{
@@ -182,6 +199,31 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 			assign_expr_collations(pstate, result);
 		}
 		(void) schema_expression_check(result, attribute < 0 ? (void *) pstate : NULL);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+		free_parsestate(pstate);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* Bind a routine parameter default, as CreateFunction does. */
+static Node *
+schema_expression_bind_default(Node *raw, Oid type)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	Node	   *result = NULL;
+	int			nest = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		result = transformExpr(pstate, raw, EXPR_KIND_FUNCTION_DEFAULT);
+		result = coerce_to_specific_type(pstate, result, type, "DEFAULT");
+		assign_expr_collations(pstate, result);
+		(void) schema_expression_check(result, NULL);
 	}
 	PG_FINALLY();
 	{
