@@ -28,11 +28,13 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
+#include "commands/alter.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
 #include "utils/syscache.h"
 #include "utils/regproc.h"
 #include "utils/varlena.h"
+#include "parser/parse_clause.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "commands/defrem.h"
@@ -125,6 +127,7 @@ static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
 static void replace_working(const char *branch, bytea *database, List *tables);
+static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations);
 static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -599,7 +602,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
-		else if (!strcmp(kinds[i], "routine"))
+		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1297,6 +1300,7 @@ static void validate_working_foreign_keys(const char *branch);
 
 #include "dg_alter.inc"
 #include "dg_dependency.inc"
+#include "dg_trigger_ddl.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
 #include "dg_patch.inc"

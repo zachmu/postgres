@@ -640,18 +640,20 @@ unique_violations(Relation rel, const PLTree * contents, const char *name, Strin
 	}
 }
 
+/*
+ * Merge the rows of |tables|, whose definitions are the same in all three
+ * states, into the working set.
+ */
 static void
-install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations)
+install_database(bytea *base, bytea *ours, bytea *theirs, List *tables, StringInfo conflicts, StringInfo violations)
 {
 	char	  **names;
-	int			n,
+	int			n = 0,
 				i;
 
-	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(metadata(theirs, "database"))), NULL, true);
-	n = SPI_processed;
-	names = palloc(sizeof(*names) * Max(n, 1));
-	for (i = 0; i < n; i++)
-		names[i] = strcell(i, 1);
+	names = palloc(sizeof(*names) * Max(list_length(tables), 1));
+	foreach_ptr(char, table, tables)
+		names[n++] = table;
 	for (i = 0; i < n; i++)
 	{
 		Relation	rel = dg_catalog_write_table(dg_current_branch(), names[i], ACL_UPDATE);
@@ -761,7 +763,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		if (revision || !pending.target)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("no merge to abort")));
 		database = child(child(pending.target, 1), 1);
-		install_database(NULL, NULL, database, NULL, NULL);
+		replace_working(dg_current_branch(), database, NIL);
 		finish_merge();
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), database);
 		move_ref(branch_ref("staged"), read_ref(branch_ref("staged")), database);
@@ -781,8 +783,6 @@ dolt_merge(PG_FUNCTION_ARGS)
 	}
 	oursdb = child(head.target, 1);
 	their_db = child(theirs, 1);
-	same_schema(metadata(oursdb, "database"), metadata(their_db, "database"));
-	same_schema(metadata(oursdb, "database"), metadata(child(base, 1), "database"));
 	live = capture(true);
 	if (!same(live.hash, oursdb) || !same(read_ref(branch_ref("staged")).target, oursdb))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
@@ -790,7 +790,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(same(base, head.target) ? NULL : child(base, 1), oursdb, their_db, &conflicts, &violations);
+	merge_databases(child(base, 1), oursdb, their_db, &conflicts, &violations);
 	database = capture(true).hash;
 
 	/*

@@ -31,6 +31,8 @@ typedef struct CatalogViewScan CatalogViewScan;
 extern CatalogView *CatalogViewCreate(const char *identity);
 extern void CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples);
 extern void CatalogViewSeal(CatalogView *view);
+extern void CatalogViewSetPartial(CatalogView *view, bool partial);
+extern bool CatalogViewIsPartial(CatalogView *view);
 extern int	catalog_view_cache_entries;
 extern void CatalogViewSetLoader(CatalogView *view, void (*loader) (CatalogView *, void *), void *arg);
 extern void CatalogViewEnsureLoaded(CatalogView *view);

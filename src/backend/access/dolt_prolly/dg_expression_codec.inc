@@ -26,7 +26,13 @@ schema_expression_check(Node *node, void *context)
 				return false;
 			break;
 		case T_FuncExpr:
-			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId)
+
+			/*
+			 * A versioned routine is deparsed by qualified name and rebound
+			 * by name; a native user function is local to this server.
+			 */
+			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
+				((FuncExpr *) node)->funcid < FirstDurableObjectId)
 				unsupported("canonical expression user-defined function");
 			break;
 		case T_OpExpr:
@@ -102,6 +108,21 @@ schema_expression_parse(const char *sql)
 	return result;
 }
 
+/* The raw parse tree of one stored expression. */
+static Node *
+schema_expression_raw(const char *sql)
+{
+	List	   *parsed = schema_expression_parse(psprintf("SELECT %s", sql));
+	SelectStmt *select;
+
+	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, SelectStmt))
+		elog(ERROR, "invalid canonical expression");
+	select = castNode(SelectStmt, linitial_node(RawStmt, parsed)->stmt);
+	if (list_length(select->targetList) != 1 || select->fromClause)
+		elog(ERROR, "invalid canonical expression SELECT");
+	return linitial_node(ResTarget, select->targetList)->val;
+}
+
 static char *
 schema_expression_sql(Node *expression, Oid relation)
 {
@@ -112,7 +133,9 @@ schema_expression_sql(Node *expression, Oid relation)
 	PG_TRY();
 	{
 		schema_expression_gucs();
-		result = deparse_expression(expression, deparse_context_for(get_rel_name(relation), relation), false, false);
+		result = deparse_expression(expression,
+									OidIsValid(relation) ? deparse_context_for(get_rel_name(relation), relation) : NIL,
+									false, false);
 	}
 	PG_FINALLY();
 	{
@@ -120,6 +143,21 @@ schema_expression_sql(Node *expression, Oid relation)
 	}
 	PG_END_TRY();
 	return result;
+}
+
+/*
+ * Whether a stored expression calls a routine outside pg_catalog. Stored SQL
+ * qualifies every such name, and only versioned routines are stored.
+ */
+static bool
+schema_expression_calls_routine(Node *node, void *context)
+{
+	if (!node)
+		return false;
+	if (IsA(node, FuncCall) && list_length(((FuncCall *) node)->funcname) > 1 &&
+		strcmp(strVal(linitial(((FuncCall *) node)->funcname)), "pg_catalog"))
+		return true;
+	return raw_expression_tree_walker(node, schema_expression_calls_routine, context);
 }
 
 static Node *
@@ -132,6 +170,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	ParseNamespaceItem *nsitem;
 	Node	   *result = NULL;
 	int			nest = NewGUCNestLevel();
+	CatalogView *previous = CatalogViewCurrent();
 
 	/*
 	 * Bind column Vars from the supplied canonical descriptor. No physical
@@ -147,6 +186,9 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	addNSItemToQuery(pstate, nsitem, true, true, true);
 	PG_TRY();
 	{
+		/* Versioned routines the expression names resolve in its own view. */
+		if (schema_expression_calls_routine(raw, NULL))
+			CatalogViewSwitch(view);
 		if (attribute >= 0)
 			schema_expression_gucs();
 		if (attribute > 0)
@@ -185,6 +227,77 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	}
 	PG_FINALLY();
 	{
+		CatalogViewSwitch(previous);
+		AtEOXact_GUC(true, nest);
+		free_parsestate(pstate);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* Bind a routine parameter default, as CreateFunction does. */
+static Node *
+schema_expression_bind_default(Node *raw, Oid type)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	Node	   *result = NULL;
+	int			nest = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		result = transformExpr(pstate, raw, EXPR_KIND_FUNCTION_DEFAULT);
+		result = coerce_to_specific_type(pstate, result, type, "DEFAULT");
+		assign_expr_collations(pstate, result);
+		(void) schema_expression_check(result, NULL);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+		free_parsestate(pstate);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
+ * Bind a trigger's WHEN clause, as CreateTrigger does: OLD and NEW are the
+ * first and second range table entries. Routines it calls resolve in |view|.
+ */
+static Node *
+schema_expression_bind_trigger(CatalogView *view, Oid relation, const char *name,
+							   TupleDesc desc, Node *raw)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	RelationData definition = {0};
+	FormData_pg_class form = {0};
+	Node	   *result = NULL;
+	int			nest = NewGUCNestLevel();
+	CatalogView *previous = CatalogViewCurrent();
+
+	definition.rd_id = relation;
+	definition.rd_att = desc;
+	definition.rd_rel = &form;
+	definition.rd_catalogview = view;
+	form.relkind = RELKIND_RELATION;
+	namestrcpy(&form.relname, name);
+	addNSItemToQuery(pstate, addRangeTableEntryForRelation(pstate, &definition, AccessShareLock,
+														   makeAlias("old", NIL), false, false),
+					 false, true, true);
+	addNSItemToQuery(pstate, addRangeTableEntryForRelation(pstate, &definition, AccessShareLock,
+														   makeAlias("new", NIL), false, false),
+					 false, true, true);
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		if (schema_expression_calls_routine(raw, NULL))
+			CatalogViewSwitch(view);
+		result = transformWhereClause(pstate, raw, EXPR_KIND_TRIGGER_WHEN, "WHEN");
+		assign_expr_collations(pstate, result);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
 		AtEOXact_GUC(true, nest);
 		free_parsestate(pstate);
 	}

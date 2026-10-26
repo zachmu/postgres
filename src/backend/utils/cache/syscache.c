@@ -243,7 +243,12 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 		if (selected)
 			view = selected;
 		if (selected && !CatalogViewContains(view, cache->cc_reloid))
+		{
+			/* A view still being built has only some catalogs as yet. */
+			if (CatalogViewIsPartial(view))
+				return NULL;
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog %u does not support this revision-bound lookup", cache->cc_reloid)));
+		}
 	}
 	else if (view && cache->cc_tupdesc)
 	{

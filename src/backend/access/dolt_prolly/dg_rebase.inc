@@ -266,11 +266,9 @@ apply_rebase_step(RebaseStep * step)
 	if (parent_count(target) < 1)
 		unsupported("rebasing a root commit");
 	parentdb = child(child(target, 2), 1);
-	same_schema(metadata(headdb, "database"), metadata(targetdb, "database"));
-	same_schema(metadata(headdb, "database"), metadata(parentdb, "database"));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(parentdb, headdb, targetdb, &conflicts, &violations);
+	merge_databases(parentdb, headdb, targetdb, &conflicts, &violations);
 	if (conflicts.len || violations.len)
 	{
 		char	   *meta = metadata(target, "commit");
@@ -459,7 +457,7 @@ stash_apply(const char *name, int idx)
 	same_schema(metadata(ours, "database"), metadata(stashdb, "database"));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(stashheaddb, ours, stashdb, &conflicts, &violations);
+	install_database(stashheaddb, ours, stashdb, state_tables(metadata(stashdb, "database")), &conflicts, &violations);
 	if (conflicts.len || violations.len)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: Your local changes to the following tables would be overwritten by applying stash@{%d}:\n%s", idx, conflicts.len ? conflicts.data : violations.data)));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);

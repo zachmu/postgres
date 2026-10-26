@@ -43,12 +43,192 @@ creates_versioned_routine(CreateFunctionStmt *stmt)
 	return !strcmp(language, "sql") || !strcmp(language, "plpgsql");
 }
 
+/*
+ * Replace the working schema's |kind| members named in |removed|, named with
+ * |prefix|, or all of them, with |definitions|, and return the published
+ * database.
+ */
+static bytea *
+objects_publish(const char *kind, List *removed, const char *prefix, bool all, List *definitions)
+{
+	VersionRef	working = read_ref(branch_ref("working"));
+	Capture		current = capture(true);
+	StringInfoData names,
+				payloads;
+	char	   *json;
+	Datum	   *members;
+	int			n;
+	bytea	   *database;
+	const char *matches = "v->>'kind'=$5 AND ($4 OR $2::jsonb ? (v->>'name') OR starts_with(v->>'name',$6))";
+
+	initStringInfo(&names);
+	appendStringInfoChar(&names, '[');
+	foreach_ptr(char, name, removed)
+	{
+		if (names.len > 1)
+			appendStringInfoChar(&names, ',');
+		escape_json(&names, name);
+	}
+	appendStringInfoChar(&names, ']');
+	initStringInfo(&payloads);
+	appendStringInfoChar(&payloads, '[');
+	foreach_ptr(char, definition, definitions)
+	{
+		if (payloads.len > 1)
+			appendStringInfoChar(&payloads, ',');
+		appendStringInfoString(&payloads, object_payload(kind, definition));
+	}
+	appendStringInfoChar(&payloads, ']');
+	run(psprintf("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (%s)),'[]'::jsonb)||$3::jsonb)::text", matches),
+		6, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, BOOLOID, TEXTOID, TEXTOID),
+		VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data),
+				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
+		NULL, true);
+	json = strcell(0, 1);
+	run(psprintf("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h CROSS JOIN LATERAL (SELECT CASE WHEN o.objkind=$5 THEN convert_from(o.objpayload,'UTF8')::jsonb END AS v) p WHERE d.objhash=$1 AND NOT coalesce(%s, false)", matches),
+		6, VC_TYPES(BYTEAOID, TEXTOID, TEXTOID, BOOLOID, TEXTOID, TEXTOID),
+		VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data),
+				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
+		NULL, true);
+	n = SPI_processed;
+	members = palloc_array(Datum, n + list_length(definitions) + 1);
+	for (int i = 0; i < n; i++)
+		members[i] = cell(i, 1);
+	foreach_ptr(char, definition, definitions)
+		members[n++] = PointerGetDatum(object_member(kind, definition));
+	database = canonical_database(json, members, n);
+	move_ref(branch_ref("working"), working, database);
+	advance_snapshot();
+	return database;
+}
+
+static bytea *
+routines_publish(List *removed, bool all, List *definitions)
+{
+	return objects_publish("routine", removed, NULL, all, definitions);
+}
+
+/* The routine an ALTER statement changes, if it is a versioned one. */
+static ObjectWithArgs *
+altered_routine(Node *statement, ObjectType *type)
+{
+	ObjectWithArgs *routine = NULL;
+	Oid			id;
+
+	if (IsA(statement, AlterFunctionStmt))
+	{
+		*type = ((AlterFunctionStmt *) statement)->objtype;
+		routine = ((AlterFunctionStmt *) statement)->func;
+	}
+	else if (IsA(statement, RenameStmt))
+	{
+		*type = ((RenameStmt *) statement)->renameType;
+		if (*type == OBJECT_FUNCTION || *type == OBJECT_PROCEDURE || *type == OBJECT_ROUTINE)
+			routine = castNode(ObjectWithArgs, ((RenameStmt *) statement)->object);
+	}
+	else if (IsA(statement, AlterObjectSchemaStmt))
+	{
+		*type = ((AlterObjectSchemaStmt *) statement)->objectType;
+		if (*type == OBJECT_FUNCTION || *type == OBJECT_PROCEDURE || *type == OBJECT_ROUTINE)
+			routine = castNode(ObjectWithArgs, ((AlterObjectSchemaStmt *) statement)->object);
+	}
+	if (!routine)
+		return NULL;
+	id = LookupFuncWithArgs(*type, routine, true);
+	return OidIsValid(id) && id >= FirstDurableObjectId ? routine : NULL;
+}
+
+/*
+ * ALTER, RENAME or SET SCHEMA of a versioned routine runs natively against a
+ * provisional copy of the branch's catalogs; every routine there is then
+ * encoded again and published. Unchanged routines encode to the same bytes.
+ */
+static void
+routine_alter(ParseState *pstate, Node *statement)
+{
+	CatalogView *view = CatalogViewCreate("provisional routine DDL");
+	CatalogView *previous = CatalogViewCurrent();
+	Oid			caller,
+				privileged;
+	int			security,
+				nest;
+	List	   *definitions = NIL;
+
+	GetUserIdAndSecContext(&caller, &security);
+	PG_TRY();
+	{
+		Capture		current;
+		Relation	catalog;
+		SysScanDesc scan;
+		HeapTuple	tuple;
+
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+		nest = begin_api();
+		current = capture(true);
+		provider_populate(view, current.hash, dg_current_branch());
+		end_api(nest);
+		CatalogViewBeginMutation(view);
+		CatalogViewSwitch(view);
+		SetUserIdAndSecContext(caller, security);
+		switch (nodeTag(statement))
+		{
+			case T_AlterFunctionStmt:
+				AlterFunction(pstate, (AlterFunctionStmt *) statement);
+				break;
+			case T_RenameStmt:
+				ExecRenameStmt((RenameStmt *) statement);
+				break;
+			default:
+				ExecAlterObjectSchemaStmt((AlterObjectSchemaStmt *) statement, NULL);
+				break;
+		}
+		CommandCounterIncrement();
+		GetUserIdAndSecContext(&privileged, &security);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+		nest = begin_api();
+		catalog = table_open(ProcedureRelationId, AccessShareLock);
+		scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
+		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+			if (((Form_pg_proc) GETSTRUCT(tuple))->oid >= FirstNormalObjectId)
+				definitions = lappend(definitions, routine_encode(tuple, RelationGetDescr(catalog)));
+		systable_endscan(scan);
+		table_close(catalog, AccessShareLock);
+		CatalogViewSwitch(NULL);
+		(void) routines_publish(NIL, true, definitions);
+		end_api(nest);
+		UpdateActiveSnapshotCommandId();
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(caller, security);
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
+}
+
 bool
 dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 {
 	CatalogView *previous;
 	bool		pushed = false;
+	ObjectType	type;
 
+	if ((IsA(statement, AlterFunctionStmt) || IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)) &&
+		dg_catalog_active() && altered_routine(statement, &type))
+	{
+		if (!ActiveSnapshotSet())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed = true;
+		}
+		if (CatalogViewCurrent())
+			unsupported("routine DDL in an immutable revision context");
+		dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
+		routine_alter(pstate, statement);
+		if (pushed)
+			PopActiveSnapshot();
+		return true;
+	}
 	if (!IsA(statement, CreateFunctionStmt) || !dg_catalog_active() ||
 		!creates_versioned_routine((CreateFunctionStmt *) statement))
 		return false;
@@ -112,36 +292,21 @@ dg_catalog_store_routine(HeapTuple tuple, TupleDesc desc)
 	PG_TRY();
 	{
 		char	   *definition,
-				   *payload,
-				   *name,
-				   *json;
-		bytea	   *member,
-				   *database;
-		VersionRef	working;
-		Capture		current;
-		Datum	   *members;
-		int			n;
+				   *name;
+		bytea	   *database;
 
 		nest = begin_api();
 		definition = routine_encode(tuple, desc);
 		name = json_value(definition, "name");
 		CatalogViewSwitch(NULL);
-		working = read_ref(branch_ref("working"));
-		current = capture(true);
-		member = routine_member(definition);
-		payload = psprintf("[%s]", routine_payload(definition));
-		run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (v->>'kind'='routine' AND v->>'name'=$2)),'[]'::jsonb)||$3::jsonb)::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(name), CStringGetTextDatum(payload)), NULL, true);
-		json = strcell(0, 1);
-		run("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h WHERE d.objhash=$1 AND NOT (o.objkind='routine' AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2)", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
-		n = SPI_processed;
-		members = palloc_array(Datum, n + 1);
-		for (int i = 0; i < n; i++)
-			members[i] = cell(i, 1);
-		members[n++] = PointerGetDatum(member);
-		database = canonical_database(json, members, n);
-		move_ref(branch_ref("working"), working, database);
-		advance_snapshot();
-		result = CatalogViewLookupObject(provider_view(database), ProcedureRelationId, name);
+		database = routines_publish(list_make1(name), false, list_make1(definition));
+
+		/*
+		 * The routine belongs to the branch head, whose view its validator
+		 * and callers use; a revision view would make its tables read-only.
+		 */
+		result = CatalogViewLookupObject(provider_branch_view(dg_current_branch(), database),
+										 ProcedureRelationId, name);
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
 	}

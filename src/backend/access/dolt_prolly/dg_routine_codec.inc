@@ -36,8 +36,8 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	ReleaseSysCache(language);
 	if (strcmp(lang, "sql") && strcmp(lang, "plpgsql"))
 		unsupported("canonical routines require SQL or PL/pgSQL");
-	if (proc->prokind != PROKIND_FUNCTION || proc->prosupport || proc->pronargdefaults)
-		unsupported("canonical routine kind, support function or parameter defaults");
+	if ((proc->prokind != PROKIND_FUNCTION && proc->prokind != PROKIND_PROCEDURE) || proc->prosupport)
+		unsupported("canonical routine kind or support function");
 	initStringInfo(&identity);
 	appendStringInfo(&identity, "%s(", dg_qualified_name(get_namespace_name(proc->pronamespace), NameStr(proc->proname)));
 	for (i = 0; i < proc->pronargs; i++)
@@ -107,10 +107,21 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 					encoded = OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(construct_array(names, n, TEXTOID, -1, false, TYPALIGN_INT)));
 					break;
 				}
+			case Anum_pg_proc_proargdefaults:
+				{
+					/* Defaults are portable SQL, rebound when the view is built. */
+					List	   *defaults = castNode(List, stringToNode(TextDatumGetCString(value)));
+					Datum	   *sql = palloc_array(Datum, Max(list_length(defaults), 1));
+					int			n = 0;
+
+					foreach_ptr(Node, expression, defaults)
+						sql[n++] = CStringGetTextDatum(schema_expression_sql(expression, InvalidOid));
+					encoded = OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(construct_array(sql, n, TEXTOID, -1, false, TYPALIGN_INT)));
+					break;
+				}
 			case Anum_pg_proc_protrftypes:
 			case Anum_pg_proc_prosqlbody:
-			case Anum_pg_proc_proargdefaults:
-				unsupported("canonical routine parsed bodies, transforms or defaults");
+				unsupported("canonical routine parsed bodies or transforms");
 				pg_unreachable();
 			default:
 				getTypeOutputInfo(attr->atttypid, &output, &varlena);
@@ -124,17 +135,21 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	return strcell(0, 1);
 }
 
+/*
+ * A schema object stored apart from tables, such as a routine or trigger: its
+ * member payload names it and hashes its definition, held in a child chunk.
+ */
 static char *
-routine_payload(const char *definition)
+object_payload(const char *kind, const char *definition)
 {
-	run("SELECT jsonb_build_object('kind','routine','name',$1::jsonb->>'name','schema',encode(sha256(convert_to($1,'UTF8')),'hex'))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT jsonb_build_object('kind',$2::text,'name',$1::jsonb->>'name','schema',encode(sha256(convert_to($1,'UTF8')),'hex'))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(kind)), NULL, true);
 	return strcell(0, 1);
 }
 
 static bytea *
-routine_member(const char *definition)
+object_member(const char *kind, const char *definition)
 {
 	bytea	   *schema = put("schema", definition, NULL, 0);
 
-	return put("routine", routine_payload(definition), VC_ARGS(PointerGetDatum(schema)), 1);
+	return put(kind, object_payload(kind, definition), VC_ARGS(PointerGetDatum(schema)), 1);
 }
