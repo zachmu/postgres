@@ -5,15 +5,24 @@
  */
 #include "dg.h"
 #include "access/htup_details.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_type_d.h"
+#include "common/int128.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/cash.h"
+#include "utils/date.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
+#include "utils/uuid.h"
+#include "utils/inet.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
@@ -571,4 +580,353 @@ PLSlice
 dg_encode_value(Oid type, Datum value)
 {
 	return encode_value(type, value);
+}
+
+/*
+ * The canonical bytes of one value of |type| with every label |old| of enum
+ * |target| replaced by |renamed|, as when the label is renamed. Stored enum
+ * values are their labels; the structure of every type is unchanged.
+ */
+PLSlice
+dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed)
+{
+	Oid			element;
+
+	check_stack_depth();
+	type = getBaseType(type);
+	if (type == TEXTOID || type == BYTEAOID || type == BOOLOID || type == INT2OID ||
+		type == INT4OID || type == INT8OID)
+		return bytes;
+	element = get_element_type(type);
+	if (OidIsValid(element) || get_typtype(type) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = OidIsValid(element) ? NULL : lookup_rowtype_tupdesc(type, -1);
+		uint32		count;
+		PLValue    *fields;
+		PLSlice		result;
+
+		if (bytes.len < 12)
+			elog(ERROR, "invalid prolly nested value");
+		count = pl_read32(bytes.data + 8);
+		fields = palloc0_array(PLValue, Max(count, 1));
+		for (uint32 i = 0; i < count; i++)
+		{
+			Oid			field;
+
+			dg_check(pl_tuple_get(bytes, i, &fields[i]));
+			if (!fields[i].present)
+				continue;
+			/* An array's first field is its shape. */
+			if (OidIsValid(element))
+			{
+				if (i == 0)
+					continue;
+				field = element;
+			}
+			else
+				field = TupleDescAttr(desc, i)->atttypid;
+			fields[i].bytes = dg_recode_label(field, fields[i].bytes, target, old, renamed);
+		}
+		result = pack_fields(fields, count);
+		if (desc)
+			ReleaseTupleDesc(desc);
+		pfree(fields);
+		return result;
+	}
+	if (type == target && bytes.len == 4 + strlen(old) && !memcmp(bytes.data + 4, old, strlen(old)))
+	{
+		uint8	   *data = palloc(4 + strlen(renamed));
+
+		memcpy(data, "DGB1", 4);
+		memcpy(data + 4, renamed, strlen(renamed));
+		return (PLSlice)
+		{
+			data, 4 + strlen(renamed)
+		};
+	}
+	return bytes;
+}
+
+/*
+ * Index keys. A key column is its value's bytes in an order matching the
+ * type's btree operator class, with values the class finds equal (such as
+ * numeric 1.0 and 1.00, or float -0 and 0) encoded the same. For the types
+ * whose row encoding already has these properties, it is the row encoding.
+ */
+static bool
+key_is_row(Oid type)
+{
+	return type == BOOLOID || type == INT2OID || type == INT4OID || type == INT8OID ||
+		type == TEXTOID || type == BYTEAOID;
+}
+
+static PLSlice
+key_bytes(const void *data, size_t len)
+{
+	uint8	   *copy = palloc(Max(len, 1));
+
+	memcpy(copy, data, len);
+	return (PLSlice)
+	{
+		copy, len
+	};
+}
+
+static PLSlice
+key_int64(int64 n)
+{
+	uint8	   *data = palloc(8);
+
+	pl_key_int64(n, data);
+	return (PLSlice)
+	{
+		data, 8
+	};
+}
+
+/* IEEE order, with -0 as 0 and every NaN above +Infinity, as float8 sorts. */
+static PLSlice
+key_float(double value)
+{
+	uint64		bits;
+	uint8	   *data = palloc(8);
+
+	if (value == 0)
+		value = 0;
+	if (isnan(value))
+		bits = UINT64CONST(0x7FF8000000000000);
+	else
+		memcpy(&bits, &value, 8);
+	bits = (bits & UINT64CONST(0x8000000000000000)) ? ~bits : bits | UINT64CONST(0x8000000000000000);
+	pl_write64(data, bits);
+	return (PLSlice)
+	{
+		data, 8
+	};
+}
+
+/*
+ * A numeric as a tag (-Infinity, negative, zero, positive, +Infinity, NaN),
+ * then for a finite nonzero value its decimal exponent and significant
+ * digits, trailing zeros removed. A negative value's exponent and digits are
+ * complemented and end with 0xFF, so a longer magnitude sorts first.
+ */
+static PLSlice
+key_numeric(Numeric value)
+{
+	char	   *text = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(value)));
+	StringInfoData out;
+	bool		negative = text[0] == '-';
+	char	   *digits = palloc(strlen(text) + 1);
+	int			n = 0,
+				integer = -1,
+				exponent;
+	uint8		e[4];
+
+	initStringInfo(&out);
+	if (!strcmp(text, "NaN") || !strcmp(text, "Infinity") || !strcmp(text, "-Infinity"))
+	{
+		appendStringInfoChar(&out, text[0] == 'N' ? 6 : negative ? 1 : 5);
+		return (PLSlice)
+		{
+			(uint8 *) out.data, out.len
+		};
+	}
+	for (char *c = text + (negative ? 1 : 0); *c; c++)
+	{
+		if (*c == '.')
+			integer = n;
+		else
+			digits[n++] = *c;
+	}
+	if (integer < 0)
+		integer = n;
+	exponent = integer;
+	while (n > 0 && digits[0] == '0')
+	{
+		memmove(digits, digits + 1, --n);
+		exponent--;
+	}
+	while (n > 0 && digits[n - 1] == '0')
+		n--;
+	if (n == 0)
+	{
+		appendStringInfoChar(&out, 3);
+		return (PLSlice)
+		{
+			(uint8 *) out.data, out.len
+		};
+	}
+	appendStringInfoChar(&out, negative ? 2 : 4);
+	pl_write32(e, (uint32) exponent ^ 0x80000000);
+	for (int i = 0; i < 4; i++)
+		appendStringInfoChar(&out, negative ? ~e[i] : e[i]);
+	for (int i = 0; i < n; i++)
+		appendStringInfoChar(&out, negative ? ~digits[i] : digits[i]);
+	if (negative)
+		appendStringInfoChar(&out, (char) 0xFF);
+	return (PLSlice)
+	{
+		(uint8 *) out.data, out.len
+	};
+}
+
+/* An interval by the 128-bit span interval_cmp compares. */
+static PLSlice
+key_interval(Interval *interval)
+{
+	INT128		span = int64_to_int128(interval->time);
+	uint8	   *data = palloc(16);
+	int64		hi;
+	uint64		lo;
+
+	int128_add_int64_mul_int64(&span, interval->month * INT64CONST(30) + interval->day, USECS_PER_DAY);
+#ifdef USE_NATIVE_INT128
+	hi = (int64) (span >> 64);
+	lo = (uint64) span;
+#else
+	hi = span.hi;
+	lo = span.lo;
+#endif
+	pl_write64(data, (uint64) hi ^ UINT64CONST(0x8000000000000000));
+	pl_write64(data + 8, lo);
+	return (PLSlice)
+	{
+		data, 16
+	};
+}
+
+/* Whether a prolly index can order keys of |type| as its operator class does. */
+bool
+dg_key_ordered(Oid type)
+{
+	type = getBaseType(type);
+	switch (type)
+	{
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case TEXTOID:
+		case BYTEAOID:
+		case VARCHAROID:
+		case BPCHAROID:
+		case CHAROID:
+		case NAMEOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case NUMERICOID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMETZOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case INTERVALOID:
+		case UUIDOID:
+		case CASHOID:
+		case MACADDROID:
+		case MACADDR8OID:
+			return true;
+		default:
+			return get_typtype(type) == TYPTYPE_ENUM;
+	}
+}
+
+/* The key bytes of |value| of |type|. */
+PLSlice
+dg_key_value(Oid type, Datum value)
+{
+	type = getBaseType(type);
+	if (key_is_row(type))
+		return encode_value(type, value);
+	switch (type)
+	{
+		case VARCHAROID:
+			{
+				struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
+
+				return key_bytes(VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+			}
+		case BPCHAROID:
+			{
+				/* bpchar compares without its trailing spaces. */
+				struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
+				size_t		len = VARSIZE_ANY_EXHDR(v);
+
+				while (len > 0 && VARDATA_ANY(v)[len - 1] == ' ')
+					len--;
+				return key_bytes(VARDATA_ANY(v), len);
+			}
+		case NAMEOID:
+			return key_bytes(NameStr(*DatumGetName(value)), strlen(NameStr(*DatumGetName(value))));
+		case CHAROID:
+			{
+				uint8		c = (uint8) DatumGetChar(value);
+
+				return key_bytes(&c, 1);
+			}
+		case FLOAT4OID:
+			return key_float(DatumGetFloat4(value));
+		case FLOAT8OID:
+			return key_float(DatumGetFloat8(value));
+		case NUMERICOID:
+			return key_numeric(DatumGetNumeric(value));
+		case DATEOID:
+			return key_int64(DatumGetDateADT(value));
+		case TIMEOID:
+			return key_int64(DatumGetTimeADT(value));
+		case TIMESTAMPOID:
+			return key_int64(DatumGetTimestamp(value));
+		case TIMESTAMPTZOID:
+			return key_int64(DatumGetTimestampTz(value));
+		case CASHOID:
+			return key_int64(DatumGetCash(value));
+		case TIMETZOID:
+			{
+				/* As timetz_cmp: UTC time, then zone. */
+				TimeTzADT  *time = DatumGetTimeTzADTP(value);
+				PLSlice		when = key_int64(time->time + time->zone * USECS_PER_SEC);
+				PLSlice		zone = key_int64(time->zone);
+				uint8	   *data = palloc(16);
+
+				memcpy(data, when.data, 8);
+				memcpy(data + 8, zone.data, 8);
+				return (PLSlice)
+				{
+					data, 16
+				};
+			}
+		case INTERVALOID:
+			return key_interval(DatumGetIntervalP(value));
+		case UUIDOID:
+			return key_bytes(DatumGetUUIDP(value)->data, UUID_LEN);
+		case MACADDROID:
+			return key_bytes(DatumGetMacaddrP(value), sizeof(macaddr));
+		case MACADDR8OID:
+			return key_bytes(DatumGetMacaddr8P(value), sizeof(macaddr8));
+	}
+	if (get_typtype(type) == TYPTYPE_ENUM)
+	{
+		/* A label by its position in its enum. */
+		HeapTuple	tuple = SearchSysCache1(ENUMOID, value);
+		PLSlice		result;
+
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for enum label %u", DatumGetObjectId(value));
+		result = key_float(((Form_pg_enum) GETSTRUCT(tuple))->enumsortorder);
+		ReleaseSysCache(tuple);
+		return result;
+	}
+	dg_unsupported("ordered index keys of this type");
+	pg_unreachable();
+}
+
+/* The key bytes of a value stored in a row as |bytes|. */
+PLSlice
+dg_key_field(Oid type, PLSlice bytes)
+{
+	type = getBaseType(type);
+	if (key_is_row(type))
+		return bytes;
+	return dg_key_value(type, decode_value(type, bytes));
 }

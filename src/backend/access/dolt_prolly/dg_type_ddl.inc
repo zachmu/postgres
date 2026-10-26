@@ -33,15 +33,6 @@ alters_versioned_type(Node *statement)
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 	else if (IsA(statement, AlterDomainStmt))
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterDomainStmt *) statement)->typeName));
-	else if (IsA(statement, RenameStmt) &&
-			 (((RenameStmt *) statement)->renameType == OBJECT_TYPE ||
-			  ((RenameStmt *) statement)->renameType == OBJECT_DOMAIN))
-		type = typenameTypeId(NULL, makeTypeNameFromNameList(castNode(List, ((RenameStmt *) statement)->object)));
-	else if (IsA(statement, RenameStmt) && ((RenameStmt *) statement)->renameType == OBJECT_ATTRIBUTE)
-		type = typenameTypeId(NULL, makeTypeNameFromNameList(((RenameStmt *) statement)->relation->schemaname ?
-															 list_make2(makeString(((RenameStmt *) statement)->relation->schemaname),
-																		makeString(((RenameStmt *) statement)->relation->relname)) :
-															 list_make1(makeString(((RenameStmt *) statement)->relation->relname))));
 	return type >= FirstDurableObjectId;
 }
 
@@ -57,34 +48,91 @@ type_versioned_row(Form_pg_type type)
 }
 
 /*
- * Whether anything but a type's own array type and composite relation depends
- * on it. Definitions name the types they use, so renaming a used type would
- * leave them naming a type that no longer exists.
+ * The tables of database root |root| that can hold a value of type |type|,
+ * directly or through domains, arrays and composite types, as its dependency
+ * record lists them.
  */
-static bool
-type_in_use(Oid type)
+static List *
+type_tables(const char *root, const char *type)
 {
-	Relation	catalog = table_open(DependRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
-	HeapTuple	tuple;
-	Oid			array = get_array_type(type);
-	Oid			relation = typeOrDomainTypeRelid(type);
-	bool		used = false;
+	List	   *types = list_make1(pstrdup(type));
+	List	   *tables = NIL;
 
-	while (!used && HeapTupleIsValid(tuple = systable_getnext(scan)))
+	foreach_ptr(char, name, types)
 	{
-		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+		foreach_ptr(List, referrer, database_referrers(root, "type", name))
+		{
+			List	  **into = !strcmp(linitial(referrer), "type") ? &types :
+				!strcmp(linitial(referrer), "table") ? &tables : NULL;
+			bool		listed = false;
 
-		if (dep->refclassid != TypeRelationId || (dep->refobjid != type && dep->refobjid != array))
-			continue;
-		if ((dep->classid == TypeRelationId && dep->objid == array) ||
-			(dep->classid == RelationRelationId && dep->objid == relation && dep->objsubid == 0))
-			continue;
-		used = true;
+			if (!into)
+				continue;
+			foreach_ptr(char, member, *into)
+				listed |= !strcmp(member, lsecond(referrer));
+			if (!listed)
+				*into = lappend(*into, lsecond(referrer));
+		}
 	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return used;
+	return tables;
+}
+
+typedef struct EnumLabel
+{
+	TupleDesc	desc;
+	Oid			type;
+	const char *old;
+	const char *renamed;
+} EnumLabel;
+
+static PLSlice
+enum_label_field(int field, PLSlice bytes, void *arg)
+{
+	EnumLabel  *label = arg;
+
+	return dg_recode_label(TupleDescAttr(label->desc, field)->atttypid, bytes, label->type, label->old, label->renamed);
+}
+
+/*
+ * Install the rows of every table that can hold a value of enum |type| again
+ * on the working branch, with label |old| renamed to |renamed| if given. Rows
+ * hold labels, and index keys label positions, which an added label shifts;
+ * installing rows rebuilds their indexes.
+ */
+static void
+enum_tables_rewrite(const char *root, const char *type, const char *old, const char *renamed)
+{
+	List	   *tables = type_tables(root, type);
+
+	foreach_ptr(char, table, tables)
+	{
+		Relation	rel = dg_catalog_write_table(dg_current_branch(), table, ACL_UPDATE);
+		DGState    *state = dg_load(rel, SnapshotSelf);
+		TupleDesc	desc = RelationGetDescr(rel);
+		PLTree		tree = state->content;
+
+		if (old)
+		{
+			int		   *mapping = palloc_array(int, Max(desc->natts, 1));
+			EnumLabel	label = {
+				.desc = desc,
+				.type = CatalogViewLookupObject(rel->rd_catalogview, TypeRelationId, type),
+				.old = old,
+				.renamed = renamed,
+			};
+
+			for (int i = 0; i < desc->natts; i++)
+				mapping[i] = i;
+			tree = alter_rows(state, desc->natts, desc->natts, mapping, enum_label_field, &label);
+		}
+		dg_history_install(rel, state, tree);
+		dg_release(state);
+		dg_storage_close_relation(rel);
+		UpdateActiveSnapshotCommandId();
+	}
+	if (tables)
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
+	advance_snapshot();
 }
 
 /* Type DDL makes no storage; a composite type's relation has none. */
@@ -101,6 +149,7 @@ type_ddl(ParseState *pstate, Node *statement)
 	CatalogView *view = CatalogViewCreate("provisional type DDL");
 	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *saved_mutation = native_mutation_view;
+	Oid			enum_type = InvalidOid;
 	Oid			caller,
 				privileged;
 	int			security,
@@ -140,13 +189,7 @@ type_ddl(ParseState *pstate, Node *statement)
 									((CompositeTypeStmt *) statement)->coldeflist);
 				break;
 			case T_AlterEnumStmt:
-
-				/*
-				 * Stored rows hold enum labels, which keep them portable; a
-				 * renamed label would no longer read back.
-				 */
-				if (((AlterEnumStmt *) statement)->oldVal)
-					unsupported("renaming a label of a versioned enum");
+				enum_type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 				AlterEnum((AlterEnumStmt *) statement);
 				break;
 			case T_AlterDomainStmt:
@@ -179,11 +222,7 @@ type_ddl(ParseState *pstate, Node *statement)
 					break;
 				}
 			default:
-				if (((RenameStmt *) statement)->renameType != OBJECT_ATTRIBUTE &&
-					type_in_use(typenameTypeId(NULL, makeTypeNameFromNameList(castNode(List, ((RenameStmt *) statement)->object)))))
-					unsupported("renaming a versioned type that other objects use");
-				ExecRenameStmt((RenameStmt *) statement);
-				break;
+				elog(ERROR, "unrecognized versioned type statement");
 		}
 		CommandCounterIncrement();
 		GetUserIdAndSecContext(&privileged, &security);
@@ -197,7 +236,14 @@ type_ddl(ParseState *pstate, Node *statement)
 		systable_endscan(scan);
 		table_close(catalog, AccessShareLock);
 		CatalogViewSwitch(NULL);
-		(void) objects_publish("type", NIL, NULL, true, definitions);
+		{
+			bytea	   *database = objects_publish("type", NIL, NULL, true, definitions);
+
+			/* An added label shifts the positions that index keys hold. */
+			if (IsA(statement, AlterEnumStmt))
+				enum_tables_rewrite(metadata(database, "database"),
+									CatalogViewObjectIdentity(enum_type, TypeRelationId), NULL, NULL);
+		}
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
 	}
@@ -217,7 +263,7 @@ dg_catalog_type_ddl(ParseState *pstate, Node *statement)
 
 	if (!IsA(statement, CreateEnumStmt) && !IsA(statement, CreateDomainStmt) &&
 		!IsA(statement, CompositeTypeStmt) && !IsA(statement, AlterEnumStmt) &&
-		!IsA(statement, AlterDomainStmt) && !IsA(statement, RenameStmt))
+		!IsA(statement, AlterDomainStmt))
 		return false;
 	if (!dg_catalog_active() || !(creates_versioned_type(statement) || alters_versioned_type(statement)))
 		return false;

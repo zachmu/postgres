@@ -1,6 +1,10 @@
 /* Branch-local metadata revisions and eager tuple-layout rewrites. */
+
+/* Rewrites one present field of a row in place, as a label rename does. */
+typedef PLSlice (*AlterField) (int field, PLSlice bytes, void *arg);
+
 static PLTree
-alter_rows(DGState *state, int oldcount, int count, int *mapping)
+alter_rows(DGState *state, int oldcount, int count, int *mapping, AlterField transform, void *arg)
 {
 	DGRows		rows = dg_rows(&state->content);
 	PLEntry    *entries = palloc_array(PLEntry, Max(rows.count, 1));
@@ -19,7 +23,11 @@ alter_rows(DGState *state, int oldcount, int count, int *mapping)
 
 		for (int j = 0; j < count; j++)
 			if (mapping[j] < oldcount)
+			{
 				dg_check(pl_tuple_get(row, mapping[j], &fields[j]));
+				if (transform && fields[j].present)
+					fields[j].bytes = transform(j, fields[j].bytes, arg);
+			}
 		dg_check(pl_tuple_pack(fields, count, &packed, &length));
 		hash = dg_rowhash(DG_SLICE(packed, length));
 		key = palloc(PL_HASH_SIZE);

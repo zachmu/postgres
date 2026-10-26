@@ -12,6 +12,7 @@ $node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_t
 $node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sub fails {my($q,$re,$label)=@_;my($code,$out,$err)=$node->psql('postgres',$q);isnt($code,0,$label);like($err,$re,"$label diagnostic");}
+my $index='SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_sort=off; ';
 sql(q{CREATE TABLE seed(id int PRIMARY KEY)});
 
 # ---- enums ----
@@ -22,10 +23,19 @@ is(sql(q{SELECT ms[2] FROM e WHERE id=1}),'ok','enum arrays');
 sql(q{ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'; ALTER TYPE mood ADD VALUE 'glad' AFTER 'happy'});
 is(sql(q{SELECT enum_range(NULL::mood)}),'{sad,meh,ok,happy,glad}','ADD VALUE');
 is(sql(q{SELECT m FROM e WHERE id=1}),'happy','stored labels read back after ADD VALUE');
-# TODO: rows store labels, so renaming one needs a stable label identity or a rewrite.
-fails(q{ALTER TYPE mood RENAME VALUE 'happy' TO 'joyful'},qr/renaming a label of a versioned enum/,'RENAME VALUE is rejected');
+sql(q{ALTER TYPE mood RENAME VALUE 'happy' TO 'joyful'});
+is(sql(q{SELECT m FROM e WHERE id=1}),'joyful','RENAME VALUE rewrites stored labels');
+sql(q{ALTER TYPE mood RENAME VALUE 'joyful' TO 'happy'});
 is(sql(q{SELECT 'meh'::mood < 'ok'::mood AND 'meh'::mood > 'sad'::mood}),'t','added label sorts in place');
 fails(q{ALTER TYPE mood ADD VALUE 'ok'},qr/enum label "ok" already exists/,'native enum validation');
+sql(q{CREATE TABLE ei(id int PRIMARY KEY, m mood); CREATE INDEX ei_m ON ei(m); INSERT INTO ei VALUES (1,'happy'),(2,'sad'),(3,'ok')});
+is(sql($index.q{SELECT string_agg(m::text, ',' ORDER BY m) FROM ei}),'sad,ok,happy','enum index keys follow label order');
+sql(q{ALTER TYPE mood ADD VALUE 'fine' BEFORE 'ok'; INSERT INTO ei VALUES (4,'fine')});
+is(sql($index.q{SELECT string_agg(id::text, ',' ORDER BY m) FROM ei WHERE m < 'ok'}),'2,4','an added label rebuilds the positions index keys hold');
+is(sql($index.q{SELECT id FROM ei WHERE m = 'ok'}),'3','index equality after an added label');
+sql(q{ALTER TYPE mood RENAME VALUE 'happy' TO 'joyful'});
+is(sql($index.q{SELECT id FROM ei WHERE m = 'joyful'}),'1','a renamed label keeps its index keys');
+sql(q{ALTER TYPE mood RENAME VALUE 'joyful' TO 'happy'});
 
 # ---- domains ----
 sql(q{CREATE DOMAIN posint AS int NOT NULL DEFAULT 1 CHECK (VALUE > 0); CREATE DOMAIN upbeat AS mood CHECK (VALUE <> 'sad')});
@@ -47,8 +57,8 @@ sql(q{ALTER TYPE pair RENAME ATTRIBUTE a TO x});
 is(sql(q{SELECT (p).x FROM c}),'1','renamed attribute');
 sql(q{CREATE TYPE spare AS ENUM ('a'); ALTER TYPE spare RENAME TO extra});
 is(sql(q{SELECT enum_range(NULL::extra)}),'{a}','an unused type renames');
-# TODO: definitions name the types they use; renaming a used type must rewrite them.
-fails(q{ALTER TYPE mood RENAME TO feeling},qr/renaming a versioned type that other objects use/,'renaming a used type is rejected');
+sql(q{ALTER TYPE mood RENAME TO feeling; ALTER TYPE feeling RENAME TO mood});
+is(sql(q{SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid='e'::regclass AND attname='m'}),'mood','renaming a used type rewrites its users');
 
 # ---- routines and dependencies ----
 sql(q{CREATE FUNCTION cheer(f mood) RETURNS mood LANGUAGE sql AS $$SELECT 'glad'::mood$$});
@@ -60,10 +70,10 @@ fails(q{CREATE TABLE h(id int, f mood) USING heap},qr/cannot make an unversioned
 sql(q{SELECT dolt_commit('-Am','types'); SELECT dolt_branch('other')});
 $node->safe_psql('postgres',q{SELECT dolt_checkout('other'); CREATE TYPE color AS ENUM ('red','blue'); ALTER TYPE mood ADD VALUE 'calm'; CREATE TABLE paint(id int PRIMARY KEY, c color); INSERT INTO paint VALUES (1,'blue'); SELECT dolt_commit('-Am','other types')});
 is(sql(q{SELECT count(*) FROM pg_type WHERE typname='color'}),'0','a type made on another branch is not visible');
-is(sql(q{SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM "postgres/other".pg_catalog.pg_enum e JOIN "postgres/other".pg_catalog.pg_type t ON t.oid=e.enumtypid WHERE t.typname='mood'}),'sad,meh,ok,happy,glad,calm','another branch\'s labels are readable');
-is(sql(q{SELECT enum_range(NULL::mood)}),'{sad,meh,ok,happy,glad}','this branch keeps its own labels');
+is(sql(q{SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM "postgres/other".pg_catalog.pg_enum e JOIN "postgres/other".pg_catalog.pg_type t ON t.oid=e.enumtypid WHERE t.typname='mood'}),'sad,meh,fine,ok,happy,glad,calm','another branch\'s labels are readable');
+is(sql(q{SELECT enum_range(NULL::mood)}),'{sad,meh,fine,ok,happy,glad}','this branch keeps its own labels');
 is(sql(q{SELECT fast_forward FROM dolt_merge('other')}),'1','a type change merges');
-is(sql(q{SELECT enum_range(NULL::mood)::text||','||(SELECT c FROM paint)}),'{sad,meh,ok,happy,glad,calm},blue','merged types and their rows');
+is(sql(q{SELECT enum_range(NULL::mood)::text||','||(SELECT c FROM paint)}),'{sad,meh,fine,ok,happy,glad,calm},blue','merged types and their rows');
 $node->safe_psql('postgres',q{SELECT dolt_branch('b1'); SELECT dolt_branch('b2'); SELECT dolt_checkout('b1'); ALTER TYPE mood ADD VALUE 'x1'; SELECT dolt_commit('-Am','b1'); SELECT dolt_checkout('b2'); ALTER TYPE mood ADD VALUE 'x2'; SELECT dolt_commit('-Am','b2')});
 sql(q{SELECT dolt_merge('b1')});
 fails(q{SELECT dolt_merge('b2')},qr/merge conflict in the definition of type public\.mood/,'a type changed on both branches conflicts');

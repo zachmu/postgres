@@ -15,6 +15,7 @@ extern bool dg_catalog_active(void);
 extern bool dg_catalog_routine_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_trigger_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
+extern bool dg_catalog_rename(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_creating_routine(void);
 extern Oid	dg_catalog_routine_namespace(Oid namespaceid);
 extern Oid	dg_catalog_store_routine(HeapTuple tuple, TupleDesc desc);
