@@ -32,6 +32,7 @@ is(sql(q{SELECT string_agg(what, ',' ORDER BY id) FROM log}),'t_note:UPDATE:1,t_
 is(sql(q{SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='t_bump'}),
    'CREATE TRIGGER t_bump BEFORE UPDATE OF v ON public.t FOR EACH ROW WHEN ((old.v IS DISTINCT FROM new.v)) EXECUTE FUNCTION bump()',
    'trigger definition deparses as native');
+is(sql(q{BEGIN; CREATE TRIGGER t_locked BEFORE DELETE ON t FOR EACH ROW EXECUTE FUNCTION upcase(); SELECT mode FROM pg_locks WHERE locktype='relation' AND relation='t'::regclass AND pid=pg_backend_pid() AND mode='ShareRowExclusiveLock'; ROLLBACK}),'ShareRowExclusiveLock','CREATE TRIGGER locks its table as native');
 fails(q{ALTER TABLE t DROP COLUMN v},qr/trigger t_bump on table (public\.)?t depends on column v/,'trigger columns cannot be dropped alone');
 fails(q{DROP FUNCTION bump()},qr/trigger t_bump on table t depends on function bump/,'a trigger function cannot be dropped alone');
 

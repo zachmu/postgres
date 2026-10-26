@@ -144,6 +144,9 @@ dg_catalog_trigger_ddl(ParseState *pstate, Node *statement)
 	}
 	if (CatalogViewCurrent())
 		unsupported("trigger DDL in an immutable revision context");
+
+	/* As CreateTrigger, which conflicts with concurrent writes to the table. */
+	(void) RangeVarGetRelid(stmt->relation, ShareRowExclusiveLock, false);
 	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
 	trigger_create(pstate, stmt);
 	if (pushed)
