@@ -75,6 +75,15 @@ check_type_recursive(Oid type, List *ancestors)
 				check_type_recursive(TupleDescAttr(desc, i)->atttypid, ancestors);
 		ReleaseTupleDesc(desc);
 	}
+
+	/*
+	 * A range sends its flags and bounds, never its type OID, so it is as
+	 * portable as its subtype; a subtype's own sender may embed OIDs.
+	 */
+	else if (kind == TYPTYPE_RANGE)
+		check_type_recursive(get_range_subtype(type), ancestors);
+	else if (kind == TYPTYPE_MULTIRANGE)
+		check_type_recursive(get_multirange_range(type), ancestors);
 	else if (kind != TYPTYPE_ENUM)
 	{
 		switch (type)
@@ -123,25 +132,6 @@ check_type_recursive(Oid type, List *ancestors)
 			case XMLOID:
 			case TSVECTOROID:
 			case TSQUERYOID:
-
-				/*
-				 * These senders omit the in-memory range type OID. Their
-				 * bound types are known portable scalars. User-defined range
-				 * senders may delegate to array_send/record_send, which embed
-				 * type OIDs.
-				 */
-			case INT4RANGEOID:
-			case INT8RANGEOID:
-			case NUMRANGEOID:
-			case TSRANGEOID:
-			case TSTZRANGEOID:
-			case DATERANGEOID:
-			case INT4MULTIRANGEOID:
-			case INT8MULTIRANGEOID:
-			case NUMMULTIRANGEOID:
-			case TSMULTIRANGEOID:
-			case TSTZMULTIRANGEOID:
-			case DATEMULTIRANGEOID:
 				break;
 			default:
 				ereport(ERROR,

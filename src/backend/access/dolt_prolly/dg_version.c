@@ -62,6 +62,7 @@
 #include "catalog/pg_description.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_range.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_attribute.h"

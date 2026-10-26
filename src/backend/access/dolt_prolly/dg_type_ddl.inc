@@ -18,6 +18,8 @@ creates_versioned_type(Node *statement)
 		namespace = QualifiedNameGetCreationNamespace(((CreateDomainStmt *) statement)->domainname, &name);
 	else if (IsA(statement, CompositeTypeStmt))
 		namespace = RangeVarGetCreationNamespace(((CompositeTypeStmt *) statement)->typevar);
+	else if (IsA(statement, CreateRangeStmt))
+		namespace = QualifiedNameGetCreationNamespace(((CreateRangeStmt *) statement)->typeName, &name);
 	else
 		return false;
 	return !isAnyTempNamespace(namespace) && !dg_system_namespace(get_namespace_name(namespace));
@@ -55,7 +57,7 @@ type_versioned_row(Form_pg_type type)
 {
 	if (type->oid < FirstNormalObjectId)
 		return false;
-	if (type->typtype == TYPTYPE_ENUM || type->typtype == TYPTYPE_DOMAIN)
+	if (type->typtype == TYPTYPE_ENUM || type->typtype == TYPTYPE_DOMAIN || type->typtype == TYPTYPE_RANGE)
 		return true;
 	return type->typtype == TYPTYPE_COMPOSITE && get_rel_relkind(type->typrelid) == RELKIND_COMPOSITE_TYPE;
 }
@@ -236,6 +238,9 @@ type_ddl(ParseState *pstate, Node *statement)
 				DefineCompositeType(((CompositeTypeStmt *) statement)->typevar,
 									((CompositeTypeStmt *) statement)->coldeflist);
 				break;
+			case T_CreateRangeStmt:
+				DefineRange(pstate, (CreateRangeStmt *) statement);
+				break;
 			case T_AlterEnumStmt:
 				altered = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 				AlterEnum((AlterEnumStmt *) statement);
@@ -349,7 +354,7 @@ dg_catalog_type_ddl(ParseState *pstate, Node *statement)
 	bool		pushed = false;
 
 	if (!IsA(statement, CreateEnumStmt) && !IsA(statement, CreateDomainStmt) &&
-		!IsA(statement, CompositeTypeStmt) && !IsA(statement, AlterEnumStmt) &&
+		!IsA(statement, CompositeTypeStmt) && !IsA(statement, CreateRangeStmt) && !IsA(statement, AlterEnumStmt) &&
 		!IsA(statement, AlterDomainStmt) && !IsA(statement, AlterTableStmt))
 		return false;
 	if (!dg_catalog_active() || !(creates_versioned_type(statement) || alters_versioned_type(statement)))

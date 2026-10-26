@@ -508,7 +508,8 @@ canonical_drop(Node *statement)
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
 				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId &&
-				 object->classId != AttrDefaultRelationId && object->classId != RewriteRelationId))
+				 object->classId != AttrDefaultRelationId && object->classId != RewriteRelationId &&
+				 object->classId != CastRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
 		CatalogViewSwitch(NULL);
