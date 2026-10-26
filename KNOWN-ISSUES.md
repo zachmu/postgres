@@ -20,3 +20,10 @@ The SQL reproductions are in /workspace/reports/rewrite-dolt-functions-*.sql.
   still needs a commit-time authority check. This is the existing-session edge
   explicitly allowed to defer in func-review.txt. Branch creation itself now
   overwrites working refs and table roots, so it does not resurrect old contents.
+
+* **Committed chunks stored twice under two hashes (2026-10-26):** a commit
+  copies every node of every table tree from `pg_dolt_chunk` into
+  `pg_dolt_object` as `chunk` objects keyed by a manifest envelope hash, not the
+  node hash the tree itself uses. History reads import those copies one SPI
+  statement per chunk. See [chunk store plan](CHUNK-STORE-PLAN.md) milestone 6;
+  the analysis is in /workspace/reports/catalog-bind-analysis/index.html.
