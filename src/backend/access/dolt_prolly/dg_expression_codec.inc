@@ -17,6 +17,13 @@ schema_expression_check(Node *node, void *context)
 				unsupported("canonical expression whole-row or external reference");
 			break;
 		case T_Const:
+
+			/*
+			 * A relation reference, such as a sequence for nextval(), is
+			 * deparsed by name and rebound by name: portable SQL, never an OID.
+			 */
+			if (((Const *) node)->consttype == REGCLASSOID)
+				return false;
 			break;
 		case T_FuncExpr:
 			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId)
@@ -71,6 +78,9 @@ schema_expression_gucs(void)
 	set_config_option("extra_float_digits", "3", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("bytea_output", "hex", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("standard_conforming_strings", "on", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+
+	/* User relations, such as sequences, are always written schema-qualified. */
+	set_config_option("search_path", "", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
 
 static List *

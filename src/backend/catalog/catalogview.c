@@ -1410,6 +1410,20 @@ CatalogViewIsProvisional(CatalogView *view)
 	return view && view->provisional && !view->retired;
 }
 
+/* Give a provisional object its name, once native DDL has created it. */
+void
+CatalogViewNameObject(Oid handle, const char *identity)
+{
+	CatalogViewObject *object = lookup_object(handle);
+	MemoryContext previous;
+
+	if (!object || !CatalogViewIsProvisional(object->view))
+		elog(ERROR, "only provisional catalog objects can be named");
+	previous = MemoryContextSwitchTo(object->view->memory);
+	object->identity = pstrdup(identity);
+	MemoryContextSwitchTo(previous);
+}
+
 Oid
 CatalogViewNewObject(Oid catalog)
 {

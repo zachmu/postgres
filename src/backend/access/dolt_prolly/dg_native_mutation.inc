@@ -698,3 +698,202 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	}
 	PG_END_TRY();
 }
+
+/* A provisional CREATE may make storage only for the relations it defines. */
+static void
+create_storage(Relation relation, CatalogViewStorageEffect effect)
+{
+	if (relation->rd_catalogview != native_mutation_view ||
+		(relation->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID && relation->rd_rel->relam != DOLT_PROLLY_INDEX_AM_OID))
+		unsupported("native CREATE storage outside prolly tables and indexes");
+}
+
+/* Run one ALTER TABLE of a provisional CREATE against its new relation. */
+static void
+create_alter(Oid id, AlterTableStmt *stmt, const char *query)
+{
+	AlterTableUtilityContext context = {0};
+	PlannedStmt *plan = makeNode(PlannedStmt);
+
+	plan->commandType = CMD_UTILITY;
+	plan->utilityStmt = (Node *) stmt;
+	context.pstmt = plan;
+	context.queryString = query;
+	context.relid = id;
+	AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
+	CommandCounterIncrement();
+}
+
+/*
+ * Native CREATE TABLE runs against a private copy of the branch's catalogs,
+ * as native ALTER does, so PostgreSQL itself interprets the statement. The
+ * result is serialized into canonical table and index definitions; nothing
+ * is published here. Sequences are database-global, as in Doltgres: serial
+ * creates its sequence natively, without an owning column. Foreign keys are
+ * returned for the caller to add once the table is published.
+ */
+static void
+native_create_definitions(Capture current, CreateStmt *statement, const char *query, Oid caller,
+						  const char *name, char **table, List **index_names,
+						  List **index_definitions, List **foreign)
+{
+	CatalogView *view = CatalogViewCreate("provisional native CREATE");
+	CatalogView *previous = CatalogViewCurrent();
+	CatalogView *saved_mutation = native_mutation_view;
+	Oid			saved_relation = native_mutation_relation;
+	Oid			privileged;
+	int			security;
+	int			pathnest = NewGUCNestLevel();
+
+	*index_names = *index_definitions = *foreign = NIL;
+	GetUserIdAndSecContext(&privileged, &security);
+	PG_TRY();
+	{
+		List	   *commands;
+		List	   *indexes = NIL;
+		RangeVar   *rv = NULL;
+		Oid			id = InvalidOid;
+		Oid			owner;
+		Acl		   *acl;
+		ListCell   *lc;
+		char	   *definition;
+		int		   *mapping;
+		int			attributes;
+
+		provider_populate(view, current.hash, NULL);
+		CatalogViewBeginMutation(view);
+		CatalogViewSetMutationValidator(view, mutation_validate_tuple);
+		CatalogViewSetStorageHandler(view, create_storage);
+		native_mutation_view = view;
+		native_mutation_relation = InvalidOid;
+		CatalogViewSwitch(view);
+		SetUserIdAndSecContext(caller, security);
+		set_config_option("search_path", api_search_path, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+
+		commands = transformCreateStmt(statement, query);
+		while (commands != NIL)
+		{
+			Node	   *command = linitial(commands);
+
+			commands = list_delete_first(commands);
+			if (IsA(command, CreateStmt))
+			{
+				rv = ((CreateStmt *) command)->relation;
+				id = DefineRelation((CreateStmt *) command, RELKIND_RELATION, InvalidOid, NULL, query).objectId;
+				CatalogViewNameObject(id, name);
+				native_mutation_relation = id;
+				CommandCounterIncrement();
+			}
+			else if (IsA(command, TableLikeClause))
+				commands = list_concat(expandTableLikeClause(rv, (TableLikeClause *) command), commands);
+			else if (IsA(command, CreateSeqStmt))
+			{
+				/* A sequence is shared by every branch: create it natively. */
+				CreateSeqStmt *sequence = (CreateSeqStmt *) command;
+				ParseState *pstate = make_parsestate(NULL);
+				ListCell   *oc;
+
+				foreach(oc, sequence->options)
+					if (!strcmp(lfirst_node(DefElem, oc)->defname, "owned_by"))
+						sequence->options = foreach_delete_current(sequence->options, oc);
+				if (sequence->for_identity)
+					unsupported("identity columns on versioned tables");
+				pstate->p_sourcetext = query;
+				CatalogViewSwitch(NULL);
+				DefineSequence(pstate, sequence);
+				CatalogViewSwitch(view);
+				CommandCounterIncrement();
+			}
+			else if (IsA(command, AlterSeqStmt))
+			{
+				/* serial's OWNED BY would tie a global sequence to one branch. */
+				ListCell   *oc;
+
+				foreach(oc, ((AlterSeqStmt *) command)->options)
+					if (strcmp(lfirst_node(DefElem, oc)->defname, "owned_by"))
+						unsupported("canonical CREATE sequence option");
+			}
+			else if (IsA(command, IndexStmt))
+			{
+				AlterTableCmd *action = makeNode(AlterTableCmd);
+				IndexStmt  *index = (IndexStmt *) command;
+
+				if (index->accessMethod && strcmp(index->accessMethod, "btree") && strcmp(index->accessMethod, "dolt_prolly_index"))
+					unsupported("canonical index storage properties");
+				index->accessMethod = pstrdup("dolt_prolly_index");
+				index->tableSpace = NULL;
+				index->options = NIL;
+				action->subtype = AT_AddIndex;
+				action->def = (Node *) transformIndexStmt(id, index, query);
+				indexes = lappend(indexes, action);
+			}
+			else if (IsA(command, AlterTableStmt))
+			{
+				AlterTableStmt *alter = (AlterTableStmt *) command;
+				bool		foreign_only = true;
+
+				foreach(lc, alter->cmds)
+				{
+					AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
+
+					if (action->subtype != AT_AddConstraint || !IsA(action->def, Constraint) ||
+						castNode(Constraint, action->def)->contype != CONSTR_FOREIGN)
+						foreign_only = false;
+				}
+				if (foreign_only)
+					*foreign = lappend(*foreign, alter);
+				else
+					create_alter(id, alter, query);
+			}
+			else
+				unsupported("canonical CREATE auxiliary command");
+		}
+		if (indexes)
+		{
+			AlterTableStmt *alter = makeNode(AlterTableStmt);
+
+			alter->relation = rv;
+			alter->objtype = OBJECT_TABLE;
+			alter->cmds = indexes;
+			create_alter(id, alter, query);
+		}
+		AtEOXact_GUC(true, pathnest);
+		SetUserIdAndSecContext(privileged, security);
+
+		/* Serialize as native ALTER does, from the provisional catalogs. */
+		{
+			CatalogView *outer = CatalogViewSwitch(view);
+			Relation	rel = relation_open(id, NoLock);
+
+			owner = rel->rd_rel->relowner;
+			relation_close(rel, NoLock);
+			CatalogViewSwitch(outer);
+		}
+		acl = acldefault(OBJECT_TABLE, owner);
+		definition = canonical_definition(name, owner, acl, "[]", "[]", "[]", NULL);
+		definition = mutation_columns(view, id, definition, &mapping, &attributes);
+		definition = mutation_constraints(view, id, definition);
+		indexes = mutation_indexes(view, id);
+		foreach(lc, indexes)
+		{
+			MutationIndex *item = lfirst(lc);
+			char	   *index = canonical_definition(item->name, item->owner, acldefault(OBJECT_TABLE, item->owner), "[]", "[]", "[]", item->sql);
+
+			index = mutation_columns(view, item->id, index, &mapping, &attributes);
+			*index_names = lappend(*index_names, item->name);
+			*index_definitions = lappend(*index_definitions, index);
+		}
+		*table = mutation_index_list(definition, indexes);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		native_mutation_view = saved_mutation;
+		native_mutation_relation = saved_relation;
+		SetUserIdAndSecContext(privileged, security);
+		if (CatalogViewIsProvisional(view))
+			CatalogViewRetireMutation(view);
+		CatalogViewRelease(view);
+	}
+	PG_END_TRY();
+}

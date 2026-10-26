@@ -1,4 +1,7 @@
 /* Canonical DDL publishes definitions and local resources, never schema copies. */
+static void native_create_definitions(Capture current, CreateStmt *statement, const char *query, Oid caller,
+									  const char *name, char **table, List **index_names,
+									  List **index_definitions, List **foreign);
 static void
 canonical_empty_cleanup(void *arg)
 {
@@ -151,12 +154,8 @@ dg_catalog_create(Node *statement, const char *query)
 				skip = false;
 	char	   *adopted = NULL;
 	char	   *name;
-	List	   *commands,
-			   *indexcmds = NIL,
-			   *foreigncmds = NIL;
+	List	   *foreigncmds = NIL;
 	ListCell   *lc;
-	TupleDesc	desc;
-	Acl		   *acl;
 
 	if (!IsA(statement, CreateStmt) || !IsUnderPostmaster || rangevar_projection_hook || catalog_api_depth ||
 		!creates_prolly((CreateStmt *) statement))
@@ -166,8 +165,12 @@ dg_catalog_create(Node *statement, const char *query)
 	stmt = copyObject((CreateStmt *) statement);
 	if (XactReadOnly)
 		PreventCommandIfReadOnly("CREATE TABLE");
-	if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT || stmt->inhRelations || stmt->partbound || stmt->partspec || stmt->ofTypename || stmt->options || stmt->tablespacename || (stmt->accessMethod && strcmp(stmt->accessMethod, "dolt_prolly_table")))
-		unsupported("branch CREATE requires a plain permanent prolly table");
+	if (stmt->relation->relpersistence != RELPERSISTENCE_PERMANENT)
+		unsupported("unlogged versioned tables");
+	if (stmt->inhRelations || stmt->partbound || stmt->partspec)
+		unsupported("partitioned and inherited versioned tables");
+	if (stmt->ofTypename)
+		unsupported("typed versioned tables");
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -230,72 +233,23 @@ dg_catalog_create(Node *statement, const char *query)
 	}
 	stmt->if_not_exists = false;
 	stmt->accessMethod = pstrdup("dolt_prolly_table");
-	commands = transformCreateStmt(stmt, query);
-	foreach(lc, commands)
-	{
-		Node	   *command = lfirst(lc);
 
-		if (IsA(command, CreateStmt))
-			stmt = (CreateStmt *) command;
-		else if (IsA(command, IndexStmt))
-			indexcmds = lappend(indexcmds, command);
-		else if (IsA(command, AlterTableStmt))
-		{
-			AlterTableStmt *alter = castNode(AlterTableStmt, command);
-			ListCell   *cc;
-
-			foreach(cc, alter->cmds)
-			{
-				AlterTableCmd *action = lfirst_node(AlterTableCmd, cc);
-
-				if (action->subtype != AT_AddConstraint || !IsA(action->def, Constraint) || castNode(Constraint, action->def)->contype != CONSTR_FOREIGN)
-					unsupported("canonical CREATE auxiliary ALTER command");
-			}
-			foreigncmds = lappend(foreigncmds, alter);
-		}
-		else
-			unsupported("canonical CREATE auxiliary command");
-	}
-	foreach(lc, stmt->tableElts)
-	{
-		ColumnDef  *col = lfirst_node(ColumnDef, lc);
-
-		if (col->raw_default || col->cooked_default || col->identity || col->generated)
-			unsupported("canonical CREATE defaults or generated columns");
-	}
-	foreach(lc, stmt->constraints)
-	{
-		Constraint *constraint = lfirst_node(Constraint, lc);
-
-		if (constraint->contype != CONSTR_NOTNULL)
-			unsupported("canonical CREATE constraint");
-	}
-	desc = BuildDescForRelation(stmt->tableElts);
-	dg_validate_descriptor(desc);
-	for (int i = 0; i < desc->natts; i++)
-		for (int j = 0; j < i; j++)
-			if (!strcmp(NameStr(TupleDescAttr(desc, i)->attname), NameStr(TupleDescAttr(desc, j)->attname)))
-				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_COLUMN), errmsg("column \"%s\" specified more than once", NameStr(TupleDescAttr(desc, i)->attname))));
-	acl = get_user_default_acl(OBJECT_TABLE, user, namespaceid);
-	if (!acl)
-		acl = acldefault(OBJECT_TABLE, user);
+	/* Storage options and tablespaces mean nothing to prolly storage. */
+	stmt->options = NIL;
+	stmt->tablespacename = NULL;
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
 		VersionRef	working;
 		Capture		current;
-		StringInfoData columns,
-					indexes,
-					constraints,
-					added;
-		char	  **column_json = palloc_array(char *, Max(desc->natts, 1));
-		char	  **index_defs = palloc_array(char *, Max(list_length(indexcmds), 1));
-		char	  **index_names = palloc_array(char *, Max(list_length(indexcmds), 1));
-		char	  **index_columns = palloc_array(char *, Max(list_length(indexcmds), 1));
-		bytea	  **newmembers = palloc_array(bytea *, list_length(indexcmds) + 1);
+		StringInfoData added;
+		List	   *index_names,
+				   *index_definitions;
+		char	   *table;
+		bytea	  **newmembers;
 		Datum	   *members;
 		int			oldcount,
-					k = 0,
+					k,
 					total;
 		bytea	   *database;
 		CatalogView *view;
@@ -304,91 +258,10 @@ dg_catalog_create(Node *statement, const char *query)
 		nest = begin_api();
 		working = read_ref(branch_ref("working"));
 		current = capture(true);
-		initStringInfo(&columns);
-		appendStringInfoChar(&columns, '[');
-		initStringInfo(&indexes);
-		appendStringInfoChar(&indexes, '[');
-		initStringInfo(&constraints);
-		appendStringInfoChar(&constraints, '[');
-		for (int i = 0; i < desc->natts; i++)
-		{
-			Form_pg_attribute a = TupleDescAttr(desc, i);
-
-			if (i)
-				appendStringInfoChar(&columns, ',');
-			run("SELECT jsonb_build_object('name',$1::text,'comment',NULL,'type',t.typname,'typmod',$3::int,'notnull',$4::boolean,'collation',CASE WHEN $5::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$5) END)::text FROM pg_type t WHERE t.oid=$2 AND t.typnamespace='pg_catalog'::regnamespace", 5, VC_TYPES(TEXTOID, OIDOID, INT4OID, BOOLOID, OIDOID), VC_ARGS(CStringGetTextDatum(NameStr(a->attname)), ObjectIdGetDatum(a->atttypid), Int32GetDatum(a->atttypmod), BoolGetDatum(a->attnotnull), ObjectIdGetDatum(a->attcollation)), NULL, true);
-			if (SPI_processed != 1)
-				unsupported("canonical CREATE user-defined column types");
-			column_json[i] = strcell(0, 1);
-			appendStringInfoString(&columns, column_json[i]);
-			if (a->attnotnull)
-			{
-				if (constraints.len > 1)
-					appendStringInfoChar(&constraints, ',');
-				appendStringInfoChar(&constraints, '[');
-				escape_json(&constraints, makeObjectName(stmt->relation->relname, NameStr(a->attname), "not_null"));
-				appendStringInfoChar(&constraints, ',');
-				escape_json(&constraints, psprintf("NOT NULL %s", dg_quote_identifier(NameStr(a->attname))));
-				appendStringInfoChar(&constraints, ']');
-			}
-		}
-		appendStringInfoChar(&columns, ']');
-		foreach(lc, indexcmds)
-		{
-			IndexStmt  *index = lfirst_node(IndexStmt, lc);
-			StringInfoData keys,
-						icols;
-			ListCell   *key;
-			char	   *indexname,
-					   *sql,
-					   *constraint;
-
-			if (index->deferrable || index->whereClause || index->indexIncludingParams || index->options || index->excludeOpNames || !index->unique)
-				unsupported("canonical CREATE index properties");
-			initStringInfo(&keys);
-			initStringInfo(&icols);
-			appendStringInfoChar(&icols, '[');
-			foreach(key, index->indexParams)
-			{
-				IndexElem  *element = lfirst_node(IndexElem, key);
-				int			att;
-
-				if (!element->name || element->expr || element->opclass || element->collation || element->ordering != SORTBY_DEFAULT || element->nulls_ordering != SORTBY_NULLS_DEFAULT)
-					unsupported("canonical CREATE index expressions/options");
-				att = provider_attribute(desc, element->name) - 1;
-				if (keys.len)
-				{
-					appendStringInfoString(&keys, ", ");
-					appendStringInfoChar(&icols, ',');
-				}
-				appendStringInfoString(&keys, dg_quote_identifier(element->name));
-				appendStringInfoString(&icols, column_json[att]);
-			}
-			appendStringInfoChar(&icols, ']');
-			indexname = index->idxname ? index->idxname : makeObjectName(stmt->relation->relname, index->primary ? NULL : ((IndexElem *) linitial(index->indexParams))->name, index->primary ? "pkey" : "key");
-			if (!strcmp(indexname, stmt->relation->relname) || catalog_contains(working.target, dg_qualified_name(stmt->relation->schemaname, indexname)))
-				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", indexname)));
-			for (int j = 0; j < k; j++)
-				if (!strcmp(index_names[j], dg_qualified_name(stmt->relation->schemaname, indexname)))
-					ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("duplicate canonical index name")));
-			sql = psprintf("CREATE UNIQUE INDEX %s ON %s USING dolt_prolly_index (%s)%s", dg_quote_identifier(indexname), name, keys.data, index->nulls_not_distinct ? " NULLS NOT DISTINCT" : "");
-			constraint = psprintf("%s%s (%s)", index->primary ? "PRIMARY KEY" : "UNIQUE", (!index->primary && index->nulls_not_distinct) ? " NULLS NOT DISTINCT" : "", keys.data);
-			if (k)
-				appendStringInfoChar(&indexes, ',');
-			escape_json(&indexes, sql);
-			if (constraints.len > 1)
-				appendStringInfoChar(&constraints, ',');
-			appendStringInfoChar(&constraints, '[');
-			escape_json(&constraints, indexname);
-			appendStringInfoChar(&constraints, ',');
-			escape_json(&constraints, constraint);
-			appendStringInfoChar(&constraints, ']');
-			index_names[k] = dg_qualified_name(stmt->relation->schemaname, indexname);
-			index_columns[k] = icols.data;
-			index_defs[k++] = sql;
-		}
-		appendStringInfoChar(&indexes, ']');
-		appendStringInfoChar(&constraints, ']');
+		native_create_definitions(current, stmt, query, user, name, &table,
+								  &index_names, &index_definitions, &foreigncmds);
+		k = list_length(index_names);
+		newmembers = palloc_array(bytea *, k + 1);
 		empty->store = pl_store_create();
 		if (!empty->store)
 			ereport(ERROR, (errmsg("out of memory creating prolly store")));
@@ -396,9 +269,9 @@ dg_catalog_create(Node *statement, const char *query)
 		empty->cleanup.arg = empty;
 		MemoryContextRegisterResetCallback(CurrentMemoryContext, &empty->cleanup);
 		dg_check(pl_build(empty->store, NULL, 0, &empty->content));
-		newmembers[0] = canonical_empty_member("table", name, canonical_definition(name, user, acl, columns.data, indexes.data, constraints.data, NULL), &empty->content);
+		newmembers[0] = canonical_empty_member("table", name, table, &empty->content);
 		for (int i = 0; i < k; i++)
-			newmembers[i + 1] = canonical_empty_member("index", index_names[i], canonical_definition(index_names[i], user, acldefault(OBJECT_TABLE, user), index_columns[i], "[]", "[]", index_defs[i]), &empty->content);
+			newmembers[i + 1] = canonical_empty_member("index", list_nth(index_names, i), list_nth(index_definitions, i), &empty->content);
 		dg_release(empty);
 		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;
@@ -426,7 +299,7 @@ dg_catalog_create(Node *statement, const char *query)
 		view = provider_view(database);
 		for (int i = 0; i <= k; i++)
 		{
-			const char *membername = i ? index_names[i - 1] : name;
+			const char *membername = i ? (const char *) list_nth(index_names, i - 1) : name;
 			Relation	definition = relation_open(CatalogViewLookupObject(view, RelationRelationId, membername), NoLock);
 			Oid			resource = dg_storage_allocate(definition, dg_current_branch());
 

@@ -744,6 +744,27 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 			if (OidIsValid(*result))
 				break;
 		}
+
+		/* Unversioned native relations, such as sequences, are physical. */
+		if (!OidIsValid(*result))
+		{
+			CatalogView *previous = CatalogViewSwitch(NULL);
+
+			foreach(lc, path)
+			{
+				char	   *ns = lfirst(lc);
+				Oid			namespace;
+
+				if (!strcmp(ns, "$user"))
+					ns = GetUserNameFromId(GetUserId(), false);
+				namespace = get_namespace_oid(ns, true);
+				if (OidIsValid(namespace))
+					*result = get_relname_relid(rv->relname, namespace);
+				if (OidIsValid(*result))
+					break;
+			}
+			CatalogViewSwitch(previous);
+		}
 		if (!OidIsValid(*result) && !missing_ok)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist in provisional schema", rv->relname)));
 		return true;
