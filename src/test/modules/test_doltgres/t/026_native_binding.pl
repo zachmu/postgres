@@ -9,7 +9,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('native_binding');
 $node->init(extra=>['--encoding=UTF8','--locale=C']);
-$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\nshared_preload_libraries='pg_stat_statements'\npg_stat_statements.track='all'\ncompute_query_id=on\n");
+$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\nshared_preload_libraries='pg_stat_statements'\npg_stat_statements.track='all'\npg_stat_statements.track_planning=on\ncompute_query_id=on\n");
 $node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sql(q{CREATE EXTENSION pg_stat_statements; CREATE ROLE reader IN ROLE pg_read_all_data; CREATE ROLE noperms; CREATE SCHEMA app; REVOKE USAGE ON SCHEMA app FROM PUBLIC; CREATE TABLE t(id int PRIMARY KEY, v text); INSERT INTO t SELECT g, 'v'||g FROM generate_series(1,100) g; CREATE INDEX t_v ON t(v); CREATE TABLE app.t(id int PRIMARY KEY, v text); INSERT INTO app.t VALUES(1,'app'); CREATE TABLE h(id int PRIMARY KEY, v text) USING heap; INSERT INTO h VALUES(1,'heap'); CREATE VIEW tv AS SELECT v FROM t WHERE id=2;  SELECT dolt_commit('-Am','base')});
@@ -59,6 +59,27 @@ is($s->query_safe(q{SELECT w IS NULL FROM t WHERE id=1}),'t','ALTER is visible t
 $s->query_safe(q{SELECT dolt_checkout('-b','other'); UPDATE t SET v='other' WHERE id=1});
 is($s->query_safe(q{SELECT v FROM t WHERE id=1}),'other','branch write is visible on the branch');
 is(sql(q{SELECT v FROM t WHERE id=1}),'v1','main is unchanged');
+$s->query_safe(q{SELECT dolt_commit('-Am','other')});
+
+# Cached plans stay valid while the refs and mappings they bound through do.
+$s->query_safe(q{SET plan_cache_mode=force_generic_plan; PREPARE p(int) AS SELECT v FROM t WHERE id=$1; EXECUTE p(1); SELECT pg_stat_statements_reset()});
+$s->query_safe(q{EXECUTE p(1); EXECUTE p(2); EXECUTE p(3); EXECUTE p(4); EXECUTE p(5)});
+is($s->query_safe(q{SELECT calls, plans FROM pg_stat_statements WHERE query LIKE 'PREPARE p(int)%'}),'5|0','five executions of a prepared query plan it no more');
+is($s->query_safe(q{EXECUTE p(1)}),'other','prepared query reads the session branch');
+$s->query_safe(q{SELECT dolt_checkout('main')});
+is($s->query_safe(q{EXECUTE p(1)}),'v1','checkout rebinds the prepared query');
+$s->query_safe(q{SELECT dolt_checkout('other')});
+is($s->query_safe(q{EXECUTE p(1)}),'other','checkout back rebinds again');
+$s->query_safe(q{PREPARE cols AS SELECT count(*) FROM pg_attribute WHERE attrelid='t'::regclass AND attnum>0 AND NOT attisdropped});
+is($s->query_safe(q{EXECUTE cols}),'2','the branch was created from the last commit');
+sql(q{SELECT dolt_checkout('other'); ALTER TABLE t ADD COLUMN x int});
+is($s->query_safe(q{EXECUTE cols}),'3','branch DDL rebinds the prepared query');
+# A plan rebuilt under an older snapshot does not outlive that snapshot.
+$s->query_safe(q{PREPARE head AS SELECT v FROM t AS OF 'main' WHERE id=1; EXECUTE head; BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1});
+sql(q{UPDATE t SET v='main2' WHERE id=1; SELECT dolt_commit('-Am','main2')});
+is($s->query_safe(q{EXECUTE head}),'v1','repeatable read sees the ref as of its snapshot');
+$s->query_safe(q{COMMIT});
+is($s->query_safe(q{EXECUTE head}),'main2','the next transaction rebinds to the moved ref');
 $s->quit;
 $node->stop;
 done_testing();

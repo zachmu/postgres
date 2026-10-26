@@ -123,6 +123,7 @@ typedef struct CachedPlanSource
 	List	   *query_list;		/* list of Query nodes, or NIL if not valid */
 	List	   *relationOids;	/* OIDs of relations the queries depend on */
 	List	   *invalItems;		/* other dependencies, as PlanInvalItems */
+	List	   *doltRefs;		/* versioned bindings, as (ref, target, relid) */
 	struct SearchPathMatcher *search_path;	/* search_path used for parsing
 											 * and planning */
 	MemoryContext query_context;	/* context holding the above, or NULL */

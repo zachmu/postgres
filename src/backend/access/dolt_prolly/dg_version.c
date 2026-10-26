@@ -945,6 +945,11 @@ parent_count(bytea *commit)
 	n = ArrayGetNItems(ARR_NDIM(children), ARR_DIMS(children));
 	return Max(n, 1) - 1;
 }
+/* The ref the last resolve() went through, if any, and what it pointed to. */
+static char *resolved_ref;
+static bytea *resolved_target;
+static bool resolved_session;	/* HEAD: relative to the session's branch */
+
 static bytea *
 resolve(const char *revision)
 {
@@ -953,18 +958,27 @@ resolve(const char *revision)
 	bytea	   *hash = NULL;
 	VersionRef	ref;
 
+	resolved_ref = NULL;
+	resolved_target = NULL;
+	resolved_session = false;
 	if (suffix)
 		*suffix++ = '\0';
 	if (!pg_strcasecmp(base, "HEAD"))
-		hash = read_ref(branch_ref("heads")).target;
+	{
+		resolved_ref = branch_ref("heads");
+		resolved_session = true;
+		hash = resolved_target = read_ref(resolved_ref).target;
+	}
 	else
 	{
-		ref = read_ref(psprintf("heads/%s", base));
-		hash = ref.target;
+		resolved_ref = psprintf("heads/%s", base);
+		ref = read_ref(resolved_ref);
+		hash = resolved_target = ref.target;
 		if (!hash)
 		{
-			ref = read_ref(psprintf("tags/%s", base));
-			hash = ref.target;
+			resolved_ref = psprintf("tags/%s", base);
+			ref = read_ref(resolved_ref);
+			hash = resolved_target = ref.target;
 			if (hash)
 			{
 				char	   *kind;
@@ -973,6 +987,8 @@ resolve(const char *revision)
 					hash = child(hash, 1);
 			}
 		}
+		if (!hash)
+			resolved_ref = NULL;
 		if (!hash && strlen(base) == 64)
 			hash = unhex(base);
 		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&

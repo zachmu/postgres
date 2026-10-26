@@ -509,6 +509,8 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 	WRITE_NODE_FIELD(alias);
 	WRITE_NODE_FIELD(eref);
 	WRITE_ENUM_FIELD(rtekind, RTEKind);
+	WRITE_STRING_FIELD(dolt_ref);
+	WRITE_STRING_FIELD(dolt_ref_target);
 	WRITE_STRING_FIELD(dolt_database);
 
 	switch (node->rtekind)
@@ -566,7 +568,6 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			WRITE_CHAR_FIELD(relkind);
 			WRITE_INT_FIELD(rellockmode);
 			WRITE_UINT_FIELD(perminfoindex);
-			WRITE_STRING_FIELD(dolt_table);
 			WRITE_OID_FIELD(dolt_catalog);
 			WRITE_OID_FIELD(dolt_rowtype);
 			WRITE_STRING_FIELD(dolt_branch);

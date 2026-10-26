@@ -64,12 +64,11 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 
 /*
  * Whether the local mapping of |name| on |branch| still names resource |relid|
- * for retained schema |schema|. Read natively under the active snapshot: a
- * catalog view bound the resource when it was built, and the mapping may have
- * changed since.
+ * for retained schema |schema|, under |snapshot|: a catalog view bound the
+ * resource when it was built, and the mapping may have changed since.
  */
 static bool
-binding_current(const char *branch, const char *name, Oid relid, bytea *schema)
+binding_current(const char *branch, const char *name, Oid relid, bytea *schema, Snapshot snapshot)
 {
 	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
 	ScanKeyData keys[2];
@@ -79,7 +78,7 @@ binding_current(const char *branch, const char *name, Oid relid, bytea *schema)
 
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
 	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
-	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true, ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot(), 2, keys);
+	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true, snapshot, 2, keys);
 	tuple = systable_getnext(scan);
 	if (HeapTupleIsValid(tuple))
 	{
@@ -97,7 +96,7 @@ binding_current(const char *branch, const char *name, Oid relid, bytea *schema)
 	/* The resource itself must still exist. */
 	rel = table_open(DoltStorageRelationId, AccessShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, DoltStorageKeyIndexId, true, ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot(), 1, keys);
+	scan = systable_beginscan(rel, DoltStorageKeyIndexId, true, snapshot, 1, keys);
 	current = HeapTupleIsValid(systable_getnext(scan));
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);

@@ -432,7 +432,19 @@ revision_selected:
 		db = rte->dolt_database ? unhex(rte->dolt_database) :
 			(working ? catalog_working_schema(revision) : NULL);
 		if (!db)
+		{
 			db = child(resolve(revision), 1);
+			if (resolved_ref)
+			{
+				rte->dolt_ref = psprintf("%c:%s", resolved_session ? 's' : 'r', resolved_ref);
+				rte->dolt_ref_target = hex(resolved_target);
+			}
+		}
+		else if (working)
+		{
+			rte->dolt_ref = psprintf("%c:working/%s", context_branch ? 'c' : 's', revision);
+			rte->dolt_ref_target = hex(db);
+		}
 		rte->dolt_database = hex(db);
 		view = context_view(db, working ? revision : NULL);
 		{
@@ -490,7 +502,6 @@ revision_selected:
 				rte->relkind = RELKIND_VIEW;
 				rte->relid = id;
 			}
-			rte->dolt_table = pstrdup("");
 			rte->dolt_rowtype = get_rel_type_id(id);
 
 			/* Catalog rows show a branch head's objects by durable OID. */
@@ -561,7 +572,7 @@ revision_selected:
 			if (working)
 			{
 				live = CatalogViewObjectStorage(handle);
-				if (!binding_current(revision, logical, live, CatalogViewObjectSchema(handle)))
+				if (!binding_current(revision, logical, live, CatalogViewObjectSchema(handle), ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot()))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
 			}
 			else
@@ -588,6 +599,100 @@ binding_done:
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
+}
+
+/*
+ * Whether the refs and local mappings that a cached query's bindings went
+ * through still say the same: |refs| holds (ref, target, relid) triples as
+ * recorded on its range table entries. Session names must still be on the
+ * same branch; a relation's mapping must still be the one its view bound.
+ */
+bool
+dg_catalog_refs_current(List *refs)
+{
+	ListCell   *lc;
+	int			i = 0;
+	char	   *ref = NULL,
+			   *target = NULL;
+	bool		pushed = false;
+	bool		current = true;
+	Snapshot	latest;
+
+	/* Refs are read under the query's snapshot; mappings as catalogs are. */
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	latest = RegisterSnapshot(GetLatestSnapshot());
+	foreach(lc, refs)
+	{
+		switch (i++ % 3)
+		{
+			case 0:
+				ref = strVal(lfirst(lc));
+				break;
+			case 1:
+				target = strVal(lfirst(lc));
+				break;
+			default:
+				{
+					char		kind = ref[0];
+					const char *name = ref + 2;
+					const char *branch = strchr(name, '/') + 1;
+					Oid			relid = intVal(lfirst(lc));
+					bytea	   *now;
+
+					if (kind == 's' && strcmp(branch, dg_current_branch()))
+						current = false;
+					else
+					{
+						now = strncmp(name, "working/", 8) == 0 ? catalog_working_schema(branch) : read_ref(name).target;
+						current = now && !strcmp(hex(now), target);
+					}
+					if (current && OidIsValid(relid))
+					{
+						const char *logical = CatalogViewObjectIdentity(relid, RelationRelationId);
+
+						current = logical && binding_current(branch, logical, CatalogViewObjectStorage(relid), CatalogViewObjectSchema(relid), latest);
+					}
+				}
+		}
+		if (!current)
+			break;
+	}
+	UnregisterSnapshot(latest);
+	if (pushed)
+		PopActiveSnapshot();
+	return current;
+}
+
+/*
+ * A reference bound through the session's branch, such as a versioned routine
+ * or type: add the branch's working schema to |refs| as a dependency, once.
+ */
+void
+dg_catalog_session_dependency(List **refs)
+{
+	const char *branch;
+	bytea	   *root;
+	char	   *ref;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (!dg_catalog_active() || dg_execution_branch())
+		return;
+	branch = dg_current_branch();
+	root = catalog_working_schema(branch);
+	if (!root)
+		return;
+	ref = psprintf("s:working/%s", branch);
+	foreach(lc, *refs)
+		if (i++ % 3 == 0 && !strcmp(strVal(lfirst(lc)), ref))
+			return;
+	*refs = lappend(*refs, makeString(ref));
+	*refs = lappend(*refs, makeString(hex(root)));
+	*refs = lappend(*refs, makeInteger(0));
 }
 
 /* Internal executor/DDL integration boundary. No SQL preparation API. Resolve
