@@ -222,16 +222,21 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
 			b = merge_member(sides[0], counts[0], key->kind, key->name);
 			o = merge_member(sides[1], counts[1], key->kind, key->name);
 			t = merge_member(sides[2], counts[2], key->kind, key->name);
-			if (merge_same(o, t) || merge_same(b, t))
-				chosen = o, from = sides[1], fromcount = counts[1];
-			else if (merge_same(b, o))
-				chosen = t, from = sides[2], fromcount = counts[2];
-			else if (!strcmp(key->kind, "table") && b && o && t &&
-					 same(child(b->hash, 1), child(o->hash, 1)) && same(child(o->hash, 1), child(t->hash, 1)))
+
+			/*
+			 * Rows changed on both sides are merged row by row even when the
+			 * results agree, as a keyless table's matching changes conflict.
+			 */
+			if (!strcmp(key->kind, "table") && b && o && t && !merge_same(b, o) && !merge_same(b, t) &&
+				same(child(b->hash, 1), child(o->hash, 1)) && same(child(o->hash, 1), child(t->hash, 1)))
 			{
 				chosen = o, from = sides[1], fromcount = counts[1];
 				*row_merges = lappend(*row_merges, key->name);
 			}
+			else if (merge_same(o, t) || merge_same(b, t))
+				chosen = o, from = sides[1], fromcount = counts[1];
+			else if (merge_same(b, o))
+				chosen = t, from = sides[2], fromcount = counts[2];
 			else
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								errmsg("merge conflict in the definition of %s %s", key->kind, key->name),
