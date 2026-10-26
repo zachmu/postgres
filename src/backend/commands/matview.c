@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -235,7 +236,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 			 "the rule for materialized view \"%s\" is not a SELECT INSTEAD OF rule",
 			 RelationGetRelationName(matviewRel));
 
-	actions = rule->actions;
+	actions = RewriteRuleActions(matviewRel, rule);
 	if (list_length(actions) != 1)
 		elog(ERROR,
 			 "the rule for materialized view \"%s\" is not a single action",
@@ -292,6 +293,33 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	CheckTableNotInUse(matviewRel,
 					   is_create ? "CREATE MATERIALIZED VIEW" :
 					   "REFRESH MATERIALIZED VIEW");
+
+	/*
+	 * A versioned materialized view keeps its rows on its branch: refill its
+	 * table there.
+	 */
+	if (matviewRel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+	{
+		if (concurrent)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("REFRESH MATERIALIZED VIEW CONCURRENTLY is not supported for versioned materialized views")));
+		/* Marking it populated rebuilds the relation's rules. */
+		dataQuery = copyObject(dataQuery);
+		dg_catalog_matview_refresh(matviewRel, !skipData);
+		if (!skipData)
+			processed = refresh_matview_datafill(CreateTransientRelDestReceiver(matviewOid), dataQuery,
+												 queryString, is_create);
+		table_close(matviewRel, NoLock);
+		AtEOXact_GUC(false, save_nestlevel);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		ObjectAddressSet(address, RelationRelationId, matviewOid);
+		if (qc)
+			SetQueryCompletion(qc,
+							   is_create ? CMDTAG_SELECT : CMDTAG_REFRESH_MATERIALIZED_VIEW,
+							   processed);
+		return address;
+	}
 
 	/*
 	 * Tentatively mark the matview as populated or not (this will roll back

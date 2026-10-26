@@ -56,7 +56,7 @@ $updater->query_safe('SELECT 1');
 is(sql('SELECT v FROM epq_target'),'6','EPQ keeps historical source and rechecks new target tuple');
 $locker->quit;$updater->quit;sql('DROP TABLE epq_target');
 
-fails("CREATE VIEW unsupported_history AS SELECT * FROM bulk AS OF '$bulk'",qr/cannot make an unversioned object depend on a versioned one/,'do not persist bindings without view authorization and dependency support');
+fails("CREATE VIEW unsupported_history AS SELECT * FROM bulk AS OF '$bulk'",qr/revision-qualified references in versioned schema objects/,'a view cannot persist a revision binding');
 fails("SELECT * FROM bulk AS OF GREATEST(NULL,NULL)",qr/non-null constant/,'null revision expression rejected');
 is(sql("SELECT count(*) FROM bulk AS OF LEAST('$bulk','$bulk')"),'500','immutable revision expression receives SQL collation');
 sql(q{CREATE TABLE versions(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO versions VALUES(1,10)});

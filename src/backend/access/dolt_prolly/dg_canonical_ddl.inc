@@ -156,6 +156,9 @@ catalog_activate(void)
 	CommandCounterIncrement();
 }
 
+/* A materialized view being created: its definition's "matview" object. */
+static char *matview_pending;
+
 bool
 dg_catalog_create(Node *statement, const char *query)
 {
@@ -275,6 +278,11 @@ dg_catalog_create(Node *statement, const char *query)
 		current = capture(true);
 		native_create_definitions(current, stmt, query, user, name, &table,
 								  &index_names, &index_definitions, &foreigncmds);
+		if (matview_pending)
+		{
+			run("SELECT jsonb_set($1::jsonb,'{matview}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(table), CStringGetTextDatum(matview_pending)), NULL, true);
+			table = strcell(0, 1);
+		}
 		k = list_length(index_names);
 		newmembers = palloc_array(bytea *, k + 1);
 		empty->store = pl_store_create();

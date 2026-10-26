@@ -168,7 +168,33 @@ definition_references(const char *kind, const char *definition)
 				references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
 		}
 	}
-	else if (!strcmp(kind, "routine"))
+	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")) ||
+		(!strcmp(kind, "routine") && json_value(definition, "dependencies")))
+	{
+		/* A view's query, a materialized view's, or a SQL-standard body lists what it uses. */
+		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies',$1::jsonb->'matview'->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+		{
+			uint64		n = SPI_processed;
+			char	  **kinds = palloc_array(char *, Max(n, 1));
+			char	  **names = palloc_array(char *, Max(n, 1));
+
+			for (uint64 i = 0; i < n; i++)
+			{
+				kinds[i] = strcell(i, 1);
+				names[i] = strcell(i, 2);
+			}
+			for (uint64 i = 0; i < n; i++)
+			{
+				if (!strcmp(kinds[i], "type"))
+					references_type(&references, names[i]);
+				else if (!strcmp(kinds[i], "routine") && strchr(names[i], '('))
+					references_add(&references, "routine", pnstrdup(names[i], strchr(names[i], '(') - names[i]));
+				else
+					references_add(&references, kinds[i], names[i]);
+			}
+		}
+	}
+	if (!strcmp(kind, "routine"))
 	{
 		references_type(&references, json_value(definition, "prorettype"));
 		references_type(&references, json_value(definition, "provariadic"));
@@ -196,6 +222,8 @@ definition_references(const char *kind, const char *definition)
 		char	   *name;
 
 		references_add(&references, "table", json_value(definition, "table"));
+		if (trigger->constrrel)
+			references_add(&references, "table", dg_qualified_name(trigger->constrrel->schemaname, trigger->constrrel->relname));
 		if ((name = references_name(trigger->funcname)))
 			references_add(&references, "routine", name);
 		(void) references_walker(trigger->whenClause, &references);
@@ -282,7 +310,7 @@ database_dependents(const char *json, Datum *members, int count)
 	bytea	  **schemas;
 	char	  **kinds;
 
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
+	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	n = SPI_processed;
 	schemas = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));

@@ -107,6 +107,10 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 			case Anum_pg_proc_proargdefaults:
 				/* Bound below, once the argument types are known. */
 				break;
+			case Anum_pg_proc_prosqlbody:
+				/* Analyzed when first read: see dg_routine_body. */
+				values[i] = CStringGetTextDatum(nodeToString(makeString(encoded)));
+				break;
 			default:
 				getTypeInputInfo(attr->atttypid, &input, &param);
 				values[i] = OidInputFunctionCall(input, encoded, param, -1);
@@ -148,4 +152,27 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 	else
 		for (int i = 0; i < proc->pronargs; i++)
 			provider_dependency(rows, ProcedureRelationId, proc->oid, 0, TypeRelationId, proc->proargtypes.values[i], 0, DEPENDENCY_NORMAL);
+
+	/* What a SQL-standard body uses, as CreateFunction records it. */
+	run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	{
+		uint64		n = SPI_processed;
+		char	  **kinds = palloc_array(char *, Max(n, 1));
+		char	  **names = palloc_array(char *, Max(n, 1));
+
+		for (uint64 i = 0; i < n; i++)
+		{
+			kinds[i] = strcell(i, 1);
+			names[i] = strcell(i, 2);
+		}
+		for (uint64 i = 0; i < n; i++)
+		{
+			Oid			referenced = provider_view_dependency(view, kinds[i], names[i]);
+
+			if (OidIsValid(referenced))
+				provider_dependency(rows, ProcedureRelationId, proc->oid, 0,
+									!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : TypeRelationId,
+									referenced, 0, DEPENDENCY_NORMAL);
+		}
+	}
 }

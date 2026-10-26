@@ -20,6 +20,7 @@
 #include "postgres.h"
 #include "catalog/catalogview.h"
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
@@ -4774,7 +4775,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		Node	   *n;
 		List	   *query_list;
 
-		n = stringToNode(TextDatumGetCString(tmp));
+		n = dg_routine_body(func_tuple, stringToNode(TextDatumGetCString(tmp)));
 		if (IsA(n, List))
 			query_list = linitial_node(List, castNode(List, n));
 		else
@@ -5345,7 +5346,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	{
 		Node	   *n;
 
-		n = stringToNode(TextDatumGetCString(tmp));
+		n = dg_routine_body(func_tuple, stringToNode(TextDatumGetCString(tmp)));
 		if (IsA(n, List))
 			querytree_list = linitial_node(List, castNode(List, n));
 		else

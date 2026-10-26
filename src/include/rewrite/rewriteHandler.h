@@ -15,6 +15,7 @@
 #define REWRITEHANDLER_H
 
 #include "nodes/parsenodes.h"
+#include "rewrite/prs2lock.h"
 #include "utils/relcache.h"
 
 extern List *QueryRewrite(Query *parsetree);
@@ -24,6 +25,7 @@ extern void AcquireRewriteLocks(Query *parsetree,
 
 extern Node *build_column_default(Relation rel, int attrno);
 
+extern List *RewriteRuleActions(Relation relation, RewriteRule *rule);
 extern Query *get_view_query(Relation view);
 extern bool view_has_instead_trigger(Relation view, CmdType event,
 									 List *mergeActionList);

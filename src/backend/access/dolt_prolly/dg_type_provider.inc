@@ -19,6 +19,19 @@ provider_type_bind(DGProviderRows *rows, CatalogView *view, const char *definiti
 	}
 	if (!strcmp(json_value(definition, "kind"), "c"))
 		(void) CatalogViewBindObject(view, RelationRelationId, name, InvalidOid);
+
+	/* A range type's multirange type and its array. */
+	if (!strcmp(json_value(definition, "kind"), "r"))
+	{
+		char	   *range = json_value(definition, "range");
+		char	   *multirange = json_value(range, "multirange");
+		char	   *schema = strVal(linitial(stringToQualifiedNameList(multirange, NULL)));
+
+		rows->elements = lappend_oid(rows->elements, CatalogViewBindObject(view, TypeRelationId, multirange, InvalidOid));
+		rows->arrays = lappend_oid(rows->arrays, CatalogViewBindObject(view, TypeRelationId,
+																	   dg_qualified_name(schema, json_value(range, "multirange_array")),
+																	   InvalidOid));
+	}
 }
 
 /* The array type of |element| among the types being rebuilt, if any. */
@@ -69,6 +82,166 @@ provider_type_array(DGProviderRows *rows, Form_pg_type type, const char *arrayna
 	array.typcollation = type->typcollation;
 	provider_add(rows, TypeRelationId, &array, sizeof(array), Anum_pg_type_typcollation);
 	provider_dependency(rows, TypeRelationId, array.oid, 0, TypeRelationId, type->oid, 0, DEPENDENCY_INTERNAL);
+}
+
+/*
+ * A constructor of a range or multirange type |owner|, as makeRangeConstructors
+ * and makeMultirangeConstructors make it, named by its signature, whose
+ * argument types |argnames| name; a variadic one takes elements of type
+ * |variadic|.
+ */
+static Oid
+provider_range_constructor(DGProviderRows *rows, CatalogView *view, const char *schema, const char *name, Oid namespace,
+						   Oid owner, int nargs, Oid *args, char **argnames, const char *source, Oid variadic)
+{
+	int			slot = provider_catalog_index(ProcedureRelationId);
+	TupleDesc	desc = RelationGetDescr(rows->relations[slot]);
+	Datum		values[Natts_pg_proc] = {0};
+	bool		nulls[Natts_pg_proc] = {0};
+	StringInfoData identity;
+	Oid			oid;
+
+	initStringInfo(&identity);
+	appendStringInfo(&identity, "%s(", dg_qualified_name(schema, name));
+	for (int i = 0; i < nargs; i++)
+		appendStringInfo(&identity, "%s%s", i ? "," : "", argnames[i]);
+	appendStringInfoChar(&identity, ')');
+	oid = CatalogViewBindObject(view, ProcedureRelationId, identity.data, InvalidOid);
+	values[Anum_pg_proc_oid - 1] = ObjectIdGetDatum(oid);
+	values[Anum_pg_proc_proname - 1] = DirectFunctionCall1(namein, CStringGetDatum(name));
+	values[Anum_pg_proc_pronamespace - 1] = ObjectIdGetDatum(namespace);
+	values[Anum_pg_proc_proowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
+	values[Anum_pg_proc_prolang - 1] = ObjectIdGetDatum(INTERNALlanguageId);
+	values[Anum_pg_proc_procost - 1] = Float4GetDatum(1);
+	values[Anum_pg_proc_prorows - 1] = Float4GetDatum(0);
+	values[Anum_pg_proc_provariadic - 1] = ObjectIdGetDatum(variadic);
+	values[Anum_pg_proc_prosupport - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_proc_prokind - 1] = CharGetDatum(PROKIND_FUNCTION);
+	values[Anum_pg_proc_prosecdef - 1] = BoolGetDatum(false);
+	values[Anum_pg_proc_proleakproof - 1] = BoolGetDatum(false);
+	/* Range constructors take null bounds; multirange constructors are strict. */
+	values[Anum_pg_proc_proisstrict - 1] = BoolGetDatum(strncmp(source, "range_", 6) != 0);
+	values[Anum_pg_proc_proretset - 1] = BoolGetDatum(false);
+	values[Anum_pg_proc_provolatile - 1] = CharGetDatum(PROVOLATILE_IMMUTABLE);
+	values[Anum_pg_proc_proparallel - 1] = CharGetDatum(PROPARALLEL_SAFE);
+	values[Anum_pg_proc_pronargs - 1] = Int16GetDatum(nargs);
+	values[Anum_pg_proc_pronargdefaults - 1] = Int16GetDatum(0);
+	values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(owner);
+	values[Anum_pg_proc_proargtypes - 1] = PointerGetDatum(buildoidvector(args, nargs));
+	if (OidIsValid(variadic))
+	{
+		Datum		all = ObjectIdGetDatum(args[0]);
+		Datum		mode = CharGetDatum(FUNC_PARAM_VARIADIC);
+
+		values[Anum_pg_proc_proallargtypes - 1] = PointerGetDatum(construct_array_builtin(&all, 1, OIDOID));
+		values[Anum_pg_proc_proargmodes - 1] = PointerGetDatum(construct_array_builtin(&mode, 1, CHAROID));
+	}
+	else
+	{
+		nulls[Anum_pg_proc_proallargtypes - 1] = true;
+		nulls[Anum_pg_proc_proargmodes - 1] = true;
+	}
+	nulls[Anum_pg_proc_proargnames - 1] = true;
+	nulls[Anum_pg_proc_proargdefaults - 1] = true;
+	nulls[Anum_pg_proc_protrftypes - 1] = true;
+	values[Anum_pg_proc_prosrc - 1] = CStringGetTextDatum(source);
+	nulls[Anum_pg_proc_probin - 1] = true;
+	nulls[Anum_pg_proc_prosqlbody - 1] = true;
+	nulls[Anum_pg_proc_proconfig - 1] = true;
+	nulls[Anum_pg_proc_proacl - 1] = true;
+	rows->rows[slot] = lappend(rows->rows[slot], heap_form_tuple(desc, values, nulls));
+	provider_dependency(rows, ProcedureRelationId, oid, 0, NamespaceRelationId, namespace, 0, DEPENDENCY_NORMAL);
+	provider_dependency(rows, ProcedureRelationId, oid, 0, TypeRelationId, owner, 0, DEPENDENCY_INTERNAL);
+	return oid;
+}
+
+/*
+ * What range type |type| derives, as DefineRange makes it: its multirange
+ * type and that type's array, its pg_range row, the constructors of both and
+ * the cast between them.
+ */
+static void
+provider_range(DGProviderRows *rows, CatalogView *view, const char *definition, Form_pg_type type)
+{
+	char	   *name = json_value(definition, "name");
+	char	   *schema = strVal(linitial(stringToQualifiedNameList(name, NULL)));
+	char	   *range = json_value(definition, "range");
+	char	   *multirange_name = json_value(range, "multirange");
+	char	   *subtype_name = json_value(range, "subtype");
+	char	   *subdiff = json_value(range, "subdiff");
+	List	   *parts = stringToQualifiedNameList(multirange_name, NULL);
+	FormData_pg_type multirange = {0};
+	FormData_pg_range form = {0};
+	FormData_pg_cast cast = {0};
+	Oid			args[3];
+	char	   *argnames[3];
+
+	multirange.oid = CatalogViewFindObject(view, TypeRelationId, multirange_name);
+	namestrcpy(&multirange.typname, strVal(lsecond(parts)));
+	multirange.typnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
+	multirange.typowner = type->typowner;
+	multirange.typlen = -1;
+	multirange.typtype = TYPTYPE_MULTIRANGE;
+	multirange.typcategory = TYPCATEGORY_RANGE;
+	multirange.typisdefined = true;
+	multirange.typdelim = DEFAULT_TYPDELIM;
+	multirange.typarray = provider_array_of(rows, multirange.oid);
+	multirange.typinput = F_MULTIRANGE_IN;
+	multirange.typoutput = F_MULTIRANGE_OUT;
+	multirange.typreceive = F_MULTIRANGE_RECV;
+	multirange.typsend = F_MULTIRANGE_SEND;
+	multirange.typanalyze = F_MULTIRANGE_TYPANALYZE;
+	multirange.typalign = type->typalign;
+	multirange.typstorage = TYPSTORAGE_EXTENDED;
+	multirange.typtypmod = -1;
+	provider_add(rows, TypeRelationId, &multirange, sizeof(multirange), Anum_pg_type_typcollation);
+	provider_dependency(rows, TypeRelationId, multirange.oid, 0, NamespaceRelationId, multirange.typnamespace, 0, DEPENDENCY_NORMAL);
+	provider_dependency(rows, TypeRelationId, multirange.oid, 0, TypeRelationId, type->oid, 0, DEPENDENCY_INTERNAL);
+	provider_type_array(rows, &multirange, json_value(range, "multirange_array"));
+
+	form.rngtypid = type->oid;
+	form.rngsubtype = routine_type_oid(rows, view, subtype_name);
+	form.rngmultitypid = multirange.oid;
+	form.rngcollation = provider_collation(json_value(range, "collation"));
+	form.rngsubopc = get_opclass_oid(BTREE_AM_OID, list_make2(makeString("pg_catalog"), makeString(json_value(range, "opclass"))), false);
+	form.rngsubdiff = subdiff ? DatumGetObjectId(DirectFunctionCall1(regprocedurein, CStringGetDatum(subdiff))) : InvalidOid;
+	provider_add(rows, RangeRelationId, &form, sizeof(form), Natts_pg_range);
+	provider_dependency(rows, TypeRelationId, type->oid, 0, TypeRelationId, form.rngsubtype, 0, DEPENDENCY_NORMAL);
+	provider_dependency(rows, TypeRelationId, type->oid, 0, OperatorClassRelationId, form.rngsubopc, 0, DEPENDENCY_NORMAL);
+	if (OidIsValid(form.rngcollation))
+		provider_dependency(rows, TypeRelationId, type->oid, 0, CollationRelationId, form.rngcollation, 0, DEPENDENCY_NORMAL);
+	if (OidIsValid(form.rngsubdiff))
+		provider_dependency(rows, TypeRelationId, type->oid, 0, ProcedureRelationId, form.rngsubdiff, 0, DEPENDENCY_NORMAL);
+
+	args[0] = args[1] = form.rngsubtype;
+	args[2] = TEXTOID;
+	argnames[0] = argnames[1] = subtype_name;
+	argnames[2] = "pg_catalog.text";
+	(void) provider_range_constructor(rows, view, schema, json_value(range, "constructor"), type->typnamespace, type->oid,
+									  2, args, argnames, "range_constructor2", InvalidOid);
+	(void) provider_range_constructor(rows, view, schema, json_value(range, "constructor"), type->typnamespace, type->oid,
+									  3, args, argnames, "range_constructor3", InvalidOid);
+	(void) provider_range_constructor(rows, view, schema, json_value(range, "multirange_constructor"), type->typnamespace,
+									  multirange.oid, 0, args, argnames, "multirange_constructor0", InvalidOid);
+	args[0] = type->oid;
+	argnames[0] = name;
+	cast.castfunc = provider_range_constructor(rows, view, schema, json_value(range, "multirange_constructor"), type->typnamespace,
+											   multirange.oid, 1, args, argnames, "multirange_constructor1", InvalidOid);
+	args[0] = type->typarray;
+	argnames[0] = psprintf("%s[]", name);
+	(void) provider_range_constructor(rows, view, schema, json_value(range, "multirange_constructor"), type->typnamespace,
+									  multirange.oid, 1, args, argnames, "multirange_constructor2", type->oid);
+
+	/* As CastCreate: the cast from the range type to its multirange type. */
+	cast.oid = CatalogViewBindObject(view, CastRelationId, psprintf("%s/multirange", name), InvalidOid);
+	cast.castsource = type->oid;
+	cast.casttarget = multirange.oid;
+	cast.castcontext = COERCION_CODE_EXPLICIT;
+	cast.castmethod = COERCION_METHOD_FUNCTION;
+	provider_add(rows, CastRelationId, &cast, sizeof(cast), Natts_pg_cast);
+	provider_dependency(rows, CastRelationId, cast.oid, 0, TypeRelationId, type->oid, 0, DEPENDENCY_INTERNAL);
+	provider_dependency(rows, CastRelationId, cast.oid, 0, TypeRelationId, multirange.oid, 0, DEPENDENCY_INTERNAL);
+	provider_dependency(rows, CastRelationId, cast.oid, 0, ProcedureRelationId, cast.castfunc, 0, DEPENDENCY_INTERNAL);
 }
 
 static void
@@ -149,6 +322,8 @@ provider_type(DGProviderRows *rows, CatalogView *view, const char *definition)
 		provider_dependency(rows, TypeRelationId, type->oid, 0, TypeRelationId, type->typbasetype, 0, DEPENDENCY_NORMAL);
 	if (OidIsValid(type->typarray))
 		provider_type_array(rows, type, json_value(definition, "array"));
+	if (type->typtype == TYPTYPE_RANGE)
+		provider_range(rows, view, definition, type);
 
 	if (type->typtype == TYPTYPE_ENUM)
 	{

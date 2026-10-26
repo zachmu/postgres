@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -1156,7 +1157,7 @@ sql_compile_callback(FunctionCallInfo fcinfo,
 		/* Source queries are already parse-analyzed */
 		Node	   *n;
 
-		n = stringToNode(TextDatumGetCString(tmp));
+		n = dg_routine_body(procedureTuple, stringToNode(TextDatumGetCString(tmp)));
 		if (IsA(n, List))
 			source_list = linitial_node(List, castNode(List, n));
 		else

@@ -190,7 +190,7 @@ dg_catalog_alter(Node *statement)
 		comment = copyObject((CommentStmt *) statement);
 		if (comment->comment && !comment->comment[0])
 			comment->comment = NULL;
-		if (comment->objtype != OBJECT_TABLE && comment->objtype != OBJECT_COLUMN)
+		if (comment->objtype != OBJECT_TABLE && comment->objtype != OBJECT_MATVIEW && comment->objtype != OBJECT_COLUMN)
 			return false;
 		parts = copyObject((List *) comment->object);
 		if (comment->objtype == OBJECT_COLUMN)
@@ -223,7 +223,8 @@ dg_catalog_alter(Node *statement)
 	if (!CatalogViewObjectContext(id))
 		unsupported("canonical ALTER of non-versioned relation");
 	definition = relation_open(id, NoLock);
-	if (definition->rd_rel->relkind != RELKIND_RELATION)
+	if (definition->rd_rel->relkind != RELKIND_RELATION &&
+		!(comment && definition->rd_rel->relkind == RELKIND_MATVIEW))
 		unsupported("canonical ALTER of non-table");
 	GetUserIdAndSecContext(&user, &security);
 	if (!object_ownercheck(RelationRelationId, id, user))

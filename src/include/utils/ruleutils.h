@@ -13,6 +13,7 @@
 #ifndef RULEUTILS_H
 #define RULEUTILS_H
 
+#include "access/htup.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
@@ -29,6 +30,7 @@ extern char *pg_get_indexdef_columns(Oid indexrelid, bool pretty);
 extern char *pg_get_indexdef_columns_extended(Oid indexrelid,
 											  bits16 flags);
 extern char *pg_get_querydef(Query *query, bool pretty);
+extern char *pg_get_function_sqlbody_tuple(HeapTuple proctup);
 
 extern char *pg_get_partkeydef_columns(Oid relid, bool pretty);
 extern char *pg_get_partconstrdef_string(Oid partitionId, char *aliasname);

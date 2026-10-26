@@ -1,9 +1,11 @@
 /*
- * Portable user-defined types: enums, domains and composite types. A type's
- * pg_type values are encoded column by column, naming every object they
- * refer to; its array type is derived again from it, and only its name is
- * kept. Enum labels are kept in sort order, a composite type's attributes by
- * name and type, and a domain's default and constraints as SQL.
+ * Portable user-defined types: enums, domains, composite types and range
+ * types. A type's pg_type values are encoded column by column, naming every
+ * object they refer to; its array type is derived again from it, and only its
+ * name is kept. Enum labels are kept in sort order, a composite type's
+ * attributes by name and type, a domain's default and constraints as SQL, and
+ * a range type's pg_range values by name, with the names of the multirange
+ * type, arrays and constructors derived from it.
  */
 static char *
 type_collation_name(Oid collation)
@@ -111,6 +113,80 @@ type_encode_attributes(StringInfo json, Oid relation)
 	relation_close(rel, AccessShareLock);
 }
 
+/* Whether routine |tuple| is a range type's constructor, which the type derives. */
+static bool
+routine_derived(HeapTuple tuple)
+{
+	return ((Form_pg_proc) GETSTRUCT(tuple))->prolang == INTERNALlanguageId;
+}
+
+/* The name of the constructors of range or multirange type |type|. */
+static char *
+type_constructor_name(Oid type)
+{
+	Relation	catalog = table_open(ProcedureRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tuple;
+	char	   *name = NULL;
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		if (((Form_pg_proc) GETSTRUCT(tuple))->prorettype == type && routine_derived(tuple))
+			name = pstrdup(NameStr(((Form_pg_proc) GETSTRUCT(tuple))->proname));
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (!name)
+		elog(ERROR, "range type %u has no constructors", type);
+	return name;
+}
+
+static void
+type_encode_range(StringInfo json, Oid type)
+{
+	HeapTuple	tuple = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(type));
+	Form_pg_range range;
+	HeapTuple	opclass;
+	HeapTuple	multirange;
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for range type %u", type);
+	range = (Form_pg_range) GETSTRUCT(tuple);
+	if (OidIsValid(range->rngcanonical))
+		unsupported("versioned range types with a canonical function");
+	if (range->rngsubdiff >= FirstNormalObjectId)
+		unsupported("versioned range types with a user-defined subtype_diff function");
+	opclass = SearchSysCache1(CLAOID, ObjectIdGetDatum(range->rngsubopc));
+	if (!HeapTupleIsValid(opclass))
+		elog(ERROR, "cache lookup failed for operator class %u", range->rngsubopc);
+	if (((Form_pg_opclass) GETSTRUCT(opclass))->opcnamespace != PG_CATALOG_NAMESPACE)
+		unsupported("versioned range types with a user-defined operator class");
+	multirange = SearchSysCache1(TYPEOID, ObjectIdGetDatum(range->rngmultitypid));
+	if (!HeapTupleIsValid(multirange))
+		elog(ERROR, "cache lookup failed for type %u", range->rngmultitypid);
+	appendStringInfoString(json, ",\"range\":{");
+	json_field(json, "subtype", routine_type_name(range->rngsubtype), false);
+	json_field(json, "opclass", NameStr(((Form_pg_opclass) GETSTRUCT(opclass))->opcname), true);
+	if (OidIsValid(range->rngcollation))
+		json_field(json, "collation", type_collation_name(range->rngcollation), true);
+	if (OidIsValid(range->rngsubdiff))
+		json_field(json, "subdiff", format_procedure_qualified(range->rngsubdiff), true);
+	json_field(json, "multirange", dg_qualified_name(get_namespace_name(((Form_pg_type) GETSTRUCT(multirange))->typnamespace),
+													  NameStr(((Form_pg_type) GETSTRUCT(multirange))->typname)), true);
+	{
+		HeapTuple	array = SearchSysCache1(TYPEOID, ObjectIdGetDatum(((Form_pg_type) GETSTRUCT(multirange))->typarray));
+
+		if (!HeapTupleIsValid(array))
+			elog(ERROR, "cache lookup failed for the array of type %u", range->rngmultitypid);
+		json_field(json, "multirange_array", NameStr(((Form_pg_type) GETSTRUCT(array))->typname), true);
+		ReleaseSysCache(array);
+	}
+	json_field(json, "constructor", type_constructor_name(type), true);
+	json_field(json, "multirange_constructor", type_constructor_name(range->rngmultitypid), true);
+	appendStringInfoChar(json, '}');
+	ReleaseSysCache(multirange);
+	ReleaseSysCache(opclass);
+	ReleaseSysCache(tuple);
+}
+
 static int
 type_entry_compare(const ListCell *a, const ListCell *b)
 {
@@ -173,8 +249,9 @@ type_encode(HeapTuple tuple, TupleDesc desc)
 	StringInfoData json;
 	char		kind[2] = {type->typtype, '\0'};
 
-	if (type->typtype != TYPTYPE_ENUM && type->typtype != TYPTYPE_DOMAIN && type->typtype != TYPTYPE_COMPOSITE)
-		unsupported("versioned base, range or pseudo types");
+	if (type->typtype != TYPTYPE_ENUM && type->typtype != TYPTYPE_DOMAIN && type->typtype != TYPTYPE_COMPOSITE &&
+		type->typtype != TYPTYPE_RANGE)
+		unsupported("versioned base or pseudo types");
 	initStringInfo(&json);
 	appendStringInfoString(&json, "{\"format\":\"DGTYPE1\",");
 	json_field(&json, "name", dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname)), false);
@@ -262,8 +339,11 @@ type_encode(HeapTuple tuple, TupleDesc desc)
 		type_encode_labels(&json, type->oid);
 	else if (type->typtype == TYPTYPE_COMPOSITE)
 		type_encode_attributes(&json, type->typrelid);
+	else if (type->typtype == TYPTYPE_RANGE)
+		type_encode_range(&json, type->oid);
 	else
 		type_encode_constraints(&json, type->oid);
+	json_comment(&json, type->oid, TypeRelationId);
 	appendStringInfoChar(&json, '}');
 	return json.data;
 }

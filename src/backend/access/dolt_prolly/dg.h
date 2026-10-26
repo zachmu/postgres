@@ -109,8 +109,12 @@ extern DGRows dg_rows(const PLTree * tree);
 extern void dg_tid(uint64 id, ItemPointer tid);
 extern uint64 dg_id(ItemPointer tid);
 extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);
+/* A prolly relation holding rows: a table, or a materialized view's table. */
+#define DG_ROWS_KIND(relkind) ((relkind) == RELKIND_RELATION || (relkind) == RELKIND_MATVIEW)
+
 extern PLSlice dg_encode_value(Oid type, Datum value);
 extern PLSlice dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed);
+extern PLSlice dg_recode_composite(Oid type, PLSlice bytes, Oid target, int count, const int *mapping);
 extern bool dg_key_ordered(Oid type);
 extern PLSlice dg_key_value(Oid type, Datum value);
 extern PLSlice dg_key_field(Oid type, PLSlice bytes);

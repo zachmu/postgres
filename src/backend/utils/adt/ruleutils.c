@@ -20,6 +20,7 @@
 #include <fcntl.h>
 
 #include "access/amapi.h"
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -3572,7 +3573,7 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 	dpns.argnames = argnames;
 
 	tmp = SysCacheGetAttrNotNull(PROCOID, proctup, Anum_pg_proc_prosqlbody);
-	n = stringToNode(TextDatumGetCString(tmp));
+	n = dg_routine_body(proctup, stringToNode(TextDatumGetCString(tmp)));
 
 	if (IsA(n, List))
 	{
@@ -3606,6 +3607,17 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 		get_query_def(query, buf, list_make1(&dpns), NULL, false,
 					  0, WRAP_COLUMN_DEFAULT, 0);
 	}
+}
+
+/* The SQL-standard body of function |proctup|, as pg_get_function_sqlbody prints it. */
+char *
+pg_get_function_sqlbody_tuple(HeapTuple proctup)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	print_function_sqlbody(&buf, proctup);
+	return buf.data;
 }
 
 Datum
@@ -5392,7 +5404,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
 	Assert(ev_action != NULL);
-	actions = (List *) stringToNode(ev_action);
+	actions = dg_rule_actions(ev_class, (List *) stringToNode(ev_action));
 	if (actions == NIL)
 		elog(ERROR, "invalid empty ev_action list");
 
@@ -5578,7 +5590,7 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
 	Assert(ev_action != NULL);
-	actions = (List *) stringToNode(ev_action);
+	actions = dg_rule_actions(ev_class, (List *) stringToNode(ev_action));
 
 	if (list_length(actions) != 1)
 	{
@@ -12419,6 +12431,15 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 								 only_marker(rte),
 								 generate_relation_name(rte->relid,
 														context->namespaces));
+				break;
+			case RTE_DOLT:
+				/* A branch head's table, by its relation's name. */
+				if (!rte->dolt_branch || rte->dolt_catalog)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot deparse a revision-qualified relation")));
+				appendStringInfoString(buf, generate_relation_name(get_typ_typrelid(rte->dolt_rowtype),
+																   context->namespaces));
 				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */

@@ -944,7 +944,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 			Node	   *n;
 			List	   *stored_query_list;
 
-			n = stringToNode(TextDatumGetCString(tmp));
+			n = dg_routine_body(tuple, stringToNode(TextDatumGetCString(tmp)));
 			if (IsA(n, List))
 				stored_query_list = linitial(castNode(List, n));
 			else

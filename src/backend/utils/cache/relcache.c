@@ -837,9 +837,15 @@ RelationBuildRuleLock(Relation relation)
 								  &isnull);
 		Assert(!isnull);
 		rule_str = TextDatumGetCString(rule_datum);
-		oldcxt = MemoryContextSwitchTo(rulescxt);
-		rule->actions = (List *) stringToNode(rule_str);
-		MemoryContextSwitchTo(oldcxt);
+
+		/* A versioned view's rule holds its SQL, analyzed here. */
+		{
+			List	   *actions = dg_rule_actions(RelationGetRelid(relation), (List *) stringToNode(rule_str));
+
+			oldcxt = MemoryContextSwitchTo(rulescxt);
+			rule->actions = copyObject(actions);
+			MemoryContextSwitchTo(oldcxt);
+		}
 		pfree(rule_str);
 
 		rule_datum = heap_getattr(rewrite_tuple,
@@ -879,7 +885,9 @@ RelationBuildRuleLock(Relation relation)
 		 * the rule tree during load is relatively cheap (compared to
 		 * constructing it in the first place), so we do it here.
 		 */
-		setRuleCheckAsUser((Node *) rule->actions, check_as_user);
+		/* A versioned view's rule not yet analyzed is analyzed when used. */
+		if (!(list_length(rule->actions) == 1 && IsA(linitial(rule->actions), String)))
+			setRuleCheckAsUser((Node *) rule->actions, check_as_user);
 		setRuleCheckAsUser(rule->qual, check_as_user);
 
 		if (numlocks >= maxlocks)

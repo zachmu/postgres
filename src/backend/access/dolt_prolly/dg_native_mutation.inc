@@ -7,7 +7,8 @@ static bool
 native_alter_action(AlterTableType type)
 {
 	return type == AT_AlterConstraint || type == AT_AddIndex || type == AT_SetStatistics || type == AT_SetOptions || type == AT_ResetOptions ||
-		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType;
+		type == AT_SetStorage || type == AT_SetCompression || type == AT_SetNotNull || type == AT_DropNotNull || type == AT_AddColumn || type == AT_DropColumn || type == AT_ColumnDefault || type == AT_AddConstraint || type == AT_DropConstraint || type == AT_ValidateConstraint || type == AT_AlterColumnType ||
+		type == AT_AddIdentity || type == AT_SetIdentity || type == AT_DropIdentity;
 }
 
 static CatalogView *native_mutation_view;
@@ -154,6 +155,11 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 				VC_ARGS(CStringGetTextDatum(column), CStringGetTextDatum(identity), CStringGetTextDatum(name)), NULL, true);
 			column = strcell(0, 1);
 		}
+		else
+		{
+			run("SELECT ($1::jsonb-'identity'-'sequence')::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(column)), NULL, true);
+			column = strcell(0, 1);
+		}
 		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
 		options = heap_getattr(tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &optionsnull);
 		nulls[2] = statsnull ? 'n' : ' ';
@@ -272,7 +278,8 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 			Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(tuple);
 			char	   *sql;
 
-			if (constraint->conrelid != relation)
+			/* A constraint trigger defines its constraint. */
+			if (constraint->conrelid != relation || constraint->contype == CONSTRAINT_TRIGGER)
 				continue;
 			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE && constraint->contype != CONSTRAINT_CHECK && constraint->contype != CONSTRAINT_FOREIGN)
 				unsupported("canonical codec for native constraint type");
@@ -428,6 +435,149 @@ mutation_index_list(const char *definition, List *indexes)
 	return strcell(0, 1);
 }
 
+/* Whether |action| changes a column's identity, which a global sequence serves. */
+static bool
+identity_action(AlterTableCmd *action)
+{
+	return action->subtype == AT_AddIdentity || action->subtype == AT_SetIdentity ||
+		action->subtype == AT_DropIdentity;
+}
+
+/*
+ * As ATExecAddIdentity, ATExecSetIdentity and ATExecDropIdentity, on table
+ * |relid| of the provisional view. Sequences are global, as at CREATE: one
+ * is created natively for an added identity, sequence options change it
+ * natively, and it outlives a dropped identity, as other branches may use
+ * it. Only the branch's catalogs record which sequence serves the column.
+ */
+static void
+mutation_identity(Oid relid, AlterTableCmd *action)
+{
+	Relation	rel = relation_open(relid, NoLock);
+	Relation	attrelation = table_open(AttributeRelationId, RowExclusiveLock);
+	HeapTuple	tuple = SearchSysCacheCopyAttName(relid, action->name);
+	ParseState *pstate = make_parsestate(NULL);
+	CatalogView *view = CatalogViewCurrent();
+	Form_pg_attribute attr;
+	List	   *options = NIL;
+
+	pstate->p_sourcetext = debug_query_string;
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						action->name, RelationGetRelationName(rel))));
+	attr = (Form_pg_attribute) GETSTRUCT(tuple);
+	if (attr->attnum <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot alter system column \"%s\"", action->name)));
+	if (action->subtype == AT_AddIdentity)
+	{
+		Constraint *constraint = castNode(Constraint, action->def);
+		CreateSeqStmt *create = makeNode(CreateSeqStmt);
+		char	   *schema = get_namespace_name(RelationGetNamespace(rel));
+		ObjectAddress sequence,
+					column;
+
+		if (!attr->attnotnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("column \"%s\" of relation \"%s\" must be declared NOT NULL before identity can be added",
+							action->name, RelationGetRelationName(rel))));
+		if (attr->attidentity)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("column \"%s\" of relation \"%s\" is already an identity column",
+							action->name, RelationGetRelationName(rel))));
+		if (attr->atthasdef)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("column \"%s\" of relation \"%s\" already has a default value",
+							action->name, RelationGetRelationName(rel))));
+
+		/* As generateSerialSequence, in the shared schema of the same name. */
+		foreach_node(DefElem, option, constraint->options)
+		{
+			if (!strcmp(option->defname, "sequence_name"))
+				create->sequence = makeRangeVarFromNameList(castNode(List, option->arg));
+			else
+				options = lappend(options, option);
+		}
+		CatalogViewSwitch(NULL);
+		PG_TRY();
+		{
+			if (!create->sequence)
+				create->sequence = makeRangeVar(schema, ChooseRelationName(RelationGetRelationName(rel), action->name, "seq",
+																			get_namespace_oid(schema, false), false), -1);
+			create->options = lappend(options, makeDefElem("as", (Node *) makeTypeNameFromOid(attr->atttypid, -1), -1));
+			create->ownerId = rel->rd_rel->relowner;
+			create->for_identity = true;
+			ObjectAddressSet(sequence, RelationRelationId, DefineSequence(pstate, create).objectId);
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(view);
+		}
+		PG_END_TRY();
+		CommandCounterIncrement();
+		attr->attidentity = constraint->generated_when;
+		ObjectAddressSubSet(column, RelationRelationId, relid, attr->attnum);
+		recordDependencyOn(&sequence, &column, DEPENDENCY_INTERNAL);
+	}
+	else if (!attr->attidentity)
+	{
+		if (action->subtype != AT_DropIdentity || !action->missing_ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("column \"%s\" of relation \"%s\" is not an identity column",
+							action->name, RelationGetRelationName(rel))));
+		ereport(NOTICE,
+				(errmsg("column \"%s\" of relation \"%s\" is not an identity column, skipping",
+						action->name, RelationGetRelationName(rel))));
+	}
+	else if (action->subtype == AT_SetIdentity)
+	{
+		foreach_node(DefElem, option, castNode(List, action->def))
+		{
+			if (!strcmp(option->defname, "generated"))
+				attr->attidentity = defGetInt32(option);
+			else
+				options = lappend(options, option);
+		}
+		if (options)
+		{
+			AlterSeqStmt *alter = makeNode(AlterSeqStmt);
+			Oid			sequence = getIdentitySequence(rel, attr->attnum, false);
+
+			CatalogViewSwitch(NULL);
+			PG_TRY();
+			{
+				alter->sequence = makeRangeVar(get_namespace_name(get_rel_namespace(sequence)), get_rel_name(sequence), -1);
+				alter->options = options;
+				alter->for_identity = true;
+				(void) AlterSequence(pstate, alter);
+			}
+			PG_FINALLY();
+			{
+				CatalogViewSwitch(view);
+			}
+			PG_END_TRY();
+		}
+	}
+	else
+	{
+		deleteDependencyRecordsForClass(RelationRelationId, getIdentitySequence(rel, attr->attnum, false),
+										RelationRelationId, DEPENDENCY_INTERNAL);
+		attr->attidentity = '\0';
+	}
+	CatalogTupleUpdate(attrelation, &tuple->t_self, tuple);
+	CommandCounterIncrement();
+	heap_freetuple(tuple);
+	table_close(attrelation, RowExclusiveLock);
+	relation_close(rel, NoLock);
+}
+
 static void
 native_alter_publish(Capture current, VersionRef working, const char *name, AlterTableStmt *statement, DGState *state, int oldcount, Oid caller)
 {
@@ -476,6 +626,11 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		{
 			AlterTableCmd *action = lfirst_node(AlterTableCmd, lc);
 
+			if (identity_action(action))
+			{
+				mutation_identity(id, action);
+				continue;
+			}
 			if (action->subtype == AT_AddConstraint &&
 				castNode(Constraint, action->def)->contype != CONSTR_CHECK && castNode(Constraint, action->def)->contype != CONSTR_NOTNULL && castNode(Constraint, action->def)->contype != CONSTR_UNIQUE && castNode(Constraint, action->def)->contype != CONSTR_PRIMARY && castNode(Constraint, action->def)->contype != CONSTR_FOREIGN)
 				unsupported("native constraint storage codec");
@@ -540,6 +695,9 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			int			security;
 			int			pathnest = NewGUCNestLevel();
 
+			foreach_node(AlterTableCmd, action, stmt->cmds)
+				if (identity_action(action))
+				stmt->cmds = foreach_delete_current(stmt->cmds, action);
 			plan->commandType = CMD_UTILITY;
 			plan->utilityStmt = (Node *) stmt;
 			context.pstmt = plan;
@@ -550,7 +708,8 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			PG_TRY(caller);
 			{
 				set_config_option("search_path", api_search_path, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-				AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
+				if (stmt->cmds)
+					AlterTable(stmt, AlterTableGetLockLevel(stmt->cmds), &context);
 			}
 			PG_FINALLY(caller);
 			{

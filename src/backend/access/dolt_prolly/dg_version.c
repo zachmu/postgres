@@ -29,6 +29,12 @@
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
 #include "commands/alter.h"
+#include "commands/comment.h"
+#include "rewrite/rewriteSupport.h"
+#include "parser/analyze.h"
+#include "commands/view.h"
+#include "rewrite/rewriteDefine.h"
+#include "rewrite/rewriteHandler.h"
 #include "commands/typecmds.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
@@ -38,6 +44,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
+#include "executor/functions.h"
 #include "commands/defrem.h"
 #include "commands/proclang.h"
 #include "parser/parse_coerce.h"
@@ -55,6 +62,7 @@
 #include "catalog/pg_description.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_range.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_attribute.h"
@@ -501,6 +509,16 @@ json_field(StringInfo b, const char *key, const char *value, bool comma)
 	escape_json(b, value);
 }
 
+/* A schema object's comment, as a "comment" field following others, if it has one. */
+static void
+json_comment(StringInfo b, Oid object, Oid catalog)
+{
+	char	   *comment = GetComment(object, catalog, 0);
+
+	if (comment)
+		json_field(b, "comment", comment, true);
+}
+
 /* The canonical membership of |branch|: its working schema, else its head's. */
 static bytea *
 catalog_database(const char *branch)
@@ -518,7 +536,7 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index','view') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	return SPI_processed != 0;
 }
 
@@ -527,6 +545,8 @@ static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static char *database_dependents(const char *json, Datum *members, int count);
+static char *routine_body_encode(HeapTuple tuple, char **dependencies);
+static Oid	provider_view_dependency(CatalogView *view, const char *kind, const char *name);
 
 static bytea *
 canonical_database(const char *json, Datum *members, int count)
@@ -608,7 +628,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
-		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
+		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1308,6 +1328,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_dependency.inc"
 #include "dg_trigger_ddl.inc"
 #include "dg_type_ddl.inc"
+#include "dg_view_ddl.inc"
 #include "dg_rename.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"

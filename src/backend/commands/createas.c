@@ -112,7 +112,7 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	 * A versioned table is created in its branch's schema, like any other
 	 * CREATE TABLE; its rows are then inserted as usual.
 	 */
-	if (!is_matview && dg_catalog_create((Node *) create, NULL))
+	if (is_matview ? dg_catalog_create_matview(create, into->viewQuery) : dg_catalog_create((Node *) create, NULL))
 	{
 		CommandCounterIncrement();
 		ObjectAddressSet(intoRelationAddr, RelationRelationId,

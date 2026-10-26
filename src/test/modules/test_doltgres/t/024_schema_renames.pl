@@ -88,7 +88,8 @@ CREATE FUNCTION app.mark() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.id :=
 CREATE TRIGGER items_mark BEFORE INSERT ON app.items FOR EACH ROW EXECUTE FUNCTION app.mark();
 CREATE TABLE outside(id int PRIMARY KEY, w int DEFAULT app.twice(2), lv app.level);
 });
-sql(q{ALTER SCHEMA app RENAME TO application; INSERT INTO application.items(id) VALUES (2); INSERT INTO outside(id) VALUES (1)});
+sql(q{COMMENT ON SCHEMA app IS 'the application'; ALTER SCHEMA app RENAME TO application; INSERT INTO application.items(id) VALUES (2); INSERT INTO outside(id) VALUES (1)});
+is(sql(q{SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace WHERE nspname='application'}),'the application','a renamed schema keeps its comment');
 is(sql(q{SELECT string_agg(id||':'||lv, ',' ORDER BY id) FROM application.items}),'1:high,102:low','a renamed schema keeps its tables, rows, defaults and triggers');
 is(sql(q{SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='application.refs'::regclass AND contype='f'}),'FOREIGN KEY (item) REFERENCES application.items(id)','foreign keys within the schema follow it');
 is(sql(q{SELECT pg_get_expr(adbin, adrelid)||','||format_type((SELECT atttypid FROM pg_attribute WHERE attrelid='outside'::regclass AND attname='lv'), NULL) FROM pg_attrdef WHERE adrelid='outside'::regclass}),'application.twice(2),application.level','objects outside the schema that refer into it follow it');

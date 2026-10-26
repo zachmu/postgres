@@ -59,6 +59,32 @@ sql(q{CREATE TYPE spare AS ENUM ('a'); ALTER TYPE spare RENAME TO extra});
 is(sql(q{SELECT enum_range(NULL::extra)}),'{a}','an unused type renames');
 sql(q{ALTER TYPE mood RENAME TO feeling; ALTER TYPE feeling RENAME TO mood});
 is(sql(q{SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid='e'::regclass AND attname='m'}),'mood','renaming a used type rewrites its users');
+sql(q{CREATE TYPE wrap AS (inner_p pair, n int); CREATE TABLE w(id int PRIMARY KEY, v wrap); INSERT INTO w VALUES (1, ROW(ROW(5,'ok')::pair, 9))});
+sql(q{ALTER TYPE pair ADD ATTRIBUTE z int});
+is(sql(q{SELECT p::text||ps::text||(SELECT v::text FROM w) FROM c}),'(1,glad,){"(2,ok,)"}("(5,ok,)",9)','ADD ATTRIBUTE extends stored values, arrays and nested values');
+sql(q{INSERT INTO c VALUES (2, ROW(3,'sad',4), NULL); ALTER TYPE pair DROP ATTRIBUTE b});
+is(sql(q{SELECT string_agg(p::text, ',' ORDER BY id) FROM c}).sql(q{SELECT v::text FROM w}),'(1,),(3,4)("(5,)",9)','DROP ATTRIBUTE removes stored fields');
+fails(q{ALTER TYPE pair ALTER ATTRIBUTE x TYPE bigint},qr/cannot alter type "pair" because column "c\.(p|ps)" uses it/,'ALTER ATTRIBUTE TYPE of a used type is rejected, as native');
+sql(q{DROP TABLE w; DROP TYPE wrap; CREATE TYPE loose AS (a int); ALTER TYPE loose ALTER ATTRIBUTE a TYPE text, ADD ATTRIBUTE b int});
+is(sql(q{SELECT string_agg(attname||':'||format_type(atttypid, NULL), ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid=(SELECT typrelid FROM pg_type WHERE typname='loose') AND attnum>0}),'a:text,b:integer','ALTER ATTRIBUTE TYPE of an unused type');
+sql(q{COMMENT ON TYPE loose IS 'loose ends'; COMMENT ON DOMAIN upbeat IS 'cheerful'});
+is(sql(q{SELECT obj_description('loose'::regtype, 'pg_type')||','||obj_description('upbeat'::regtype, 'pg_type')}),'loose ends,cheerful','COMMENT ON TYPE and DOMAIN');
+
+# ---- range types ----
+sql(q{CREATE TYPE span AS RANGE (subtype = float8, subtype_diff = float8mi); CREATE TYPE moodrange AS RANGE (subtype = mood, multirange_type_name = moodspans);
+CREATE TABLE spans(id int PRIMARY KEY, s span, ms span_multirange, m moodrange); INSERT INTO spans VALUES (1, '[1,2)', '{[1,2),[5,6)}', '[sad,ok]')});
+is(sql(q{SELECT s::text||ms::text||m::text FROM spans WHERE s @> 1.5::float8 AND m @> 'meh'::mood}),'[1,2){[1,2),[5,6)}[sad,ok]','range and multirange columns of versioned range types');
+is(sql(q{SELECT span(1, 3, '[]')::text||span_multirange()::text||span_multirange(span(1,2), span(3,4))::text||(span(1,2)::span_multirange)::text||moodspans(moodrange('sad','ok'))::text}),
+   '[1,3]{}{[1,2),[3,4)}{[1,2)}{[sad,ok)}','constructors and the multirange cast');
+is(sql(q{SELECT string_agg(typname||':'||typtype::text, ',' ORDER BY typname) FROM pg_type WHERE typname IN ('span','_span','span_multirange','_span_multirange')}),'_span:b,_span_multirange:b,span:r,span_multirange:m','a range type and what it derives');
+sql(q{ALTER TYPE span RENAME TO interval_span});
+is(sql(q{SELECT pg_typeof(span(1,2))::text||','||(SELECT s FROM spans)}),'interval_span,[1,2)','a renamed range type keeps its constructors\' names, as native');
+fails(q{DROP TYPE interval_span},qr/column s of table spans depends on type interval_span/,'DROP TYPE is blocked by range columns');
+sql(q{DROP TYPE interval_span CASCADE});
+is(sql(q{SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid='spans'::regclass AND attnum>0}).':'.sql(q{SELECT count(*) FROM pg_proc WHERE proname IN ('span','span_multirange')}),
+   'id,m:0','DROP TYPE CASCADE drops a range type\'s columns and constructors');
+sql(q{CREATE FUNCTION fdiff(a float8, b float8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT a - b'});
+fails(q{CREATE TYPE odd AS RANGE (subtype = float8, subtype_diff = fdiff)},qr/versioned range types with a user-defined subtype_diff function/,'a user-defined subtype_diff is not yet supported');
 
 # ---- routines and dependencies ----
 sql(q{CREATE FUNCTION cheer(f mood) RETURNS mood LANGUAGE sql AS $$SELECT 'glad'::mood$$});
@@ -68,19 +94,19 @@ fails(q{CREATE TABLE h(id int, f mood) USING heap},qr/cannot make an unversioned
 
 # ---- branches and merge ----
 sql(q{SELECT dolt_commit('-Am','types'); SELECT dolt_branch('other')});
-$node->safe_psql('postgres',q{SELECT dolt_checkout('other'); CREATE TYPE color AS ENUM ('red','blue'); ALTER TYPE mood ADD VALUE 'calm'; CREATE TABLE paint(id int PRIMARY KEY, c color); INSERT INTO paint VALUES (1,'blue'); SELECT dolt_commit('-Am','other types')});
+$node->safe_psql('postgres',q{SELECT dolt_checkout('other'); CREATE TYPE color AS ENUM ('red','blue'); CREATE TYPE numspan AS RANGE (subtype = numeric); ALTER TYPE mood ADD VALUE 'calm'; CREATE TABLE paint(id int PRIMARY KEY, c color, r numspan); INSERT INTO paint VALUES (1,'blue','[1,2]'); SELECT dolt_commit('-Am','other types')});
 is(sql(q{SELECT count(*) FROM pg_type WHERE typname='color'}),'0','a type made on another branch is not visible');
 is(sql(q{SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM "postgres/other".pg_catalog.pg_enum e JOIN "postgres/other".pg_catalog.pg_type t ON t.oid=e.enumtypid WHERE t.typname='mood'}),'sad,meh,fine,ok,happy,glad,calm','another branch\'s labels are readable');
 is(sql(q{SELECT enum_range(NULL::mood)}),'{sad,meh,fine,ok,happy,glad}','this branch keeps its own labels');
 is(sql(q{SELECT fast_forward FROM dolt_merge('other')}),'1','a type change merges');
-is(sql(q{SELECT enum_range(NULL::mood)::text||','||(SELECT c FROM paint)}),'{sad,meh,fine,ok,happy,glad,calm},blue','merged types and their rows');
+is(sql(q{SELECT enum_range(NULL::mood)::text||','||(SELECT c::text||r::text FROM paint)}),'{sad,meh,fine,ok,happy,glad,calm},blue[1,2]','merged types and their rows');
 $node->safe_psql('postgres',q{SELECT dolt_branch('b1'); SELECT dolt_branch('b2'); SELECT dolt_checkout('b1'); ALTER TYPE mood ADD VALUE 'x1'; SELECT dolt_commit('-Am','b1'); SELECT dolt_checkout('b2'); ALTER TYPE mood ADD VALUE 'x2'; SELECT dolt_commit('-Am','b2')});
 sql(q{SELECT dolt_merge('b1')});
 fails(q{SELECT dolt_merge('b2')},qr/merge conflict in the definition of type public\.mood/,'a type changed on both branches conflicts');
 
 # ---- drops ----
-sql(q{DROP TABLE c, d; DROP TYPE pair; DROP DOMAIN upbeat});
-is(sql(q{SELECT count(*) FROM pg_type WHERE typname IN ('pair','_pair','upbeat')}),'0','DROP TYPE and DROP DOMAIN');
+sql(q{DROP TABLE c, d; DROP TYPE pair; DROP DOMAIN upbeat; DROP TYPE loose});
+is(sql(q{SELECT count(*) FROM pg_type WHERE typname IN ('pair','_pair','upbeat','loose')}),'0','DROP TYPE and DROP DOMAIN');
 is(sql(q{SELECT count(*) FROM pg_type AS OF 'HEAD' WHERE typname='pair'}),'1','history keeps dropped types');
 $node->stop;
 done_testing();

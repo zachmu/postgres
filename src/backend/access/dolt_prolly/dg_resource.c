@@ -126,7 +126,7 @@ dg_storage_allocate(Relation definition, const char *branch)
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot allocate storage in a read-only transaction")));
 	if (!definition->rd_catalogview ||
-		!((definition->rd_rel->relkind == RELKIND_RELATION && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
+		!((DG_ROWS_KIND(definition->rd_rel->relkind) && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
 		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
 		elog(ERROR, "storage allocation requires a canonical prolly definition");
 	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
@@ -381,7 +381,7 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot write canonical storage in a read-only transaction")));
-	if (rel->rd_rel->relkind != RELKIND_RELATION && rel->rd_rel->relkind != RELKIND_INDEX)
+	if (!DG_ROWS_KIND(rel->rd_rel->relkind) && rel->rd_rel->relkind != RELKIND_INDEX)
 		dg_unsupported("canonical resource write kind");
 
 	/*
@@ -458,7 +458,7 @@ storage_base(DGStorage *storage, DGState *state)
 		PG_TRY();
 		{
 			state->content = dg_history_import(state->store, storage->base);
-			if (rel->rd_rel->relkind == RELKIND_RELATION)
+			if (DG_ROWS_KIND(rel->rd_rel->relkind))
 				dg_history_handles(state);
 		}
 		PG_FINALLY();

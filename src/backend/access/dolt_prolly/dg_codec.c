@@ -75,6 +75,26 @@ check_type_recursive(Oid type, List *ancestors)
 				check_type_recursive(TupleDescAttr(desc, i)->atttypid, ancestors);
 		ReleaseTupleDesc(desc);
 	}
+
+	/*
+	 * A range sends its flags and bounds, never its type OID, so it is as
+	 * portable as its subtype; a subtype's own sender may embed OIDs.
+	 */
+	else if (kind == TYPTYPE_RANGE)
+	{
+		Oid			subtype = getBaseType(get_range_subtype(type));
+
+		/* Nested in a range, arrays and records send their own type OIDs. */
+		if (OidIsValid(get_element_type(subtype)) || get_typtype(subtype) == TYPTYPE_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("prolly storage rejects type %s", format_type_be(type)),
+					 errdetail("Only codecs verified to exclude non-portable identifiers are supported."),
+					 errhint("OID and other local identifier translation is not implemented.")));
+		check_type_recursive(subtype, ancestors);
+	}
+	else if (kind == TYPTYPE_MULTIRANGE)
+		check_type_recursive(get_multirange_range(type), ancestors);
 	else if (kind != TYPTYPE_ENUM)
 	{
 		switch (type)
@@ -123,25 +143,6 @@ check_type_recursive(Oid type, List *ancestors)
 			case XMLOID:
 			case TSVECTOROID:
 			case TSQUERYOID:
-
-				/*
-				 * These senders omit the in-memory range type OID. Their
-				 * bound types are known portable scalars. User-defined range
-				 * senders may delegate to array_send/record_send, which embed
-				 * type OIDs.
-				 */
-			case INT4RANGEOID:
-			case INT8RANGEOID:
-			case NUMRANGEOID:
-			case TSRANGEOID:
-			case TSTZRANGEOID:
-			case DATERANGEOID:
-			case INT4MULTIRANGEOID:
-			case INT8MULTIRANGEOID:
-			case NUMMULTIRANGEOID:
-			case TSMULTIRANGEOID:
-			case TSTZMULTIRANGEOID:
-			case DATEMULTIRANGEOID:
 				break;
 			default:
 				ereport(ERROR,
@@ -583,12 +584,20 @@ dg_encode_value(Oid type, Datum value)
 }
 
 /*
- * The canonical bytes of one value of |type| with every label |old| of enum
- * |target| replaced by |renamed|, as when the label is renamed. Stored enum
- * values are their labels; the structure of every type is unchanged.
+ * A change to one user type that stored values must follow: an enum label
+ * renamed, or a composite type's fields laid out again.
  */
-PLSlice
-dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed)
+typedef struct Recode
+{
+	Oid			target;
+	const char *old;			/* enum label, and its new name */
+	const char *renamed;
+	int			count;			/* composite fields: the old field of each */
+	const int  *mapping;		/* new one, or -1 for a new, absent field */
+} Recode;
+
+static PLSlice
+recode_value(Oid type, PLSlice bytes, const Recode *recode)
 {
 	Oid			element;
 
@@ -610,10 +619,22 @@ dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char
 		count = pl_read32(bytes.data + 8);
 		fields = palloc0_array(PLValue, Max(count, 1));
 		for (uint32 i = 0; i < count; i++)
+			dg_check(pl_tuple_get(bytes, i, &fields[i]));
+		if (type == recode->target && recode->mapping)
+		{
+			/* The old fields, in their new places; |desc| is the new layout. */
+			PLValue    *moved = palloc0_array(PLValue, Max(recode->count, 1));
+
+			for (int i = 0; i < recode->count; i++)
+				if (recode->mapping[i] >= 0 && recode->mapping[i] < count)
+					moved[i] = fields[recode->mapping[i]];
+			fields = moved;
+			count = recode->count;
+		}
+		for (uint32 i = 0; i < count; i++)
 		{
 			Oid			field;
 
-			dg_check(pl_tuple_get(bytes, i, &fields[i]));
 			if (!fields[i].present)
 				continue;
 			/* An array's first field is its shape. */
@@ -625,7 +646,7 @@ dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char
 			}
 			else
 				field = TupleDescAttr(desc, i)->atttypid;
-			fields[i].bytes = dg_recode_label(field, fields[i].bytes, target, old, renamed);
+			fields[i].bytes = recode_value(field, fields[i].bytes, recode);
 		}
 		result = pack_fields(fields, count);
 		if (desc)
@@ -633,18 +654,55 @@ dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char
 		pfree(fields);
 		return result;
 	}
-	if (type == target && bytes.len == 4 + strlen(old) && !memcmp(bytes.data + 4, old, strlen(old)))
+	if (type == recode->target && recode->old &&
+		bytes.len == 4 + strlen(recode->old) && !memcmp(bytes.data + 4, recode->old, strlen(recode->old)))
 	{
-		uint8	   *data = palloc(4 + strlen(renamed));
+		uint8	   *data = palloc(4 + strlen(recode->renamed));
 
 		memcpy(data, "DGB1", 4);
-		memcpy(data + 4, renamed, strlen(renamed));
+		memcpy(data + 4, recode->renamed, strlen(recode->renamed));
 		return (PLSlice)
 		{
-			data, 4 + strlen(renamed)
+			data, 4 + strlen(recode->renamed)
 		};
 	}
 	return bytes;
+}
+
+/*
+ * The canonical bytes of one value of |type| with every label |old| of enum
+ * |target| replaced by |renamed|, as when the label is renamed. Stored enum
+ * values are their labels; the structure of every type is unchanged.
+ */
+PLSlice
+dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed)
+{
+	Recode		recode = {
+		.target = target,
+		.old = old,
+		.renamed = renamed,
+	};
+
+	return recode_value(type, bytes, &recode);
+}
+
+/*
+ * The canonical bytes of one value of |type| with every value of composite
+ * type |target| holding its fields as |target| now lays them out: new field i
+ * is old field |mapping|[i], or absent if that is -1. Stored composite values
+ * hold their fields by position, so a type's added or dropped attributes
+ * change them.
+ */
+PLSlice
+dg_recode_composite(Oid type, PLSlice bytes, Oid target, int count, const int *mapping)
+{
+	Recode		recode = {
+		.target = target,
+		.count = count,
+		.mapping = mapping,
+	};
+
+	return recode_value(type, bytes, &recode);
 }
 
 /*

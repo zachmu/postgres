@@ -61,6 +61,11 @@ typedef struct DGProviderRows
 /* The view and rows being built, against which column types resolve. */
 static CatalogView *provider_current_view;
 static DGProviderRows *provider_current_rows;
+
+/* The members being rebuilt, by kind and definition. */
+static int	provider_definition_count;
+static char **provider_definition_kinds;
+static char **provider_definition_list;
 static Oid routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name);
 
 static int
@@ -685,6 +690,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 
 #include "dg_routine_provider.inc"
 #include "dg_type_provider.inc"
+#include "dg_view_provider.inc"
 #include "dg_trigger_provider.inc"
 
 /* Shared role references are derived from canonical owners and ACLs. They
@@ -832,11 +838,14 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			definitions[i] = metadata(child(addresses[i], 1), "schema");
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
 	}
+	provider_definition_count = n;
+	provider_definition_kinds = kinds;
+	provider_definition_list = definitions;
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "namespace"))
 		{
@@ -872,6 +881,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_bind(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "view"))
+		{
+			/* Views may use one another. */
+			(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
+			(void) CatalogViewBindObject(view, TypeRelationId, json_value(definitions[i], "name"), InvalidOid);
+		}
+	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
@@ -887,6 +903,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			FormData_pg_class form = {0};
 			TupleDesc	desc = provider_columns(definition);
 			bool		index = !strcmp(kinds[i], "index");
+			char	   *matview;
 			HeapTuple	tuple;
 			int			slot = provider_catalog_index(RelationRelationId);
 
@@ -899,12 +916,19 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
+			matview = index ? NULL : json_value(definition, "matview");
+			if (matview)
+			{
+				/* A materialized view is a table with its view's rule. */
+				form.relkind = RELKIND_MATVIEW;
+				form.relhasrules = true;
+			}
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			run("SELECT count(*) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1 LIKE 'CHECK %'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			form.relchecks = DatumGetInt64(cell(0, 1));
 			form.reltuples = -1;
-			form.relispopulated = true;
+			form.relispopulated = !matview || !strcmp(json_value(matview, "populated"), "true");
 			form.relreplident = REPLICA_IDENTITY_DEFAULT;
 			run("SELECT jsonb_array_length(COALESCE($1::jsonb->'indexes','[]'::jsonb))>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			form.relhasindex = DatumGetBool(cell(0, 1));
@@ -1006,7 +1030,12 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			run("SELECT ord::int,v->>'comment' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'comment' IS NOT NULL", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			for (j = 0; j < SPI_processed; j++)
 				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
+			if (matview)
+				provider_view_rule(&rows, view, name, form.oid, matview);
 		}
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "view"))
+			provider_view_member(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "routine"))
 			provider_routine(&rows, view, definitions[i]);
@@ -1035,6 +1064,19 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "trigger"))
 			provider_trigger(&rows, view, definitions[i], n, definitions, kinds);
+	for (i = 0; i < n; i++)
+	{
+		/* Comments on schema objects kept apart from tables. */
+		Oid			catalog = !strcmp(kinds[i], "routine") ? ProcedureRelationId :
+			!strcmp(kinds[i], "type") ? TypeRelationId :
+			!strcmp(kinds[i], "trigger") ? TriggerRelationId :
+			!strcmp(kinds[i], "view") ? RelationRelationId : InvalidOid;
+		char	   *comment = OidIsValid(catalog) ? json_value(definitions[i], "comment") : NULL;
+
+		if (comment)
+			provider_description(&rows, CatalogViewLookupObject(view, catalog, json_value(definitions[i], "name")),
+								 catalog, 0, comment);
+	}
 	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
@@ -1046,6 +1088,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	}
 	provider_current_view = NULL;
 	provider_current_rows = NULL;
+	provider_definition_count = 0;
 	CatalogViewSeal(view);
 }
 
