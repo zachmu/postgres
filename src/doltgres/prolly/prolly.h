@@ -137,6 +137,15 @@ const char *pl_status_string(PLStatus status);
  * Pack allocates *buffer with malloc; caller frees it. Get returns a borrowed slice.
  */
 PLStatus	pl_tuple_pack(const PLValue *fields, size_t count, uint8_t **buffer, size_t *length);
+/* A validated view borrows immutable tuple bytes for its entire lifetime. */
+typedef struct PLTupleView
+{
+	PLSlice bytes;
+	size_t count;
+	size_t header;
+} PLTupleView;
+PLStatus pl_tuple_open(PLSlice tuple, PLTupleView *view);
+PLStatus pl_tuple_field(const PLTupleView *view, size_t attribute, PLValue *out);
 PLStatus	pl_tuple_get(PLSlice tuple, size_t attribute, PLValue *out);
 void		pl_key_int64(int64_t value, uint8_t out[8]);
 

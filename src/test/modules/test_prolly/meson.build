@@ -30,5 +30,6 @@ tests += {
     't/024_rebase_stash.pl',
     't/025_compat.pl',
     't/026_function_integration.pl',
+    't/028_bitmap.pl',
   ]},
 }
