@@ -11,8 +11,7 @@ sub rejects {my ($out,$failed)=$s->query($_[0]);is($failed,1,$_[1]);$s->{stderr}
 sql(q{SET statement_timeout='10s'; SET client_min_messages=warning;
 CREATE TABLE t(id int PRIMARY KEY,x int,payload text) USING dolt_prolly_table;
 INSERT INTO t VALUES(1,1,'a'),(2,NULL,'b');
-CREATE TABLE owned(x text, moment timestamptz) USING dolt_prolly_table;
-ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2000-01-01 00:00:00+00';
+CREATE TABLE owned(x text, moment timestamptz DEFAULT '2000-01-01 00:00:00+00') USING dolt_prolly_table;
 INSERT INTO owned VALUES('initial');
 CREATE FUNCTION public.unportable_default() RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RAISE EXCEPTION 'unexpected evaluation'; END $$;
 SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','other')});
