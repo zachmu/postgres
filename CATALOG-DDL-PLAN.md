@@ -501,11 +501,9 @@ object-level schema merge (`6c06fa14602`), and user-defined types
 - **Dependency record and renames:** done (`zachmu/schema-renames`,
   `reports/renames-and-index-keys.html`). Database roots carry a `dependents`
   record; renames of tables, columns, indexes, constraints, triggers, routines,
-  types and enum labels rewrite exactly the dependents it lists, and enum label
-  renames rewrite stored rows. Still open: schema renames (ALTER SCHEMA ...
-  RENAME), which rewrite the serialized definitions of every member of the
-  schema and of their referrers, and re-key storage bindings and identities;
-  no row data changes.
+  types, enum labels and schemas rewrite exactly the dependents it lists. Enum
+  label renames rewrite stored rows; schema renames rewrite only definitions
+  and bindings, never rows.
 - **Renames in merge (decision, 2026-10-26):** objects, including tables, are
   identified by name only. A rename merges as a drop of the old name and a
   create of the new one, so it conflicts only with changes to the old object
@@ -520,10 +518,26 @@ object-level schema merge (`6c06fa14602`), and user-defined types
   position; ADD VALUE rebuilds affected indexes). Deferred, with no effect on
   current plans: inet/cidr, bit strings, jsonb, arrays, ranges, composites,
   non-C collations and cross-type comparisons in the new families.
-- **Remaining DDL:** partitioning and inheritance; unlogged and temporary
-  prolly tables; deferrable constraints; materialized views and views; range
-  types; ALTER TYPE ADD/DROP/ALTER ATTRIBUTE; DROP ... CASCADE that drops table
-  columns; ALTER TRIGGER and ENABLE/DISABLE TRIGGER; constraint triggers;
-  BEGIN ATOMIC routine bodies; COMMENT ON routines; identity ALTERs.
+- **Views, materialized views and the remaining DDL (2026-10-26):** done
+  (`zachmu/versioned-views`, `zachmu/versioned-ddl-odds`,
+  `reports/versioned-views-and-ddl.html`). Views are members (DGVIEW1) whose
+  stored SQL is analyzed lazily in their revision's catalogs; materialized
+  views are tables whose definitions also hold their query and populated
+  state. Also versioned: range types (with their multirange types,
+  constructors and casts), ALTER TYPE ... ATTRIBUTE (stored composite values
+  are rewritten), DROP ... CASCADE that drops columns, trigger
+  ENABLE/DISABLE, constraint triggers, SQL-standard routine bodies (stored as
+  SQL, analyzed when read, with their dependencies), COMMENT on routines,
+  types, views, triggers and schemas, and identity ALTERs (DROP IDENTITY keeps
+  the global sequence).
+- **Remaining DDL:** partitioning and inheritance (skipped, 2026-10-26);
+  unlogged and temporary prolly tables; deferrable constraints; range types
+  with user-defined canonical or subtype_diff functions or operator classes;
+  views, materialized views and routine bodies that name another revision or
+  branch (rejected, since deparsing does not record the qualifier); refreshing
+  materialized views concurrently.
+- **Known gaps found on the way:** CREATE TYPE before a database's first
+  prolly table makes a native type that later versioned tables cannot use;
+  versioned SQL functions are never inlined by the planner.
 - **Ownership and ACLs** remain a separate design: role identities stay out of
   versioned storage, like OIDs.
