@@ -343,9 +343,7 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	char	   *revision,
 			   *dbname,
 			   *logical = NULL;
-	Oid			user;
-	int			security,
-				nest;
+	Oid			user = GetUserId();
 	bytea	   *db;
 	CatalogView *view;
 
@@ -412,8 +410,6 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 revision_selected:
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
-	GetUserIdAndSecContext(&user, &security);
-
 	/*
 	 * Names on a branch head resolve against its latest schema, as against
 	 * catalogs. A SQL query of a catalog itself reads it under the query's
@@ -430,10 +426,7 @@ revision_selected:
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
 	}
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
 	{
-		nest = begin_api();
 		working = (!rte->dolt_database || context_branch) && !rv->dolt_revision &&
 			read_ref(psprintf("heads/%s", revision)).target != NULL;
 		db = rte->dolt_database ? unhex(rte->dolt_database) :
@@ -590,11 +583,8 @@ revision_selected:
 			}
 		}
 binding_done:
-		end_api(nest);
-	} PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-	} PG_END_TRY();
+		;
+	}
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
@@ -739,9 +729,7 @@ dg_catalog_target(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 bool
 dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 {
-	Oid			user;
-	int			security,
-				nest;
+	Oid			user = GetUserId();
 	bool		pushed = false;
 	bool		native_found = false;
 	char	   *search_path;
@@ -803,7 +791,6 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 	if (rv->dolt_revision)
 		unsupported("revision-qualified native utility lookup");
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
-	GetUserIdAndSecContext(&user, &security);
 
 	/*
 	 * Names on the session's branch resolve against its latest committed
@@ -820,13 +807,10 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		pushed = true;
 	}
 	*result = InvalidOid;
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
 	{
 		bytea	   *db;
 		const char *branch;
 
-		nest = begin_api();
 		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
@@ -844,15 +828,9 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 				*result = CatalogViewLookupObject(view, RelationRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
-		end_api(nest);
 	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
-	}
-	PG_END_TRY();
+	if (pushed)
+		PopActiveSnapshot();
 	if (!OidIsValid(*result) && !missing_ok)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", rv->relname, dg_current_branch())));
 	return !native_found;
@@ -971,9 +949,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 	const char *branch = NULL;
 	char	   *path;
 	RangeVar   *rv;
-	Oid			user;
-	int			security,
-				nest;
+	Oid			user = GetUserId();
 	bool		pushed = false;
 
 	if (!view)
@@ -992,36 +968,26 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 		branch = dg_current_branch();
 	path = pstrdup(GetConfigOption("search_path", false, false));
 	rv = makeRangeVar(NULL, pstrdup(name), -1);
-	GetUserIdAndSecContext(&user, &security);
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
 	}
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
 	{
 		bytea	   *db;
 		CatalogView *context;
 		Oid			native;
 		char	   *ns;
 
-		nest = begin_api();
 		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
 		context = db ? context_view(db, branch) : NULL;
 		ns = catalog_resolve_name(context, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
 						  CatalogViewLookupObject(context, RelationRelationId,
 												  dg_qualified_name(ns, name)) == id);
-		end_api(nest);
 	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
-	}
-	PG_END_TRY();
+	if (pushed)
+		PopActiveSnapshot();
 	return true;
 }
 
@@ -1030,9 +996,7 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 bool
 dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *result)
 {
-	Oid			user;
-	int			security,
-				nest;
+	Oid			user = GetUserId();
 	bool		pushed = false;
 	RangeVar   *rv = makeRangeVar((char *) schema, (char *) name, -1);
 	char	   *search_path;
@@ -1082,7 +1046,6 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 	if (!dg_catalog_active())
 		return false;
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
-	GetUserIdAndSecContext(&user, &security);
 
 	/*
 	 * Names on the session's branch resolve against its latest committed
@@ -1099,13 +1062,10 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		pushed = true;
 	}
 	*result = InvalidOid;
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
 	{
 		bytea	   *db;
 		const char *branch;
 
-		nest = begin_api();
 		branch = catalog_current_database() ? catalog_current_branch() : dg_current_branch();
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
@@ -1122,15 +1082,9 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 				*result = CatalogViewLookupObject(view, TypeRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
-		end_api(nest);
 	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
-	}
-	PG_END_TRY();
+	if (pushed)
+		PopActiveSnapshot();
 	return true;
 }
 
@@ -1161,30 +1115,15 @@ dg_catalog_type_visible(Oid id, const char *name, bool *visible)
 CatalogView *
 dg_catalog_session_view(void)
 {
-	Oid			user;
-	int			security,
-				nest;
 	CatalogView *result = CatalogViewCurrent();
 
 	if (result || !dg_catalog_active())
 		return result;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 
 	/* The session's branch schema is read as catalogs are, latest committed. */
 	PushActiveSnapshot(GetLatestSnapshot());
-	PG_TRY();
-	{
-		nest = begin_api();
-		result = provider_branch_view(dg_current_branch(), catalog_working_schema(dg_current_branch()));
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		PopActiveSnapshot();
-		SetUserIdAndSecContext(user, security);
-	}
-	PG_END_TRY();
+	result = provider_branch_view(dg_current_branch(), catalog_working_schema(dg_current_branch()));
+	PopActiveSnapshot();
 	return result;
 }
 

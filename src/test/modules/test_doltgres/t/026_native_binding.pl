@@ -27,8 +27,7 @@ sub internal {
 sub no_lookup_sql {
  my ($query,$label)=@_;
  my @stmts=internal($query);
- my @lookups=grep {/pg_dolt_|jsonb/} @stmts;
- is(scalar @lookups,0,"$label resolves without catalog SQL") or diag(join("\n",@stmts));
+ is(scalar @stmts,1,"$label runs no internal statements") or diag(join("\n",@stmts));
  return @stmts;
 }
 no_lookup_sql(q{SELECT v FROM t WHERE id=1},'branch table');

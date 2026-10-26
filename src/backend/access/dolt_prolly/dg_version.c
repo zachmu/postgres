@@ -500,6 +500,43 @@ object_read(bytea *hash, const char *kind, char **actual, bytea **payload, Array
 	return found;
 }
 
+/*
+ * Whether object |hash| of |kind| exists, and the transaction that created
+ * it if that is this transaction and no other copy is committed.
+ */
+static bool
+object_creator(bytea *hash, const char *kind, bool *found, TransactionId *creator)
+{
+	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	*found = false;
+	*creator = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
+	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
+		TransactionId xid = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		if (strcmp(objkind, kind))
+			continue;
+		*found = true;
+		if (!TransactionIdIsCurrentTransactionId(xid))
+		{
+			*creator = InvalidTransactionId;
+			break;
+		}
+		*creator = xid;
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return *found;
+}
+
 /* The |index|th (from 1) child of object |hash|, or NULL. */
 static bytea *
 object_child(bytea *hash, int index)
@@ -941,11 +978,28 @@ resolve(const char *revision)
 		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&
 				 strspn(base, "0123456789abcdef") == strlen(base))
 		{
-			run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
-			if (SPI_processed > 1)
-				ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
-			if (SPI_processed)
-				hash = DatumGetByteaPCopy(cell(0, 1));
+			Oid			user;
+			int			security,
+						nest;
+
+			/* An abbreviated hash is searched by SQL, in its own scope. */
+			GetUserIdAndSecContext(&user, &security);
+			SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+			PG_TRY();
+			{
+				nest = begin_api();
+				run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
+				if (SPI_processed > 1)
+					ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
+				if (SPI_processed)
+					hash = DatumGetByteaPCopy(cell(0, 1));
+				end_api(nest);
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(user, security);
+			}
+			PG_END_TRY();
 		}
 	}
 	if (!hash)

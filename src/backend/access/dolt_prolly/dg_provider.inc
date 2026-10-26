@@ -1123,7 +1123,8 @@ provider_reload(CatalogView *view, void *arg)
 		}
 		nest = begin_api();
 		database = unhex(entry->database);
-		(void) metadata(database, "database");
+		if (!object_read(database, "database", NULL, NULL, NULL))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 		provider_populate(view, database, entry->branch);
 		end_api(nest);
 	}
@@ -1143,18 +1144,10 @@ static TransactionId
 provider_creator(bytea *database)
 {
 	TransactionId creator = InvalidTransactionId;
+	bool		found = false;
 
-	run("SELECT xmin FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind='database'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	if (!SPI_processed)
+	if (!object_creator(database, "database", &found, &creator))
 		elog(ERROR, "canonical catalog root disappeared");
-	for (uint64 i = 0; i < SPI_processed; i++)
-	{
-		TransactionId xid = DatumGetTransactionId(cell(i, 1));
-
-		if (!TransactionIdIsCurrentTransactionId(xid))
-			return InvalidTransactionId;
-		creator = xid;
-	}
 	return creator;
 }
 
@@ -1169,6 +1162,9 @@ provider_lookup(const char *branch, bytea *database)
 	char	   *key = hex(database);
 	DGProvider *entry;
 	CatalogView *view;
+	Oid			user;
+	int			security,
+				nest;
 
 	/*
 	 * Visibility is required even on a cache hit: an aborted object must not
@@ -1206,13 +1202,19 @@ provider_lookup(const char *branch, bytea *database)
 	entry->generation = identity_generation;
 	entry->next = providers;
 	providers = entry;
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
+		/* Decoding the schema runs internal SQL, in its own scope. */
+		nest = begin_api();
 		CatalogViewSetCreator(view, provider_creator(database));
 		provider_populate(view, database, branch);
+		end_api(nest);
 	}
 	PG_CATCH();
 	{
+		SetUserIdAndSecContext(user, security);
 		providers = entry->next;
 		pfree(entry->database);
 		if (entry->branch)
@@ -1222,6 +1224,7 @@ provider_lookup(const char *branch, bytea *database)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	SetUserIdAndSecContext(user, security);
 	CatalogViewSetLoader(view, provider_reload, entry);
 	return view;
 }
@@ -1359,10 +1362,6 @@ dg_catalog_resolve_durable(Oid oid)
 	char	   *branch,
 			   *name;
 	char		kind;
-	Oid			user;
-	int			security,
-				nest;
-	bool		pushed = false;
 	CatalogView *result = NULL;
 	CatalogView *previous;
 
@@ -1373,23 +1372,16 @@ dg_catalog_resolve_durable(Oid oid)
 	/* The schema is read as catalogs are: latest committed, not as of the
 	 * transaction's snapshot. */
 	PushActiveSnapshot(GetLatestSnapshot());
-	pushed = true;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
 		bytea	   *working = catalog_working_schema(branch);
 
-		nest = begin_api();
 		if (working)
 			result = provider_branch_view(branch, working);
-		end_api(nest);
 	}
 	PG_FINALLY();
 	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
+		PopActiveSnapshot();
 		CatalogViewSwitch(previous);
 	}
 	PG_END_TRY();
