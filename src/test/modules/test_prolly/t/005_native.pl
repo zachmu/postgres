@@ -11,7 +11,7 @@ $node->start;
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_extension WHERE extname='dolt_prolly'}), '0', 'no extension installed');
 is($node->safe_psql('postgres', q{SELECT string_agg(amname,',' ORDER BY amname) FROM pg_am WHERE amname LIKE 'dolt_prolly_%'}), 'dolt_prolly_index,dolt_prolly_table', 'native AMs present after initdb');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang WHERE p.proname IN ('dolt_prolly_table_handler','dolt_prolly_index_handler','dolt_prolly_root') AND l.lanname='internal' AND p.pronamespace='pg_catalog'::regnamespace AND p.probin IS NULL}), '3', 'handlers and diagnostic linked into backend');
-is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_opclass WHERE opcmethod=(SELECT oid FROM pg_am WHERE amname='dolt_prolly_index') AND opcdefault}), '6', 'native default prolly opclasses present');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM pg_opclass WHERE opcmethod=(SELECT oid FROM pg_am WHERE amname='dolt_prolly_index') AND opcdefault}), '23', 'native default prolly opclasses present');
 is($node->safe_psql('postgres', 'SHOW default_table_access_method'), 'heap', 'heap remains default');
 is($node->safe_psql('postgres', q{SELECT string_agg(amname,',' ORDER BY amname) FROM pg_am WHERE amname NOT LIKE 'dolt_prolly_%'}), 'brin,btree,gin,gist,hash,heap,spgist', 'all upstream access methods retained');
 $node->safe_psql('postgres', q{
