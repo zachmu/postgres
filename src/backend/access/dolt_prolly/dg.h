@@ -44,6 +44,7 @@ typedef struct DGRows
 	size_t		capacity;
 }			DGRows;
 typedef struct DGStorage DGStorage;
+extern struct _SPI_plan *dg_manifest_plan(const char *sql, int nargs, Oid *types);
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern void dg_initialize_resource(Relation rel, const char *branch);
 extern void dg_storage_record(Relation source);

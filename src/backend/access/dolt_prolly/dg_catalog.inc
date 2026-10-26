@@ -154,10 +154,14 @@ catalog_namespace(bytea *db, const char *name)
 
 /* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
  * candidates in that same order, never a shortcut ahead of an explicit path. */
-static char *catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok);
+static char *catalog_resolve_candidates(bytea *db, const char *branch, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok);
 
+/*
+ * Resolve in revision |db|, on |branch|'s head when given. Its catalog view is
+ * built only if a name reaches it: system and native names need no view.
+ */
 static char *
-catalog_resolve_name(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
+catalog_resolve_name(bytea *db, const char *branch, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
 	CatalogView *previous = CatalogViewSwitch(NULL);
 	char	   *result;
@@ -169,7 +173,7 @@ catalog_resolve_name(CatalogView *view, const RangeVar *rv, Oid user, Oid *nativ
 	 */
 	PG_TRY();
 	{
-		result = catalog_resolve_candidates(view, rv, user, native, search_path, type_lookup, temp_ok);
+		result = catalog_resolve_candidates(db, branch, rv, user, native, search_path, type_lookup, temp_ok);
 	}
 	PG_FINALLY();
 	{
@@ -180,8 +184,9 @@ catalog_resolve_name(CatalogView *view, const RangeVar *rv, Oid user, Oid *nativ
 }
 
 static char *
-catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
+catalog_resolve_candidates(bytea *db, const char *branch, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
+	CatalogView *view = NULL;
 	List	   *path = NIL;
 	ListCell   *lc;
 	bool		explicit = rv->schemaname != NULL;
@@ -247,6 +252,8 @@ catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid 
 		 * its catalogs.
 		 */
 		name = dg_qualified_name(ns, rv->relname);
+		if (db && !view)
+			view = context_view(db, branch);
 		if (view && OidIsValid(CatalogViewFindObject(view, type_lookup ? TypeRelationId : RelationRelationId, name)))
 		{
 			namespace = CatalogViewFindObject(view, NamespaceRelationId, ns);
@@ -446,10 +453,9 @@ revision_selected:
 			rte->dolt_ref_target = hex(db);
 		}
 		rte->dolt_database = hex(db);
-		view = context_view(db, working ? revision : NULL);
 		{
 			Oid			native;
-			char	   *ns = catalog_resolve_name(view, rv, user, &native, resolution_path, false, true);
+			char	   *ns = catalog_resolve_name(db, working ? revision : NULL, rv, user, &native, resolution_path, false, true);
 			RangeVar   *resolved = copyObject(rv);
 
 			if (!ns)
@@ -531,6 +537,7 @@ revision_selected:
 			 * come from its ACL rows, as for physical catalogs.
 			 */
 			logical = dg_qualified_name(rv->schemaname, rv->relname);
+			view = context_view(db, working ? revision : NULL);
 			handle = CatalogViewFindObject(view, RelationRelationId, logical);
 			if (!OidIsValid(handle))
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
@@ -920,9 +927,8 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
-			CatalogView *view = db ? context_view(db, branch) : NULL;
 			Oid			native;
-			char	   *ns = catalog_resolve_name(view, rv, user, &native, search_path, false, true);
+			char	   *ns = catalog_resolve_name(db, branch, rv, user, &native, search_path, false, true);
 
 			if (OidIsValid(native))
 			{
@@ -930,7 +936,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(view, RelationRelationId,
+				*result = CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
 	}
@@ -1080,15 +1086,13 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 	}
 	{
 		bytea	   *db;
-		CatalogView *context;
 		Oid			native;
 		char	   *ns;
 
 		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
-		context = db ? context_view(db, branch) : NULL;
-		ns = catalog_resolve_name(context, rv, user, &native, path, false, true);
+		ns = catalog_resolve_name(db, branch, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
-						  CatalogViewLookupObject(context, RelationRelationId,
+						  CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
 												  dg_qualified_name(ns, name)) == id);
 	}
 	if (pushed)
@@ -1175,16 +1179,15 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
-			CatalogView *view = db ? context_view(db, branch) : NULL;
 			Oid			native;
-			char	   *ns = catalog_resolve_name(view, rv, user, &native, search_path, true, temp_ok);
+			char	   *ns = catalog_resolve_name(db, branch, rv, user, &native, search_path, true, temp_ok);
 
 			if (OidIsValid(native))
 			{
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(view, TypeRelationId,
+				*result = CatalogViewLookupObject(context_view(db, branch), TypeRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
 	}

@@ -157,8 +157,12 @@ static void
 run(const char *sql, int n, Oid *types, Datum *args, const char *nulls, bool ro)
 {
 	MemoryContext c = CurrentMemoryContext;
+	SPIPlanPtr	plan = dg_manifest_plan(sql, n, types);
 
-	SPI_execute_with_args(sql, n, types, args, nulls, ro, 0);
+	if (plan)
+		SPI_execute_plan(plan, args, nulls, ro, 0);
+	else
+		SPI_execute_with_args(sql, n, types, args, nulls, ro, 0);
 	MemoryContextSwitchTo(c);
 }
 static Datum

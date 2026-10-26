@@ -81,5 +81,11 @@ is($s->query_safe(q{EXECUTE head}),'v1','repeatable read sees the ref as of its 
 $s->query_safe(q{COMMIT});
 is($s->query_safe(q{EXECUTE head}),'main2','the next transaction rebinds to the moved ref');
 $s->quit;
+
+# The SQL that decodes a schema into a session's catalog view is prepared once.
+sql(q{SELECT pg_stat_statements_reset()});
+sql(q{SELECT count(*) FROM t; SELECT count(*) FROM app.t});
+is(sql(q{SELECT bool_and(plans <= 6) FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','repeated internal statements reuse their plans');
+is(sql(q{SELECT count(*) > 0 FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','and there were such statements to reuse');
 $node->stop;
 done_testing();

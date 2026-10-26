@@ -16,6 +16,9 @@
 #include "utils/snapmgr.h"
 #include "utils/json.h"
 #include "mb/pg_wchar.h"
+#include "common/hashfn.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
@@ -33,14 +36,63 @@ manifest_begin(void)
 	MemoryContextSwitchTo(caller);
 }
 
+/*
+ * Internal SQL is a fixed set of statements, each run many times: prepare
+ * each once and keep its plan, as a PL function keeps its statements' plans.
+ * The plan cache replans them when the objects they use change.
+ */
+typedef struct ManifestPlan
+{
+	uint64		key;			/* hash of the statement text */
+	char	   *sql;
+	SPIPlanPtr	plan;
+} ManifestPlan;
+static HTAB *manifest_plans;
+
+SPIPlanPtr
+dg_manifest_plan(const char *sql, int nargs, Oid *types)
+{
+	uint64		key = hash_bytes_extended((const unsigned char *) sql, strlen(sql), nargs);
+	ManifestPlan *entry;
+	SPIPlanPtr	plan;
+	bool		found;
+
+	if (!manifest_plans)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(uint64);
+		ctl.entrysize = sizeof(ManifestPlan);
+		ctl.hcxt = TopMemoryContext;
+		manifest_plans = hash_create("manifest SQL plans", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(manifest_plans, &key, HASH_FIND, NULL);
+	if (entry)
+		return strcmp(entry->sql, sql) == 0 ? entry->plan : NULL;
+	/* Table-less statements never prefer a generic plan on cost: force one. */
+	plan = SPI_prepare_cursor(sql, nargs, types, CURSOR_OPT_GENERIC_PLAN);
+	if (!plan)
+		elog(ERROR, "SPI_prepare failed: %s", SPI_result_code_string(SPI_result));
+	if (SPI_keepplan(plan))
+		elog(ERROR, "SPI_keepplan failed");
+	entry = hash_search(manifest_plans, &key, HASH_ENTER, &found);
+	entry->sql = MemoryContextStrdup(TopMemoryContext, sql);
+	entry->plan = plan;
+	return plan;
+}
+
 /* SPI restores its procedure context, not an arbitrary caller context. */
 static void
 manifest_execute(const char *sql, int nargs, Oid *types, Datum *args,
 				 const char *nulls, bool readonly, long count)
 {
 	MemoryContext caller = CurrentMemoryContext;
+	SPIPlanPtr	plan = dg_manifest_plan(sql, nargs, types);
 
-	SPI_execute_with_args(sql, nargs, types, args, nulls, readonly, count);
+	if (plan)
+		SPI_execute_plan(plan, args, nulls, readonly, count);
+	else
+		SPI_execute_with_args(sql, nargs, types, args, nulls, readonly, count);
 	MemoryContextSwitchTo(caller);
 }
 
