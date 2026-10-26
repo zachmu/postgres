@@ -28,6 +28,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
+#include "commands/alter.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
 #include "utils/syscache.h"

@@ -52,6 +52,11 @@ is($s->query_safe(q{SELECT string_agg(v, ',' ORDER BY id) FROM t WHERE id >= 20}
 is($s->query_safe(q{SELECT count(*) FROM t AS OF 'main' WHERE id >= 20}),'0','procedure write leaves another branch unchanged');
 $s->query_safe(q{CREATE PROCEDURE plpgsql_proc(i int) LANGUAGE plpgsql AS $$BEGIN DELETE FROM t WHERE id = i; END$$; CALL plpgsql_proc(20)});
 is($s->query_safe(q{SELECT count(*) FROM t WHERE id >= 20}),'1','PL/pgSQL procedure is callable');
+$s->query_safe(q{CREATE FUNCTION altered(x int) RETURNS int LANGUAGE plpgsql AS $$BEGIN RETURN x*2; END$$; ALTER FUNCTION altered(int) IMMUTABLE SET work_mem = '8MB'});
+is($s->query_safe(q{SELECT provolatile::text||array_to_string(proconfig,',') FROM pg_proc WHERE proname='altered'}),'iwork_mem=8MB','ALTER FUNCTION changes versioned attributes');
+$s->query_safe(q{CREATE SCHEMA moved; ALTER FUNCTION altered(int) SET SCHEMA moved; ALTER FUNCTION moved.altered(int) RENAME TO renamed; ALTER FUNCTION moved.renamed(int) RESET ALL});
+is($s->query_safe(q{SELECT moved.renamed(6)||','||(SELECT count(*) FROM pg_proc WHERE proname='altered')||','||(SELECT proconfig IS NULL FROM pg_proc WHERE proname='renamed')}),'12,0,true','SET SCHEMA, RENAME and RESET of a versioned routine');
+is($s->query_safe(q{SELECT count(*) FROM pg_proc AS OF 'main' WHERE proname IN ('altered','renamed')}),'0','routine ALTER leaves another branch unchanged');
 my ($badout,$bad)=$s->query(q{CREATE OR REPLACE FUNCTION f(input text) RETURNS int LANGUAGE sql AS $$SELECT 1$$});
 is($bad,1,'native replacement rejects changing return type');$s->{stderr}='';
 is($s->query_safe(q{SELECT f('x')}),'x_other','failed replacement leaves definition intact');
