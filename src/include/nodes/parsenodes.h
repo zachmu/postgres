@@ -1257,8 +1257,13 @@ typedef struct RangeTblEntry
 	/*
 	 * Fields valid for ENR RTEs (else NULL/zero):
 	 */
-	/* RTE_DOLT: retained table descriptor address (hex), not a runtime OID. */
-	char	   *dolt_table;
+	/*
+	 * The ref a versioned binding resolved through, as "<kind>:<ref name>"
+	 * (s: a session name, c: a nested context's branch, r: an explicit
+	 * revision), and the target it had: cached plans compare them later.
+	 */
+	char	   *dolt_ref pg_node_attr(query_jumble_ignore);
+	char	   *dolt_ref_target pg_node_attr(query_jumble_ignore);
 	char	   *dolt_database;	/* canonical schema context, also for catalog
 								 * scans */
 	Oid			dolt_catalog;	/* native catalog scanned through that

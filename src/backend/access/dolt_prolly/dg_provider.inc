@@ -253,19 +253,29 @@ provider_columns(const char *definition)
 	TupleDesc	desc;
 	char	  **names,
 			  **types,
-			  **collations;
+			  **collations,
+			  **storages,
+			  **compressions,
+			  **generated,
+			  **identities;
 	int		   *mods;
-	bool	   *notnull;
+	bool	   *notnull,
+			   *hasdef;
 	int			i,
 				n;
 
-	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END,COALESCE((v->>'notnull')::bool,false) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END,COALESCE((v->>'notnull')::bool,false),v->>'storage',v->>'compression',(v->>'default') IS NOT NULL,v->>'generated',v->>'identity' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	n = SPI_processed;
 	names = palloc_array(char *, Max(n, 1));
 	types = palloc_array(char *, Max(n, 1));
 	collations = palloc_array(char *, Max(n, 1));
 	mods = palloc_array(int, Max(n, 1));
 	notnull = palloc_array(bool, Max(n, 1));
+	storages = palloc_array(char *, Max(n, 1));
+	compressions = palloc_array(char *, Max(n, 1));
+	hasdef = palloc_array(bool, Max(n, 1));
+	generated = palloc_array(char *, Max(n, 1));
+	identities = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		names[i] = strcell(i, 1);
@@ -273,6 +283,11 @@ provider_columns(const char *definition)
 		mods[i] = DatumGetInt32(cell(i, 3));
 		collations[i] = strcell(i, 4);
 		notnull[i] = DatumGetBool(cell(i, 5));
+		storages[i] = strcell(i, 6);
+		compressions[i] = strcell(i, 7);
+		hasdef[i] = DatumGetBool(cell(i, 8));
+		generated[i] = strcell(i, 9);
+		identities[i] = strcell(i, 10);
 	}
 	desc = CreateTemplateTupleDesc(n);
 	for (i = 0; i < n; i++)
@@ -291,28 +306,15 @@ provider_columns(const char *definition)
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
-		{
-			char	   *storage,
-					   *compression;
-
-			char	   *generated,
-					   *identity;
-
-			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL,$1::jsonb->'columns'->$2->>'generated',$1::jsonb->'columns'->$2->>'identity'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
-			storage = strcell(0, 1);
-			compression = strcell(0, 2);
-			generated = strcell(0, 4);
-			identity = strcell(0, 5);
-			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
-			if (generated)
-				TupleDescAttr(desc, i)->attgenerated = generated[0];
-			if (identity)
-				TupleDescAttr(desc, i)->attidentity = identity[0];
-			if (storage)
-				TupleDescAttr(desc, i)->attstorage = storage[0];
-			if (compression)
-				TupleDescAttr(desc, i)->attcompression = compression[0];
-		}
+		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
+		if (generated[i])
+			TupleDescAttr(desc, i)->attgenerated = generated[i][0];
+		if (identities[i])
+			TupleDescAttr(desc, i)->attidentity = identities[i][0];
+		if (storages[i])
+			TupleDescAttr(desc, i)->attstorage = storages[i][0];
+		if (compressions[i])
+			TupleDescAttr(desc, i)->attcompression = compressions[i][0];
 	}
 
 	/*
@@ -803,7 +805,9 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
-	bytea	  **addresses;
+	bytea	  **addresses,
+			  **schemas,
+			  **contents;
 	char	  **kinds,
 			  **definitions;
 	int			n,
@@ -827,6 +831,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	addresses = palloc_array(bytea *, Max(n, 1));
+	schemas = palloc0_array(bytea *, Max(n, 1));
+	contents = palloc0_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	definitions = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -839,7 +845,12 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
 		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
-			definitions[i] = metadata(child(addresses[i], 1), "schema");
+		{
+			schemas[i] = child(addresses[i], 1);
+			definitions[i] = metadata(schemas[i], "schema");
+			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+				contents[i] = child(addresses[i], 2);
+		}
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
 	}
@@ -910,6 +921,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			if (list_length(parts) != 2)
 				elog(ERROR, "canonical relation name is not qualified");
 			form.oid = CatalogViewFindObject(view, RelationRelationId, name);
+			CatalogViewObjectSetRetained(view, form.oid, schemas[i], contents[i]);
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
 			form.relowner = get_role_oid(owner, false);
@@ -937,26 +949,41 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, RelationRelationId, 0, json_value(definition, "comment"));
 			provider_dependency(&rows, RelationRelationId, form.oid, 0, NamespaceRelationId, form.relnamespace, 0, DEPENDENCY_NORMAL);
-			for (j = 0; j < desc->natts; j++)
 			{
-				Form_pg_attribute attr = TupleDescAttr(desc, j);
+				Datum	   *statistics = palloc0_array(Datum, Max(desc->natts, 1)),
+						   *options = palloc0_array(Datum, Max(desc->natts, 1));
+				bool	   *nostatistics = palloc_array(bool, Max(desc->natts, 1)),
+						   *nooptions = palloc_array(bool, Max(desc->natts, 1));
 
-				int			aslot = provider_catalog_index(AttributeRelationId);
-				HeapTuple	atuple;
-				bool		nullvalue;
-				Datum		value;
+				/* Per-column statistics targets and options, in one statement. */
+				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+				if (SPI_processed != desc->natts)
+					elog(ERROR, "canonical column count mismatch");
+				for (j = 0; j < desc->natts; j++)
+				{
+					Datum		value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nostatistics[j]);
 
-				attr->attrelid = form.oid;
-				atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
-				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM (SELECT $1::jsonb->'columns'->$2 v) s", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(j)), NULL, true);
-				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &nullvalue);
-				if (!nullvalue)
-					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, value);
-				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &nullvalue);
-				if (!nullvalue && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(value)), ARR_DIMS(DatumGetArrayTypeP(value))) > 0)
-					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, value);
-				rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
-				provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
+					if (!nostatistics[j])
+						statistics[j] = value;
+					value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nooptions[j]);
+					if (!nooptions[j])
+						options[j] = PointerGetDatum(DatumGetArrayTypePCopy(value));
+				}
+				for (j = 0; j < desc->natts; j++)
+				{
+					Form_pg_attribute attr = TupleDescAttr(desc, j);
+					int			aslot = provider_catalog_index(AttributeRelationId);
+					HeapTuple	atuple;
+
+					attr->attrelid = form.oid;
+					atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
+					if (!nostatistics[j])
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, statistics[j]);
+					if (!nooptions[j] && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(options[j])), ARR_DIMS(DatumGetArrayTypeP(options[j]))) > 0)
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, options[j]);
+					rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
+					provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
+				}
 			}
 			if (!index)
 			{
@@ -1118,7 +1145,8 @@ provider_reload(CatalogView *view, void *arg)
 		}
 		nest = begin_api();
 		database = unhex(entry->database);
-		(void) metadata(database, "database");
+		if (!object_read(database, "database", NULL, NULL, NULL))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 		provider_populate(view, database, entry->branch);
 		end_api(nest);
 	}
@@ -1138,18 +1166,10 @@ static TransactionId
 provider_creator(bytea *database)
 {
 	TransactionId creator = InvalidTransactionId;
+	bool		found = false;
 
-	run("SELECT xmin FROM pg_catalog.pg_dolt_object WHERE objhash=$1 AND objkind='database'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	if (!SPI_processed)
+	if (!object_creator(database, "database", &found, &creator))
 		elog(ERROR, "canonical catalog root disappeared");
-	for (uint64 i = 0; i < SPI_processed; i++)
-	{
-		TransactionId xid = DatumGetTransactionId(cell(i, 1));
-
-		if (!TransactionIdIsCurrentTransactionId(xid))
-			return InvalidTransactionId;
-		creator = xid;
-	}
 	return creator;
 }
 
@@ -1164,12 +1184,16 @@ provider_lookup(const char *branch, bytea *database)
 	char	   *key = hex(database);
 	DGProvider *entry;
 	CatalogView *view;
+	Oid			user;
+	int			security,
+				nest;
 
 	/*
 	 * Visibility is required even on a cache hit: an aborted object must not
 	 * survive through a backend cache.
 	 */
-	(void) metadata(database, "database");
+	if (!object_read(database, "database", NULL, NULL, NULL))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
 	if (!identity_callback)
 	{
 		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);
@@ -1200,13 +1224,19 @@ provider_lookup(const char *branch, bytea *database)
 	entry->generation = identity_generation;
 	entry->next = providers;
 	providers = entry;
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
+		/* Decoding the schema runs internal SQL, in its own scope. */
+		nest = begin_api();
 		CatalogViewSetCreator(view, provider_creator(database));
 		provider_populate(view, database, branch);
+		end_api(nest);
 	}
 	PG_CATCH();
 	{
+		SetUserIdAndSecContext(user, security);
 		providers = entry->next;
 		pfree(entry->database);
 		if (entry->branch)
@@ -1216,6 +1246,7 @@ provider_lookup(const char *branch, bytea *database)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	SetUserIdAndSecContext(user, security);
 	CatalogViewSetLoader(view, provider_reload, entry);
 	return view;
 }
@@ -1224,22 +1255,6 @@ static CatalogView *
 provider_view(bytea *database)
 {
 	return provider_lookup(NULL, database);
-}
-
-/*
- * A view of schema |database| for questions about its definitions only, such
- * as whether a name exists. Reuses a branch head's view of the same schema so
- * one statement does not decode the schema twice.
- */
-static CatalogView *
-provider_schema_view(bytea *database)
-{
-	char	   *key = hex(database);
-
-	for (DGProvider *entry = providers; entry; entry = entry->next)
-		if (entry->branch && !strcmp(entry->database, key) && provider_current(entry, entry->branch))
-			return provider_lookup(entry->branch, database);
-	return provider_view(database);
 }
 
 /* The current schema of |branch|'s head, with its objects' durable OIDs. */
@@ -1291,35 +1306,10 @@ dg_catalog_durable_content(Oid oid)
 	char	   *branch,
 			   *name;
 	char		kind;
-	bytea	   *working,
-			   *result = NULL;
-	Oid			user;
-	int			security,
-				nest;
 
 	if (!dg_identity_describe(oid, &branch, &kind, &name) || kind != DOLT_IDENTITY_RELATION)
 		return NULL;
-	working = catalog_working_schema(branch);
-	if (!working)
-		return NULL;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PushActiveSnapshot(GetLatestSnapshot());
-	PG_TRY();
-	{
-		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed == 1)
-			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		PopActiveSnapshot();
-		SetUserIdAndSecContext(user, security);
-	}
-	PG_END_TRY();
-	return result;
+	return CatalogViewObjectContent(oid);
 }
 
 /*
@@ -1329,34 +1319,7 @@ dg_catalog_durable_content(Oid oid)
 bytea *
 dg_catalog_revision_content(Oid handle)
 {
-	CatalogView *view = CatalogViewObjectContext(handle);
-	const char *name = CatalogViewObjectIdentity(handle, RelationRelationId);
-	DGProvider *entry;
-	bytea	   *result = NULL;
-	Oid			user;
-	int			security,
-				nest;
-
-	for (entry = providers; entry && entry->view != view; entry = entry->next)
-		;
-	if (!entry || !name)
-		return NULL;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(unhex(entry->database)), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed == 1)
-			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-	}
-	PG_END_TRY();
-	return result;
+	return CatalogViewObjectContent(handle);
 }
 
 /*
@@ -1369,10 +1332,6 @@ dg_catalog_resolve_durable(Oid oid)
 	char	   *branch,
 			   *name;
 	char		kind;
-	Oid			user;
-	int			security,
-				nest;
-	bool		pushed = false;
 	CatalogView *result = NULL;
 	CatalogView *previous;
 
@@ -1383,23 +1342,16 @@ dg_catalog_resolve_durable(Oid oid)
 	/* The schema is read as catalogs are: latest committed, not as of the
 	 * transaction's snapshot. */
 	PushActiveSnapshot(GetLatestSnapshot());
-	pushed = true;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
 		bytea	   *working = catalog_working_schema(branch);
 
-		nest = begin_api();
 		if (working)
 			result = provider_branch_view(branch, working);
-		end_api(nest);
 	}
 	PG_FINALLY();
 	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
+		PopActiveSnapshot();
 		CatalogViewSwitch(previous);
 	}
 	PG_END_TRY();

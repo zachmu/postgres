@@ -150,6 +150,9 @@ typedef struct PlannerGlobal
 	/* other dependencies, as PlanInvalItems */
 	List	   *invalItems;
 
+	/* versioned bindings, as (ref, target, relid) triples; see plancache */
+	List	   *doltRefs;
+
 	/* type OIDs for PARAM_EXEC Params */
 	List	   *paramExecTypes;
 

@@ -130,6 +130,7 @@ extern int	plan_create_index_workers(Oid tableOid, Oid indexOid);
 extern void extract_query_dependencies(Node *query,
 									   List **relationOids,
 									   List **invalItems,
+									   List **doltRefs,
 									   bool *hasRowSecurity);
 
 /* in prep/prepqual.c: */

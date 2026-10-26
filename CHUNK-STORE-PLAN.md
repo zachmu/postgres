@@ -359,6 +359,19 @@ PostgreSQL's own structures.
 6. **History.**
    - Commit and capture record roots without copying.
    - Rekey and dedupe `pg_dolt_object`.
+     - Known defect (2026-10-26): every committed chunk is stored twice, under
+       two different hashes. The live tree lives in `pg_dolt_chunk`, keyed by
+       the SHA-256 of the node bytes, which is also the hash that interior
+       nodes and the `content` field of table objects carry. `export_node` then
+       copies each node into `pg_dolt_object` as a `chunk` object whose
+       `objhash` is the SHA-256 of a `DGMOBJ01` envelope (kind, child count,
+       child object hashes, payload), so the same bytes have a second address
+       and content addressing cannot deduplicate across the two stores.
+       `import_node` reads the copies back one SPI statement per chunk and
+       materializes a whole tree before opening it. Committing one 5,000-row
+       table created 541 chunk objects. The fix is to make `pg_dolt_object`
+       chunk references use the node hash and read history through the chunk
+       store, so a commit records roots without copying.
    - Resolve the working-state duplication found in the audit, including branch
      rename losing uncommitted work.
 7. **Garbage collection.** Define the reachability and safepoint protocol, then

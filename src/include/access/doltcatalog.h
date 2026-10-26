@@ -12,6 +12,8 @@
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
+extern bool dg_catalog_refs_current(List *refs);
+extern void dg_catalog_session_dependency(List **refs);
 extern bool dg_catalog_routine_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_trigger_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
