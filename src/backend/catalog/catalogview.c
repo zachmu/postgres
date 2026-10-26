@@ -72,6 +72,7 @@ struct CatalogView
 	uint64		serial;
 	uint64		references;
 	bool		sealed;
+	bool		partial;
 	List	   *catalogs;
 	List	   *caches;
 	List	   *handles;
@@ -192,6 +193,25 @@ CatalogViewSeal(CatalogView *view)
 {
 	view->sealed = true;
 	view->loaded = true;
+	view->partial = false;
+}
+
+/*
+ * Let a view under construction, or being reloaded, be selected once some of
+ * its catalogs are complete, so that later rows can be bound against earlier
+ * ones. Lookups in catalogs it does not contain yet use the physical catalogs.
+ * Sealing the view ends this state.
+ */
+void
+CatalogViewSetPartial(CatalogView *view, bool partial)
+{
+	view->partial = partial;
+}
+
+bool
+CatalogViewIsPartial(CatalogView *view)
+{
+	return view && view->partial;
 }
 
 void
@@ -233,7 +253,7 @@ CatalogViewSwitch(CatalogView *view)
 {
 	CatalogView *previous = current_view;
 
-	Assert(!view || view->sealed);
+	Assert(!view || view->sealed || view->partial);
 	if (view)
 		CatalogViewEnsureLoaded(view);
 	current_view = view;
@@ -970,7 +990,7 @@ CatalogViewEnsureLoaded(CatalogView *view)
 	if (CatalogViewCreatorAborted(view))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("catalog handle refers to an aborted schema revision")));
-	if (view->loaded)
+	if (view->loaded || view->partial)
 		return;
 	if (!view->loader || view->loading)
 		elog(ERROR, "catalog view cannot reload its rows");

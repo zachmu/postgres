@@ -91,6 +91,21 @@ publish_deletions(List *objects, CatalogView *view)
 				HeapTuple	tuple;
 				Form_pg_constraint con;
 
+				/* A default dropped with a routine it calls, as by CASCADE. */
+				if (object->classId == AttrDefaultRelationId)
+				{
+					ObjectAddress column = GetAttrDefaultColumnAddress(object->objectId);
+
+					if (column.objectId == tableid)
+					{
+						if (get_attgenerated(tableid, column.objectSubId))
+							unsupported("dropping a generation expression with a routine it calls");
+						run("SELECT ($1::jsonb #- ARRAY['columns',($2::int-1)::text,'default'])::text", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(column.objectSubId)), NULL, true);
+						definition = strcell(0, 1);
+						changed = true;
+					}
+					continue;
+				}
 				if (object->classId != ConstraintRelationId)
 					continue;
 				tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(object->objectId));

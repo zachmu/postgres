@@ -26,7 +26,13 @@ schema_expression_check(Node *node, void *context)
 				return false;
 			break;
 		case T_FuncExpr:
-			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId)
+
+			/*
+			 * A versioned routine is deparsed by qualified name and rebound
+			 * by name; a native user function is local to this server.
+			 */
+			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
+				((FuncExpr *) node)->funcid < FirstDurableObjectId)
 				unsupported("canonical expression user-defined function");
 			break;
 		case T_OpExpr:
@@ -139,6 +145,21 @@ schema_expression_sql(Node *expression, Oid relation)
 	return result;
 }
 
+/*
+ * Whether a stored expression calls a routine outside pg_catalog. Stored SQL
+ * qualifies every such name, and only versioned routines are stored.
+ */
+static bool
+schema_expression_calls_routine(Node *node, void *context)
+{
+	if (!node)
+		return false;
+	if (IsA(node, FuncCall) && list_length(((FuncCall *) node)->funcname) > 1 &&
+		strcmp(strVal(linitial(((FuncCall *) node)->funcname)), "pg_catalog"))
+		return true;
+	return raw_expression_tree_walker(node, schema_expression_calls_routine, context);
+}
+
 static Node *
 schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 					   TupleDesc desc, Node *raw, int attribute)
@@ -149,6 +170,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	ParseNamespaceItem *nsitem;
 	Node	   *result = NULL;
 	int			nest = NewGUCNestLevel();
+	CatalogView *previous = CatalogViewCurrent();
 
 	/*
 	 * Bind column Vars from the supplied canonical descriptor. No physical
@@ -164,6 +186,9 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	addNSItemToQuery(pstate, nsitem, true, true, true);
 	PG_TRY();
 	{
+		/* Versioned routines the expression names resolve in its own view. */
+		if (schema_expression_calls_routine(raw, NULL))
+			CatalogViewSwitch(view);
 		if (attribute >= 0)
 			schema_expression_gucs();
 		if (attribute > 0)
@@ -202,6 +227,7 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	}
 	PG_FINALLY();
 	{
+		CatalogViewSwitch(previous);
 		AtEOXact_GUC(true, nest);
 		free_parsestate(pstate);
 	}

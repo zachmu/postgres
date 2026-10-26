@@ -309,6 +309,37 @@ provider_attribute(TupleDesc desc, const char *name)
 	return 0;
 }
 
+typedef struct ProviderRoutineReferences
+{
+	DGProviderRows *rows;
+	Oid			classid;
+	Oid			objid;
+} ProviderRoutineReferences;
+
+/* As recordDependencyOnExpr: an expression depends on the routines it calls. */
+static bool
+provider_routine_references(Node *node, ProviderRoutineReferences *context)
+{
+	if (!node)
+		return false;
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, ProcedureRelationId,
+							((FuncExpr *) node)->funcid, 0, DEPENDENCY_NORMAL);
+	return expression_tree_walker(node, provider_routine_references, context);
+}
+
+static void
+provider_expression_dependencies(DGProviderRows *rows, Oid classid, Oid objid, Node *expression)
+{
+	ProviderRoutineReferences context = {
+		.rows = rows,
+		.classid = classid,
+		.objid = objid,
+	};
+
+	(void) provider_routine_references(expression, &context);
+}
+
 static void
 provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definition)
 {
@@ -358,6 +389,7 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		 */
 		provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation, i + 1,
 							TupleDescAttr(desc, i)->attgenerated ? DEPENDENCY_INTERNAL : DEPENDENCY_AUTO);
+		provider_expression_dependencies(rows, AttrDefaultRelationId, form.oid, expression);
 		if (TupleDescAttr(desc, i)->attgenerated)
 		{
 			Bitmapset  *inputs = NULL;
@@ -474,6 +506,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 			/* Constant checks still depend on their owning relation. */
 			if (!k)
 				provider_dependency(rows, ConstraintRelationId, form.oid, 0, RelationRelationId, relid, 0, DEPENDENCY_AUTO);
+			provider_expression_dependencies(rows, ConstraintRelationId, form.oid, expression);
 		}
 		foreach(lc, constraint->keys)
 		{
@@ -888,6 +921,17 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
 		}
 	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "routine"))
+			provider_routine(&rows, view, definitions[i]);
+
+	/*
+	 * Table expressions may call versioned routines, which they name; the
+	 * routines and their schemas are visible while those are bound.
+	 */
+	CatalogViewAddRows(view, NamespaceRelationId, rows.rows[provider_catalog_index(NamespaceRelationId)]);
+	CatalogViewAddRows(view, ProcedureRelationId, rows.rows[provider_catalog_index(ProcedureRelationId)]);
+	CatalogViewSetPartial(view, true);
+	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table"))
 		{
 			provider_defaults(&rows, view, definitions[i]);
@@ -896,13 +940,11 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "index"))
 			provider_index(&rows, view, definitions[i], n, definitions, kinds);
-	for (i = 0; i < n; i++)
-		if (!strcmp(kinds[i], "routine"))
-			provider_routine(&rows, view, definitions[i]);
 	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
-		CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);
+		if (provider_catalogs[i] != NamespaceRelationId && provider_catalogs[i] != ProcedureRelationId)
+			CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);
 		table_close(rows.relations[i], AccessShareLock);
 	}
 	CatalogViewSeal(view);
