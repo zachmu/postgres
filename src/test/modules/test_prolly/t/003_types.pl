@@ -163,7 +163,7 @@ for my $case (@cases)
  {
   my ($status, $out, $err) = $node->psql('postgres', "CREATE TABLE rejected(v $case->[0]) USING dolt_prolly_table");
   isnt($status, 0, "$case->[0] rejected until user-defined types are versioned");
-  like($err, qr/user-defined column types/, "$case->[0] diagnostic");
+  like($err, qr/user-defined (column )?type/, "$case->[0] diagnostic");
  }
  else { push @portable, $case; }
 }

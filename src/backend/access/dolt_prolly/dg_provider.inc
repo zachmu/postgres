@@ -243,15 +243,19 @@ provider_columns(const char *definition)
 			char	   *storage,
 					   *compression;
 
-			char	   *generated;
+			char	   *generated,
+					   *identity;
 
-			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL,$1::jsonb->'columns'->$2->>'generated'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL,$1::jsonb->'columns'->$2->>'generated',$1::jsonb->'columns'->$2->>'identity'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
 			storage = strcell(0, 1);
 			compression = strcell(0, 2);
 			generated = strcell(0, 4);
+			identity = strcell(0, 5);
 			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
 			if (generated)
 				TupleDescAttr(desc, i)->attgenerated = generated[0];
+			if (identity)
+				TupleDescAttr(desc, i)->attidentity = identity[0];
 			if (storage)
 				TupleDescAttr(desc, i)->attstorage = storage[0];
 			if (compression)
@@ -323,6 +327,20 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		HeapTuple	tuple;
 		int			slot = provider_catalog_index(AttrDefaultRelationId);
 
+		/* An identity column reaches its global sequence by dependency. */
+		if (TupleDescAttr(desc, i)->attidentity)
+		{
+			CatalogView *previous = CatalogViewSwitch(NULL);
+			List	   *qualified;
+			Oid			sequence;
+
+			run("SELECT $1::jsonb->'columns'->$2->>'sequence'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			qualified = stringToQualifiedNameList(strcell(0, 1), NULL);
+			sequence = get_relname_relid(strVal(lsecond(qualified)), get_namespace_oid(strVal(linitial(qualified)), true));
+			CatalogViewSwitch(previous);
+			if (OidIsValid(sequence))
+				provider_dependency(rows, RelationRelationId, sequence, 0, RelationRelationId, relation, i + 1, DEPENDENCY_INTERNAL);
+		}
 		if (!TupleDescAttr(desc, i)->atthasdef)
 			continue;
 		run("SELECT $1::jsonb->'columns'->$2->>'default'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);

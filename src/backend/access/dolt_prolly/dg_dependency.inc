@@ -326,6 +326,13 @@ canonical_drop(Node *statement)
 			ObjectAddress *object = lfirst(lc);
 			Oid			relation = InvalidOid;
 
+			/* A global sequence survives the branch's table it serves. */
+			if (object->classId == RelationRelationId && !CatalogViewObjectContext(object->objectId) &&
+				get_rel_relkind(object->objectId) == RELKIND_SEQUENCE)
+			{
+				targets = foreach_delete_current(targets, lc);
+				continue;
+			}
 			if (object->classId == RelationRelationId)
 				relation = object->objectId;
 			else if (object->classId == ConstraintRelationId)

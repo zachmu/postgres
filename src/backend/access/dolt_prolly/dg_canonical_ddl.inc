@@ -41,6 +41,8 @@ namespace_definition(const char *name)
 	return strcell(0, 1);
 }
 
+static void adopt_schema(Oid schema);
+
 /*
  * A schema created in a repository is versioned on the session's branch, as
  * Doltgres versions schemas. Its physical namespace is shared by all branches.
@@ -49,13 +51,26 @@ void
 dg_catalog_schema_created(Oid schema)
 {
 	char	   *name = get_namespace_name(schema);
-	Oid			user;
-	int			security,
-				nest;
 
 	if (!IsUnderPostmaster || catalog_api_depth || isAnyTempNamespace(schema) ||
 		dg_system_namespace(name) || !dg_catalog_active())
 		return;
+	adopt_schema(schema);
+}
+
+/*
+ * Add physical schema |schema| to the session branch's working schema, unless
+ * it is already there. A schema created before the database had prolly
+ * storage joins the branch with its first versioned table.
+ */
+static void
+adopt_schema(Oid schema)
+{
+	char	   *name = get_namespace_name(schema);
+	Oid			user;
+	int			security,
+				nest;
+
 	CommandCounterIncrement();
 	PushActiveSnapshot(GetLatestSnapshot());
 	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
@@ -152,7 +167,7 @@ dg_catalog_create(Node *statement, const char *query)
 				nest;
 	bool		pushed = false,
 				skip = false;
-	char	   *adopted = NULL;
+	bool		adopt = false;
 	char	   *name;
 	List	   *foreigncmds = NIL;
 	ListCell   *lc;
@@ -206,12 +221,7 @@ dg_catalog_create(Node *statement, const char *query)
 		if (nsdef)
 			catalog_acl(nsdef, "CREATE", user);
 		else
-		{
-			MemoryContext caller = MemoryContextSwitchTo(TopTransactionContext);
-
-			adopted = namespace_definition(stmt->relation->schemaname);
-			MemoryContextSwitchTo(caller);
-		}
+			adopt = true;
 		skip = catalog_contains(read_ref(branch_ref("working")).target, name);
 		if (skip && !stmt->if_not_exists)
 			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", stmt->relation->relname)));
@@ -230,6 +240,11 @@ dg_catalog_create(Node *statement, const char *query)
 		if (pushed)
 			PopActiveSnapshot();
 		return true;
+	}
+	if (adopt)
+	{
+		adopt_schema(namespaceid);
+		UpdateActiveSnapshotCommandId();
 	}
 	stmt->if_not_exists = false;
 	stmt->accessMethod = pstrdup("dolt_prolly_table");
@@ -275,7 +290,7 @@ dg_catalog_create(Node *statement, const char *query)
 		dg_release(empty);
 		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;
-		total = oldcount + k + 1 + (adopted ? 1 : 0);
+		total = oldcount + k + 1;
 		members = palloc_array(Datum, total);
 		for (int i = 0; i < oldcount; i++)
 			members[i] = cell(i, 1);
@@ -287,11 +302,6 @@ dg_catalog_create(Node *statement, const char *query)
 			if (i)
 				appendStringInfoChar(&added, ',');
 			appendStringInfoString(&added, metadata(newmembers[i], i ? "index" : "table"));
-		}
-		if (adopted)
-		{
-			members[total - 1] = PointerGetDatum(put("namespace", adopted, NULL, 0));
-			appendStringInfo(&added, ",{\"kind\":\"namespace\",\"definition\":%s}", adopted);
 		}
 		appendStringInfoChar(&added, ']');
 		run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(added.data)), NULL, true);

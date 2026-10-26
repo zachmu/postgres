@@ -21,7 +21,8 @@ sql(q{BEGIN; CREATE TABLE aborted(id int); INSERT INTO aborted VALUES(1); ROLLBA
 is(sql(q{SELECT to_regclass('aborted') IS NULL}),'t','abort removes canonical table membership');
 sql(q{BEGIN; SAVEPOINT s; CREATE TABLE rolled(id int); ROLLBACK TO s; COMMIT});
 is(sql(q{SELECT to_regclass('rolled') IS NULL}),'t','savepoint rolls back CREATE');
-fails(q{CREATE TABLE unsupported(id int DEFAULT 1)},qr/defaults or generated columns/,'unsupported defaults remain guarded');
+sql(q{CREATE TABLE defaulted(id int DEFAULT 1); INSERT INTO defaulted DEFAULT VALUES});
+is(sql(q{SELECT id FROM defaulted}),'1','CREATE TABLE publishes column defaults on the branch');
 is(sql(q{SELECT to_regclass('unsupported') IS NULL}),'t','rejected CREATE leaves no canonical object');
 sql(q{CREATE TABLE composite(a int,b int,PRIMARY KEY(a,b)); INSERT INTO composite VALUES(1,2)});
 is(sql('SELECT * FROM composite'),'1|2','table-level composite primary key supported');

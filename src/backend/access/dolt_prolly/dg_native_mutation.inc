@@ -80,7 +80,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 
 		if (attr->attisdropped)
 			continue;
-		if (attr->attidentity || (attr->atthasmissing && !native_mutation_destination))
+		if (attr->atthasmissing && !native_mutation_destination)
 			unsupported("canonical native column expression codec");
 		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
 		if (SPI_processed != 1)
@@ -123,6 +123,24 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 					VC_ARGS(CStringGetTextDatum(column), sql ? CStringGetTextDatum(sql) : (Datum) 0, CStringGetTextDatum(generated)),
 					sql ? (attr->attgenerated ? NULL : "  n") : (attr->attgenerated ? " n " : " nn"), true);
 			}
+			column = strcell(0, 1);
+		}
+
+		/* An identity column names its global sequence, never its OID. */
+		if (attr->attidentity)
+		{
+			char		identity[2] = {attr->attidentity, '\0'};
+			CatalogView *outer = CatalogViewSwitch(view);
+			Relation	rel = relation_open(relation, NoLock);
+			Oid			sequence = getIdentitySequence(rel, attr->attnum, false);
+			char	   *name;
+
+			relation_close(rel, NoLock);
+			CatalogViewSwitch(NULL);
+			name = dg_qualified_name(get_namespace_name(get_rel_namespace(sequence)), get_rel_name(sequence));
+			CatalogViewSwitch(outer);
+			run("SELECT ($1::jsonb || jsonb_build_object('identity',$2::text,'sequence',$3::text))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID),
+				VC_ARGS(CStringGetTextDatum(column), CStringGetTextDatum(identity), CStringGetTextDatum(name)), NULL, true);
 			column = strcell(0, 1);
 		}
 		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
@@ -758,6 +776,8 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 	{
 		List	   *commands;
 		List	   *indexes = NIL;
+		List	   *identities = NIL;	/* (column name, sequence OID) */
+		List	   *identity_sequences = NIL;
 		RangeVar   *rv = NULL;
 		Oid			id = InvalidOid;
 		Oid			owner;
@@ -789,6 +809,13 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 				id = DefineRelation((CreateStmt *) command, RELKIND_RELATION, InvalidOid, NULL, query).objectId;
 				CatalogViewNameObject(id, name);
 				native_mutation_relation = id;
+				{
+					/* Storage codecs vet column types before any definition. */
+					Relation	rel = relation_open(id, NoLock);
+
+					dg_validate_descriptor(RelationGetDescr(rel));
+					relation_close(rel, NoLock);
+				}
 				CommandCounterIncrement();
 			}
 			else if (IsA(command, TableLikeClause))
@@ -803,22 +830,39 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 				foreach(oc, sequence->options)
 					if (!strcmp(lfirst_node(DefElem, oc)->defname, "owned_by"))
 						sequence->options = foreach_delete_current(sequence->options, oc);
-				if (sequence->for_identity)
-					unsupported("identity columns on versioned tables");
 				pstate->p_sourcetext = query;
 				CatalogViewSwitch(NULL);
-				DefineSequence(pstate, sequence);
+				{
+					Oid			created = DefineSequence(pstate, sequence).objectId;
+
+					if (sequence->for_identity)
+						identity_sequences = lappend_oid(identity_sequences, created);
+				}
 				CatalogViewSwitch(view);
 				CommandCounterIncrement();
 			}
 			else if (IsA(command, AlterSeqStmt))
 			{
-				/* serial's OWNED BY would tie a global sequence to one branch. */
+				/*
+				 * serial's OWNED BY would tie a global sequence to one branch.
+				 * An identity column still needs to find its sequence.
+				 */
+				AlterSeqStmt *alter = (AlterSeqStmt *) command;
 				ListCell   *oc;
+				Oid			sequence;
 
-				foreach(oc, ((AlterSeqStmt *) command)->options)
-					if (strcmp(lfirst_node(DefElem, oc)->defname, "owned_by"))
+				CatalogViewSwitch(NULL);
+				sequence = RangeVarGetRelid(alter->sequence, NoLock, false);
+				CatalogViewSwitch(view);
+				foreach(oc, alter->options)
+				{
+					DefElem    *option = lfirst_node(DefElem, oc);
+
+					if (strcmp(option->defname, "owned_by"))
 						unsupported("canonical CREATE sequence option");
+					if (list_member_oid(identity_sequences, sequence))
+						identities = lappend(identities, list_make2(llast(castNode(List, option->arg)), (void *) (uintptr_t) sequence));
+				}
 			}
 			else if (IsA(command, IndexStmt))
 			{
@@ -854,6 +898,21 @@ native_create_definitions(Capture current, CreateStmt *statement, const char *qu
 			}
 			else
 				unsupported("canonical CREATE auxiliary command");
+		}
+		/*
+		 * An identity column finds its global sequence through an internal
+		 * dependency, recorded in the branch's catalogs only.
+		 */
+		foreach(lc, identities)
+		{
+			List	   *identity = lfirst(lc);
+			ObjectAddress sequence,
+						column;
+
+			ObjectAddressSet(sequence, RelationRelationId, (Oid) (uintptr_t) lsecond(identity));
+			ObjectAddressSubSet(column, RelationRelationId, id, get_attnum(id, strVal(linitial(identity))));
+			recordDependencyOn(&sequence, &column, DEPENDENCY_INTERNAL);
+			CommandCounterIncrement();
 		}
 		if (indexes)
 		{
