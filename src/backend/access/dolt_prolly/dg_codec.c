@@ -378,15 +378,17 @@ decode_fields(TupleDesc desc, PLSlice bytes)
 	Datum	   *values = palloc0(sizeof(*values) * desc->natts);
 	bool	   *nulls = palloc(sizeof(*nulls) * desc->natts);
 	HeapTuple	result;
+	PLTupleView view;
 	int			i;
 
-	if (bytes.len < 12 || pl_read32(bytes.data + 8) != (uint32) desc->natts)
+	dg_check(pl_tuple_open(bytes, &view));
+	if (view.count != (size_t) desc->natts)
 		dg_unsupported("schema changes to stored tuples");
 	for (i = 0; i < desc->natts; i++)
 	{
 		PLValue		field;
 
-		dg_check(pl_tuple_get(bytes, i, &field));
+		dg_check(pl_tuple_field(&view, i, &field));
 		nulls[i] = !field.present || TupleDescAttr(desc, i)->attisdropped;
 		if (!nulls[i])
 			values[i] = decode_value(TupleDescAttr(desc, i)->atttypid, field.bytes);
