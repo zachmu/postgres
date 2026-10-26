@@ -146,7 +146,7 @@ merge_parent(void)
 	if (!pending.target)
 		return NULL;
 	json = metadata(pending.target, "merge");
-	run("SELECT jsonb_array_length($1::jsonb->'conflicts'),coalesce(jsonb_array_length($1::jsonb->'violations'),0)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT jsonb_array_length($1::jsonb->'conflicts')+coalesce(jsonb_array_length($1::jsonb->'schema_conflicts'),0),coalesce(jsonb_array_length($1::jsonb->'violations'),0)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	if (DatumGetInt32(cell(0, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unresolved merge conflicts")));
 	if (DatumGetInt32(cell(0, 2)))
@@ -292,6 +292,9 @@ json_bytes(StringInfo json, PLValue value)
 		escape_json(json, hex(b));
 	}
 }
+/* Whether conflicting rows are laid out in the merged definition, not their commits'. */
+static bool conflict_merged_layout;
+
 static void
 record_conflict(StringInfo conflicts, const char *name, PLSlice key, PLValue base, PLValue ours, PLValue theirs)
 {
@@ -307,6 +310,8 @@ record_conflict(StringInfo conflicts, const char *name, PLSlice key, PLValue bas
 	json_bytes(conflicts, ours);
 	appendStringInfoString(conflicts, ",\"theirs\":");
 	json_bytes(conflicts, theirs);
+	if (conflict_merged_layout)
+		appendStringInfoString(conflicts, ",\"layout\":\"merged\"");
 	appendStringInfoChar(conflicts, '}');
 }
 
@@ -408,8 +413,37 @@ merge_json_field(Oid type, PLValue * f, PLValue * result)
 }
 
 /* Walk all keys, including identical keyless changes: those still conflict. */
+/*
+ * Merge rows |base|, |ours| and |theirs| of |rel|. When the sides' rows were
+ * laid out again from other definitions, |lacks|[side][column] says which
+ * columns a side's definition lacked: a row only that side has gets their
+ * defaults. Rows hold |width| fields: past those of |rel|, the columns the
+ * merge drops, which only a conflict could keep.
+ */
+static PLSlice
+strip_row(PLSlice row, int width, int natts)
+{
+	PLValue    *fields;
+
+	if (width == natts)
+		return row;
+	fields = palloc_array(PLValue, Max(natts, 1));
+	for (int k = 0; k < natts; k++)
+		dg_check(pl_tuple_get(row, k, &fields[k]));
+	return pack_merge_fields(fields, natts);
+}
+
+static PLValue
+strip_value(PLValue value, int width, int natts)
+{
+	if (value.present)
+		value.bytes = strip_row(value.bytes, width, natts);
+	return value;
+}
+
 static PLTree
-merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *name, StringInfo conflicts)
+merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *name, StringInfo conflicts, bool **lacks,
+		   int width)
 {
 	bool		keyed;
 	PLTree		logical[3],
@@ -431,6 +465,7 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 		PLSlice		key = {0};
 		PLValue		v[3] = {{0}}, value = {0};
 		bool		conflict = false;
+		int			source = 0;
 
 		CHECK_FOR_INTERRUPTS();
 		for (j = 0; j < 3; j++)
@@ -452,21 +487,21 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 			 * equal counts.
 			 */
 			if (equal_value(v[0], v[1]))
-				value = v[2];
+				value = v[2], source = 2;
 			else if (equal_value(v[0], v[2]))
-				value = v[1];
+				value = v[1], source = 1;
 			else
 				conflict = true;
 		}
 		else if (equal_value(v[1], v[2]))
 			value = v[1];
 		else if (equal_value(v[0], v[1]))
-			value = v[2];
+			value = v[2], source = 2;
 		else if (equal_value(v[0], v[2]))
-			value = v[1];
+			value = v[1], source = 1;
 		else if (v[0].present && v[1].present && v[2].present)
 		{
-			int			n = RelationGetDescr(rel)->natts,
+			int			n = width,
 						k;
 			PLValue    *fields = palloc(sizeof(*fields) * n);
 
@@ -480,7 +515,9 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 					fields[k] = f[1];
 				else if (equal_value(f[0], f[1]))
 					fields[k] = f[2];
-				else if ((TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONOID || TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONBOID) && merge_json_field(TupleDescAttr(RelationGetDescr(rel), k)->atttypid, f, &fields[k]))
+				else if (k < RelationGetDescr(rel)->natts &&
+						 (TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONOID || TupleDescAttr(RelationGetDescr(rel), k)->atttypid == JSONBOID) &&
+						 merge_json_field(TupleDescAttr(RelationGetDescr(rel), k)->atttypid, f, &fields[k]))
 					continue;
 				else
 				{
@@ -493,10 +530,23 @@ merge_rows(Relation rel, PLTree base, PLTree ours, PLTree theirs, const char *na
 		}
 		else
 			conflict = true;
+		for (j = 0; j < 3; j++)
+			v[j] = strip_value(v[j], width, RelationGetDescr(rel)->natts);
+		value = strip_value(value, width, RelationGetDescr(rel)->natts);
 		if (conflict)
 		{
 			record_conflict(conflicts, name, key, v[0], v[1], v[2]);
 			value = v[1];
+		}
+		/* A row the other side never had takes defaults for the columns its side lacked. */
+		if (lacks && source && value.present && !v[3 - source].present && !v[0].present)
+		{
+			bool		fill = false;
+
+			for (j = 0; j < RelationGetDescr(rel)->natts; j++)
+				fill |= lacks[source][j];
+			if (fill)
+				value.bytes = fill_row(rel, value.bytes, lacks[source]);
 		}
 		if (value.present)
 			out[used++] = DG_ENTRY(key, value.bytes);
@@ -644,32 +694,69 @@ unique_violations(Relation rel, const PLTree * contents, const char *name, Strin
  * Merge the rows of |tables|, whose definitions are the same in all three
  * states, into the working set.
  */
-static void
-install_database(bytea *base, bytea *ours, bytea *theirs, List *tables, StringInfo conflicts, StringInfo violations)
+/*
+ * A table whose rows merge: its definitions on the base, ours and theirs, if
+ * any differs from its merged definition, so that their rows are laid out
+ * again first. A table both sides added has no base definition.
+ */
+typedef struct RowMerge
 {
-	char	  **names;
-	int			n = 0,
-				i;
+	char	   *table;
+	bool		remap;
+	char	   *definitions[3];
+} RowMerge;
 
-	names = palloc(sizeof(*names) * Max(list_length(tables), 1));
-	foreach_ptr(char, table, tables)
-		names[n++] = table;
-	for (i = 0; i < n; i++)
+static void
+install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringInfo conflicts, StringInfo violations)
+{
+	foreach_ptr(RowMerge, merge, merges)
 	{
-		Relation	rel = dg_catalog_write_table(dg_current_branch(), names[i], ACL_UPDATE);
+		char	   *name = merge->table;
+		Relation	rel = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 		DGState    *state = dg_load(rel, SnapshotSelf);
-		PLTree		right = dg_history_import(state->store, table_chunk(theirs, names[i])),
+		PLTree		right = dg_history_import(state->store, table_chunk(theirs, name)),
 					result = right;
 
 		if (base)
 		{
-			PLTree		left = dg_history_import(state->store, table_chunk(ours, names[i]));
-			PLTree		ancestor = dg_history_import(state->store, table_chunk(base, names[i]));
+			PLTree		left = dg_history_import(state->store, table_chunk(ours, name));
+			PLTree		ancestor;
+			bool	   *lacks[3] = {NULL};
+			bool		keyed = OidIsValid(RelationGetPrimaryKeyIndex(rel, false));
 
+			/*
+			 * The base's columns the merge drops; a side may have changed
+			 * them. A keyless row has no identity to conflict on.
+			 */
+			List	   *dropped = merge->remap && keyed ? merge_dropped_columns(rel, merge->definitions[0]) : NIL;
+
+			if (merge->remap && !merge->definitions[0])
+				dg_check(pl_build(state->store, NULL, 0, &ancestor));
+			else
+				ancestor = dg_history_import(state->store, table_chunk(base, name));
+			if (merge->remap)
+			{
+				PLTree	   *sides[3] = {&ancestor, &left, &right};
+
+				for (int side = 0; side < 3; side++)
+				{
+					lacks[side] = palloc0_array(bool, Max(RelationGetDescr(rel)->natts, 1));
+					if (merge->definitions[side])
+						*sides[side] = remap_rows(rel, *sides[side], merge->definitions[side], dropped, lacks[side]);
+					if (!keyed)
+						*sides[side] = fill_rows(rel, *sides[side], lacks[side]);
+				}
+			}
 			{
 				int			before = conflicts->len;
 
-				result = merge_rows(rel, ancestor, left, right, names[i], conflicts);
+				/* Set for every merge: an error may leave it set. */
+				conflict_merged_layout = merge->remap;
+				result = merge_rows(rel, ancestor, left, right, name, conflicts, merge->remap && keyed ? lacks : NULL,
+									RelationGetDescr(rel)->natts + list_length(dropped));
+				conflict_merged_layout = false;
+				if (merge->remap && violations)
+					result = check_violations(rel, result, name, violations);
 				if (!unique_contents(rel, &result))
 				{
 					/*
@@ -681,7 +768,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, List *tables, StringIn
 					conflicts->len = before;
 					conflicts->data[before] = '\0';
 					if (violations)
-						unique_violations(rel, &result, names[i], violations);
+						unique_violations(rel, &result, name, violations);
 					result = left;
 				}
 			}
@@ -720,6 +807,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			   *commit = NULL;
 	StringInfoData conflicts,
 				violations,
+				schema_conflicts,
 				json;
 	Datum		values[4];
 	bool		nulls[4] = {false, false, false, false};
@@ -790,7 +878,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	merge_databases(child(base, 1), oursdb, their_db, &conflicts, &violations);
+	initStringInfo(&schema_conflicts);
+	merge_databases(child(base, 1), oursdb, their_db, &conflicts, &violations, &schema_conflicts);
 	database = capture(true).hash;
 
 	/*
@@ -805,14 +894,14 @@ dolt_merge(PG_FUNCTION_ARGS)
 		if (squash)
 			commit = theirs;
 	}
-	if (conflicts.len || violations.len || nocommit)
+	if (conflicts.len || violations.len || schema_conflicts.len || nocommit)
 	{
 		initStringInfo(&json);
 		appendStringInfo(&json, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", squash ? "true" : "false");
 		escape_json(&json, revision);
-		appendStringInfo(&json, ",\"conflicts\":[%s],\"violations\":[%s]}", conflicts.data, violations.data);
+		appendStringInfo(&json, ",\"conflicts\":[%s],\"violations\":[%s],\"schema_conflicts\":[%s]}", conflicts.data, violations.data, schema_conflicts.data);
 		move_ref(branch_ref("merge"), pending, put("merge", json.data, VC_ARGS(PointerGetDatum(head.target), PointerGetDatum(theirs), PointerGetDatum(base)), 3));
-		conflicted = (conflicts.len || violations.len) ? 1 : 0;
+		conflicted = (conflicts.len || violations.len || schema_conflicts.len) ? 1 : 0;
 		result_message = conflicted ? "conflicts found" : "merge successful";
 	}
 	else if (!squash)
@@ -856,6 +945,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			  **records;
 	VersionRef	pending;
 	StringInfoData remaining,
+				schema_remaining,
 				updated;
 	Datum		parents[3];
 	bool		theirs;
@@ -876,7 +966,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 
 		if (!strcmp(args[i], "."))
 			continue;
-		run("SELECT count(DISTINCT v->>'table')::int FROM jsonb_array_elements($1::jsonb->'conflicts') v WHERE v->>'table'=$2 OR (array_length(parse_ident($2),1)=1 AND (parse_ident(v->>'table'))[2]=(parse_ident($2))[1])", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(args[i])), NULL, true);
+		run("SELECT count(DISTINCT v->>'table')::int FROM jsonb_array_elements($1::jsonb->'conflicts' || coalesce($1::jsonb->'schema_conflicts','[]')) v WHERE v->>'table'=$2 OR CASE WHEN strpos($2,'(')>0 OR strpos(v->>'table','(')>0 THEN false ELSE array_length(parse_ident($2),1)=1 AND (parse_ident(v->>'table'))[2]=(parse_ident($2))[1] END", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(args[i])), NULL, true);
 		matches = DatumGetInt32(cell(0, 1));
 		if (matches > 1)
 			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous conflict table: %s", args[i])));
@@ -945,11 +1035,42 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		}
 	}
 	validate_working_foreign_keys(dg_current_branch());
+
+	/*
+	 * A schema conflict resolves to one side's whole object: ours is already
+	 * in the working set; theirs replaces it, with a table's rows. (Dolt
+	 * cannot resolve these yet; ALTER TABLE on one side and merging again
+	 * still works.)
+	 */
+	run("SELECT v::text FROM jsonb_array_elements(coalesce($1::jsonb->'schema_conflicts','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	count = SPI_processed;
+	records = palloc(sizeof(*records) * Max(count, 1));
+	for (i = 0; i < count; i++)
+		records[i] = strcell(i, 1);
+	initStringInfo(&schema_remaining);
+	for (i = 0; i < count; i++)
+	{
+		char	   *name = json_value(records[i], "table");
+		bool		selected = false;
+
+		for (int j = 1; j < n; j++)
+			if (!strcmp(args[j], ".") || !strcmp(args[j], name) ||
+				(!strchr(name, '(') && !strcmp(args[j], strVal(llast(stringToQualifiedNameList(name, NULL))))))
+				selected = true;
+		if (!selected)
+		{
+			if (schema_remaining.len)
+				appendStringInfoChar(&schema_remaining, ',');
+			appendStringInfoString(&schema_remaining, records[i]);
+		}
+		else if (theirs)
+			restore_table(child((bytea *) DatumGetPointer(parents[1]), 1), name);
+	}
 	initStringInfo(&updated);
 	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", json_value(json, "squash") ? json_value(json, "squash") : "false");
 	escape_json(&updated, json_value(json, "source") ? json_value(json, "source") : "");
 	run("SELECT coalesce(($1::jsonb->'violations')::text,'[]')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
-	appendStringInfo(&updated, ",\"conflicts\":[%s],\"violations\":%s}", remaining.data, strcell(0, 1));
+	appendStringInfo(&updated, ",\"conflicts\":[%s],\"violations\":%s,\"schema_conflicts\":[%s]}", remaining.data, strcell(0, 1), schema_remaining.data);
 	move_ref(branch_ref("merge"), pending, put("merge", updated.data, parents, 3));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	end_api(nest);

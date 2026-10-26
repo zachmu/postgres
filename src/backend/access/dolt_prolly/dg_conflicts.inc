@@ -234,6 +234,15 @@ pending_merge_commits(bytea **ours, bytea **theirs, bytea **base, char **json)
 	return true;
 }
 
+/* Whether |table|'s conflicting rows are laid out in its merged definition. */
+static bool
+conflicts_merged(const char *json, const char *table)
+{
+	run("SELECT EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb->'conflicts') v WHERE v->>'table'=$2 AND v->>'layout'='merged')", 2,
+		VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(table)), NULL, true);
+	return DatumGetBool(cell(0, 1));
+}
+
 /* Layout for dolt_conflicts_<t> and dolt_preview_merge_conflicts(). */
 static TupleDesc
 conflict_layout(const char *table, const char *from, const char *to)
@@ -263,7 +272,7 @@ conflict_layout(const char *table, const char *from, const char *to)
 		ours = diff_table_schema("WORKING", table);
 		if (!ours->present)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", table)));
-		if (pending_merge_commits(&oursc, &theirsc, &basec, &json))
+		if (pending_merge_commits(&oursc, &theirsc, &basec, &json) && !conflicts_merged(json, table))
 		{
 			base = diff_table_at(child(basec, 1), table, false);
 			theirs = diff_table_at(child(theirsc, 1), table, false);
@@ -298,9 +307,14 @@ dolt_conflicts_table(PG_FUNCTION_ARGS)
 		end_api(nest);
 		return (Datum) 0;
 	}
-	base = diff_table_at(child(basec, 1), name, false);
-	ours = diff_table_at(child(oursc, 1), name, false);
-	theirs = diff_table_at(child(theirsc, 1), name, false);
+	if (conflicts_merged(json, name))
+		base = ours = theirs = diff_table_schema("WORKING", name);
+	else
+	{
+		base = diff_table_at(child(basec, 1), name, false);
+		ours = diff_table_at(child(oursc, 1), name, false);
+		theirs = diff_table_at(child(theirsc, 1), name, false);
+	}
 	e.rsinfo = rsinfo;
 	e.root_ish = hex(theirsc);
 	e.base = base;
@@ -499,12 +513,31 @@ preview_branch(const char *name, bool summary)
 	return NULL;
 }
 
-/* Schema conflict: both sides changed the table definition differently. */
-static bool
-schema_conflict(const char *basejson, const char *oursjson, const char *theirsjson, const char *name)
+/*
+ * How table |name|'s definitions merge: 1 if they conflict, 0 if they are the
+ * same on all sides or one side's is taken, and -1 if they merge column by
+ * column, so the sides' rows are laid out differently.
+ */
+static int
+schema_conflict(bytea *base, bytea *ours, bytea *theirs, const char *name)
 {
-	run("WITH b AS (SELECT v->>'schema' s FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),o AS (SELECT v->>'schema' s FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4),t AS (SELECT v->>'schema' s FROM jsonb_array_elements($3::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$4) SELECT (SELECT s FROM o) IS DISTINCT FROM (SELECT s FROM t) AND (SELECT s FROM o) IS DISTINCT FROM (SELECT s FROM b) AND (SELECT s FROM t) IS DISTINCT FROM (SELECT s FROM b)", 4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(basejson), CStringGetTextDatum(oursjson), CStringGetTextDatum(theirsjson), CStringGetTextDatum(name)), NULL, true);
-	return DatumGetBool(cell(0, 1));
+	int			counts[3];
+	Member	   *sides[3] = {
+		database_members(base, &counts[0]),
+		database_members(ours, &counts[1]),
+		database_members(theirs, &counts[2]),
+	};
+	char	   *defs[3];
+	StringInfoData description;
+
+	for (int side = 0; side < 3; side++)
+		defs[side] = member_definition(merge_member(sides[side], counts[side], "table", name));
+	if (json_equal(defs[1], defs[2]) || json_equal(defs[0], defs[1]) || json_equal(defs[0], defs[2]))
+		return 0;
+	initStringInfo(&description);
+	if (!defs[1] || !defs[2])
+		return 1;
+	return merge_table_definition(name, defs[0], defs[1], defs[2], &description) ? -1 : 1;
 }
 
 static void
@@ -522,8 +555,7 @@ dolt_preview_merge_conflicts_summary(PG_FUNCTION_ARGS)
 	bytea	   *oursc = preview_branch(args[0], true),
 			   *theirsc = preview_branch(args[1], true),
 			   *basec = merge_base(oursc, theirsc);
-	char	   *basejson = metadata(child(basec, 1), "database"),
-			   *oursjson = metadata(child(oursc, 1), "database"),
+	char	   *oursjson = metadata(child(oursc, 1), "database"),
 			   *theirsjson = metadata(child(theirsc, 1), "database");
 	char	  **names;
 	int			n,
@@ -542,7 +574,12 @@ dolt_preview_merge_conflicts_summary(PG_FUNCTION_ARGS)
 		bool		nulls[3] = {false, false, false};
 		int64		conflicts = 0;
 
-		if (schema_conflict(basejson, oursjson, theirsjson, names[i]))
+		int			state = schema_conflict(child(basec, 1), child(oursc, 1), child(theirsc, 1), names[i]);
+
+		/* Rows laid out by different definitions are not previewed. */
+		if (state < 0)
+			continue;
+		if (state > 0)
 		{
 			values[0] = CStringGetTextDatum(names[i]);
 			nulls[1] = true;
@@ -581,8 +618,7 @@ dolt_preview_merge_conflicts(PG_FUNCTION_ARGS)
 	bytea	   *oursc = preview_branch(args[0], false),
 			   *theirsc = preview_branch(args[1], false),
 			   *basec = merge_base(oursc, theirsc);
-	char	   *basejson = metadata(child(basec, 1), "database"),
-			   *oursjson = metadata(child(oursc, 1), "database"),
+	char	   *oursjson = metadata(child(oursc, 1), "database"),
 			   *theirsjson = metadata(child(theirsc, 1), "database");
 	char	   *name = resolve_table_argument(args[2], oursjson, theirsjson, true);
 	DiffTable  *base,
@@ -591,7 +627,7 @@ dolt_preview_merge_conflicts(PG_FUNCTION_ARGS)
 	ConflictEmit e;
 
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
-	if (schema_conflict(basejson, oursjson, theirsjson, name))
+	if (schema_conflict(child(basec, 1), child(oursc, 1), child(theirsc, 1), name) > 0)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("schema conflicts found: 1")));
 	base = diff_table_at(child(basec, 1), name, true);
 	ours = diff_table_at(child(oursc, 1), name, true);

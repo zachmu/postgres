@@ -113,6 +113,19 @@ extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);
 #define DG_ROWS_KIND(relkind) ((relkind) == RELKIND_RELATION || (relkind) == RELKIND_MATVIEW)
 
 extern PLSlice dg_encode_value(Oid type, Datum value);
+extern Datum dg_decode_value(Oid type, PLSlice bytes);
+
+typedef struct DGConversion
+{
+	Oid			from;
+	Oid			to;
+	struct ParamListInfoData *params;
+	struct ExprState *state;
+	struct ExprContext *context;
+} DGConversion;
+
+extern DGConversion *dg_conversion_begin(Oid from, Oid to, int32 typmod);
+extern PLSlice dg_conversion_apply(DGConversion *conversion, PLSlice bytes);
 extern PLSlice dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed);
 extern PLSlice dg_recode_composite(Oid type, PLSlice bytes, Oid target, int count, const int *mapping);
 extern bool dg_key_ordered(Oid type);

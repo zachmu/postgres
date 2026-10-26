@@ -137,7 +137,14 @@ static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
 static void replace_working(const char *branch, bytea *database, List *tables);
-static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations);
+static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
+							StringInfo schema_conflicts);
+static PLTree remap_rows(Relation rel, PLTree content, const char *definition, List *dropped, bool *lacks);
+static void restore_table(bytea *db, const char *name);
+static PLSlice fill_row(Relation rel, PLSlice row, const bool *fill);
+static PLTree fill_rows(Relation rel, PLTree content, const bool *fill);
+static List *merge_dropped_columns(Relation rel, const char *base);
+static PLTree check_violations(Relation rel, PLTree content, const char *name, StringInfo violations);
 static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
@@ -1325,6 +1332,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_routine_ddl.inc"
 
 #include "dg_alter.inc"
+#include "dg_schema_merge.inc"
 #include "dg_dependency.inc"
 #include "dg_trigger_ddl.inc"
 #include "dg_type_ddl.inc"
