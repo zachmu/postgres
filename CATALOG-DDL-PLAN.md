@@ -1,6 +1,8 @@
 # Branch-local DDL viability gate
 
-> Current direction: see [the latest clarification](#current-execution-plan-and-ddl-semantics-clarification--2026-10-22).
+> Current direction: see [the latest clarification](#current-execution-plan-and-ddl-semantics-clarification--2026-10-22)
+> and [versioned schema objects](#versioned-schema-objects--2026-10-26), which records what is
+> implemented and the decisions made since.
 > Earlier runtime-name/private-namespace proposals are historical and superseded
 > where they conflict with that clarification.
 
@@ -146,7 +148,8 @@ remove guards incrementally. Existing table reads alone cannot establish success
 
 ## Non-goals and unresolved questions
 
-Schema merge, general multi-branch writes, full PostgreSQL DDL coverage, optimized
+Schema merge (see [versioned schema objects](#versioned-schema-objects--2026-10-26) for the
+object-level merge since implemented), general multi-branch writes, full PostgreSQL DDL coverage, optimized
 historical index access and removal of all writer serialization are not implied by
 this gate. Existing guards remain for unsupported cases. Function lookup syntax,
 versioned view ownership, catalog introspection context, runtime OID lifetimes and
@@ -445,3 +448,71 @@ old-snapshot/recreation authority remains deferred in KNOWN-ISSUES.md.
 Docs, stored tests and saved queries are public prolly tables reached through
 built-in aliases. The six administrative heap tables now use native catalog
 headers, C-collated text indexes and valid pg_proc argument metadata.
+
+## Versioned schema objects — 2026-10-26
+
+Implemented and merged into `zachmu/doltgres-rewrite`: versioned CREATE TABLE
+(`af927e91761`), CREATE TABLE AS (`46cb92a3fc0`), routines, triggers and
+object-level schema merge (`6c06fa14602`), and user-defined types
+(`15ca840a0ae`). Reports: `reports/versioned-create.html`,
+`reports/versioned-routines.html`, `reports/versioned-types.html`.
+
+### Decisions
+
+- **Every schema object is versioned, branched and mergeable.** Tables,
+  indexes, namespaces, routines (functions and procedures), triggers and
+  user-defined types (enums, domains, composites) are members of a database
+  root. Each has a portable serialization: SQL text and names, never OIDs or
+  anything else outside prolly storage, and nothing that depends on history.
+  The catalog provider rebuilds native catalog rows from these when it builds
+  a branch's catalog view.
+- **Native DDL in provisional views.** DDL on a versioned object runs
+  PostgreSQL's own code against a provisional copy of the branch's catalogs.
+  The affected objects are then encoded from the rows native code wrote and
+  published. Native validation and messages therefore apply unchanged.
+- **Sequences are global per database,** shared by all branches, as in
+  Doltgres. `serial` and identity sequences are created natively and unowned,
+  and dropping a versioned table keeps them.
+- **Table options with no effect on prolly storage are ignored**
+  (reloptions, tablespaces), after native validation.
+- **Triggers are members of their own,** named `schema.table/trigger`, not
+  part of their table's definition, so adding one does not change the table
+  (as Dolt keeps triggers in `dolt_schemas`).
+- **Enum values are stored by label** (the bytes `enum_send` writes), which
+  is portable and independent of history. PostgreSQL stores the label's
+  pg_enum OID and renames for free. Here, renaming a label rewrites the rows
+  that use it; renames are expected to be expensive.
+- **Definitions refer to other objects by qualified name.** Renaming an object
+  rewrites the definitions that refer to it. To make that possible without
+  scanning every schema object, a database root will keep a persistent record
+  of dependencies (which objects refer to which others), maintained as schema
+  changes are published.
+- **Schema merge is object by object.** An object added, changed or dropped
+  on one side takes that side; a table whose definition is unchanged has its
+  rows merged as before; anything else changed on both sides is a schema
+  conflict. Merge, cherry-pick, revert and rebase use this. Stash pop still
+  requires identical definitions.
+- A database becomes versioned at its first versioned table; objects created
+  before that stay native. Native objects cannot depend on versioned ones
+  (for example, a heap table cannot use a versioned type).
+
+### Future work
+
+- **Dependency record and renames:** the persistent dependency record above,
+  then RENAME of tables, routines and types that rewrites dependent
+  definitions (columns, signatures, stored expressions, trigger members), and
+  ALTER TYPE ... RENAME VALUE that rewrites dependent rows. Both renames are
+  rejected today when the object is in use.
+- **Column-level schema merge:** a table whose definition changed on one side
+  and rows on the other, or whose definition changed on both sides.
+- **Schema conflicts as data,** in `dolt_schema_conflicts`, resolvable,
+  instead of an error.
+- **Index key encodings** for more types (enums by label order, dates,
+  timestamps, and others) and their operator classes.
+- **Remaining DDL:** partitioning and inheritance; unlogged and temporary
+  prolly tables; deferrable constraints; materialized views and views; range
+  types; ALTER TYPE ADD/DROP/ALTER ATTRIBUTE; DROP ... CASCADE that drops table
+  columns; ALTER TRIGGER and ENABLE/DISABLE TRIGGER; constraint triggers;
+  BEGIN ATOMIC routine bodies; COMMENT ON routines; identity ALTERs.
+- **Ownership and ACLs** remain a separate design: role identities stay out of
+  versioned storage, like OIDs.

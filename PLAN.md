@@ -736,6 +736,8 @@ The native branch-and-merge slice now implements independent session data views,
 checkout, merge-base discovery, fast-forward/no-op and unchanged-schema three-way
 merges. Conflicts return status flags and preserve heap/WAL-backed evidence and
 pending parents for resolution or abort. Schema merges remain excluded.
+(Since 2026-10-26, schemas merge object by object; see
+[versioned schema objects](CATALOG-DDL-PLAN.md#versioned-schema-objects--2026-10-26).)
 See the [implementation contract](postgres/postgres/doc/doltgres/branch-merge.md)
 and [milestone report](reports/branch-merge.html) for decisions, tests and limits.
 

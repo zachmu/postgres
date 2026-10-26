@@ -204,8 +204,10 @@ Outstanding from this plan:
   system columns such as tableoid (pg_dump fails), and do not route by
   revision OIDs in their quals.
 
-Versioned DDL that does not exist yet, each needing a design checkpoint;
-these statements fail cleanly on versioned tables today:
+Versioned DDL that did not exist yet at this milestone, each needing a design
+checkpoint. Most of it has since been implemented; see
+[versioned schema objects](CATALOG-DDL-PLAN.md#versioned-schema-objects--2026-10-26)
+for what remains:
 
 - Ownership and ACLs (GRANT/REVOKE, OWNER TO, privilege checks). Role
   identities should likely stay out of versioned storage, like OIDs.
