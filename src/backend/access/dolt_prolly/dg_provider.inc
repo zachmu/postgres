@@ -243,10 +243,15 @@ provider_columns(const char *definition)
 			char	   *storage,
 					   *compression;
 
-			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
+			char	   *generated;
+
+			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL,$1::jsonb->'columns'->$2->>'generated'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
 			storage = strcell(0, 1);
 			compression = strcell(0, 2);
+			generated = strcell(0, 4);
 			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
+			if (generated)
+				TupleDescAttr(desc, i)->attgenerated = generated[0];
 			if (storage)
 				TupleDescAttr(desc, i)->attstorage = storage[0];
 			if (compression)
@@ -336,7 +341,24 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_attrdef_adnum);
 		tuple = provider_set(rows->relations[slot], tuple, Anum_pg_attrdef_adbin, CStringGetTextDatum(nodeToString(expression)));
 		rows->rows[slot] = lappend(rows->rows[slot], tuple);
-		provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation, i + 1, DEPENDENCY_AUTO);
+		/*
+		 * As StoreAttrDefault records: a default belongs to its column, while
+		 * a generation expression is part of its column and depends on its
+		 * inputs, which then cannot be dropped alone.
+		 */
+		provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation, i + 1,
+							TupleDescAttr(desc, i)->attgenerated ? DEPENDENCY_INTERNAL : DEPENDENCY_AUTO);
+		if (TupleDescAttr(desc, i)->attgenerated)
+		{
+			Bitmapset  *inputs = NULL;
+			int			input = -1;
+
+			pull_varattnos(expression, 1, &inputs);
+			while ((input = bms_next_member(inputs, input)) >= 0)
+				if (input + FirstLowInvalidHeapAttributeNumber != i + 1)
+					provider_dependency(rows, AttrDefaultRelationId, form.oid, 0, RelationRelationId, relation,
+										input + FirstLowInvalidHeapAttributeNumber, DEPENDENCY_NORMAL);
+		}
 	}
 }
 

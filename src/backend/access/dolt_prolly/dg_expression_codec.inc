@@ -153,7 +153,22 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 		{
 			Form_pg_attribute attr = TupleDescAttr(desc, attribute - 1);
 
-			result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
+			if (attr->attgenerated)
+			{
+				/*
+				 * As cookDefault, but the native DDL that stored this
+				 * expression has already checked the generated-column rules,
+				 * which the half-built view cannot answer.
+				 */
+				result = transformExpr(pstate, raw, EXPR_KIND_GENERATED_COLUMN);
+				result = coerce_to_target_type(pstate, result, exprType(result), attr->atttypid, attr->atttypmod,
+											   COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+				if (!result)
+					elog(ERROR, "canonical generation expression has the wrong type");
+				assign_expr_collations(pstate, result);
+			}
+			else
+				result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
 		}
 		else if (attribute < 0)
 		{

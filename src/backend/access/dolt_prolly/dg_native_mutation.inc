@@ -80,7 +80,7 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 
 		if (attr->attisdropped)
 			continue;
-		if (attr->attidentity || attr->attgenerated || (attr->atthasmissing && !native_mutation_destination))
+		if (attr->attidentity || (attr->atthasmissing && !native_mutation_destination))
 			unsupported("canonical native column expression codec");
 		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
 		if (SPI_processed != 1)
@@ -115,7 +115,14 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 			PG_END_TRY();
 			if (attr->atthasdef != (sql != NULL))
 				elog(ERROR, "native attribute/default catalogs disagree");
-			run("SELECT (($1::jsonb-'default') || jsonb_strip_nulls(jsonb_build_object('default',$2::text)))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(column), sql ? CStringGetTextDatum(sql) : (Datum) 0), sql ? NULL : " n", true);
+			{
+				/* A generated column's expression is its default's, with a kind. */
+				char		generated[2] = {attr->attgenerated, '\0'};
+
+				run("SELECT (($1::jsonb-'default'-'generated') || jsonb_strip_nulls(jsonb_build_object('default',$2::text,'generated',$3::text)))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID),
+					VC_ARGS(CStringGetTextDatum(column), sql ? CStringGetTextDatum(sql) : (Datum) 0, CStringGetTextDatum(generated)),
+					sql ? (attr->attgenerated ? NULL : "  n") : (attr->attgenerated ? " n " : " nn"), true);
+			}
 			column = strcell(0, 1);
 		}
 		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
