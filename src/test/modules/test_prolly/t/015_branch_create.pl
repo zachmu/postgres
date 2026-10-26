@@ -21,14 +21,15 @@ sql(q{BEGIN; CREATE TABLE aborted(id int); INSERT INTO aborted VALUES(1); ROLLBA
 is(sql(q{SELECT to_regclass('aborted') IS NULL}),'t','abort removes canonical table membership');
 sql(q{BEGIN; SAVEPOINT s; CREATE TABLE rolled(id int); ROLLBACK TO s; COMMIT});
 is(sql(q{SELECT to_regclass('rolled') IS NULL}),'t','savepoint rolls back CREATE');
-fails(q{CREATE TABLE unsupported(id int DEFAULT 1)},qr/defaults or generated columns/,'unsupported defaults remain guarded');
+sql(q{CREATE TABLE defaulted(id int DEFAULT 1); INSERT INTO defaulted DEFAULT VALUES});
+is(sql(q{SELECT id FROM defaulted}),'1','CREATE TABLE publishes column defaults on the branch');
 is(sql(q{SELECT to_regclass('unsupported') IS NULL}),'t','rejected CREATE leaves no canonical object');
 sql(q{CREATE TABLE composite(a int,b int,PRIMARY KEY(a,b)); INSERT INTO composite VALUES(1,2)});
 is(sql('SELECT * FROM composite'),'1|2','table-level composite primary key supported');
 sql(q{CREATE INDEX additional_index ON new_table(id)});
 is(sql(q{SELECT count(*) FROM pg_indexes WHERE indexname='additional_index'}),'1','standalone index DDL publishes canonical membership');
 sql(q{DROP INDEX additional_index});
-fails(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)},qr/index properties/, 'deferred constraint remains rejected');
+fails(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)},qr/deferred constraint/, 'deferred constraint remains rejected');
 fails(q{CREATE TABLE bad_index(id json PRIMARY KEY)},qr/default operator class/, 'native index creation failure aborts entire CREATE');
 is(sql(q{SELECT to_regclass('bad_index') IS NULL}),'t','failed index leaves no canonical table');
 sql(q{CREATE TABLE after_failure(id int PRIMARY KEY); INSERT INTO after_failure VALUES(4)});

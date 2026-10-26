@@ -1285,6 +1285,9 @@ heap_create_with_catalog(const char *relname,
 			}
 		}
 
+		/* A relation created in a provisional branch catalog gets a handle. */
+		if (!OidIsValid(relid) && CatalogViewIsProvisional(CatalogViewCurrent()))
+			relid = CatalogViewNewObject(RelationRelationId);
 		if (!OidIsValid(relid))
 			relid = GetNewRelFileNumber(reltablespace, pg_class_desc,
 										relpersistence);

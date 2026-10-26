@@ -69,6 +69,7 @@
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
+#include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "parser/parse_utilcmd.h"

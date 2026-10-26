@@ -46,6 +46,7 @@
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
+#include "catalog/catalogview.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -4293,7 +4294,13 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 
 	/* Look up the relevant pg_default_acl entries */
 	glob_acl = get_default_acl_internal(ownerId, InvalidOid, defaclobjtype);
-	schema_acl = get_default_acl_internal(ownerId, nsp_oid, defaclobjtype);
+
+	/*
+	 * TODO: default privileges of a branch's schemas, with the ownership and
+	 * ACL design. A versioned schema is not a physical namespace.
+	 */
+	schema_acl = nsp_oid >= FirstDurableObjectId ? NULL :
+		get_default_acl_internal(ownerId, nsp_oid, defaclobjtype);
 
 	/* Quick out if neither entry exists */
 	if (glob_acl == NULL && schema_acl == NULL)

@@ -22,6 +22,7 @@
 
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/catalogview.h"
 #include "access/doltcatalog.h"
 #include "catalog/pg_db_role_setting_d.h"
@@ -248,14 +249,15 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 	{
 		/*
 		 * Views hold built-in rows and branch objects only. A native user
-		 * object, unversioned, is always in the physical catalogs.
+		 * object, unversioned, is always in the physical catalogs, and so is
+		 * the physical public schema, which a view replaces with its own.
 		 */
 		for (i = 0; i < nkeys; i++)
 		{
 			Oid			key = DatumGetObjectId(keys[i]);
 
 			if (TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid == OIDOID &&
-				key >= FirstNormalObjectId && key < FirstDurableObjectId)
+				((key >= FirstNormalObjectId && key < FirstDurableObjectId) || key == PG_PUBLIC_NAMESPACE))
 				return NULL;
 		}
 	}

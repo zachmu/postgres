@@ -79,6 +79,7 @@ extern void CatalogViewBeginMutation(CatalogView *view);
 extern void CatalogViewSetMutationValidator(CatalogView *view, void (*validator) (Relation, HeapTuple));
 extern bool CatalogViewIsProvisional(CatalogView *view);
 extern Oid	CatalogViewNewObject(Oid catalog);
+extern void CatalogViewNameObject(Oid handle, const char *identity);
 extern void CatalogViewMutationCommandEnd(void);
 extern List *CatalogViewTuples(CatalogView *view, Oid catalog);
 extern void CatalogViewRetireMutation(CatalogView *view);

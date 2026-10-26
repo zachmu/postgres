@@ -17,6 +17,13 @@ schema_expression_check(Node *node, void *context)
 				unsupported("canonical expression whole-row or external reference");
 			break;
 		case T_Const:
+
+			/*
+			 * A relation reference, such as a sequence for nextval(), is
+			 * deparsed by name and rebound by name: portable SQL, never an OID.
+			 */
+			if (((Const *) node)->consttype == REGCLASSOID)
+				return false;
 			break;
 		case T_FuncExpr:
 			if (((FuncExpr *) node)->funcid >= FirstNormalObjectId)
@@ -71,6 +78,9 @@ schema_expression_gucs(void)
 	set_config_option("extra_float_digits", "3", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("bytea_output", "hex", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	set_config_option("standard_conforming_strings", "on", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+
+	/* User relations, such as sequences, are always written schema-qualified. */
+	set_config_option("search_path", "", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
 
 static List *
@@ -143,7 +153,22 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 		{
 			Form_pg_attribute attr = TupleDescAttr(desc, attribute - 1);
 
-			result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
+			if (attr->attgenerated)
+			{
+				/*
+				 * As cookDefault, but the native DDL that stored this
+				 * expression has already checked the generated-column rules,
+				 * which the half-built view cannot answer.
+				 */
+				result = transformExpr(pstate, raw, EXPR_KIND_GENERATED_COLUMN);
+				result = coerce_to_target_type(pstate, result, exprType(result), attr->atttypid, attr->atttypmod,
+											   COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+				if (!result)
+					elog(ERROR, "canonical generation expression has the wrong type");
+				assign_expr_collations(pstate, result);
+			}
+			else
+				result = cookDefault(pstate, raw, attr->atttypid, attr->atttypmod, NameStr(attr->attname), 0);
 		}
 		else if (attribute < 0)
 		{

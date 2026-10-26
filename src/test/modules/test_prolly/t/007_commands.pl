@@ -61,8 +61,7 @@ is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','STAGED')}),'0','staging 
 sql(q{CREATE TABLE heap_only(id int) USING heap});
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING') WHERE to_table_name LIKE '%heap_only'}),'0','native heap tables are unversioned');
 sql('DROP TABLE heap_only');
-# TODO: defaults in CREATE TABLE of a versioned table; ALTER publishes them today.
-sql(q{CREATE TABLE with_default(id int) USING dolt_prolly_table; ALTER TABLE with_default ALTER COLUMN id SET DEFAULT 4});
+sql(q{CREATE TABLE with_default(id int DEFAULT 4) USING dolt_prolly_table});
 sql(q{SELECT dolt_commit('-Am','captured default')});
 is(sql(q{SELECT count(*) FROM pg_attrdef WHERE adrelid='with_default'::regclass}),'1','portable default is captured');
 sql('DROP TABLE with_default');
