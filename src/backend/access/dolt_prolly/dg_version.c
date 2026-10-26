@@ -34,6 +34,7 @@
 #include "utils/syscache.h"
 #include "utils/regproc.h"
 #include "utils/varlena.h"
+#include "parser/parse_clause.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
 #include "commands/defrem.h"
@@ -600,7 +601,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
-		else if (!strcmp(kinds[i], "routine"))
+		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1298,6 +1299,7 @@ static void validate_working_foreign_keys(const char *branch);
 
 #include "dg_alter.inc"
 #include "dg_dependency.inc"
+#include "dg_trigger_ddl.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
 #include "dg_patch.inc"

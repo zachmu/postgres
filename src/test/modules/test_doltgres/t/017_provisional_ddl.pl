@@ -53,12 +53,12 @@ is(sql(q{SELECT count(*) FROM t WHERE id=2}),'1','indexed drop rollback preserve
 sql(q{BEGIN; ALTER TABLE t DROP COLUMN extra; ROLLBACK});
 is(sql(q{SELECT extra FROM t ORDER BY id LIMIT 1}),'kept','layout and data publication roll back together');
 my ($unsupported_out,$unsupported_status)=$s->query(q{ALTER TABLE t ADD COLUMN unsupported int DEFAULT public.unportable_default()});
-is($unsupported_status,1,'unsupported default expression rejected');
-like($s->{stderr},qr/canonical expression user-defined function/,'default codec rejects before native constant evaluation');
+is($unsupported_status,1,'default calling a failing versioned routine rejected');
+like($s->{stderr},qr/unexpected evaluation/,'versioned routine default is evaluated natively for existing rows');
 $s->{stderr}='';
 ($unsupported_out,$unsupported_status)=$s->query(q{ALTER TABLE t ALTER COLUMN newer TYPE integer USING public.unportable_default()});
-is($unsupported_status,1,'unsupported USING expression rejected');
-like($s->{stderr},qr/canonical expression user-defined function/,'USING codec rejects before native expression planning');
+is($unsupported_status,1,'USING calling a failing versioned routine rejected');
+like($s->{stderr},qr/unexpected evaluation/,'versioned routine USING expression is evaluated natively');
 $s->{stderr}='';
 sql(q{ALTER TABLE t ALTER COLUMN newer SET DEFAULT 40 + 2, ADD CONSTRAINT payload_check CHECK (length(payload)>0)});
 sql(q{INSERT INTO t(id,payload,extra) VALUES(4,'four','kept')});

@@ -135,17 +135,21 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	return strcell(0, 1);
 }
 
+/*
+ * A schema object stored apart from tables, such as a routine or trigger: its
+ * member payload names it and hashes its definition, held in a child chunk.
+ */
 static char *
-routine_payload(const char *definition)
+object_payload(const char *kind, const char *definition)
 {
-	run("SELECT jsonb_build_object('kind','routine','name',$1::jsonb->>'name','schema',encode(sha256(convert_to($1,'UTF8')),'hex'))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT jsonb_build_object('kind',$2::text,'name',$1::jsonb->>'name','schema',encode(sha256(convert_to($1,'UTF8')),'hex'))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(kind)), NULL, true);
 	return strcell(0, 1);
 }
 
 static bytea *
-routine_member(const char *definition)
+object_member(const char *kind, const char *definition)
 {
 	bytea	   *schema = put("schema", definition, NULL, 0);
 
-	return put("routine", routine_payload(definition), VC_ARGS(PointerGetDatum(schema)), 1);
+	return put(kind, object_payload(kind, definition), VC_ARGS(PointerGetDatum(schema)), 1);
 }

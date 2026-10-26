@@ -44,11 +44,12 @@ creates_versioned_routine(CreateFunctionStmt *stmt)
 }
 
 /*
- * Replace the working schema's routines named in |removed|, or all of them,
- * with |definitions|, and return the published database.
+ * Replace the working schema's |kind| members named in |removed|, named with
+ * |prefix|, or all of them, with |definitions|, and return the published
+ * database.
  */
 static bytea *
-routines_publish(List *removed, bool all, List *definitions)
+objects_publish(const char *kind, List *removed, const char *prefix, bool all, List *definitions)
 {
 	VersionRef	working = read_ref(branch_ref("working"));
 	Capture		current = capture(true);
@@ -58,6 +59,7 @@ routines_publish(List *removed, bool all, List *definitions)
 	Datum	   *members;
 	int			n;
 	bytea	   *database;
+	const char *matches = "v->>'kind'=$5 AND ($4 OR $2::jsonb ? (v->>'name') OR starts_with(v->>'name',$6))";
 
 	initStringInfo(&names);
 	appendStringInfoChar(&names, '[');
@@ -74,22 +76,36 @@ routines_publish(List *removed, bool all, List *definitions)
 	{
 		if (payloads.len > 1)
 			appendStringInfoChar(&payloads, ',');
-		appendStringInfoString(&payloads, routine_payload(definition));
+		appendStringInfoString(&payloads, object_payload(kind, definition));
 	}
 	appendStringInfoChar(&payloads, ']');
-	run("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (v->>'kind'='routine' AND ($4 OR $2::jsonb ? (v->>'name')))),'[]'::jsonb)||$3::jsonb)::text", 4, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, BOOLOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data), BoolGetDatum(all)), NULL, true);
+	run(psprintf("SELECT jsonb_set($1::jsonb,'{members}',COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements($1::jsonb->'members') v WHERE NOT (%s)),'[]'::jsonb)||$3::jsonb)::text", matches),
+		6, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, BOOLOID, TEXTOID, TEXTOID),
+		VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data),
+				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
+		NULL, true);
 	json = strcell(0, 1);
-	run("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h WHERE d.objhash=$1 AND NOT (o.objkind='routine' AND ($3 OR $2::jsonb ? (convert_from(o.objpayload,'UTF8')::jsonb->>'name')))", 3, VC_TYPES(BYTEAOID, TEXTOID, BOOLOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(names.data), BoolGetDatum(all)), NULL, true);
+	run(psprintf("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h CROSS JOIN LATERAL (SELECT CASE WHEN o.objkind=$5 THEN convert_from(o.objpayload,'UTF8')::jsonb END AS v) p WHERE d.objhash=$1 AND NOT coalesce(%s, false)", matches),
+		6, VC_TYPES(BYTEAOID, TEXTOID, TEXTOID, BOOLOID, TEXTOID, TEXTOID),
+		VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(names.data), CStringGetTextDatum(payloads.data),
+				BoolGetDatum(all), CStringGetTextDatum(kind), CStringGetTextDatum(prefix ? prefix : "\x01")),
+		NULL, true);
 	n = SPI_processed;
 	members = palloc_array(Datum, n + list_length(definitions) + 1);
 	for (int i = 0; i < n; i++)
 		members[i] = cell(i, 1);
 	foreach_ptr(char, definition, definitions)
-		members[n++] = PointerGetDatum(routine_member(definition));
+		members[n++] = PointerGetDatum(object_member(kind, definition));
 	database = canonical_database(json, members, n);
 	move_ref(branch_ref("working"), working, database);
 	advance_snapshot();
 	return database;
+}
+
+static bytea *
+routines_publish(List *removed, bool all, List *definitions)
+{
+	return objects_publish("routine", removed, NULL, all, definitions);
 }
 
 /* The routine an ALTER statement changes, if it is a versioned one. */
@@ -197,7 +213,8 @@ dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 	bool		pushed = false;
 	ObjectType	type;
 
-	if (dg_catalog_active() && altered_routine(statement, &type))
+	if ((IsA(statement, AlterFunctionStmt) || IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)) &&
+		dg_catalog_active() && altered_routine(statement, &type))
 	{
 		if (!ActiveSnapshotSet())
 		{

@@ -54,7 +54,8 @@ publish_deletions(List *objects, CatalogView *view)
 		definitions[i] = !strcmp(kinds[i], "namespace") ? payloads[i] : metadata(child(hashes[i], 1), "schema");
 		names[i] = json_value(definitions[i], "name");
 		classid = !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
-			!strcmp(kinds[i], "routine") ? ProcedureRelationId : RelationRelationId;
+			!strcmp(kinds[i], "routine") ? ProcedureRelationId :
+			!strcmp(kinds[i], "trigger") ? TriggerRelationId : RelationRelationId;
 		id = CatalogViewLookupObject(view, classid, names[i]);
 		removed[i] = deletion_contains(objects, classid, id);
 	}
@@ -200,7 +201,7 @@ canonical_drop(Node *statement)
 	if (stmt->removeType != OBJECT_TABLE && stmt->removeType != OBJECT_INDEX &&
 		stmt->removeType != OBJECT_FUNCTION && stmt->removeType != OBJECT_ROUTINE &&
 		stmt->removeType != OBJECT_SCHEMA && stmt->removeType != OBJECT_TYPE &&
-		stmt->removeType != OBJECT_TABCONSTRAINT)
+		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER)
 		return false;
 	if (!dg_catalog_active())
 		return false;
@@ -219,6 +220,8 @@ canonical_drop(Node *statement)
 				branch = branch_relation(constraint_table);
 			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX)
 				branch = branch_relation(makeRangeVarFromNameList(lfirst(lc)));
+			else if (stmt->removeType == OBJECT_TRIGGER)
+				branch = branch_relation(makeRangeVarFromNameList(list_copy_head(lfirst(lc), list_length(lfirst(lc)) - 1)));
 			else if (stmt->removeType == OBJECT_SCHEMA)
 				branch = true;
 			else
@@ -306,6 +309,20 @@ canonical_drop(Node *statement)
 					if (kind != (stmt->removeType == OBJECT_INDEX ? RELKIND_INDEX : RELKIND_RELATION))
 						ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("wrong relation kind for DROP")));
 					namespaceid = get_rel_namespace(object.objectId);
+				}
+			}
+			else if (stmt->removeType == OBJECT_TRIGGER)
+			{
+				List	   *names = lfirst(lc);
+				RangeVar   *rv = makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1));
+
+				if (!dg_catalog_lookup_relation(rv, stmt->missing_ok, &owning_table))
+					unsupported("trigger deletion on a shared relation");
+				object.classId = TriggerRelationId;
+				if (OidIsValid(owning_table))
+				{
+					object.objectId = get_trigger_oid(owning_table, strVal(llast(names)), stmt->missing_ok);
+					namespaceid = get_rel_namespace(owning_table);
 				}
 			}
 			else if (stmt->removeType == OBJECT_SCHEMA)

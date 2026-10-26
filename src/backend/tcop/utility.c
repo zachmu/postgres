@@ -609,6 +609,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		CommandCounterIncrement();
 		return;
 	}
+	if (dg_catalog_trigger_ddl(pstate, parsetree))
+	{
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
 	if (dg_catalog_grant(parsetree))
 	{
 		if (qc)

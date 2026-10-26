@@ -259,3 +259,48 @@ schema_expression_bind_default(Node *raw, Oid type)
 	PG_END_TRY();
 	return result;
 }
+
+/*
+ * Bind a trigger's WHEN clause, as CreateTrigger does: OLD and NEW are the
+ * first and second range table entries. Routines it calls resolve in |view|.
+ */
+static Node *
+schema_expression_bind_trigger(CatalogView *view, Oid relation, const char *name,
+							   TupleDesc desc, Node *raw)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	RelationData definition = {0};
+	FormData_pg_class form = {0};
+	Node	   *result = NULL;
+	int			nest = NewGUCNestLevel();
+	CatalogView *previous = CatalogViewCurrent();
+
+	definition.rd_id = relation;
+	definition.rd_att = desc;
+	definition.rd_rel = &form;
+	definition.rd_catalogview = view;
+	form.relkind = RELKIND_RELATION;
+	namestrcpy(&form.relname, name);
+	addNSItemToQuery(pstate, addRangeTableEntryForRelation(pstate, &definition, AccessShareLock,
+														   makeAlias("old", NIL), false, false),
+					 false, true, true);
+	addNSItemToQuery(pstate, addRangeTableEntryForRelation(pstate, &definition, AccessShareLock,
+														   makeAlias("new", NIL), false, false),
+					 false, true, true);
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		if (schema_expression_calls_routine(raw, NULL))
+			CatalogViewSwitch(view);
+		result = transformWhereClause(pstate, raw, EXPR_KIND_TRIGGER_WHEN, "WHEN");
+		assign_expr_collations(pstate, result);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		AtEOXact_GUC(true, nest);
+		free_parsestate(pstate);
+	}
+	PG_END_TRY();
+	return result;
+}

@@ -619,6 +619,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+#include "dg_trigger_provider.inc"
 
 /* Shared role references are derived from canonical owners and ACLs. They
  * remain runtime catalog tuples; local role OIDs never enter schema payloads. */
@@ -763,7 +764,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine"))
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger"))
 			definitions[i] = metadata(child(addresses[i], 1), "schema");
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
@@ -940,6 +941,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "index"))
 			provider_index(&rows, view, definitions[i], n, definitions, kinds);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "trigger"))
+			provider_trigger(&rows, view, definitions[i], n, definitions, kinds);
 	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
