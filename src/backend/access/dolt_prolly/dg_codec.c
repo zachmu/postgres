@@ -572,3 +572,68 @@ dg_encode_value(Oid type, Datum value)
 {
 	return encode_value(type, value);
 }
+
+/*
+ * The canonical bytes of one value of |type| with every label |old| of enum
+ * |target| replaced by |renamed|, as when the label is renamed. Stored enum
+ * values are their labels; the structure of every type is unchanged.
+ */
+PLSlice
+dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed)
+{
+	Oid			element;
+
+	check_stack_depth();
+	type = getBaseType(type);
+	if (type == TEXTOID || type == BYTEAOID || type == BOOLOID || type == INT2OID ||
+		type == INT4OID || type == INT8OID)
+		return bytes;
+	element = get_element_type(type);
+	if (OidIsValid(element) || get_typtype(type) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = OidIsValid(element) ? NULL : lookup_rowtype_tupdesc(type, -1);
+		uint32		count;
+		PLValue    *fields;
+		PLSlice		result;
+
+		if (bytes.len < 12)
+			elog(ERROR, "invalid prolly nested value");
+		count = pl_read32(bytes.data + 8);
+		fields = palloc0_array(PLValue, Max(count, 1));
+		for (uint32 i = 0; i < count; i++)
+		{
+			Oid			field;
+
+			dg_check(pl_tuple_get(bytes, i, &fields[i]));
+			if (!fields[i].present)
+				continue;
+			/* An array's first field is its shape. */
+			if (OidIsValid(element))
+			{
+				if (i == 0)
+					continue;
+				field = element;
+			}
+			else
+				field = TupleDescAttr(desc, i)->atttypid;
+			fields[i].bytes = dg_recode_label(field, fields[i].bytes, target, old, renamed);
+		}
+		result = pack_fields(fields, count);
+		if (desc)
+			ReleaseTupleDesc(desc);
+		pfree(fields);
+		return result;
+	}
+	if (type == target && bytes.len == 4 + strlen(old) && !memcmp(bytes.data + 4, old, strlen(old)))
+	{
+		uint8	   *data = palloc(4 + strlen(renamed));
+
+		memcpy(data, "DGB1", 4);
+		memcpy(data + 4, renamed, strlen(renamed));
+		return (PLSlice)
+		{
+			data, 4 + strlen(renamed)
+		};
+	}
+	return bytes;
+}

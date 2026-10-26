@@ -603,6 +603,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
 
+	if (dg_catalog_rename(pstate, parsetree))
+	{
+		free_parsestate(pstate);
+		CommandCounterIncrement();
+		return;
+	}
 	if (dg_catalog_routine_ddl(pstate, parsetree))
 	{
 		free_parsestate(pstate);

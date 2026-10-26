@@ -526,6 +526,8 @@ static CatalogView *provider_view(bytea *database);
 static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
+static char *database_dependents(const char *json, Datum *members, int count);
+
 static bytea *
 canonical_database(const char *json, Datum *members, int count)
 {
@@ -536,7 +538,7 @@ canonical_database(const char *json, Datum *members, int count)
 	int			n;
 
 	run("SELECT jsonb_set($1::jsonb || jsonb_build_object('encoding',current_setting('server_encoding')),'{members}',COALESCE((SELECT jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\") FROM jsonb_array_elements($1::jsonb->'members') v),'[]'::jsonb))::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
-	normalized = strcell(0, 1);
+	normalized = database_dependents(strcell(0, 1), members, count);
 	run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	array = DatumGetArrayTypeP(cell(0, 1));
 	deconstruct_array(array, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
@@ -547,6 +549,7 @@ canonical_database(const char *json, Datum *members, int count)
 #include "dg_foreign_codec.inc"
 #include "dg_routine_codec.inc"
 #include "dg_type_codec.inc"
+#include "dg_dependents.inc"
 
 /* Capture and working-tree diff must use exactly the same portable schema codec. */
 static char *
@@ -1305,6 +1308,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_dependency.inc"
 #include "dg_trigger_ddl.inc"
 #include "dg_type_ddl.inc"
+#include "dg_rename.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
 #include "dg_patch.inc"

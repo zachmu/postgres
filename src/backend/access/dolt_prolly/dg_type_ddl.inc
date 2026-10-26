@@ -33,15 +33,6 @@ alters_versioned_type(Node *statement)
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 	else if (IsA(statement, AlterDomainStmt))
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterDomainStmt *) statement)->typeName));
-	else if (IsA(statement, RenameStmt) &&
-			 (((RenameStmt *) statement)->renameType == OBJECT_TYPE ||
-			  ((RenameStmt *) statement)->renameType == OBJECT_DOMAIN))
-		type = typenameTypeId(NULL, makeTypeNameFromNameList(castNode(List, ((RenameStmt *) statement)->object)));
-	else if (IsA(statement, RenameStmt) && ((RenameStmt *) statement)->renameType == OBJECT_ATTRIBUTE)
-		type = typenameTypeId(NULL, makeTypeNameFromNameList(((RenameStmt *) statement)->relation->schemaname ?
-															 list_make2(makeString(((RenameStmt *) statement)->relation->schemaname),
-																		makeString(((RenameStmt *) statement)->relation->relname)) :
-															 list_make1(makeString(((RenameStmt *) statement)->relation->relname))));
 	return type >= FirstDurableObjectId;
 }
 
@@ -54,37 +45,6 @@ type_versioned_row(Form_pg_type type)
 	if (type->typtype == TYPTYPE_ENUM || type->typtype == TYPTYPE_DOMAIN)
 		return true;
 	return type->typtype == TYPTYPE_COMPOSITE && get_rel_relkind(type->typrelid) == RELKIND_COMPOSITE_TYPE;
-}
-
-/*
- * Whether anything but a type's own array type and composite relation depends
- * on it. Definitions name the types they use, so renaming a used type would
- * leave them naming a type that no longer exists.
- */
-static bool
-type_in_use(Oid type)
-{
-	Relation	catalog = table_open(DependRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
-	HeapTuple	tuple;
-	Oid			array = get_array_type(type);
-	Oid			relation = typeOrDomainTypeRelid(type);
-	bool		used = false;
-
-	while (!used && HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
-
-		if (dep->refclassid != TypeRelationId || (dep->refobjid != type && dep->refobjid != array))
-			continue;
-		if ((dep->classid == TypeRelationId && dep->objid == array) ||
-			(dep->classid == RelationRelationId && dep->objid == relation && dep->objsubid == 0))
-			continue;
-		used = true;
-	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return used;
 }
 
 /* Type DDL makes no storage; a composite type's relation has none. */
@@ -140,13 +100,6 @@ type_ddl(ParseState *pstate, Node *statement)
 									((CompositeTypeStmt *) statement)->coldeflist);
 				break;
 			case T_AlterEnumStmt:
-
-				/*
-				 * Stored rows hold enum labels, which keep them portable; a
-				 * renamed label would no longer read back.
-				 */
-				if (((AlterEnumStmt *) statement)->oldVal)
-					unsupported("renaming a label of a versioned enum");
 				AlterEnum((AlterEnumStmt *) statement);
 				break;
 			case T_AlterDomainStmt:
@@ -179,11 +132,7 @@ type_ddl(ParseState *pstate, Node *statement)
 					break;
 				}
 			default:
-				if (((RenameStmt *) statement)->renameType != OBJECT_ATTRIBUTE &&
-					type_in_use(typenameTypeId(NULL, makeTypeNameFromNameList(castNode(List, ((RenameStmt *) statement)->object)))))
-					unsupported("renaming a versioned type that other objects use");
-				ExecRenameStmt((RenameStmt *) statement);
-				break;
+				elog(ERROR, "unrecognized versioned type statement");
 		}
 		CommandCounterIncrement();
 		GetUserIdAndSecContext(&privileged, &security);
@@ -217,7 +166,7 @@ dg_catalog_type_ddl(ParseState *pstate, Node *statement)
 
 	if (!IsA(statement, CreateEnumStmt) && !IsA(statement, CreateDomainStmt) &&
 		!IsA(statement, CompositeTypeStmt) && !IsA(statement, AlterEnumStmt) &&
-		!IsA(statement, AlterDomainStmt) && !IsA(statement, RenameStmt))
+		!IsA(statement, AlterDomainStmt))
 		return false;
 	if (!dg_catalog_active() || !(creates_versioned_type(statement) || alters_versioned_type(statement)))
 		return false;

@@ -120,18 +120,6 @@ altered_routine(Node *statement, ObjectType *type)
 		*type = ((AlterFunctionStmt *) statement)->objtype;
 		routine = ((AlterFunctionStmt *) statement)->func;
 	}
-	else if (IsA(statement, RenameStmt))
-	{
-		*type = ((RenameStmt *) statement)->renameType;
-		if (*type == OBJECT_FUNCTION || *type == OBJECT_PROCEDURE || *type == OBJECT_ROUTINE)
-			routine = castNode(ObjectWithArgs, ((RenameStmt *) statement)->object);
-	}
-	else if (IsA(statement, AlterObjectSchemaStmt))
-	{
-		*type = ((AlterObjectSchemaStmt *) statement)->objectType;
-		if (*type == OBJECT_FUNCTION || *type == OBJECT_PROCEDURE || *type == OBJECT_ROUTINE)
-			routine = castNode(ObjectWithArgs, ((AlterObjectSchemaStmt *) statement)->object);
-	}
 	if (!routine)
 		return NULL;
 	id = LookupFuncWithArgs(*type, routine, true);
@@ -139,7 +127,7 @@ altered_routine(Node *statement, ObjectType *type)
 }
 
 /*
- * ALTER, RENAME or SET SCHEMA of a versioned routine runs natively against a
+ * ALTER FUNCTION of a versioned routine runs natively against a
  * provisional copy of the branch's catalogs; every routine there is then
  * encoded again and published. Unchanged routines encode to the same bytes.
  */
@@ -170,18 +158,7 @@ routine_alter(ParseState *pstate, Node *statement)
 		CatalogViewBeginMutation(view);
 		CatalogViewSwitch(view);
 		SetUserIdAndSecContext(caller, security);
-		switch (nodeTag(statement))
-		{
-			case T_AlterFunctionStmt:
-				AlterFunction(pstate, (AlterFunctionStmt *) statement);
-				break;
-			case T_RenameStmt:
-				ExecRenameStmt((RenameStmt *) statement);
-				break;
-			default:
-				ExecAlterObjectSchemaStmt((AlterObjectSchemaStmt *) statement, NULL);
-				break;
-		}
+		AlterFunction(pstate, (AlterFunctionStmt *) statement);
 		CommandCounterIncrement();
 		GetUserIdAndSecContext(&privileged, &security);
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
@@ -213,7 +190,7 @@ dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 	bool		pushed = false;
 	ObjectType	type;
 
-	if ((IsA(statement, AlterFunctionStmt) || IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)) &&
+	if (IsA(statement, AlterFunctionStmt) &&
 		dg_catalog_active() && altered_routine(statement, &type))
 	{
 		if (!ActiveSnapshotSet())

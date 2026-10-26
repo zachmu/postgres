@@ -634,10 +634,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					if (native_mutation_destination)
 					{
 						rewrite = true;
-						tree = alter_rows(native_mutation_destination, native_mutation_width, attributes, mapping);
+						tree = alter_rows(native_mutation_destination, native_mutation_width, attributes, mapping, NULL, NULL);
 					}
 					else if (rewrite)
-						tree = alter_rows(state, oldcount, attributes, mapping);
+						tree = alter_rows(state, oldcount, attributes, mapping, NULL, NULL);
 				}
 
 				if (!strcmp(kinds[i], "table"))

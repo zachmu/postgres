@@ -22,8 +22,9 @@ is(sql(q{SELECT ms[2] FROM e WHERE id=1}),'ok','enum arrays');
 sql(q{ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'; ALTER TYPE mood ADD VALUE 'glad' AFTER 'happy'});
 is(sql(q{SELECT enum_range(NULL::mood)}),'{sad,meh,ok,happy,glad}','ADD VALUE');
 is(sql(q{SELECT m FROM e WHERE id=1}),'happy','stored labels read back after ADD VALUE');
-# TODO: rows store labels, so renaming one needs a stable label identity or a rewrite.
-fails(q{ALTER TYPE mood RENAME VALUE 'happy' TO 'joyful'},qr/renaming a label of a versioned enum/,'RENAME VALUE is rejected');
+sql(q{ALTER TYPE mood RENAME VALUE 'happy' TO 'joyful'});
+is(sql(q{SELECT m FROM e WHERE id=1}),'joyful','RENAME VALUE rewrites stored labels');
+sql(q{ALTER TYPE mood RENAME VALUE 'joyful' TO 'happy'});
 is(sql(q{SELECT 'meh'::mood < 'ok'::mood AND 'meh'::mood > 'sad'::mood}),'t','added label sorts in place');
 fails(q{ALTER TYPE mood ADD VALUE 'ok'},qr/enum label "ok" already exists/,'native enum validation');
 
@@ -47,8 +48,8 @@ sql(q{ALTER TYPE pair RENAME ATTRIBUTE a TO x});
 is(sql(q{SELECT (p).x FROM c}),'1','renamed attribute');
 sql(q{CREATE TYPE spare AS ENUM ('a'); ALTER TYPE spare RENAME TO extra});
 is(sql(q{SELECT enum_range(NULL::extra)}),'{a}','an unused type renames');
-# TODO: definitions name the types they use; renaming a used type must rewrite them.
-fails(q{ALTER TYPE mood RENAME TO feeling},qr/renaming a versioned type that other objects use/,'renaming a used type is rejected');
+sql(q{ALTER TYPE mood RENAME TO feeling; ALTER TYPE feeling RENAME TO mood});
+is(sql(q{SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid='e'::regclass AND attname='m'}),'mood','renaming a used type rewrites its users');
 
 # ---- routines and dependencies ----
 sql(q{CREATE FUNCTION cheer(f mood) RETURNS mood LANGUAGE sql AS $$SELECT 'glad'::mood$$});
