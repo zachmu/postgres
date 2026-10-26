@@ -103,6 +103,7 @@ typedef struct CatalogViewObject
 	Oid			handle;
 	Oid			objectclass;
 	Oid			storage;
+	bytea	   *schema;			/* retained schema object of a durable relation */
 	CatalogView *view;
 	char	   *identity;
 } CatalogViewObject;
@@ -555,7 +556,7 @@ view_durable(CatalogView *view, Oid oid)
 }
 
 void
-CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage)
+CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage, bytea *schema)
 {
 	CatalogViewObject *object;
 	MemoryContext previous;
@@ -577,6 +578,7 @@ CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity,
 	object->handle = oid;
 	object->objectclass = objectclass;
 	object->storage = storage;
+	object->schema = schema ? DatumGetByteaPCopy(PointerGetDatum(schema)) : NULL;
 	object->view = view;
 	object->identity = pstrdup(identity);
 	view->durable = lappend(view->durable, object);
@@ -703,6 +705,15 @@ CatalogViewObjectStorage(Oid handle)
 	CatalogViewObject *object = lookup_object(handle);
 
 	return object ? object->storage : handle;
+}
+
+/* The retained schema object a durable relation was bound with, or NULL. */
+bytea *
+CatalogViewObjectSchema(Oid handle)
+{
+	CatalogViewObject *object = lookup_object(handle);
+
+	return object ? object->schema : NULL;
 }
 
 CatalogView *

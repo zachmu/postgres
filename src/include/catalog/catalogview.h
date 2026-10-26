@@ -44,7 +44,7 @@ extern CatalogView *CatalogViewCurrent(void);
 extern Oid	CatalogViewNamespace(CatalogView *view, Oid namespaceid);
 extern uint64 CatalogViewCacheId(CatalogView *view);
 extern Oid	CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, Oid storage);
-extern void CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage);
+extern void CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage, bytea *schema);
 extern void CatalogViewForgetDurable(void);
 extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity);
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
@@ -54,6 +54,7 @@ extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);
 extern HeapTuple CatalogViewFunctionTuple(Oid functionid);
 extern Oid	CatalogViewObjectStorage(Oid handle);
+extern bytea *CatalogViewObjectSchema(Oid handle);
 extern const char *CatalogViewObjectIdentity(Oid handle, Oid objectclass);
 extern CatalogView *CatalogViewSelectKeys(CatalogView *fallback, TupleDesc desc, int nkeys, const int *attributes, const Datum *values);
 

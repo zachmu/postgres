@@ -62,6 +62,48 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 	}
 }
 
+/*
+ * Whether the local mapping of |name| on |branch| still names resource |relid|
+ * for retained schema |schema|. Read natively under the active snapshot: a
+ * catalog view bound the resource when it was built, and the mapping may have
+ * changed since.
+ */
+static bool
+binding_current(const char *branch, const char *name, Oid relid, bytea *schema)
+{
+	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		current = false;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true, ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot(), 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		stored = heap_getattr(tuple, Anum_pg_dolt_binding_bindschema, RelationGetDescr(rel), &isnull);
+
+		current = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid == relid &&
+			OidIsValid(relid) && schema && !isnull && same(DatumGetByteaPP(stored), schema);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	if (!current)
+		return false;
+
+	/* The resource itself must still exist. */
+	rel = table_open(DoltStorageRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, DoltStorageKeyIndexId, true, ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot(), 1, keys);
+	current = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return current;
+}
+
 static Oid
 binding_relation(const char *branch, const char *name, bytea *schema)
 {

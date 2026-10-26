@@ -775,7 +775,7 @@ provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
  */
 static Oid
 provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
-			  const char *name, const char *identity)
+			  const char *name, const char *identity, bytea *schema)
 {
 	Oid			existing = CatalogViewFindObject(view, objectclass, identity);
 	Oid			oid;
@@ -793,7 +793,7 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 			if (SPI_processed == 1)
 				storage = DatumGetObjectId(cell(0, 1));
 		}
-		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
+		CatalogViewBindDurable(view, objectclass, identity, oid, storage, schema);
 		return oid;
 	}
 	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
@@ -803,7 +803,8 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
-	bytea	  **addresses;
+	bytea	  **addresses,
+			  **schemas;
 	char	  **kinds,
 			  **definitions;
 	int			n,
@@ -827,6 +828,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	addresses = palloc_array(bytea *, Max(n, 1));
+	schemas = palloc0_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	definitions = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -839,7 +841,10 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
 		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
-			definitions[i] = metadata(child(addresses[i], 1), "schema");
+		{
+			schemas[i] = child(addresses[i], 1);
+			definitions[i] = metadata(schemas[i], "schema");
+		}
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
 	}
@@ -867,7 +872,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 			(void) provider_bind(view, branch, RelationRelationId, DOLT_IDENTITY_RELATION,
-								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"), schemas[i]);
 
 	/*
 	 * Types, tables and routines name one another's types: bind them all,
@@ -876,7 +881,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table"))
 			(void) provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE,
-								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"), NULL);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_bind(&rows, view, definitions[i]);
@@ -913,7 +918,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
 			form.relowner = get_role_oid(owner, false);
-			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
+			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name, NULL);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
 			matview = index ? NULL : json_value(definition, "matview");
@@ -976,7 +981,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 					pfree(arrayname);
 					arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
 				}
-				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity);
+				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity, NULL);
 				type.typarray = array.oid;
 
 				type.oid = form.reltype;

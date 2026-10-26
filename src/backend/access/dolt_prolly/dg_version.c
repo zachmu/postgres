@@ -23,6 +23,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_storage.h"
 #include "catalog/pg_dolt_identity.h"
 #include "utils/inval.h"
 #include "access/genam.h"

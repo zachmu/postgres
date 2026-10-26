@@ -154,10 +154,10 @@ catalog_namespace(bytea *db, const char *name)
 
 /* Resolve symbolic membership in SQL search-path order. Bootstrap catalogs are
  * candidates in that same order, never a shortcut ahead of an explicit path. */
-static char *catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok);
+static char *catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok);
 
 static char *
-catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
+catalog_resolve_name(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
 	CatalogView *previous = CatalogViewSwitch(NULL);
 	char	   *result;
@@ -169,7 +169,7 @@ catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const
 	 */
 	PG_TRY();
 	{
-		result = catalog_resolve_candidates(db, rv, user, native, search_path, type_lookup, temp_ok);
+		result = catalog_resolve_candidates(view, rv, user, native, search_path, type_lookup, temp_ok);
 	}
 	PG_FINALLY();
 	{
@@ -180,7 +180,7 @@ catalog_resolve_name(bytea *db, const RangeVar *rv, Oid user, Oid *native, const
 }
 
 static char *
-catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
+catalog_resolve_candidates(CatalogView *view, const RangeVar *rv, Oid user, Oid *native, const char *search_path, bool type_lookup, bool temp_ok)
 {
 	List	   *path = NIL;
 	ListCell   *lc;
@@ -241,15 +241,21 @@ catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native,
 				return get_namespace_name(temp);
 			continue;
 		}
+		/*
+		 * The revision's catalog view holds every member decoded, with its
+		 * namespace's ACL: resolve there, as PostgreSQL resolves names in
+		 * its catalogs.
+		 */
 		name = dg_qualified_name(ns, rv->relname);
-		if (type_lookup ? OidIsValid(CatalogViewFindObject(provider_schema_view(db), TypeRelationId, name)) : catalog_contains(db, name))
+		if (view && OidIsValid(CatalogViewFindObject(view, type_lookup ? TypeRelationId : RelationRelationId, name)))
 		{
-			char	   *definition = catalog_namespace(db, ns);
-
-			if (!catalog_acl_allows(definition, "USAGE", user))
+			namespace = CatalogViewFindObject(view, NamespaceRelationId, ns);
+			if (!OidIsValid(namespace))
+				elog(ERROR, "missing retained namespace");
+			if (object_aclcheck(NamespaceRelationId, namespace, user, ACL_USAGE) != ACLCHECK_OK)
 			{
 				if (explicit)
-					catalog_acl(definition, "USAGE", user);
+					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
 				continue;
 			}
 			return ns;
@@ -327,15 +333,12 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	char	   *resolution_path = pstrdup(GetConfigOption("search_path", false, false));
 	char	   *revision,
 			   *dbname,
-			   *schema = NULL,
 			   *logical = NULL;
-	List	   *path = NIL;
-	ListCell   *lc;
 	Oid			user;
 	int			security,
 				nest;
-	bytea	   *db,
-			   *descriptor = NULL;
+	bytea	   *db;
+	CatalogView *view;
 
 	TupleDesc	result = NULL;
 	bool		pushed = false;
@@ -401,15 +404,6 @@ revision_selected:
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
 	GetUserIdAndSecContext(&user, &security);
-	if (rv->schemaname)
-		path = list_make1(pstrdup(rv->schemaname));
-	else
-	{
-		char	   *raw = pstrdup(GetConfigOption("search_path", false, false));
-
-		if (!SplitIdentifierString(raw, ',', &path))
-			elog(ERROR, "invalid search_path");
-	}
 
 	/*
 	 * Names on a branch head resolve against its latest schema, as against
@@ -438,9 +432,10 @@ revision_selected:
 		if (!db)
 			db = child(resolve(revision), 1);
 		rte->dolt_database = hex(db);
+		view = context_view(db, working ? revision : NULL);
 		{
 			Oid			native;
-			char	   *ns = catalog_resolve_name(db, rv, user, &native, resolution_path, false, true);
+			char	   *ns = catalog_resolve_name(view, rv, user, &native, resolution_path, false, true);
 			RangeVar   *resolved = copyObject(rv);
 
 			if (!ns)
@@ -461,7 +456,6 @@ revision_selected:
 			}
 			resolved->schemaname = pstrdup(ns);
 			rv = resolved;
-			path = list_make1(resolved->schemaname);
 		}
 
 		if (rv->schemaname && dg_system_namespace(rv->schemaname))
@@ -512,98 +506,79 @@ revision_selected:
 		}
 		else
 		{
-			foreach(lc, path)
+			Oid			handle;
+			char		relkind;
+			Relation	rel;
+			Oid			currentns,
+						currentrel;
+
+			/*
+			 * The view has every member of the revision decoded and bound to
+			 * its OID: no need to read the retained objects again. Permissions
+			 * come from its ACL rows, as for physical catalogs.
+			 */
+			logical = dg_qualified_name(rv->schemaname, rv->relname);
+			handle = CatalogViewFindObject(view, RelationRelationId, logical);
+			if (!OidIsValid(handle))
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
+			relkind = get_rel_relkind(handle);
+			if (relkind == RELKIND_VIEW)
 			{
-				char	   *ns = (char *) lfirst(lc);
-
-				if (!strcmp(ns, "$user"))
-					ns = GetUserNameFromId(user, false);
-				logical = dg_qualified_name(ns, rv->relname);
-				run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
-				if (SPI_processed)
+				/*
+				 * A versioned view on the session's branch is an ordinary
+				 * relation of its catalog view, which the rewriter expands.
+				 */
+				if (session_name && working)
 				{
-					char	   *nsdef;
-					Oid			currentns,
-								currentrel;
-
-					descriptor = DatumGetByteaPCopy(cell(0, 1));
-					schema = metadata(child(descriptor, 1), "schema");
-					nsdef = catalog_namespace(db, ns);
-					catalog_acl(nsdef, "USAGE", user);
-					if (!target)
-						catalog_acl(schema, "SELECT", user);
-
-					/*
-					 * Do not let historical grants bypass current revocations
-					 * on a live object.
-					 */
-					currentns = get_namespace_oid(ns, true);
-					currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
-					if (working)
-					{
-						live = binding_relation(revision, logical, child(descriptor, 1));
-						if (!OidIsValid(live))
-							ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
-					}
-					if (!working)
-						live = currentrel;
-					if (!working && OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
-						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, ns);
-					if (!working && !target && OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
-						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
-					break;
-				}
-
-				/* A versioned view of the revision, which the rewriter expands there. */
-				run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='view' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
-				if (SPI_processed)
-				{
-					CatalogView *view;
-
-					/*
-					 * A versioned view on the session's branch is an ordinary
-					 * relation of its catalog view, which the rewriter expands.
-					 */
-					if (session_name && working)
-					{
-						rte->dolt_database = NULL;
-						goto binding_done;
-					}
-					view = working ? provider_branch_view(revision, db) : provider_view(db);
-					if (target)
-						unsupported("writes through a revision's view");
-
-					/*
-					 * The caller opens the view: its query is analyzed when it
-					 * is opened, which cannot bind names within this scope.
-					 */
-					rte->relkind = RELKIND_VIEW;
-					rte->relid = CatalogViewLookupObject(view, RelationRelationId, logical);
-					result = CreateTemplateTupleDesc(0);
+					rte->dolt_database = NULL;
 					goto binding_done;
 				}
+				if (target)
+					unsupported("writes through a revision's view");
+
+				/*
+				 * The caller opens the view: its query is analyzed when it
+				 * is opened, which cannot bind names within this scope.
+				 */
+				rte->relkind = RELKIND_VIEW;
+				rte->relid = handle;
+				result = CreateTemplateTupleDesc(0);
+				goto binding_done;
 			}
-			if (!descriptor)
+			if (relkind == RELKIND_INDEX)
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
-			rte->dolt_table = hex(descriptor);
+			if (!target && pg_class_aclcheck(handle, user, ACL_SELECT) != ACLCHECK_OK)
+				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
+
+			/*
+			 * Do not let historical grants bypass current revocations on a
+			 * live object.
+			 */
+			currentns = get_namespace_oid(rv->schemaname, true);
+			currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
+			if (working)
 			{
-				CatalogView *view = working ? provider_branch_view(revision, db) : provider_view(db);
-				Oid			handle = CatalogViewLookupObject(view, RelationRelationId, logical);
-				Relation	rel = relation_open(handle, AccessShareLock);
-
-				result = CreateTupleDescCopy(RelationGetDescr(rel));
-				rte->dolt_rowtype = rel->rd_rel->reltype;
-				relation_close(rel, AccessShareLock);
+				live = CatalogViewObjectStorage(handle);
+				if (!binding_current(revision, logical, live, CatalogViewObjectSchema(handle)))
+					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
 			}
-
-			if (working && OidIsValid(live))
+			else
+			{
+				live = currentrel;
+				if (OidIsValid(currentns) && object_aclcheck(NamespaceRelationId, currentns, user, ACL_USAGE) != ACLCHECK_OK)
+					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SCHEMA, rv->schemaname);
+				if (!target && OidIsValid(currentrel) && pg_class_aclcheck(currentrel, user, ACL_SELECT) != ACLCHECK_OK)
+					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
+			}
+			rel = relation_open(handle, AccessShareLock);
+			result = CreateTupleDescCopy(RelationGetDescr(rel));
+			rte->dolt_rowtype = rel->rd_rel->reltype;
+			relation_close(rel, AccessShareLock);
+			if (working)
 			{
 				rte->dolt_branch = pstrdup(revision);
 				rte->dolt_relid = live;
 			}
-
-			if (working && !OidIsValid(live))
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unpublished branch schema changes are not supported yet")));
 		}
 binding_done:
 		end_api(nest);
@@ -847,8 +822,9 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
+			CatalogView *view = db ? context_view(db, branch) : NULL;
 			Oid			native;
-			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, false, true);
+			char	   *ns = catalog_resolve_name(view, rv, user, &native, search_path, false, true);
 
 			if (OidIsValid(native))
 			{
@@ -856,7 +832,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
+				*result = CatalogViewLookupObject(view, RelationRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
 		end_api(nest);
@@ -1017,14 +993,16 @@ dg_catalog_relation_visible(Oid id, const char *name, bool *visible)
 	PG_TRY();
 	{
 		bytea	   *db;
+		CatalogView *context;
 		Oid			native;
 		char	   *ns;
 
 		nest = begin_api();
 		db = database ? unhex(database) : read_ref(branch_ref("working")).target;
-		ns = catalog_resolve_name(db, rv, user, &native, path, false, true);
+		context = db ? context_view(db, branch) : NULL;
+		ns = catalog_resolve_name(context, rv, user, &native, path, false, true);
 		*visible = ns && (OidIsValid(native) ? native == id :
-						  CatalogViewLookupObject(context_view(db, branch), RelationRelationId,
+						  CatalogViewLookupObject(context, RelationRelationId,
 												  dg_qualified_name(ns, name)) == id);
 		end_api(nest);
 	}
@@ -1123,15 +1101,16 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 		db = catalog_current_database() ? unhex(catalog_current_database()) :
 			catalog_working_schema(branch);
 		{
+			CatalogView *view = db ? context_view(db, branch) : NULL;
 			Oid			native;
-			char	   *ns = catalog_resolve_name(db, rv, user, &native, search_path, true, temp_ok);
+			char	   *ns = catalog_resolve_name(view, rv, user, &native, search_path, true, temp_ok);
 
 			if (OidIsValid(native))
 			{
 				*result = native;
 			}
 			else if (ns)
-				*result = CatalogViewLookupObject(context_view(db, branch), TypeRelationId,
+				*result = CatalogViewLookupObject(view, TypeRelationId,
 												  dg_qualified_name(ns, rv->relname));
 		}
 		end_api(nest);
