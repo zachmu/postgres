@@ -443,7 +443,12 @@ query_dependencies_walker(Node *node, QueryDependencies *found)
 					 errmsg("transition table \"%s\" cannot be referenced in a persistent object",
 							rte->eref->aliasname)));
 		if (rte->rtekind == RTE_RELATION)
+		{
+			/* A relation of another revision is opened in that revision's catalogs. */
+			if (CatalogViewObjectContext(rte->relid) && CatalogViewObjectContext(rte->relid) != dg_catalog_session_view())
+				unsupported("revision-qualified references in versioned schema objects");
 			query_dependency(found, RelationRelationId, rte->relid);
+		}
 		else if (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_rowtype))
 		{
 			/* What it uses is on its own branch: the query names no revision. */

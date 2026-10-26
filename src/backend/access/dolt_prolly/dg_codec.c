@@ -81,7 +81,18 @@ check_type_recursive(Oid type, List *ancestors)
 	 * portable as its subtype; a subtype's own sender may embed OIDs.
 	 */
 	else if (kind == TYPTYPE_RANGE)
-		check_type_recursive(get_range_subtype(type), ancestors);
+	{
+		Oid			subtype = getBaseType(get_range_subtype(type));
+
+		/* Nested in a range, arrays and records send their own type OIDs. */
+		if (OidIsValid(get_element_type(subtype)) || get_typtype(subtype) == TYPTYPE_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("prolly storage rejects type %s", format_type_be(type)),
+					 errdetail("Only codecs verified to exclude non-portable identifiers are supported."),
+					 errhint("OID and other local identifier translation is not implemented.")));
+		check_type_recursive(subtype, ancestors);
+	}
 	else if (kind == TYPTYPE_MULTIRANGE)
 		check_type_recursive(get_multirange_range(type), ancestors);
 	else if (kind != TYPTYPE_ENUM)
