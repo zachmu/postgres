@@ -61,7 +61,8 @@ $s->query_safe(q{SELECT dolt_checkout('main')});
 is($s->query_safe(q{SELECT f('x')}),'x_main','other branch routine survives drop');
 $s->quit;
 my $e=$node->background_psql('empty_routines',on_error_stop=>0);
-$e->query_safe(q{CREATE FUNCTION f(input text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN input; END$$; SELECT dolt_add('.')});
+# A database versions its routines once it has prolly storage.
+$e->query_safe(q{CREATE TABLE anchor(id int) USING dolt_prolly_table; CREATE FUNCTION f(input text) RETURNS text LANGUAGE plpgsql AS $$BEGIN RETURN input; END$$; SELECT dolt_add('.')});
 my ($out,$failed)=$e->query(q{SELECT length(dolt_commit('-m','scalar-wrapped commit'))});
 is($failed,0,'standalone scalar-wrapped version-control commit');$e->{stderr}='';
 $e->query_safe(q{SELECT dolt_checkout('-b','other')});

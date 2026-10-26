@@ -27,8 +27,6 @@ extern void dg_catalog_foreign_lock(Relation definition);
 extern bool dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait);
 extern bool dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result);
 extern Relation dg_catalog_target(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);
-extern Relation dg_catalog_copy_relation(Relation definition, bool from);
-extern Relation dg_catalog_executor_target(RangeTblEntry *rte, CmdType command);
 extern void dg_storage_close_relation(Relation rel);
 extern void dg_truncate(Relation rel);
 extern Relation dg_storage_index(Relation rel, Oid id);

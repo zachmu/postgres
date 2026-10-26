@@ -279,34 +279,25 @@ catalog_resolve_candidates(bytea *db, const RangeVar *rv, Oid user, Oid *native,
 }
 
 /*
- * Whether the database is a repository: from its first prolly object onward,
- * every prolly reference resolves through a branch's canonical schema.
+ * Whether the database has prolly storage. From its first prolly table on,
+ * every prolly reference resolves through a branch's canonical schema and
+ * routines and schemas are versioned; a database without one is ordinary
+ * PostgreSQL. Storage bindings are kept for history, so this never reverts.
  */
 bool
 dg_catalog_active(void)
 {
-	Relation	refs;
+	Relation	bindings;
 	SysScanDesc scan;
-	ScanKeyData key;
-	HeapTuple	tuple;
-	bool		active = false;
+	bool		active;
 
 	if (!IsUnderPostmaster || catalog_api_depth || rangevar_projection_hook)
 		return false;
-	refs = table_open(DoltRefRelationId, AccessShareLock);
-	ScanKeyEntryInitialize(&key, 0, Anum_pg_dolt_ref_refname, BTGreaterEqualStrategyNumber, InvalidOid,
-						   C_COLLATION_OID, F_TEXT_GE, CStringGetTextDatum("heads/"));
-	scan = systable_beginscan(refs, DoltRefKeyIndexId, true, NULL, 1, &key);
-	tuple = systable_getnext(scan);
-	if (HeapTupleIsValid(tuple))
-	{
-		bool		isnull;
-		char	   *name = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_ref_refname, RelationGetDescr(refs), &isnull));
-
-		active = strncmp(name, "heads/", 6) == 0;
-	}
+	bindings = table_open(DoltBindingRelationId, AccessShareLock);
+	scan = systable_beginscan(bindings, InvalidOid, false, NULL, 0, NULL);
+	active = HeapTupleIsValid(systable_getnext(scan));
 	systable_endscan(scan);
-	table_close(refs, AccessShareLock);
+	table_close(bindings, AccessShareLock);
 	return active;
 }
 
@@ -708,29 +699,12 @@ dg_catalog_target(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte)
 	{
 		Oid			relid = get_typ_typrelid(rte->dolt_rowtype);
 
-		if (CatalogViewIsDurable(relid))
-		{
-			rte->dolt_branch = NULL;
-			rte->dolt_relid = InvalidOid;
-			return table_open(relid, RowExclusiveLock);
-		}
-		return table_open(relid, NoLock);
+		if (!CatalogViewIsDurable(relid))
+			elog(ERROR, "branch table %u has no durable OID", relid);
+		rte->dolt_branch = NULL;
+		rte->dolt_relid = InvalidOid;
+		return table_open(relid, RowExclusiveLock);
 	}
-}
-
-Relation
-dg_catalog_executor_target(RangeTblEntry *rte, CmdType command)
-{
-	char	   *name = dg_qualified_name(get_namespace_name(get_rel_namespace(rte->relid)), get_rel_name(rte->relid));
-	AclMode		permission = command == CMD_INSERT ? ACL_INSERT : command == CMD_UPDATE ? ACL_UPDATE : ACL_DELETE;
-	Relation	rel;
-
-	if (command != CMD_INSERT && command != CMD_UPDATE && command != CMD_DELETE)
-		unsupported("canonical executor operation");
-	rel = dg_catalog_write_table(rte->dolt_branch, name, permission);
-	if (RelationGetRelid(rel) != rte->relid)
-		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical target changed; replan statement")));
-	return rel;
 }
 
 /* Name-to-OID conversions (regclass and native utility lookup) obey the same
@@ -842,17 +816,6 @@ dg_catalog_write_table(const char *branch, const char *name, AclMode permission)
 	if (permission != ACL_INSERT && permission != ACL_UPDATE && permission != ACL_DELETE)
 		elog(ERROR, "invalid canonical write permission");
 	return catalog_open_table(branch, name, permission);
-}
-
-Relation
-dg_catalog_copy_relation(Relation definition, bool from)
-{
-	char	   *name = dg_qualified_name(get_namespace_name(RelationGetNamespace(definition)), RelationGetRelationName(definition));
-	Relation	rel = catalog_open_table(dg_current_branch(), name, from ? ACL_INSERT : ACL_SELECT);
-
-	if (RelationGetRelid(rel) != RelationGetRelid(definition))
-		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical COPY definition changed; retry statement")));
-	return rel;
 }
 
 /* Caller has performed native LOCK TABLE ACL checks on the bound definition. */
@@ -1114,14 +1077,18 @@ dg_catalog_session_view(void)
 		return result;
 	GetUserIdAndSecContext(&user, &security);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+
+	/* The session's branch schema is read as catalogs are, latest committed. */
+	PushActiveSnapshot(GetLatestSnapshot());
 	PG_TRY();
 	{
 		nest = begin_api();
-		result = provider_branch_view(dg_current_branch(), read_ref(branch_ref("working")).target);
+		result = provider_branch_view(dg_current_branch(), catalog_working_schema(dg_current_branch()));
 		end_api(nest);
 	}
 	PG_FINALLY();
 	{
+		PopActiveSnapshot();
 		SetUserIdAndSecContext(user, security);
 	}
 	PG_END_TRY();

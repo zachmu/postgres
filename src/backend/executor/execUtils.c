@@ -840,13 +840,7 @@ ExecGetRangeTableRelation(EState *estate, Index rti, bool isResultRel)
 
 		Assert(rte->rtekind == RTE_RELATION);
 
-		if (rte->dolt_branch)
-		{
-			if (IsParallelWorker())
-				elog(ERROR, "parallel canonical write target is not supported");
-			rel = dg_catalog_executor_target(rte, estate->es_plannedstmt->commandType);
-		}
-		else if (!IsParallelWorker())
+		if (!IsParallelWorker())
 		{
 			/*
 			 * In a normal query, we should already have the appropriate lock,

@@ -124,13 +124,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		/* Open and lock the relation, using the appropriate lock type. */
 		rel = table_openrv(stmt->relation, lockmode);
-		if (rel->rd_catalogview && CatalogViewIsLeased(RelationGetRelid(rel)))
-		{
-			Relation	definition = rel;
-
-			rel = dg_catalog_copy_relation(definition, is_from);
-			table_close(definition, NoLock);
-		}
 
 		relid = RelationGetRelid(rel);
 
