@@ -498,17 +498,21 @@ object-level schema merge (`6c06fa14602`), and user-defined types
 
 ### Future work
 
-- **Dependency record and renames:** the persistent dependency record above,
-  then RENAME of tables, routines and types that rewrites dependent
-  definitions (columns, signatures, stored expressions, trigger members), and
-  ALTER TYPE ... RENAME VALUE that rewrites dependent rows. Both renames are
-  rejected today when the object is in use.
+- **Dependency record and renames:** done (`zachmu/schema-renames`,
+  `reports/renames-and-index-keys.html`). Database roots carry a `dependents`
+  record; renames of tables, columns, indexes, constraints, triggers, routines,
+  types and enum labels rewrite exactly the dependents it lists, and enum label
+  renames rewrite stored rows. Still open: merging across a rename (objects
+  match by name; Dolt matches tables by tag), and schema renames.
 - **Column-level schema merge:** a table whose definition changed on one side
   and rows on the other, or whose definition changed on both sides.
 - **Schema conflicts as data,** in `dolt_schema_conflicts`, resolvable,
   instead of an error.
-- **Index key encodings** for more types (enums by label order, dates,
-  timestamps, and others) and their operator classes.
+- **Index key encodings:** done for numeric, floats, date and time types,
+  interval, uuid, character types, money, MAC addresses and enums (by label
+  position; ADD VALUE rebuilds affected indexes). Still open: inet/cidr, bit
+  strings, jsonb, arrays, ranges, composites, non-C collations and cross-type
+  comparisons in the new families.
 - **Remaining DDL:** partitioning and inheritance; unlogged and temporary
   prolly tables; deferrable constraints; materialized views and views; range
   types; ALTER TYPE ADD/DROP/ALTER ATTRIBUTE; DROP ... CASCADE that drops table
