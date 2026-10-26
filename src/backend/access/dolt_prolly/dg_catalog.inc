@@ -344,9 +344,26 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	const char *context_branch = NULL;
 	Snapshot	outer;
 
-	if (rangevar_projection_hook || catalog_api_depth)
+	/*
+	 * In a provisional copy of a branch's catalogs, names resolve in the copy,
+	 * as ordinary relations: what DDL there analyzes must refer to the copy.
+	 */
+	if (rangevar_projection_hook || catalog_api_depth || CatalogViewIsProvisional(CatalogViewCurrent()))
 		return NULL;
 	rv = system_alias(rv);
+
+	/*
+	 * A versioned view on the session's branch is an ordinary relation of its
+	 * catalog view, which the rewriter expands.
+	 */
+	if (!rv->dolt_revision && !rv->catalogname && !rte->dolt_database)
+	{
+		Oid			relid;
+
+		if (dg_catalog_lookup_relation(rv, true, &relid) && OidIsValid(relid) &&
+			get_rel_relkind(relid) == RELKIND_VIEW && CatalogViewObjectContext(relid))
+			return NULL;
+	}
 	if (!rte->dolt_database && !rv->dolt_revision &&
 		!(rv->catalogname && strpbrk(rv->catalogname, "@/")) && catalog_current_database())
 	{
@@ -540,6 +557,25 @@ revision_selected:
 						aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, rv->relname);
 					break;
 				}
+
+				/* A versioned view of the revision, which the rewriter expands there. */
+				run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='view' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(logical)), NULL, true);
+				if (SPI_processed)
+				{
+					CatalogView *view = working ? provider_branch_view(revision, db) : provider_view(db);
+
+					if (target)
+						unsupported("writes through a revision's view");
+
+					/*
+					 * The caller opens the view: its query is analyzed when it
+					 * is opened, which cannot bind names within this scope.
+					 */
+					rte->relkind = RELKIND_VIEW;
+					rte->relid = CatalogViewLookupObject(view, RelationRelationId, logical);
+					result = CreateTemplateTupleDesc(0);
+					goto binding_done;
+				}
 			}
 			if (!descriptor)
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
@@ -726,7 +762,7 @@ dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result)
 			return false;
 		List	   *path = NIL;
 		ListCell   *lc;
-		char	   *raw = pstrdup(api_search_path ? api_search_path : "public");
+		char	   *raw = pstrdup(GetConfigOption("search_path", false, false));
 
 		*result = InvalidOid;
 		if (rv->schemaname)

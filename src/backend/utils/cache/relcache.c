@@ -837,9 +837,15 @@ RelationBuildRuleLock(Relation relation)
 								  &isnull);
 		Assert(!isnull);
 		rule_str = TextDatumGetCString(rule_datum);
-		oldcxt = MemoryContextSwitchTo(rulescxt);
-		rule->actions = (List *) stringToNode(rule_str);
-		MemoryContextSwitchTo(oldcxt);
+
+		/* A versioned view's rule holds its SQL, analyzed here. */
+		{
+			List	   *actions = dg_rule_actions(RelationGetRelid(relation), (List *) stringToNode(rule_str));
+
+			oldcxt = MemoryContextSwitchTo(rulescxt);
+			rule->actions = copyObject(actions);
+			MemoryContextSwitchTo(oldcxt);
+		}
 		pfree(rule_str);
 
 		rule_datum = heap_getattr(rewrite_tuple,

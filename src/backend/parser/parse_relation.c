@@ -2542,6 +2542,16 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		FreeTupleDesc(desc);
 		return item;
 	}
+	if (rte->relkind == RELKIND_VIEW && !rte->dolt_catalog)
+	{
+		/* A versioned view, as its revision has it. */
+		Relation	rel = relation_open(rte->relid, AccessShareLock);
+		ParseNamespaceItem *item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
+
+		relation_close(rel, NoLock);
+		FreeTupleDesc(desc);
+		return item;
+	}
 	if (rte->relkind == RELKIND_VIEW)
 	{
 		RangeVar   *native = copyObject(rv);

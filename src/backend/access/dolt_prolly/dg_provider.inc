@@ -61,6 +61,11 @@ typedef struct DGProviderRows
 /* The view and rows being built, against which column types resolve. */
 static CatalogView *provider_current_view;
 static DGProviderRows *provider_current_rows;
+
+/* The members being rebuilt, by kind and definition. */
+static int	provider_definition_count;
+static char **provider_definition_kinds;
+static char **provider_definition_list;
 static Oid routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name);
 
 static int
@@ -685,6 +690,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 
 #include "dg_routine_provider.inc"
 #include "dg_type_provider.inc"
+#include "dg_view_provider.inc"
 #include "dg_trigger_provider.inc"
 
 /* Shared role references are derived from canonical owners and ACLs. They
@@ -832,11 +838,14 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			definitions[i] = metadata(child(addresses[i], 1), "schema");
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
 	}
+	provider_definition_count = n;
+	provider_definition_kinds = kinds;
+	provider_definition_list = definitions;
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "namespace"))
 		{
@@ -871,6 +880,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_bind(&rows, view, definitions[i]);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "view"))
+		{
+			/* Views may use one another. */
+			(void) CatalogViewBindObject(view, RelationRelationId, json_value(definitions[i], "name"), InvalidOid);
+			(void) CatalogViewBindObject(view, TypeRelationId, json_value(definitions[i], "name"), InvalidOid);
+		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type(&rows, view, definitions[i]);
@@ -1008,6 +1024,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
 		}
 	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "view"))
+			provider_view_member(&rows, view, definitions[i]);
+	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "routine"))
 			provider_routine(&rows, view, definitions[i]);
 
@@ -1046,6 +1065,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	}
 	provider_current_view = NULL;
 	provider_current_rows = NULL;
+	provider_definition_count = 0;
 	CatalogViewSeal(view);
 }
 

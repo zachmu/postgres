@@ -20,6 +20,7 @@
 #include <fcntl.h>
 
 #include "access/amapi.h"
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -5392,7 +5393,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
 	Assert(ev_action != NULL);
-	actions = (List *) stringToNode(ev_action);
+	actions = dg_rule_actions(ev_class, (List *) stringToNode(ev_action));
 	if (actions == NIL)
 		elog(ERROR, "invalid empty ev_action list");
 
@@ -5578,7 +5579,7 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
 	Assert(ev_action != NULL);
-	actions = (List *) stringToNode(ev_action);
+	actions = dg_rule_actions(ev_class, (List *) stringToNode(ev_action));
 
 	if (list_length(actions) != 1)
 	{

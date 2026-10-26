@@ -203,7 +203,7 @@ canonical_drop(Node *statement)
 		stmt->removeType != OBJECT_FUNCTION && stmt->removeType != OBJECT_ROUTINE &&
 		stmt->removeType != OBJECT_SCHEMA && stmt->removeType != OBJECT_TYPE &&
 		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER &&
-		stmt->removeType != OBJECT_DOMAIN)
+		stmt->removeType != OBJECT_DOMAIN && stmt->removeType != OBJECT_VIEW)
 		return false;
 	if (!dg_catalog_active())
 		return false;
@@ -220,7 +220,7 @@ canonical_drop(Node *statement)
 
 			if (constraint_table)
 				branch = branch_relation(constraint_table);
-			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX)
+			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX || stmt->removeType == OBJECT_VIEW)
 				branch = branch_relation(makeRangeVarFromNameList(lfirst(lc)));
 			else if (stmt->removeType == OBJECT_TRIGGER)
 				branch = branch_relation(makeRangeVarFromNameList(list_copy_head(lfirst(lc), list_length(lfirst(lc)) - 1)));
@@ -297,7 +297,7 @@ canonical_drop(Node *statement)
 					ReleaseSysCache(constraint);
 				}
 			}
-			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX)
+			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX || stmt->removeType == OBJECT_VIEW)
 			{
 				RangeVar   *rv = makeRangeVarFromNameList(lfirst(lc));
 
@@ -308,7 +308,7 @@ canonical_drop(Node *statement)
 				{
 					char		kind = get_rel_relkind(object.objectId);
 
-					if (kind != (stmt->removeType == OBJECT_INDEX ? RELKIND_INDEX : RELKIND_RELATION))
+					if (kind != (stmt->removeType == OBJECT_INDEX ? RELKIND_INDEX : stmt->removeType == OBJECT_VIEW ? RELKIND_VIEW : RELKIND_RELATION))
 						ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("wrong relation kind for DROP")));
 					namespaceid = get_rel_namespace(object.objectId);
 				}
@@ -383,7 +383,7 @@ canonical_drop(Node *statement)
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
 				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId &&
-				 object->classId != AttrDefaultRelationId))
+				 object->classId != AttrDefaultRelationId && object->classId != RewriteRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
 		CatalogViewSwitch(NULL);

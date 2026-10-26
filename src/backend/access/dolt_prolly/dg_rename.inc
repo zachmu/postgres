@@ -42,6 +42,8 @@ rename_encode(CatalogView *view, const char *kind, const char *name, const char 
 				VC_ARGS(CStringGetTextDatum(result), CStringGetTextDatum(dg_qualified_name(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)))), NULL, true);
 			result = strcell(0, 1);
 		}
+		else if (!strcmp(kind, "view"))
+			result = view_encode(CatalogViewLookupObject(view, RelationRelationId, name));
 		else if (!strcmp(kind, "routine"))
 		{
 			HeapTuple	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(CatalogViewLookupObject(view, ProcedureRelationId, name)));
@@ -297,12 +299,14 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 	{
 		case OBJECT_TABLE:
 		case OBJECT_INDEX:
+		case OBJECT_VIEW:
 			{
 				Oid			relid = RangeVarGetRelid(relation, NoLock, true);
 
 				if (!OidIsValid(relid) || relid < FirstDurableObjectId)
 					return false;
-				*kind = get_rel_relkind(relid) == RELKIND_INDEX ? "index" : "table";
+				*kind = get_rel_relkind(relid) == RELKIND_INDEX ? "index" :
+					get_rel_relkind(relid) == RELKIND_VIEW ? "view" : "table";
 				*name = CatalogViewObjectIdentity(relid, RelationRelationId);
 				if (!strcmp(*kind, "index"))
 				{
@@ -424,8 +428,9 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 	PG_TRY();
 	{
 		Capture		current;
-		List	   *targets;
+		List	   *targets = NIL;
 		char	   *root;
+		MemoryContext caller_context = CurrentMemoryContext;
 
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
@@ -433,10 +438,37 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		CommandCounterIncrement();
 		UpdateActiveSnapshotCommandId();
 		provider_populate(view, current.hash, NULL);
+		root = metadata(current.hash, "database");
+		{
+			List	   *found = list_make1(list_make2(kind, name));
+			MemoryContext api_context;
+
+			if (!strcmp(kind, "namespace"))
+				found = rename_schema_members(found, root, name);
+			foreach_ptr(List, reference, references)
+			{
+				if (!strcmp(linitial(reference), "table") && strcmp(kind, "table") && strcmp(kind, "view"))
+				{
+					/* An index's table lists it; the table itself is re-encoded. */
+					if (!rename_targeted(found, "table", lsecond(reference)))
+						found = lappend(found, reference);
+				}
+				found = rename_referrers(found, root, linitial(reference), lsecond(reference));
+			}
+
+			/* The targets outlive this API call. */
+			api_context = MemoryContextSwitchTo(caller_context);
+			foreach_ptr(List, target, found)
+				targets = lappend(targets, list_make2(pstrdup(linitial(target)), pstrdup(lsecond(target))));
+			MemoryContextSwitchTo(api_context);
+		}
 		end_api(nest);
 		CatalogViewBeginMutation(view);
 		CatalogViewSetStorageHandler(view, rename_storage);
 		native_mutation_view = view;
+
+		/* Views' queries name what they use; bind them before it is renamed. */
+		view_materialize_rules(view, targets);
 		CatalogViewSwitch(view);
 		SetUserIdAndSecContext(caller, security);
 		if (IsA(statement, RenameStmt))
@@ -458,19 +490,6 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		CommandCounterIncrement();
 		UpdateActiveSnapshotCommandId();
 		root = metadata(current.hash, "database");
-		targets = list_make1(list_make2(kind, name));
-		if (!strcmp(kind, "namespace"))
-			targets = rename_schema_members(targets, root, name);
-		foreach_ptr(List, reference, references)
-		{
-			if (!strcmp(linitial(reference), "table") && strcmp(kind, "table"))
-			{
-				/* An index's table lists it; the table itself is re-encoded. */
-				if (!rename_targeted(targets, "table", lsecond(reference)))
-					targets = lappend(targets, reference);
-			}
-			targets = rename_referrers(targets, root, linitial(reference), lsecond(reference));
-		}
 		rename_publish(view, current, targets);
 		if (IsA(statement, AlterEnumStmt))
 			enum_tables_rewrite(root, name, ((AlterEnumStmt *) statement)->oldVal,

@@ -29,6 +29,11 @@
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
 #include "commands/alter.h"
+#include "rewrite/rewriteSupport.h"
+#include "parser/analyze.h"
+#include "commands/view.h"
+#include "rewrite/rewriteDefine.h"
+#include "rewrite/rewriteHandler.h"
 #include "commands/typecmds.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
@@ -518,7 +523,7 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index','view') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	return SPI_processed != 0;
 }
 
@@ -608,7 +613,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
-		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
+		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1308,6 +1313,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_dependency.inc"
 #include "dg_trigger_ddl.inc"
 #include "dg_type_ddl.inc"
+#include "dg_view_ddl.inc"
 #include "dg_rename.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"

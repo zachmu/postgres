@@ -19,7 +19,7 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type", "view"};
 
 static void
 manifest_begin(void)
@@ -134,10 +134,10 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		child = object_kind(DatumGetByteaPP(links[i]), false);
 		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
-			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0) :
+			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
 			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 :
-			(id == 9 || id == 12 || id == 13) ? strcmp(child, "schema") == 0 :
+			(id == 9 || id == 12 || id == 13 || id == 14) ? strcmp(child, "schema") == 0 :
 			id == 10 ? strcmp(child, "commit") == 0 :
 			id == 11 ? strcmp(child, i < 2 ? "database" : "commit") == 0 : false;
 		if (!valid)
