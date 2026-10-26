@@ -133,7 +133,22 @@ rename_publish(CatalogView *view, Capture current, List *targets)
 		char	   *payload = metadata(members[i], kinds[i]);
 		bytea	   *member = members[i];
 
-		if (names[i] && rename_targeted(targets, kinds[i], names[i]))
+		if (!strcmp(kinds[i], "namespace"))
+			names[i] = json_value(payload, "name");
+
+		if (names[i] && !strcmp(kinds[i], "namespace") && rename_targeted(targets, kinds[i], names[i]))
+		{
+			/* A schema's definition is its member's payload. */
+			Oid			namespace = CatalogViewLookupObject(view, NamespaceRelationId, names[i]);
+			CatalogView *previous = CatalogViewSwitch(view);
+			char	   *name = get_namespace_name(namespace);
+
+			CatalogViewSwitch(previous);
+			run("SELECT jsonb_set($1::jsonb,'{name}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(name)), NULL, true);
+			payload = strcell(0, 1);
+			member = put("namespace", payload, NULL, 0);
+		}
+		else if (names[i] && rename_targeted(targets, kinds[i], names[i]))
 		{
 			bytea	   *oldschema = child(members[i], 1);
 			char	   *definition = rename_encode(view, kinds[i], names[i], metadata(oldschema, "schema"));
@@ -179,6 +194,57 @@ rename_referrers(List *targets, const char *json, const char *kind, const char *
 	foreach_ptr(List, referrer, database_referrers(json, kind, name))
 		if (!rename_targeted(targets, linitial(referrer), lsecond(referrer)))
 		targets = lappend(targets, referrer);
+	return targets;
+}
+
+/* The schema a member's name qualifies it with. */
+static char *
+rename_member_schema(const char *kind, const char *name)
+{
+	char	   *prefix = pstrdup(name);
+	char	   *end = strpbrk(prefix, !strcmp(kind, "routine") ? "(" : !strcmp(kind, "trigger") ? "/" : "");
+
+	if (end)
+		*end = '\0';
+	return strVal(linitial(stringToQualifiedNameList(prefix, NULL)));
+}
+
+/* A routine is referred to by its name without its argument types. */
+static char *
+rename_reference_name(const char *kind, const char *name)
+{
+	char	   *result = pstrdup(name);
+
+	if (!strcmp(kind, "routine") && strchr(result, '('))
+		*strchr(result, '(') = '\0';
+	return result;
+}
+
+/*
+ * Add every member in schema |schema| of database root |root|, and every
+ * member that refers to one of them, to |targets|.
+ */
+static List *
+rename_schema_members(List *targets, const char *root, const char *schema)
+{
+	List	   *members = NIL;
+
+	run("SELECT v->>'kind',v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'<>'namespace'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(root)), NULL, true);
+	for (uint64 i = 0; i < SPI_processed; i++)
+		members = lappend(members, list_make2(strcell(i, 1), strcell(i, 2)));
+	foreach_ptr(List, member, members)
+	{
+		char	   *kind = linitial(member);
+		char	   *name = lsecond(member);
+
+		if (strcmp(rename_member_schema(kind, name), schema))
+			continue;
+		if (!rename_targeted(targets, kind, name))
+			targets = lappend(targets, member);
+		targets = rename_referrers(targets, root, kind, rename_reference_name(kind, name));
+		if (!strcmp(kind, "table"))
+			targets = rename_referrers(targets, root, "type", name);
+	}
 	return targets;
 }
 
@@ -249,6 +315,20 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 				{
 					*references = list_make2(list_make2("table", *name), list_make2("type", *name));
 				}
+				return true;
+			}
+		case OBJECT_SCHEMA:
+			{
+				/* A schema the branch has; the members in it are found later. */
+				char	   *schema = ((RenameStmt *) statement)->subname;
+				int			nest = begin_api();
+				bool		versioned = catalog_namespace_find(read_ref(branch_ref("working")).target, schema) != NULL;
+
+				end_api(nest);
+				if (!versioned)
+					return false;
+				*kind = "namespace";
+				*name = pstrdup(schema);
 				return true;
 			}
 		case OBJECT_TRIGGER:
@@ -379,6 +459,8 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		UpdateActiveSnapshotCommandId();
 		root = metadata(current.hash, "database");
 		targets = list_make1(list_make2(kind, name));
+		if (!strcmp(kind, "namespace"))
+			targets = rename_schema_members(targets, root, name);
 		foreach_ptr(List, reference, references)
 		{
 			if (!strcmp(linitial(reference), "table") && strcmp(kind, "table"))
@@ -394,6 +476,20 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 			enum_tables_rewrite(root, name, ((AlterEnumStmt *) statement)->oldVal,
 								((AlterEnumStmt *) statement)->newVal);
 		end_api(nest);
+
+		/*
+		 * Physical schemas are shared by every branch and by native objects:
+		 * the old one stays, and the new name has one too.
+		 */
+		if (!strcmp(kind, "namespace") && !OidIsValid(get_namespace_oid(((RenameStmt *) statement)->newname, true)))
+		{
+			HeapTuple	old = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(get_namespace_oid(name, false)));
+
+			(void) NamespaceCreate(((RenameStmt *) statement)->newname,
+								   ((Form_pg_namespace) GETSTRUCT(old))->nspowner, false);
+			ReleaseSysCache(old);
+			CommandCounterIncrement();
+		}
 		UpdateActiveSnapshotCommandId();
 	}
 	PG_FINALLY();
