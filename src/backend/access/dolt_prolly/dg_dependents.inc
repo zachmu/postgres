@@ -114,7 +114,8 @@ definition_references(const char *kind, const char *definition)
 {
 	List	   *references = NIL;
 
-	if (!strcmp(kind, "table"))
+	/* An index's definition lists its key columns as a table's does. */
+	if (!strcmp(kind, "table") || !strcmp(kind, "index"))
 	{
 		run("SELECT v->>'type',v->>'default' FROM jsonb_array_elements($1::jsonb->'columns') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 		{
@@ -133,7 +134,7 @@ definition_references(const char *kind, const char *definition)
 				references_sql(&references, defaults[i]);
 			}
 		}
-		run("SELECT v->>0,v->>1 FROM jsonb_array_elements($1::jsonb->'constraints') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 		{
 			uint64		n = SPI_processed;
 			char	  **names = palloc_array(char *, Max(n, 1));
@@ -155,7 +156,7 @@ definition_references(const char *kind, const char *definition)
 			}
 		}
 	}
-	else if (!strcmp(kind, "index"))
+	if (!strcmp(kind, "index"))
 	{
 		char	   *sql = json_value(definition, "index_definition");
 		IndexStmt  *index;

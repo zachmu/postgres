@@ -47,6 +47,94 @@ type_versioned_row(Form_pg_type type)
 	return type->typtype == TYPTYPE_COMPOSITE && get_rel_relkind(type->typrelid) == RELKIND_COMPOSITE_TYPE;
 }
 
+/*
+ * The tables of database root |root| that can hold a value of type |type|,
+ * directly or through domains, arrays and composite types, as its dependency
+ * record lists them.
+ */
+static List *
+type_tables(const char *root, const char *type)
+{
+	List	   *types = list_make1(pstrdup(type));
+	List	   *tables = NIL;
+
+	foreach_ptr(char, name, types)
+	{
+		foreach_ptr(List, referrer, database_referrers(root, "type", name))
+		{
+			List	  **into = !strcmp(linitial(referrer), "type") ? &types :
+				!strcmp(linitial(referrer), "table") ? &tables : NULL;
+			bool		listed = false;
+
+			if (!into)
+				continue;
+			foreach_ptr(char, member, *into)
+				listed |= !strcmp(member, lsecond(referrer));
+			if (!listed)
+				*into = lappend(*into, lsecond(referrer));
+		}
+	}
+	return tables;
+}
+
+typedef struct EnumLabel
+{
+	TupleDesc	desc;
+	Oid			type;
+	const char *old;
+	const char *renamed;
+} EnumLabel;
+
+static PLSlice
+enum_label_field(int field, PLSlice bytes, void *arg)
+{
+	EnumLabel  *label = arg;
+
+	return dg_recode_label(TupleDescAttr(label->desc, field)->atttypid, bytes, label->type, label->old, label->renamed);
+}
+
+/*
+ * Install the rows of every table that can hold a value of enum |type| again
+ * on the working branch, with label |old| renamed to |renamed| if given. Rows
+ * hold labels, and index keys label positions, which an added label shifts;
+ * installing rows rebuilds their indexes.
+ */
+static void
+enum_tables_rewrite(const char *root, const char *type, const char *old, const char *renamed)
+{
+	List	   *tables = type_tables(root, type);
+
+	foreach_ptr(char, table, tables)
+	{
+		Relation	rel = dg_catalog_write_table(dg_current_branch(), table, ACL_UPDATE);
+		DGState    *state = dg_load(rel, SnapshotSelf);
+		TupleDesc	desc = RelationGetDescr(rel);
+		PLTree		tree = state->content;
+
+		if (old)
+		{
+			int		   *mapping = palloc_array(int, Max(desc->natts, 1));
+			EnumLabel	label = {
+				.desc = desc,
+				.type = CatalogViewLookupObject(rel->rd_catalogview, TypeRelationId, type),
+				.old = old,
+				.renamed = renamed,
+			};
+
+			for (int i = 0; i < desc->natts; i++)
+				mapping[i] = i;
+			tree = alter_rows(state, desc->natts, desc->natts, mapping, enum_label_field, &label);
+		}
+		dg_history_install(rel, state, tree);
+		dg_release(state);
+		dg_storage_close_relation(rel);
+		UpdateActiveSnapshotCommandId();
+	}
+	if (tables)
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
+	advance_snapshot();
+}
+
 /* Type DDL makes no storage; a composite type's relation has none. */
 static void
 type_storage(Relation relation, CatalogViewStorageEffect effect)
@@ -61,6 +149,7 @@ type_ddl(ParseState *pstate, Node *statement)
 	CatalogView *view = CatalogViewCreate("provisional type DDL");
 	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *saved_mutation = native_mutation_view;
+	Oid			enum_type = InvalidOid;
 	Oid			caller,
 				privileged;
 	int			security,
@@ -100,6 +189,7 @@ type_ddl(ParseState *pstate, Node *statement)
 									((CompositeTypeStmt *) statement)->coldeflist);
 				break;
 			case T_AlterEnumStmt:
+				enum_type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 				AlterEnum((AlterEnumStmt *) statement);
 				break;
 			case T_AlterDomainStmt:
@@ -146,7 +236,14 @@ type_ddl(ParseState *pstate, Node *statement)
 		systable_endscan(scan);
 		table_close(catalog, AccessShareLock);
 		CatalogViewSwitch(NULL);
-		(void) objects_publish("type", NIL, NULL, true, definitions);
+		{
+			bytea	   *database = objects_publish("type", NIL, NULL, true, definitions);
+
+			/* An added label shifts the positions that index keys hold. */
+			if (IsA(statement, AlterEnumStmt))
+				enum_tables_rewrite(metadata(database, "database"),
+									CatalogViewObjectIdentity(enum_type, TypeRelationId), NULL, NULL);
+		}
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
 	}

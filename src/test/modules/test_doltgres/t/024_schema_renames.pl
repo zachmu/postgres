@@ -28,6 +28,7 @@ CREATE DOMAIN upbeat AS mood CHECK (VALUE <> 'sad');
 CREATE TYPE pair AS (a int, m mood);
 CREATE TABLE m(id int PRIMARY KEY, mo mood DEFAULT 'ok', ms mood[], d upbeat, p pair);
 INSERT INTO m VALUES (1,'sad','{ok,sad}','ok',ROW(1,'ok')), (2,'ok',NULL,NULL,NULL);
+CREATE INDEX m_mo ON m(mo);
 CREATE FUNCTION cheer(x mood) RETURNS mood LANGUAGE sql AS $$SELECT x$$;
 SELECT dolt_commit('-Am','base');
 });
@@ -64,6 +65,7 @@ is(sql(q{SELECT string_agg(format_type(atttypid, atttypmod), ',' ORDER BY attnum
 is(sql(q{SELECT pg_get_function_arguments('cheer'::regproc)||','||format_type((SELECT typbasetype FROM pg_type WHERE typname='cheerful'), NULL)}),'x feeling,feeling','and the routines and domains');
 sql(q{INSERT INTO m(id) VALUES (3)});
 is(sql(q{SELECT mo FROM m WHERE id=3}),'ok','and the defaults that cast to them');
+is(sql(q{SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT string_agg(id::text, ',' ORDER BY id) FROM m WHERE mo = 'ok'}),'2,3','and the indexes on columns of them');
 
 # ---- enum labels ----
 sql(q{ALTER TYPE feeling RENAME VALUE 'ok' TO 'fine'});
@@ -71,6 +73,7 @@ is(sql(q{SELECT string_agg(id||':'||mo||':'||coalesce(ms::text,'-')||':'||coales
 	'1:sad:{fine,sad}:fine:fine 2:fine:-:-:- 3:fine:-:-:-','RENAME VALUE rewrites stored labels in columns, arrays, domains and composites');
 is(sql(q{SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid='m'::regclass}),"'fine'::feeling",'and the defaults that name it');
 is(sql(q{SELECT string_agg(mo::text, ',' ORDER BY id) FROM m AS OF 'HEAD'}),'sad,ok','history keeps the old labels');
+is(sql(q{SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT string_agg(id::text, ',' ORDER BY id) FROM m WHERE mo = 'fine'}),'2,3','a renamed label keeps its index keys');
 
 # ---- branches ----
 sql(q{SELECT dolt_commit('-Am','renames')});

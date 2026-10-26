@@ -173,6 +173,8 @@ for my $case (@cases)
 
 my @checks;
 my $n = 0;
+# Types whose index keys order as their btree operator class does.
+my %ordered = map { $_ => 1 } qw(bool bytea char name int2 int4 int8 text varchar float4 float8 numeric money date time timetz timestamp timestamptz interval uuid macaddr macaddr8);
 for my $case (@cases)
 {
  my ($type, $a, $b) = @$case;
@@ -186,6 +188,18 @@ for my $case (@cases)
  is($node->safe_psql('postgres', "SELECT dolt_prolly_root('p$n')=dolt_prolly_root('q$n')"), 't', "$type history independence");
  is($node->safe_psql('postgres', 'SET enable_seqscan=off; '.sprintf($query,"p$n")), $expected, "$type index-only payload");
  push @checks, [sprintf($query,"p$n"), $expected, $type];
+ (my $key = $type) =~ s/\(.*\)//;
+ $key =~ s/"//g;
+ if ($ordered{$key})
+ {
+  # Index order and equality, against heap's.
+  $node->safe_psql('postgres', "CREATE INDEX ki$n ON p$n(v)");
+  my $order = "SELECT string_agg(coalesce(v::text,'NULL'), '|' ORDER BY v) FROM %s";
+  my $equal = "SELECT string_agg(id::text, ',' ORDER BY id) FROM %s WHERE v = ($a)::$type";
+  my $index = 'SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_sort=off; ';
+  is($node->safe_psql('postgres', $index.sprintf($order, "p$n")), $node->safe_psql('postgres', sprintf($order, "h$n")), "$type index order matches heap");
+  is($node->safe_psql('postgres', $index.sprintf($equal, "p$n")), $node->safe_psql('postgres', sprintf($equal, "h$n")), "$type index equality matches heap");
+ }
 }
 
 my ($node_status, $node_out, $node_err) = $node->psql('postgres', q{CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table});
@@ -243,10 +257,14 @@ INSERT INTO one_scale VALUES (1.0); INSERT INTO another_scale VALUES (1.00);
 is($node->safe_psql('postgres', q{SELECT dolt_prolly_root('one_scale')<>dolt_prolly_root('another_scale')}), 't', 'SQL-equal numeric scales may have different content hashes');
 like($node->safe_psql('postgres', 'SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id,v FROM p1 ORDER BY id'), qr/Index Only Scan/, 'payload checks exercise index-only scans');
 
+# Index keys normalize values their operator class finds equal.
+my ($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE UNIQUE INDEX scales ON one_scale(n); INSERT INTO one_scale VALUES (1.00)});
+isnt($status, 0, 'numeric index keys equate scales');
+like($stderr, qr/duplicate key value violates unique constraint "scales"/, 'numeric uniqueness diagnostic');
 # Reject unavailable ordered encodings rather than applying byte ordering to a
-# generic binary representation (e.g. numeric or a collation-aware string).
-my ($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE INDEX unsupported_numeric ON one_scale(n)});
-isnt($status, 0, 'new storage support does not claim numeric ordered keys');
+# generic binary representation.
+($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE TABLE unordered(j jsonb) USING dolt_prolly_table; CREATE INDEX unordered_j ON unordered(j)});
+isnt($status, 0, 'types without an ordered key encoding have no prolly index');
 like($stderr, qr/no default operator class/, 'missing ordered opclass is explicit');
 # TODO: user-defined types in versioned tables.
 SKIP: {

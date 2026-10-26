@@ -80,12 +80,68 @@ index_entry(Relation index, PLSlice row, PLSlice digest, StringInfo key, size_t 
 		dg_check(pl_tuple_get(row, attribute, &field));
 		appendStringInfoChar(key, field.present ? 1 : (nullfirst ? 0 : 2));
 		if (field.present)
-			escaped(key, field.bytes, desc);
+			escaped(key, dg_key_field(TupleDescAttr(RelationGetDescr(index), j)->atttypid, field.bytes), desc);
 		else
 			*nullkey = true;
 	}
 	*prefix = key->len;
 	escaped(key, digest, false);
+}
+
+/* The btree comparison function the key encoding of |type| orders as. */
+static const char *
+index_comparator(Oid type)
+{
+	switch (type)
+	{
+		case BOOLOID:
+			return "btboolcmp";
+		case INT2OID:
+			return "btint2cmp";
+		case INT4OID:
+			return "btint4cmp";
+		case INT8OID:
+			return "btint8cmp";
+		case TEXTOID:
+		case VARCHAROID:
+			return "bttextcmp";
+		case BYTEAOID:
+			return "byteacmp";
+		case BPCHAROID:
+			return "bpcharcmp";
+		case CHAROID:
+			return "btcharcmp";
+		case NAMEOID:
+			return "btnamecmp";
+		case FLOAT4OID:
+			return "btfloat4cmp";
+		case FLOAT8OID:
+			return "btfloat8cmp";
+		case NUMERICOID:
+			return "numeric_cmp";
+		case DATEOID:
+			return "date_cmp";
+		case TIMEOID:
+			return "time_cmp";
+		case TIMETZOID:
+			return "timetz_cmp";
+		case TIMESTAMPOID:
+			return "timestamp_cmp";
+		case TIMESTAMPTZOID:
+			return "timestamptz_cmp";
+		case INTERVALOID:
+			return "interval_cmp";
+		case UUIDOID:
+			return "uuid_cmp";
+		case CASHOID:
+			return "cash_cmp";
+		case MACADDROID:
+			return "macaddr_cmp";
+		case MACADDR8OID:
+			return "macaddr8_cmp";
+		default:
+			return "enum_cmp";
+	}
 }
 
 /* Reject index definitions the encoding cannot order correctly. */
@@ -109,15 +165,21 @@ dg_index_validate(Relation table, Relation index)
 
 		if (att <= 0)
 			dg_unsupported("system-column indexes");
-		type = TupleDescAttr(RelationGetDescr(table), att - 1)->atttypid;
-		if (type != BOOLOID && type != INT2OID && type != INT4OID &&
-			type != INT8OID && type != TEXTOID && type != BYTEAOID)
+		type = getBaseType(TupleDescAttr(RelationGetDescr(table), att - 1)->atttypid);
+		if (!dg_key_ordered(type))
 			dg_unsupported("ordered index keys of this type");
-		if (type == TEXTOID && !pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
+		if ((type == TEXTOID || type == VARCHAROID || type == BPCHAROID || type == NAMEOID) &&
+			!pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
 			dg_unsupported("non-C index collations");
-		expected = type == BOOLOID ? "btboolcmp" : type == INT2OID ? "btint2cmp" : type == INT4OID ? "btint4cmp" : type == INT8OID ? "btint8cmp" : type == TEXTOID ? "bttextcmp" : "byteacmp";
+		expected = index_comparator(type);
 		if (get_func_namespace(function) != PG_CATALOG_NAMESPACE || strcmp(get_func_name(function), expected))
 			dg_unsupported("custom index comparators");
+
+		/* Operator classes are declared on varchar's text and an enum's anyenum. */
+		if (type == VARCHAROID)
+			type = TEXTOID;
+		else if (get_typtype(type) == TYPTYPE_ENUM)
+			type = ANYENUMOID;
 		for (strategy = 1; strategy <= 5; strategy++)
 		{
 			Oid			actual = get_opfamily_member(index->rd_opfamily[j], type, type, strategy);
@@ -636,11 +698,11 @@ static void
 append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 {
 	Relation	index = scan->indexRelation;
-	Oid			type = OidIsValid(key->sk_subtype) ? key->sk_subtype :
+	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID ? key->sk_subtype :
 		TupleDescAttr(RelationGetDescr(scan->heapRelation), index->rd_index->indkey.values[j] - 1)->atttypid;
 
 	appendStringInfoChar(out, 1);
-	escaped(out, dg_encode_value(type, key->sk_argument), (index->rd_indoption[j] & INDOPTION_DESC) != 0);
+	escaped(out, dg_key_value(type, key->sk_argument), (index->rd_indoption[j] & INDOPTION_DESC) != 0);
 }
 
 /*

@@ -299,77 +299,6 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 	}
 }
 
-typedef struct RenameLabel
-{
-	TupleDesc	desc;
-	Oid			type;
-	const char *old;
-	const char *renamed;
-} RenameLabel;
-
-static PLSlice
-rename_label_field(int field, PLSlice bytes, void *arg)
-{
-	RenameLabel *label = arg;
-
-	return dg_recode_label(TupleDescAttr(label->desc, field)->atttypid, bytes, label->type, label->old, label->renamed);
-}
-
-/*
- * Rows hold enum labels: rewrite the rows of every table that can hold a
- * value of enum |type|, directly or through domains, arrays and composite
- * types, as the dependency record of |root| lists them.
- */
-static void
-rename_label_rows(const char *root, const char *type, const char *old, const char *renamed)
-{
-	List	   *types = list_make1(pstrdup(type));
-	List	   *tables = NIL;
-
-	foreach_ptr(char, name, types)
-	{
-		foreach_ptr(List, referrer, database_referrers(root, "type", name))
-		{
-			List	  **into = !strcmp(linitial(referrer), "type") ? &types :
-				!strcmp(linitial(referrer), "table") ? &tables : NULL;
-			bool		listed = false;
-
-			if (!into)
-				continue;
-			foreach_ptr(char, member, *into)
-				listed |= !strcmp(member, lsecond(referrer));
-			if (!listed)
-				*into = lappend(*into, lsecond(referrer));
-		}
-	}
-	foreach_ptr(char, table, tables)
-	{
-		Relation	rel = dg_catalog_write_table(dg_current_branch(), table, ACL_UPDATE);
-		Oid			target = CatalogViewLookupObject(rel->rd_catalogview, TypeRelationId, type);
-		DGState    *state = dg_load(rel, SnapshotSelf);
-		TupleDesc	desc = RelationGetDescr(rel);
-		int		   *mapping = palloc_array(int, Max(desc->natts, 1));
-		RenameLabel label = {
-			.desc = desc,
-			.type = target,
-			.old = old,
-			.renamed = renamed,
-		};
-		PLTree		tree;
-
-		for (int i = 0; i < desc->natts; i++)
-			mapping[i] = i;
-		tree = alter_rows(state, desc->natts, desc->natts, mapping, rename_label_field, &label);
-		dg_history_install(rel, state, tree);
-		dg_release(state);
-		dg_storage_close_relation(rel);
-		UpdateActiveSnapshotCommandId();
-	}
-	if (tables)
-		move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
-	advance_snapshot();
-}
-
 static void
 rename_storage(Relation relation, CatalogViewStorageEffect effect)
 {
@@ -462,8 +391,8 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		}
 		rename_publish(view, current, targets);
 		if (IsA(statement, AlterEnumStmt))
-			rename_label_rows(root, name, ((AlterEnumStmt *) statement)->oldVal,
-							  ((AlterEnumStmt *) statement)->newVal);
+			enum_tables_rewrite(root, name, ((AlterEnumStmt *) statement)->oldVal,
+								((AlterEnumStmt *) statement)->newVal);
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
 	}
