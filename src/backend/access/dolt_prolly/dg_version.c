@@ -23,6 +23,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_storage.h"
 #include "catalog/pg_dolt_identity.h"
 #include "utils/inval.h"
 #include "access/genam.h"
@@ -54,6 +55,8 @@
 #include "access/doltbranch.h"
 #include "access/doltsystem.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/pg_dolt_object.h"
+#include "mb/pg_wchar.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "access/relation.h"
@@ -161,8 +164,12 @@ static void
 run(const char *sql, int n, Oid *types, Datum *args, const char *nulls, bool ro)
 {
 	MemoryContext c = CurrentMemoryContext;
+	SPIPlanPtr	plan = dg_manifest_plan(sql, n, types);
 
-	SPI_execute_with_args(sql, n, types, args, nulls, ro, 0);
+	if (plan)
+		SPI_execute_plan(plan, args, nulls, ro, 0);
+	else
+		SPI_execute_with_args(sql, n, types, args, nulls, ro, 0);
 	MemoryContextSwitchTo(c);
 }
 static Datum
@@ -429,20 +436,103 @@ same(bytea *a, bytea *b)
 {
 	return a && b && VARSIZE_ANY_EXHDR(a) == VARSIZE_ANY_EXHDR(b) && !memcmp(VARDATA_ANY(a), VARDATA_ANY(b), VARSIZE_ANY_EXHDR(a));
 }
+/*
+ * Refs and retained objects are read natively, under the snapshot internal
+ * SQL would use: the active one. Only the callers that need them pay for
+ * payloads, which may be large.
+ */
+static Snapshot
+api_snapshot(void)
+{
+	return ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+}
+
 static VersionRef
 read_ref(const char *name)
 {
 	VersionRef	r = {0};
-	Oid			types[] = {TEXTOID};
-	Datum		args[] = {CStringGetTextDatum(name)};
+	Relation	catalog = table_open(DoltRefRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
 
-	run("SELECT reftarget,reftoken FROM pg_catalog.pg_dolt_ref WHERE refname=$1", 1, types, args, NULL, true);
-	if (SPI_processed)
+	ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltRefKeyIndexId, true, api_snapshot(), 1, &key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
 	{
-		r.target = (bytea *) DatumGetPointer(cell(0, 1));
-		r.token = (bytea *) DatumGetPointer(cell(0, 2));
+		bool		isnull;
+		Datum		value = heap_getattr(tuple, Anum_pg_dolt_ref_reftarget, RelationGetDescr(catalog), &isnull);
+
+		if (!isnull)
+			r.target = DatumGetByteaPCopy(value);
+		value = heap_getattr(tuple, Anum_pg_dolt_ref_reftoken, RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+			r.token = DatumGetByteaPCopy(value);
 	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
 	return r;
+}
+
+static bool
+object_read(bytea *hash, const char *kind, char **actual, bytea **payload, ArrayType **children)
+{
+	return dg_object_read(hash, kind, actual, payload, children);
+}
+
+/*
+ * Whether object |hash| of |kind| exists, and the transaction that created
+ * it if that is this transaction and no other copy is committed.
+ */
+static bool
+object_creator(bytea *hash, const char *kind, bool *found, TransactionId *creator)
+{
+	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	*found = false;
+	*creator = InvalidTransactionId;
+	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
+	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
+		TransactionId xid = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		if (strcmp(objkind, kind))
+			continue;
+		*found = true;
+		if (!TransactionIdIsCurrentTransactionId(xid))
+		{
+			*creator = InvalidTransactionId;
+			break;
+		}
+		*creator = xid;
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return *found;
+}
+
+/* The |index|th (from 1) child of object |hash|, or NULL. */
+static bytea *
+object_child(bytea *hash, int index)
+{
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	if (!object_read(hash, NULL, NULL, NULL, &children))
+		return NULL;
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	if (index < 1 || index > n || nulls[index - 1])
+		return NULL;
+	return DatumGetByteaPCopy(values[index - 1]);
 }
 static void
 move_ref(const char *name, VersionRef old, bytea *target)
@@ -484,27 +574,24 @@ put(const char *kind, const char *json, Datum *hashes, int count)
 static char *
 metadata(bytea *hash, const char *kind)
 {
-	Oid			types[] = {BYTEAOID, TEXTOID};
-	Datum		args[] = {PointerGetDatum(hash), CStringGetTextDatum(kind)};
+	bytea	   *payload;
+	char	   *text;
 
 	if (!strcmp(kind, "schema") || !strcmp(kind, "namespace"))
 		return dg_schema_read(hash, kind);
-
-	run("SELECT convert_from(objpayload,'UTF8') FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true);
-	if (!SPI_processed)
+	if (!object_read(hash, kind, NULL, &payload, NULL))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible %s object", kind)));
-	return strcell(0, 1);
+	text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+	return pg_any_to_server(text, strlen(text), PG_UTF8);
 }
 static bytea *
 child(bytea *hash, int index)
 {
-	Oid			types[] = {BYTEAOID, INT4OID};
-	Datum		args[] = {PointerGetDatum(hash), Int32GetDatum(index)};
+	bytea	   *result = object_child(hash, index);
 
-	run("SELECT objchildren[$2] FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 2, types, args, NULL, true);
-	if (!SPI_processed || !cell(0, 1))
+	if (!result)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision has no requested ancestor or state")));
-	return (bytea *) DatumGetPointer(cell(0, 1));
+	return result;
 }
 static void
 json_field(StringInfo b, const char *key, const char *value, bool comma)
@@ -548,7 +635,6 @@ catalog_contains(bytea *db, const char *name)
 }
 
 static CatalogView *provider_view(bytea *database);
-static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static char *database_dependents(const char *json, Datum *members, int count);
@@ -832,11 +918,19 @@ valid_name(const char *s)
 static int
 parent_count(bytea *commit)
 {
-	run("SELECT coalesce(array_length(objchildren,1),1)-1 FROM pg_dolt_object_visible WHERE objhash=$1 AND objkind='commit'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(commit)), NULL, true);
-	if (!SPI_processed)
+	ArrayType  *children;
+	int			n;
+
+	if (!object_read(commit, "commit", NULL, NULL, &children))
 		return 0;
-	return DatumGetInt32(cell(0, 1));
+	n = ArrayGetNItems(ARR_NDIM(children), ARR_DIMS(children));
+	return Max(n, 1) - 1;
 }
+/* The ref the last resolve() went through, if any, and what it pointed to. */
+static char *resolved_ref;
+static bytea *resolved_target;
+static bool resolved_session;	/* HEAD: relative to the session's branch */
+
 static bytea *
 resolve(const char *revision)
 {
@@ -845,35 +939,64 @@ resolve(const char *revision)
 	bytea	   *hash = NULL;
 	VersionRef	ref;
 
+	resolved_ref = NULL;
+	resolved_target = NULL;
+	resolved_session = false;
 	if (suffix)
 		*suffix++ = '\0';
 	if (!pg_strcasecmp(base, "HEAD"))
-		hash = read_ref(branch_ref("heads")).target;
+	{
+		resolved_ref = branch_ref("heads");
+		resolved_session = true;
+		hash = resolved_target = read_ref(resolved_ref).target;
+	}
 	else
 	{
-		ref = read_ref(psprintf("heads/%s", base));
-		hash = ref.target;
+		resolved_ref = psprintf("heads/%s", base);
+		ref = read_ref(resolved_ref);
+		hash = resolved_target = ref.target;
 		if (!hash)
 		{
-			ref = read_ref(psprintf("tags/%s", base));
-			hash = ref.target;
+			resolved_ref = psprintf("tags/%s", base);
+			ref = read_ref(resolved_ref);
+			hash = resolved_target = ref.target;
 			if (hash)
 			{
-				run("SELECT objkind FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(hash)), NULL, true);
-				if (SPI_processed && !strcmp(strcell(0, 1), "tag"))
+				char	   *kind;
+
+				if (object_read(hash, NULL, &kind, NULL, NULL) && !strcmp(kind, "tag"))
 					hash = child(hash, 1);
 			}
 		}
+		if (!hash)
+			resolved_ref = NULL;
 		if (!hash && strlen(base) == 64)
 			hash = unhex(base);
 		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&
 				 strspn(base, "0123456789abcdef") == strlen(base))
 		{
-			run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
-			if (SPI_processed > 1)
-				ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
-			if (SPI_processed)
-				hash = DatumGetByteaPCopy(cell(0, 1));
+			Oid			user;
+			int			security,
+						nest;
+
+			/* An abbreviated hash is searched by SQL, in its own scope. */
+			GetUserIdAndSecContext(&user, &security);
+			SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+			PG_TRY();
+			{
+				nest = begin_api();
+				run("SELECT objhash FROM pg_dolt_object_visible WHERE objkind='commit' AND encode(objhash,'hex') LIKE $1 LIMIT 2", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(psprintf("%s%%", base))), NULL, true);
+				if (SPI_processed > 1)
+					ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_PARAMETER), errmsg("ambiguous commit prefix: %s", base)));
+				if (SPI_processed)
+					hash = DatumGetByteaPCopy(cell(0, 1));
+				end_api(nest);
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(user, security);
+			}
+			PG_END_TRY();
 		}
 	}
 	if (!hash)

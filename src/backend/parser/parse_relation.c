@@ -2538,6 +2538,8 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		ParseNamespaceItem *item;
 
 		item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
+		item->p_rte->dolt_ref = rte->dolt_ref;
+		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
 		table_close(rel, NoLock);
 		FreeTupleDesc(desc);
 		return item;
@@ -2548,6 +2550,8 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		Relation	rel = relation_open(rte->relid, AccessShareLock);
 		ParseNamespaceItem *item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
 
+		item->p_rte->dolt_ref = rte->dolt_ref;
+		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
 		relation_close(rel, NoLock);
 		FreeTupleDesc(desc);
 		return item;
@@ -2562,6 +2566,8 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		native->schemaname = get_namespace_name(get_rel_namespace(rte->relid));
 		item = addRangeTableEntry(pstate, native, rv->alias, false, true);
 		item->p_rte->dolt_database = rte->dolt_database;
+		item->p_rte->dolt_ref = rte->dolt_ref;
+		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
 		FreeTupleDesc(desc);
 		return item;
 	}

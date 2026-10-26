@@ -16,6 +16,11 @@
 #include "utils/snapmgr.h"
 #include "utils/json.h"
 #include "mb/pg_wchar.h"
+#include "common/hashfn.h"
+#include "access/genam.h"
+#include "utils/fmgroids.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
@@ -33,14 +38,63 @@ manifest_begin(void)
 	MemoryContextSwitchTo(caller);
 }
 
+/*
+ * Internal SQL is a fixed set of statements, each run many times: prepare
+ * each once and keep its plan, as a PL function keeps its statements' plans.
+ * The plan cache replans them when the objects they use change.
+ */
+typedef struct ManifestPlan
+{
+	uint64		key;			/* hash of the statement text */
+	char	   *sql;
+	SPIPlanPtr	plan;
+} ManifestPlan;
+static HTAB *manifest_plans;
+
+SPIPlanPtr
+dg_manifest_plan(const char *sql, int nargs, Oid *types)
+{
+	uint64		key = hash_bytes_extended((const unsigned char *) sql, strlen(sql), nargs);
+	ManifestPlan *entry;
+	SPIPlanPtr	plan;
+	bool		found;
+
+	if (!manifest_plans)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(uint64);
+		ctl.entrysize = sizeof(ManifestPlan);
+		ctl.hcxt = TopMemoryContext;
+		manifest_plans = hash_create("manifest SQL plans", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(manifest_plans, &key, HASH_FIND, NULL);
+	if (entry)
+		return strcmp(entry->sql, sql) == 0 ? entry->plan : NULL;
+	/* Table-less statements never prefer a generic plan on cost: force one. */
+	plan = SPI_prepare_cursor(sql, nargs, types, CURSOR_OPT_GENERIC_PLAN);
+	if (!plan)
+		elog(ERROR, "SPI_prepare failed: %s", SPI_result_code_string(SPI_result));
+	if (SPI_keepplan(plan))
+		elog(ERROR, "SPI_keepplan failed");
+	entry = hash_search(manifest_plans, &key, HASH_ENTER, &found);
+	entry->sql = MemoryContextStrdup(TopMemoryContext, sql);
+	entry->plan = plan;
+	return plan;
+}
+
 /* SPI restores its procedure context, not an arbitrary caller context. */
 static void
 manifest_execute(const char *sql, int nargs, Oid *types, Datum *args,
 				 const char *nulls, bool readonly, long count)
 {
 	MemoryContext caller = CurrentMemoryContext;
+	SPIPlanPtr	plan = dg_manifest_plan(sql, nargs, types);
 
-	SPI_execute_with_args(sql, nargs, types, args, nulls, readonly, count);
+	if (plan)
+		SPI_execute_plan(plan, args, nulls, readonly, count);
+	else
+		SPI_execute_with_args(sql, nargs, types, args, nulls, readonly, count);
 	MemoryContextSwitchTo(caller);
 }
 
@@ -95,6 +149,51 @@ children_array(Datum *values, int count)
 	if (!count)
 		return construct_empty_array(BYTEAOID);
 	return construct_array(values, count, BYTEAOID, -1, false, TYPALIGN_INT);
+}
+
+/*
+ * The retained object |hash| of |kind| (any kind if NULL) visible under the
+ * active snapshot, else the transaction's. Identical objects may have several
+ * rows; any one serves. Returns false if there is none; fills only the parts
+ * requested, since payloads may be large.
+ */
+bool
+dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, ArrayType **children)
+{
+	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		pushed = false;
+	bool		found = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
+	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, GetActiveSnapshot(), 1, &key);
+	while (!found && HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
+
+		if (kind && strcmp(objkind, kind))
+			continue;
+		found = true;
+		if (actual)
+			*actual = objkind;
+		if (payload)
+			*payload = DatumGetByteaPCopy(heap_getattr(tuple, Anum_pg_dolt_object_objpayload, RelationGetDescr(catalog), &isnull));
+		if (children)
+			*children = DatumGetArrayTypePCopy(heap_getattr(tuple, Anum_pg_dolt_object_objchildren, RelationGetDescr(catalog), &isnull));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (pushed)
+		PopActiveSnapshot();
+	return found;
 }
 
 /* Children are immutable and already visible, so construction cannot form cycles. */
@@ -405,9 +504,6 @@ dolt_manifest_export(PG_FUNCTION_ARGS)
 static PLHash
 import_node(PLStore *store, bytea *address, int depth)
 {
-	Oid			types[] = {BYTEAOID};
-	Datum		args[] = {PointerGetDatum(address)};
-	bool		isnull;
 	bytea	   *payload;
 	ArrayType  *children;
 	Datum	   *values;
@@ -420,11 +516,8 @@ import_node(PLStore *store, bytea *address, int depth)
 	check_stack_depth();
 	if (depth >= PL_MAX_DEPTH)
 		elog(ERROR, "history chunk tree too deep");
-	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind='chunk'", 1, types, args, NULL, true, 1);
-	if (SPI_processed != 1)
+	if (!dg_object_read(address, "chunk", NULL, &payload, &children))
 		elog(ERROR, "missing history chunk");
-	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-	children = DatumGetArrayTypePCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	for (i = 0; i < n; i++)
 		import_node(store, DatumGetByteaP(values[i]), depth + 1);
@@ -446,10 +539,8 @@ dg_history_import(PLStore *store, bytea *address)
 	PLTree		result;
 	PLHash		hash;
 
-	manifest_begin();
 	hash = import_node(store, address, 0);
 	dg_check(pl_open(store, hash, &result));
-	SPI_finish();
 	return result;
 }
 
@@ -515,21 +606,14 @@ dg_schema_read(bytea *address, const char *kind)
 {
 	PLStore    *volatile store = NULL;
 	char	   *result = NULL;
-	Oid			types[] = {BYTEAOID, TEXTOID};
-	Datum		args[] = {PointerGetDatum(address), CStringGetTextDatum(kind)};
-	bool		isnull;
 	bytea	   *payload;
 	ArrayType  *children;
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
 
-	manifest_begin();
-	manifest_execute("SELECT objpayload,objchildren FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1 AND objkind=$2", 2, types, args, NULL, true, 1);
-	if (SPI_processed != 1)
+	if (!dg_object_read(address, kind, NULL, &payload, &children))
 		elog(ERROR, "missing retained schema object");
-	payload = DatumGetByteaPCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-	children = DatumGetArrayTypePCopy(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	if (n == 0)
 	{
@@ -576,6 +660,5 @@ dg_schema_read(bytea *address, const char *kind)
 		PG_END_TRY();
 	}
 	result = pg_any_to_server(result, strlen(result), PG_UTF8);
-	SPI_finish();
 	return result;
 }

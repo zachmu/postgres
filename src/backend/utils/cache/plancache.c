@@ -57,6 +57,7 @@
  */
 #include "postgres.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/pg_dolt_ref.h"
 
 #include <limits.h>
@@ -237,6 +238,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
+	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
 	plansource->rewriteRoleId = InvalidOid;
@@ -336,6 +338,7 @@ CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
+	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
 	plansource->rewriteRoleId = InvalidOid;
@@ -455,6 +458,7 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 		extract_query_dependencies((Node *) querytree_list,
 								   &plansource->relationOids,
 								   &plansource->invalItems,
+								   &plansource->doltRefs,
 								   &plansource->dependsOnRLS);
 
 		/* Update RLS info as well. */
@@ -698,13 +702,18 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	}
 
 	/*
-	 * Ref resolution is MVCC-sensitive, not just invalidation-sensitive: a
-	 * plan rebuilt inside an older transaction snapshot must not escape it.
-	 * Conservatively reanalyze retained projections at each execution until
-	 * bindings carry explicit ref/snapshot validity tokens.
+	 * Versioned bindings depend on refs and local storage mappings that
+	 * relcache invalidation does not fully cover, and a plan rebuilt under an
+	 * older snapshot must not outlive it: compare what the query bound with
+	 * what the same names bind now, and rebind on any difference.
 	 */
-	if (list_member_oid(plansource->relationOids, DoltRefRelationId))
+	if (plansource->is_valid && plansource->doltRefs != NIL &&
+		!dg_catalog_refs_current(plansource->doltRefs))
+	{
 		plansource->is_valid = false;
+		if (plansource->gplan)
+			plansource->gplan->is_valid = false;
+	}
 
 	/*
 	 * If the query is currently valid, we should have a saved search_path ---
@@ -767,6 +776,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	plansource->query_list = NIL;
 	plansource->relationOids = NIL;
 	plansource->invalItems = NIL;
+	plansource->doltRefs = NIL;
 	plansource->search_path = NULL;
 
 	/*
@@ -905,6 +915,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	extract_query_dependencies((Node *) qlist,
 							   &plansource->relationOids,
 							   &plansource->invalItems,
+							   &plansource->doltRefs,
 							   &plansource->dependsOnRLS);
 
 	/* Update RLS info as well. */
@@ -1723,6 +1734,7 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->query_list = copyObject(plansource->query_list);
 	newsource->relationOids = copyObject(plansource->relationOids);
 	newsource->invalItems = copyObject(plansource->invalItems);
+	newsource->doltRefs = copyObject(plansource->doltRefs);
 	if (plansource->search_path)
 		newsource->search_path = CopySearchPathMatcher(plansource->search_path);
 	newsource->query_context = querytree_context;

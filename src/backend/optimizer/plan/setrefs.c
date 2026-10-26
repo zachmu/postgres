@@ -2082,6 +2082,7 @@ fix_expr_common(PlannerInfo *root, Node *node)
 	{
 		root->glob->relationOids = list_append_unique_oid(root->glob->relationOids, DoltRefRelationId);
 		root->glob->dependsOnRole = true;
+		dg_catalog_session_dependency(&root->glob->doltRefs);
 	}
 
 	/* We assume callers won't call us on a NULL pointer */
@@ -3690,6 +3691,7 @@ void
 extract_query_dependencies(Node *query,
 						   List **relationOids,
 						   List **invalItems,
+						   List **doltRefs,
 						   bool *hasRowSecurity)
 {
 	PlannerGlobal glob;
@@ -3700,6 +3702,7 @@ extract_query_dependencies(Node *query,
 	glob.type = T_PlannerGlobal;
 	glob.relationOids = NIL;
 	glob.invalItems = NIL;
+	glob.doltRefs = NIL;
 	/* Hack: we use glob.dependsOnRole to collect hasRowSecurity flags */
 	glob.dependsOnRole = false;
 
@@ -3711,6 +3714,7 @@ extract_query_dependencies(Node *query,
 
 	*relationOids = glob.relationOids;
 	*invalItems = glob.invalItems;
+	*doltRefs = glob.doltRefs;
 	*hasRowSecurity = glob.dependsOnRole;
 }
 
@@ -3772,6 +3776,14 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 
+			if (rte->dolt_ref)
+			{
+				Oid			relid = rte->rtekind == RTE_RELATION && CatalogViewIsDurable(rte->relid) ? rte->relid : InvalidOid;
+
+				context->glob->doltRefs = lappend(context->glob->doltRefs, makeString(rte->dolt_ref));
+				context->glob->doltRefs = lappend(context->glob->doltRefs, makeString(rte->dolt_ref_target));
+				context->glob->doltRefs = lappend(context->glob->doltRefs, makeInteger(relid));
+			}
 			if (rte->rtekind == RTE_DOLT ||
 				(rte->rtekind == RTE_RELATION && get_rel_relam(rte->relid) == DOLT_PROLLY_TABLE_AM_OID))
 			{

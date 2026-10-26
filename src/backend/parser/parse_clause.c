@@ -216,10 +216,11 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 										   RowExclusiveLock,
 										   relation->alias, inh, false);
 
+	nsitem->p_rte->dolt_ref = binding->dolt_ref;
+	nsitem->p_rte->dolt_ref_target = binding->dolt_ref_target;
 	if (binding->dolt_branch)
 	{
 		nsitem->p_rte->dolt_branch = binding->dolt_branch;
-		nsitem->p_rte->dolt_table = binding->dolt_table;
 		nsitem->p_rte->dolt_database = binding->dolt_database;
 		nsitem->p_rte->dolt_relid = binding->dolt_relid;
 		nsitem->p_rte->inh = false;

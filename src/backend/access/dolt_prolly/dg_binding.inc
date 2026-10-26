@@ -62,6 +62,48 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 	}
 }
 
+/*
+ * The resource the local mapping of |name| on |branch| names for retained
+ * schema |schema|, under |snapshot|, if that resource exists: what
+ * binding_relation finds, read natively. InvalidOid otherwise.
+ */
+static Oid
+binding_lookup(const char *branch, const char *name, bytea *schema, Snapshot snapshot)
+{
+	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			resource = InvalidOid;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true, snapshot, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		stored = heap_getattr(tuple, Anum_pg_dolt_binding_bindschema, RelationGetDescr(rel), &isnull);
+
+		if (schema && !isnull && same(DatumGetByteaPP(stored), schema))
+			resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	if (!OidIsValid(resource))
+		return InvalidOid;
+
+	/* The resource itself must still exist. */
+	rel = table_open(DoltStorageRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
+	scan = systable_beginscan(rel, DoltStorageKeyIndexId, true, snapshot, 1, keys);
+	if (!HeapTupleIsValid(systable_getnext(scan)))
+		resource = InvalidOid;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return resource;
+}
+
 static Oid
 binding_relation(const char *branch, const char *name, bytea *schema)
 {

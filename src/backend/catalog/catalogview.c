@@ -103,6 +103,8 @@ typedef struct CatalogViewObject
 	Oid			handle;
 	Oid			objectclass;
 	Oid			storage;
+	bytea	   *schema;			/* a relation's retained schema object ... */
+	bytea	   *content;		/* ... and content root, as of its revision */
 	CatalogView *view;
 	char	   *identity;
 } CatalogViewObject;
@@ -703,6 +705,43 @@ CatalogViewObjectStorage(Oid handle)
 	CatalogViewObject *object = lookup_object(handle);
 
 	return object ? object->storage : handle;
+}
+
+/*
+ * Record the retained schema object and content root of relation |handle|,
+ * bound in |view|, which may still be under construction.
+ */
+void
+CatalogViewObjectSetRetained(CatalogView *view, Oid handle, bytea *schema, bytea *content)
+{
+	CatalogViewObject *object = CatalogViewIsDurable(handle) ? view_durable(view, handle) :
+		(objects ? hash_search(objects, &handle, HASH_FIND, NULL) : NULL);
+	MemoryContext previous;
+
+	if (!object || object->view != view)
+		elog(ERROR, "catalog object %u is not bound in this context", handle);
+	previous = MemoryContextSwitchTo(object->view->memory);
+	object->schema = schema ? DatumGetByteaPCopy(PointerGetDatum(schema)) : NULL;
+	object->content = content ? DatumGetByteaPCopy(PointerGetDatum(content)) : NULL;
+	MemoryContextSwitchTo(previous);
+}
+
+/* The retained schema object a relation was bound with, or NULL. */
+bytea *
+CatalogViewObjectSchema(Oid handle)
+{
+	CatalogViewObject *object = lookup_object(handle);
+
+	return object ? object->schema : NULL;
+}
+
+/* The content root of a relation as of its revision, or NULL. */
+bytea *
+CatalogViewObjectContent(Oid handle)
+{
+	CatalogViewObject *object = lookup_object(handle);
+
+	return object ? object->content : NULL;
 }
 
 CatalogView *

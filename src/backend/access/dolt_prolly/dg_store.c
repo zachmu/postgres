@@ -31,6 +31,7 @@
  *-------------------------------------------------------------------------
  */
 #include "dg.h"
+#include "nodes/tidbitmap.h"
 #include "access/doltchunk.h"
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -1466,17 +1467,18 @@ dg_rows(const PLTree * tree)
 	dg_check(pl_scan(tree, NULL, NULL, collect, &rows));
 	return rows;
 }
+/* Logical pages must fit PostgreSQL's exact TID bitmap representation. */
 void
 dg_tid(uint64 id, ItemPointer tid)
 {
-	if (id / 65535 >= InvalidBlockNumber)
+	if (id / TBM_MAX_TUPLES_PER_PAGE >= InvalidBlockNumber)
 		elog(ERROR, "prolly TID space exhausted");
-	ItemPointerSet(tid, id / 65535, (id % 65535) + 1);
+	ItemPointerSet(tid, id / TBM_MAX_TUPLES_PER_PAGE, (id % TBM_MAX_TUPLES_PER_PAGE) + 1);
 }
 uint64
 dg_id(ItemPointer tid)
 {
-	return (uint64) ItemPointerGetBlockNumber(tid) * 65535 + ItemPointerGetOffsetNumber(tid) - 1;
+	return (uint64) ItemPointerGetBlockNumber(tid) * TBM_MAX_TUPLES_PER_PAGE + ItemPointerGetOffsetNumber(tid) - 1;
 }
 Datum
 dolt_prolly_root(PG_FUNCTION_ARGS)
