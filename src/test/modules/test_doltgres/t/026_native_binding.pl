@@ -87,5 +87,6 @@ sql(q{SELECT pg_stat_statements_reset()});
 sql(q{SELECT count(*) FROM t; SELECT count(*) FROM app.t});
 is(sql(q{SELECT bool_and(plans <= 6) FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','repeated internal statements reuse their plans');
 is(sql(q{SELECT count(*) > 0 FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','and there were such statements to reuse');
+is(sql(q{SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%::jsonb->$_->$_->>%'}),'0','columns are decoded by table, not by column');
 $node->stop;
 done_testing();

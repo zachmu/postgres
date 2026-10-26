@@ -253,19 +253,29 @@ provider_columns(const char *definition)
 	TupleDesc	desc;
 	char	  **names,
 			  **types,
-			  **collations;
+			  **collations,
+			  **storages,
+			  **compressions,
+			  **generated,
+			  **identities;
 	int		   *mods;
-	bool	   *notnull;
+	bool	   *notnull,
+			   *hasdef;
 	int			i,
 				n;
 
-	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END,COALESCE((v->>'notnull')::bool,false) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END,COALESCE((v->>'notnull')::bool,false),v->>'storage',v->>'compression',(v->>'default') IS NOT NULL,v->>'generated',v->>'identity' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	n = SPI_processed;
 	names = palloc_array(char *, Max(n, 1));
 	types = palloc_array(char *, Max(n, 1));
 	collations = palloc_array(char *, Max(n, 1));
 	mods = palloc_array(int, Max(n, 1));
 	notnull = palloc_array(bool, Max(n, 1));
+	storages = palloc_array(char *, Max(n, 1));
+	compressions = palloc_array(char *, Max(n, 1));
+	hasdef = palloc_array(bool, Max(n, 1));
+	generated = palloc_array(char *, Max(n, 1));
+	identities = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		names[i] = strcell(i, 1);
@@ -273,6 +283,11 @@ provider_columns(const char *definition)
 		mods[i] = DatumGetInt32(cell(i, 3));
 		collations[i] = strcell(i, 4);
 		notnull[i] = DatumGetBool(cell(i, 5));
+		storages[i] = strcell(i, 6);
+		compressions[i] = strcell(i, 7);
+		hasdef[i] = DatumGetBool(cell(i, 8));
+		generated[i] = strcell(i, 9);
+		identities[i] = strcell(i, 10);
 	}
 	desc = CreateTemplateTupleDesc(n);
 	for (i = 0; i < n; i++)
@@ -291,28 +306,15 @@ provider_columns(const char *definition)
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
-		{
-			char	   *storage,
-					   *compression;
-
-			char	   *generated,
-					   *identity;
-
-			run("SELECT $1::jsonb->'columns'->$2->>'storage',$1::jsonb->'columns'->$2->>'compression',($1::jsonb->'columns'->$2->>'default') IS NOT NULL,$1::jsonb->'columns'->$2->>'generated',$1::jsonb->'columns'->$2->>'identity'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
-			storage = strcell(0, 1);
-			compression = strcell(0, 2);
-			generated = strcell(0, 4);
-			identity = strcell(0, 5);
-			TupleDescAttr(desc, i)->atthasdef = DatumGetBool(cell(0, 3));
-			if (generated)
-				TupleDescAttr(desc, i)->attgenerated = generated[0];
-			if (identity)
-				TupleDescAttr(desc, i)->attidentity = identity[0];
-			if (storage)
-				TupleDescAttr(desc, i)->attstorage = storage[0];
-			if (compression)
-				TupleDescAttr(desc, i)->attcompression = compression[0];
-		}
+		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
+		if (generated[i])
+			TupleDescAttr(desc, i)->attgenerated = generated[i][0];
+		if (identities[i])
+			TupleDescAttr(desc, i)->attidentity = identities[i][0];
+		if (storages[i])
+			TupleDescAttr(desc, i)->attstorage = storages[i][0];
+		if (compressions[i])
+			TupleDescAttr(desc, i)->attcompression = compressions[i][0];
 	}
 
 	/*
@@ -947,26 +949,41 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
 			provider_description(&rows, form.oid, RelationRelationId, 0, json_value(definition, "comment"));
 			provider_dependency(&rows, RelationRelationId, form.oid, 0, NamespaceRelationId, form.relnamespace, 0, DEPENDENCY_NORMAL);
-			for (j = 0; j < desc->natts; j++)
 			{
-				Form_pg_attribute attr = TupleDescAttr(desc, j);
+				Datum	   *statistics = palloc0_array(Datum, Max(desc->natts, 1)),
+						   *options = palloc0_array(Datum, Max(desc->natts, 1));
+				bool	   *nostatistics = palloc_array(bool, Max(desc->natts, 1)),
+						   *nooptions = palloc_array(bool, Max(desc->natts, 1));
 
-				int			aslot = provider_catalog_index(AttributeRelationId);
-				HeapTuple	atuple;
-				bool		nullvalue;
-				Datum		value;
+				/* Per-column statistics targets and options, in one statement. */
+				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+				if (SPI_processed != desc->natts)
+					elog(ERROR, "canonical column count mismatch");
+				for (j = 0; j < desc->natts; j++)
+				{
+					Datum		value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nostatistics[j]);
 
-				attr->attrelid = form.oid;
-				atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
-				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM (SELECT $1::jsonb->'columns'->$2 v) s", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(j)), NULL, true);
-				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &nullvalue);
-				if (!nullvalue)
-					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, value);
-				value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &nullvalue);
-				if (!nullvalue && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(value)), ARR_DIMS(DatumGetArrayTypeP(value))) > 0)
-					atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, value);
-				rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
-				provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
+					if (!nostatistics[j])
+						statistics[j] = value;
+					value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nooptions[j]);
+					if (!nooptions[j])
+						options[j] = PointerGetDatum(DatumGetArrayTypePCopy(value));
+				}
+				for (j = 0; j < desc->natts; j++)
+				{
+					Form_pg_attribute attr = TupleDescAttr(desc, j);
+					int			aslot = provider_catalog_index(AttributeRelationId);
+					HeapTuple	atuple;
+
+					attr->attrelid = form.oid;
+					atuple = provider_fixed(rows.relations[aslot], attr, ATTRIBUTE_FIXED_PART_SIZE, Anum_pg_attribute_attcollation);
+					if (!nostatistics[j])
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attstattarget, statistics[j]);
+					if (!nooptions[j] && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(options[j])), ARR_DIMS(DatumGetArrayTypeP(options[j]))) > 0)
+						atuple = provider_set(rows.relations[aslot], atuple, Anum_pg_attribute_attoptions, options[j]);
+					rows.rows[aslot] = lappend(rows.rows[aslot], atuple);
+					provider_dependency(&rows, RelationRelationId, form.oid, j + 1, TypeRelationId, attr->atttypid, 0, DEPENDENCY_NORMAL);
+				}
 			}
 			if (!index)
 			{

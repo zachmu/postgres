@@ -63,18 +63,18 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 }
 
 /*
- * Whether the local mapping of |name| on |branch| still names resource |relid|
- * for retained schema |schema|, under |snapshot|: a catalog view bound the
- * resource when it was built, and the mapping may have changed since.
+ * The resource the local mapping of |name| on |branch| names for retained
+ * schema |schema|, under |snapshot|, if that resource exists: what
+ * binding_relation finds, read natively. InvalidOid otherwise.
  */
-static bool
-binding_current(const char *branch, const char *name, Oid relid, bytea *schema, Snapshot snapshot)
+static Oid
+binding_lookup(const char *branch, const char *name, bytea *schema, Snapshot snapshot)
 {
 	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
 	ScanKeyData keys[2];
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	bool		current = false;
+	Oid			resource = InvalidOid;
 
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
 	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
@@ -85,22 +85,23 @@ binding_current(const char *branch, const char *name, Oid relid, bytea *schema, 
 		bool		isnull;
 		Datum		stored = heap_getattr(tuple, Anum_pg_dolt_binding_bindschema, RelationGetDescr(rel), &isnull);
 
-		current = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid == relid &&
-			OidIsValid(relid) && schema && !isnull && same(DatumGetByteaPP(stored), schema);
+		if (schema && !isnull && same(DatumGetByteaPP(stored), schema))
+			resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
-	if (!current)
-		return false;
+	if (!OidIsValid(resource))
+		return InvalidOid;
 
 	/* The resource itself must still exist. */
 	rel = table_open(DoltStorageRelationId, AccessShareLock);
-	ScanKeyInit(&keys[0], Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+	ScanKeyInit(&keys[0], Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
 	scan = systable_beginscan(rel, DoltStorageKeyIndexId, true, snapshot, 1, keys);
-	current = HeapTupleIsValid(systable_getnext(scan));
+	if (!HeapTupleIsValid(systable_getnext(scan)))
+		resource = InvalidOid;
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
-	return current;
+	return resource;
 }
 
 static Oid

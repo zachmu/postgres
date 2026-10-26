@@ -578,8 +578,8 @@ revision_selected:
 			currentrel = OidIsValid(currentns) ? get_relname_relid(rv->relname, currentns) : InvalidOid;
 			if (working)
 			{
-				live = CatalogViewObjectStorage(handle);
-				if (!binding_current(revision, logical, live, CatalogViewObjectSchema(handle), ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot()))
+				live = binding_lookup(revision, logical, CatalogViewObjectSchema(handle), ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot());
+				if (!OidIsValid(live))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", logical, revision)));
 			}
 			else
@@ -661,7 +661,7 @@ dg_catalog_refs_current(List *refs)
 					{
 						const char *logical = CatalogViewObjectIdentity(relid, RelationRelationId);
 
-						current = logical && binding_current(branch, logical, CatalogViewObjectStorage(relid), CatalogViewObjectSchema(relid), latest);
+						current = logical && OidIsValid(binding_lookup(branch, logical, CatalogViewObjectSchema(relid), latest));
 					}
 				}
 		}
@@ -987,8 +987,8 @@ dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait)
 	handle = view ? CatalogViewFindObject(view, RelationRelationId, name) : InvalidOid;
 	if (!OidIsValid(handle))
 		elog(ERROR, "canonical lock target disappeared");
-	resource = CatalogViewObjectStorage(handle);
-	if (!binding_current(branch, name, resource, CatalogViewObjectSchema(handle), GetActiveSnapshot()))
+	resource = binding_lookup(branch, name, CatalogViewObjectSchema(handle), GetActiveSnapshot());
+	if (!OidIsValid(resource))
 		elog(ERROR, "canonical lock resource unavailable");
 	if (!nowait)
 		LockRelationOid(resource, mode);
@@ -1319,9 +1319,7 @@ dg_catalog_trigger_relation(Oid id, const char *branch)
 		/* ... must keep the schema the event's revision had. */
 		if (!schema || !same(schema, CatalogViewObjectSchema(id)))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("cannot change a relation with pending versioned trigger events")));
-		resource = CatalogViewObjectStorage(handle);
-		if (!binding_current(branch, name, resource, schema, GetActiveSnapshot()))
-			resource = InvalidOid;
+		resource = binding_lookup(branch, name, schema, GetActiveSnapshot());
 		storage = dg_storage_open(id, branch, name, schema, resource, GetActiveSnapshot());
 		result = dg_storage_enable_write(storage, content);
 	}
