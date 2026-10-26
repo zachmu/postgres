@@ -502,17 +502,24 @@ object-level schema merge (`6c06fa14602`), and user-defined types
   `reports/renames-and-index-keys.html`). Database roots carry a `dependents`
   record; renames of tables, columns, indexes, constraints, triggers, routines,
   types and enum labels rewrite exactly the dependents it lists, and enum label
-  renames rewrite stored rows. Still open: merging across a rename (objects
-  match by name; Dolt matches tables by tag), and schema renames.
+  renames rewrite stored rows. Still open: schema renames (ALTER SCHEMA ...
+  RENAME), which rewrite the serialized definitions of every member of the
+  schema and of their referrers, and re-key storage bindings and identities;
+  no row data changes.
+- **Renames in merge (decision, 2026-10-26):** objects, including tables, are
+  identified by name only. A rename merges as a drop of the old name and a
+  create of the new one, so it conflicts only with changes to the old object
+  on the other branch. Heuristic rename detection may come later if renames
+  across branches prove common.
 - **Column-level schema merge:** a table whose definition changed on one side
   and rows on the other, or whose definition changed on both sides.
 - **Schema conflicts as data,** in `dolt_schema_conflicts`, resolvable,
   instead of an error.
 - **Index key encodings:** done for numeric, floats, date and time types,
   interval, uuid, character types, money, MAC addresses and enums (by label
-  position; ADD VALUE rebuilds affected indexes). Still open: inet/cidr, bit
-  strings, jsonb, arrays, ranges, composites, non-C collations and cross-type
-  comparisons in the new families.
+  position; ADD VALUE rebuilds affected indexes). Deferred, with no effect on
+  current plans: inet/cidr, bit strings, jsonb, arrays, ranges, composites,
+  non-C collations and cross-type comparisons in the new families.
 - **Remaining DDL:** partitioning and inheritance; unlogged and temporary
   prolly tables; deferrable constraints; materialized views and views; range
   types; ALTER TYPE ADD/DROP/ALTER ATTRIBUTE; DROP ... CASCADE that drops table
