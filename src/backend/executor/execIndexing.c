@@ -210,7 +210,7 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		Relation	indexDesc;
 		IndexInfo  *ii;
 
-		indexDesc = resultRelation->rd_catalogview ? dg_storage_index(resultRelation, indexOid) : index_open(indexOid, RowExclusiveLock);
+		indexDesc = dg_storage_bound(resultRelation) ? dg_storage_index(resultRelation, indexOid) : index_open(indexOid, RowExclusiveLock);
 
 		/* extract index key information from the index's pg_index info */
 		ii = BuildIndexInfo(indexDesc);
@@ -257,7 +257,7 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
-		if (!resultRelInfo->ri_RelationDesc->rd_catalogview)
+		if (!dg_storage_bound(resultRelInfo->ri_RelationDesc))
 			index_close(indexDescs[i], RowExclusiveLock);
 
 		/* Mark the index as closed */

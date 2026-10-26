@@ -137,7 +137,7 @@ GetExtensibleNodeMethods(const char *extnodename, bool missing_ok)
 const CustomScanMethods *
 GetCustomScanMethods(const char *CustomName, bool missing_ok)
 {
-	if (!strcmp(CustomName, "DoltVersionedScan"))
+	if (!strcmp(CustomName, "DoltCatalogScan"))
 		return dg_catalog_scan_methods();
 	return (const CustomScanMethods *)
 		GetExtensibleNodeEntry(custom_scan_methods,

@@ -1,12 +1,14 @@
 /* Read-only versioned catalog provider. No persistent projection objects. */
 #ifndef DOLT_CATALOG_H
 #define DOLT_CATALOG_H
+#include "access/htup.h"
 #include "access/tupdesc.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pathnodes.h"
 #include "nodes/extensible.h"
+#include "storage/relfilelocator.h"
 struct ParseState;
 struct CatalogView;
 extern bool dg_catalog_active(void);
@@ -25,22 +27,25 @@ extern void dg_catalog_foreign_lock(Relation definition);
 extern bool dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait);
 extern bool dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid *result);
 extern Relation dg_catalog_target(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);
-extern Relation dg_catalog_copy_relation(Relation definition, bool from);
-extern Relation dg_catalog_executor_target(RangeTblEntry *rte, CmdType command);
 extern void dg_storage_close_relation(Relation rel);
+extern void dg_truncate(Relation rel);
 extern Relation dg_storage_index(Relation rel, Oid id);
-extern struct CatalogView *dg_catalog_view(const char *database);
-extern bool dg_catalog_creating_relation(Relation rel);
-extern void dg_catalog_create_scope(bool enter);
-extern void dg_catalog_created(Oid id);
-extern bool dg_catalog_create_index(Node *statement);
+extern struct CatalogView *dg_catalog_view(const char *database, const char *branch);
 extern bool dg_catalog_create(Node *statement, const char *query);
-extern bool dg_catalog_create_begin(Node *statement);
-extern void dg_catalog_create_finish(CreateStmt *stmt);
+extern void dg_catalog_schema_created(Oid schema);
 extern bool dg_catalog_drop(Node *statement);
+extern bool dg_catalog_grant(Node *statement);
 extern void dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot);
 extern TupleDesc dg_catalog_bind(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);
 extern void dg_catalog_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
 extern const CustomScanMethods *dg_catalog_scan_methods(void);
 extern void dg_catalog_permission(const char *descriptor, Oid user);
+extern void dg_storage_locator(Oid resource, RelFileLocator *locator);
+extern struct CatalogView *dg_catalog_resolve_durable(Oid oid);
+extern Oid	dg_binding_identity(Relation binding, HeapTuple tuple);
+extern Oid	dg_identity_storage(Oid oid);
+extern bytea *dg_catalog_durable_content(Oid oid);
+extern bytea *dg_catalog_revision_content(Oid handle);
+extern bool dg_catalog_provides(Oid catalog);
+extern bool dg_storage_bound(Relation rel);
 #endif

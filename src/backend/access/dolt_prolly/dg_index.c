@@ -191,8 +191,8 @@ maintained_indexes(Relation table, bool *opened)
 	List	   *indexes;
 	ListCell   *cell;
 
-	*opened = !table->rd_catalogview;
-	if (table->rd_catalogview)
+	*opened = !dg_storage_bound(table);
+	if (dg_storage_bound(table))
 		return list_copy(dg_storage_indexes(table));
 	indexes = RelationGetIndexList(table);
 	foreach(cell, indexes)
@@ -285,7 +285,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 		 * Writers of bound canonical storage may bypass the executor's index
 		 * insertion, so the AM checks their unique indexes itself.
 		 */
-		if (delta > 0 && table->rd_catalogview && index->rd_index->indisunique &&
+		if (delta > 0 && dg_storage_bound(table) && index->rd_index->indisunique &&
 			(!nullkey || index->rd_index->indnullsnotdistinct))
 		{
 			key.len = prefix;
@@ -548,7 +548,7 @@ insert(Relation index, Datum *values, bool *nulls, ItemPointer tid, Relation tab
 		dg_unsupported("deferred unique constraints");
 
 	/* The table AM added the entry, and checks bound storage itself. */
-	if (unique == UNIQUE_CHECK_YES && !table->rd_catalogview)
+	if (unique == UNIQUE_CHECK_YES && !dg_storage_bound(table))
 		dg_index_check_unique(table, index, tid, values, nulls);
 	return true;
 }

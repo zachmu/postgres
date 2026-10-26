@@ -1936,7 +1936,7 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 				  (rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid))))
 				continue;
 
-			if (CatalogViewObjectContext(rte->relid))
+			if (CatalogViewIsLeased(rte->relid))
 				continue;
 
 			/*
@@ -2004,7 +2004,7 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				if (CatalogViewObjectContext(rte->relid))
+				if (CatalogViewIsLeased(rte->relid))
 					break;
 				/* Acquire or release the appropriate type of lock */
 				if (acquire)

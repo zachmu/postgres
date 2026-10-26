@@ -11,8 +11,19 @@
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
-/* Backend-local identifiers never enter WAL or canonical schema bytes. */
+/*
+ * Durable OIDs name prolly objects on branch heads (see pg_dolt_identity.h).
+ * They are shared by all backends and replicated, and the ordinary OID counter
+ * never assigns them. Backend-local handles name objects in read-only
+ * revisions and never enter WAL or canonical schema bytes.
+ */
+#define FirstDurableObjectId ((Oid) 0xA0000000U)
 #define FirstCatalogViewObjectId ((Oid) 0xC0000000U)
+#define CatalogViewIsDurable(oid) ((oid) >= FirstDurableObjectId && (oid) < FirstCatalogViewObjectId)
+#define CatalogViewIsLeased(oid) ((oid) >= FirstCatalogViewObjectId)
+
+/* View rows have TIDs from a block range no physical catalog reaches. */
+#define CatalogViewFirstBlock ((BlockNumber) 0xF0000000U)
 struct catcache;
 typedef struct CatalogView CatalogView;
 typedef struct CatalogViewScan CatalogViewScan;
@@ -31,9 +42,12 @@ extern CatalogView *CatalogViewCurrent(void);
 extern Oid	CatalogViewNamespace(CatalogView *view, Oid namespaceid);
 extern uint64 CatalogViewCacheId(CatalogView *view);
 extern Oid	CatalogViewBindObject(CatalogView *view, Oid objectclass, const char *identity, Oid storage);
+extern void CatalogViewBindDurable(CatalogView *view, Oid objectclass, const char *identity, Oid oid, Oid storage);
+extern void CatalogViewForgetDurable(void);
 extern Oid	CatalogViewFindObject(CatalogView *view, Oid objectclass, const char *identity);
 extern Oid	CatalogViewLookupObject(CatalogView *view, Oid objectclass, const char *identity);
 extern CatalogView *CatalogViewObjectContext(Oid handle);
+extern void CatalogViewMarkBranchHead(CatalogView *view);
 extern bool CatalogViewIsObjectIdType(Oid type);
 extern CatalogView *CatalogViewCallContext(FunctionCallInfo fcinfo);
 extern HeapTuple CatalogViewFunctionTuple(Oid functionid);
@@ -47,6 +61,7 @@ extern bool CatalogViewContains(CatalogView *view, Oid catalog);
 extern struct catcache *CatalogViewCache(CatalogView *view, struct catcache *base);
 extern void CatalogViewInvalidateCache(int cacheid, uint32 hashvalue);
 extern void CatalogViewRejectPhysicalAccess(Relation relation);
+extern void CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple);
 
 /* Private command-visible catalog mutation state for native DDL. */
 extern bool CatalogViewCaptureUpdate(Relation relation, ItemPointer tid, HeapTuple tuple);

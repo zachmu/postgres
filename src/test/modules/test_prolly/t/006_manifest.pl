@@ -168,7 +168,7 @@ my $objects = sql('SELECT count(*) FROM pg_dolt_object');
 ok($objects > 10, 'multi-node tree exported as DAG');
 sql('TRUNCATE p; DROP TABLE p');
 is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
-is(sql('SELECT count(*) FROM pg_dolt_object'), $objects, 'all historical chunks retained');
+cmp_ok(sql('SELECT count(*) FROM pg_dolt_object'), '>=', $objects, 'all historical chunks retained; DROP only publishes a new schema');
 
 # Large opaque payloads exercise heap TOAST separately from prolly page storage.
 my $large = sql(q{SELECT encode(dolt_manifest_put('chunk',convert_to(string_agg(md5(g::text),''),'UTF8'),ARRAY[]::bytea[]),'hex') FROM generate_series(1,2000) g});

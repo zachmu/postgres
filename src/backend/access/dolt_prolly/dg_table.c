@@ -204,12 +204,23 @@ index_delete(Relation rel, TM_IndexDeleteOp *op)
  * publication merges disjoint changes. Canonical storage bindings still check
  * their write authority.
  */
+/* A revision is history: its rows can be neither changed nor locked. */
+static void
+read_only_revision(Relation rel)
+{
+	if (CatalogViewIsLeased(RelationGetRelid(rel)) && !dg_storage_bound(rel) &&
+		!CatalogViewIsProvisional(rel->rd_catalogview))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("relation \"%s\" is a revision, which is read-only", RelationGetRelationName(rel))));
+}
+
 static void
 writer(Relation rel)
 {
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
-	if (rel->rd_catalogview)
+	read_only_revision(rel);
+	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 }
 static void
@@ -555,6 +566,7 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
+	read_only_revision(rel);
 	for (;;)
 	{
 		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))
@@ -608,6 +620,16 @@ new_storage(Relation rel, const RelFileLocator *loc, char persistence, Transacti
 {
 	if (persistence != RELPERSISTENCE_PERMANENT)
 		dg_unsupported("temporary/unlogged tables");
+
+	/*
+	 * Prolly tables live on branches: CREATE TABLE publishes them to the
+	 * branch's schema and allocates their storage there. Physical prolly
+	 * relations, from CREATE TABLE AS, SET ACCESS METHOD and the like, are
+	 * not supported yet.
+	 */
+	if (!rel->rd_catalogview)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("prolly tables can only be created with CREATE TABLE")));
 	dg_validate_descriptor(RelationGetDescr(rel));
 	GetHeapamTableAmRoutine()->relation_set_new_filelocator(rel, loc, persistence, xid, multi);
 }
@@ -938,4 +960,18 @@ dg_history_install(Relation rel, DGState *state, PLTree contents)
 	UpdateActiveSnapshotCommandId();
 	if (rel->rd_catalogview)
 		PopActiveSnapshot();
+}
+
+/* TRUNCATE of a branch's table: an empty root for the branch, and its indexes. */
+void
+dg_truncate(Relation rel)
+{
+	DGState    *state;
+	PLTree		empty;
+
+	writer(rel);
+	state = dg_load(rel, SnapshotSelf);
+	dg_check(pl_build(state->store, NULL, 0, &empty));
+	dg_history_install(rel, state, empty);
+	dg_release(state);
 }

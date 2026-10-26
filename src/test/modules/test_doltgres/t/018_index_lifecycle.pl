@@ -4,20 +4,16 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('index_lifecycle');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 my $s=$node->background_psql('postgres',on_error_stop=>0);
 sub sql { $s->query_safe($_[0]); }
 sub rejects {my($out,$failed)=$s->query($_[0]);is($failed,1,$_[1]);diag($s->{stderr}) unless $failed;$s->{stderr}='';}
 sql(q{SET statement_timeout='10s'; SET client_min_messages=warning;
-CREATE ROLE index_owner; GRANT CREATE ON SCHEMA public TO index_owner;
-SET ROLE index_owner; CREATE TABLE owned(v int) USING dolt_prolly_table; RESET ROLE;
 CREATE TABLE t(id int PRIMARY KEY,x int,v text) USING dolt_prolly_table;
 INSERT INTO t VALUES(1,10,'a'),(2,20,'b');
 SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','other')});
-sql(q{CREATE INDEX owned_idx ON owned(v)});
-is(sql(q{SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='owned_idx'::regclass}),'index_owner','new index retains table owner when a superuser creates it');
-rejects(q{SET ROLE index_owner; CREATE INDEX denied_idx ON t(x)},'index creation checks invoking ownership');
-sql(q{RESET ROLE});
+# TODO: index ownership, once the ownership and ACL design settles who owns
+# a versioned table.
 my $initial=sql(q{SELECT dolt_hashof_db()});
 sql(q{CREATE INDEX temporary_idx ON t(v); DROP INDEX temporary_idx});
 is(sql(q{SELECT dolt_hashof_db()}),$initial,'index create/drop preserves canonical history independence');

@@ -371,7 +371,7 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	int64		size;
 
 	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewObjectContext(relOid))
+	if (CatalogViewIsLeased(relOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("physical size is not defined for a revision-bound relation")));
@@ -516,7 +516,7 @@ pg_table_size(PG_FUNCTION_ARGS)
 	int64		size;
 
 	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewObjectContext(relOid))
+	if (CatalogViewIsLeased(relOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("physical size is not defined for a revision-bound relation")));
@@ -541,7 +541,7 @@ pg_indexes_size(PG_FUNCTION_ARGS)
 	int64		size;
 
 	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewObjectContext(relOid))
+	if (CatalogViewIsLeased(relOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("physical size is not defined for a revision-bound relation")));
@@ -589,7 +589,7 @@ pg_total_relation_size(PG_FUNCTION_ARGS)
 	int64		size;
 
 	/* A canonical descriptor is not a physical file locator. */
-	if (CatalogViewObjectContext(relOid))
+	if (CatalogViewIsLeased(relOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("physical size is not defined for a revision-bound relation")));

@@ -5,7 +5,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('canonical_merge');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sql(q{CREATE TABLE seed(id int) USING dolt_prolly_table; SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','activation'); SELECT dolt_checkout('main')});
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v int UNIQUE); INSERT INTO t VALUES(1,10),(2,20); SELECT dolt_commit('-Am','canonical table'); SELECT dolt_branch('side')});

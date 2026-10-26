@@ -114,11 +114,13 @@
 
 #include <limits.h>
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_dolt_binding.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/sinval.h"
@@ -1547,6 +1549,17 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		else
 			return;
 	}
+	else if (tupleRelId == DoltBindingRelationId)
+	{
+		/*
+		 * A storage binding supplies a branch-head prolly relation's file, as
+		 * relfilenode does for others.
+		 */
+		relationId = dg_binding_identity(relation, tuple);
+		if (!OidIsValid(relationId))
+			return;
+		databaseId = MyDatabaseId;
+	}
 	else
 		return;
 
@@ -1697,6 +1710,18 @@ CacheInvalidateRelcacheByRelid(Oid relid)
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 	CacheInvalidateRelcacheByTuple(tup);
 	ReleaseSysCache(tup);
+}
+
+/*
+ * CacheInvalidateRelcacheInDatabase
+ *		As CacheInvalidateRelcacheByRelid, for a relation of this database whose
+ *		pg_class row need not be readable, such as a branch head's relation
+ *		while its branch's schema is being replaced.
+ */
+void
+CacheInvalidateRelcacheInDatabase(Oid relid)
+{
+	RegisterRelcacheInvalidation(PrepareInvalidationState(), MyDatabaseId, relid);
 }
 
 /*

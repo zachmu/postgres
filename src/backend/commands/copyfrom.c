@@ -26,6 +26,7 @@
 
 #include "access/heapam.h"
 #include "access/tableam.h"
+#include "access/doltcatalog.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "commands/copyapi.h"
@@ -916,7 +917,7 @@ CopyFrom(CopyFromState cstate)
 	ExecInitRangeTable(estate, cstate->range_table, cstate->rteperminfos,
 					   bms_make_singleton(1));
 	/* COPY owns the already-bound descriptor through DoCopy. */
-	if (cstate->rel->rd_catalogview)
+	if (dg_storage_bound(cstate->rel))
 		estate->es_relations[0] = cstate->rel;
 	resultRelInfo = target_resultRelInfo = makeNode(ResultRelInfo);
 	ExecInitResultRelation(estate, resultRelInfo, 1);
@@ -1508,7 +1509,7 @@ CopyFrom(CopyFromState cstate)
 
 	/* Close the result relations, including any trigger target relations */
 	ExecCloseResultRelations(estate);
-	if (cstate->rel->rd_catalogview)
+	if (dg_storage_bound(cstate->rel))
 		estate->es_relations[0] = NULL;
 	ExecCloseRangeTableRelations(estate);
 

@@ -26,6 +26,7 @@
  */
 #include "postgres.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 
 #include <sys/file.h>
 #include <fcntl.h>
@@ -1350,6 +1351,12 @@ RelationInitPhysicalAddr(Relation relation)
 	 * Canonical definitions are not mapped physical relations. Storage access
 	 * must use an explicitly bound resource; retained metadata has no file.
 	 */
+	if (CatalogViewIsDurable(RelationGetRelid(relation)))
+	{
+		/* A branch head's relation uses its bound storage resource's file. */
+		dg_storage_locator(dg_identity_storage(RelationGetRelid(relation)), &relation->rd_locator);
+		return;
+	}
 	if (CatalogViewObjectContext(RelationGetRelid(relation)))
 	{
 		MemSet(&relation->rd_locator, 0, sizeof(relation->rd_locator));
@@ -2651,11 +2658,14 @@ RelationRebuildRelation(Relation relation)
 	 * been initialized yet.  Index creation relies on that: it first builds
 	 * the relcache entry with RelationBuildLocalRelation(), creates the
 	 * pg_index tuple only after that, and then relies on
-	 * CommandCounterIncrement to load the pg_index contents.
+	 * CommandCounterIncrement to load the pg_index contents.  A prolly index
+	 * on a branch head keeps its durable OID when its definition changes, so
+	 * it always takes the full procedure.
 	 */
 	if ((relation->rd_rel->relkind == RELKIND_INDEX ||
 		 relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) &&
-		relation->rd_indexcxt != NULL)
+		relation->rd_indexcxt != NULL &&
+		!CatalogViewIsDurable(RelationGetRelid(relation)))
 	{
 		RelationReloadIndexInfo(relation);
 		return;
@@ -2989,6 +2999,9 @@ RelationCacheInvalidateEntry(Oid relationId)
 {
 	Relation	relation;
 
+	if (CatalogViewIsDurable(relationId))
+		CatalogViewForgetDurable();
+
 	RelationIdCacheLookup(relationId, relation);
 
 	if (PointerIsValid(relation))
@@ -3055,6 +3068,7 @@ RelationCacheInvalidate(bool debug_discard)
 	 * Reload relation mapping data before starting to reconstruct cache.
 	 */
 	RelationMapInvalidateAll();
+	CatalogViewForgetDurable();
 
 	/* Phase 1 */
 	hash_seq_init(&status, RelationIdCache);
@@ -3242,7 +3256,7 @@ AssertPendingSyncs_RelationCache(void)
 		 * already be retired after DDL.  Check the backing physical relations
 		 * instead.
 		 */
-		if (CatalogViewObjectContext(relid))
+		if (CatalogViewIsLeased(relid))
 			continue;
 		r = RelationIdGetRelation(relid);
 		if (!RelationIsValid(r))

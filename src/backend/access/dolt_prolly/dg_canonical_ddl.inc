@@ -9,7 +9,7 @@ static char *
 canonical_definition(const char *name, Oid owner, Acl *acl, const char *columns,
 					 const char *indexes, const char *constraints, const char *indexdef)
 {
-	run("SELECT jsonb_build_object('format','DGTABLE1','name',$1::text,'owner',pg_get_userbyid($2),'comment',NULL,'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode($3::aclitem[]) x),'[]'::jsonb),'columns',$4::jsonb,'indexes',$5::jsonb,'constraints',$6::jsonb,'index_definition',NULLIF($7::text,''))::text", 7, VC_TYPES(TEXTOID, OIDOID, ACLITEMARRAYOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(name), ObjectIdGetDatum(owner), PointerGetDatum(acl), CStringGetTextDatum(columns), CStringGetTextDatum(indexes), CStringGetTextDatum(constraints), CStringGetTextDatum(indexdef ? indexdef : "")), NULL, true);
+	run("SELECT jsonb_build_object('format','DGTABLE1','name',$1::text,'owner',pg_get_userbyid($2),'comment',NULL,'acl',COALESCE((SELECT jsonb_agg(jsonb_build_array(pg_get_userbyid(x.grantor),CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END,x.privilege_type,x.is_grantable) ORDER BY pg_get_userbyid(x.grantor) COLLATE \"C\",CASE WHEN x.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(x.grantee) END COLLATE \"C\",x.privilege_type COLLATE \"C\") FROM aclexplode($3::aclitem[]) x),'[]'::jsonb),'columns',$4::jsonb,'indexes',(SELECT coalesce(jsonb_agg(v ORDER BY v #>> '{}' COLLATE \"C\"),'[]'::jsonb) FROM jsonb_array_elements($5::jsonb) v),'constraints',(SELECT coalesce(jsonb_agg(v ORDER BY (v->>0) COLLATE \"C\"),'[]'::jsonb) FROM jsonb_array_elements($6::jsonb) v),'index_definition',NULLIF($7::text,''))::text", 7, VC_TYPES(TEXTOID, OIDOID, ACLITEMARRAYOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(name), ObjectIdGetDatum(owner), PointerGetDatum(acl), CStringGetTextDatum(columns), CStringGetTextDatum(indexes), CStringGetTextDatum(constraints), CStringGetTextDatum(indexdef ? indexdef : "")), NULL, true);
 	return strcell(0, 1);
 }
 
@@ -28,6 +28,116 @@ canonical_empty_member(const char *kind, const char *name, const char *definitio
 	return put(kind, payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
 }
 
+/* The canonical definition of physical namespace |name|. */
+static char *
+namespace_definition(const char *name)
+{
+	run("SELECT d FROM (" NAMESPACE_DEFINITIONS_SQL ") AS x(d) WHERE d::jsonb->>'name'=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
+	if (SPI_processed != 1)
+		elog(ERROR, "schema \"%s\" has no definition", name);
+	return strcell(0, 1);
+}
+
+/*
+ * A schema created in a repository is versioned on the session's branch, as
+ * Doltgres versions schemas. Its physical namespace is shared by all branches.
+ */
+void
+dg_catalog_schema_created(Oid schema)
+{
+	char	   *name = get_namespace_name(schema);
+	Oid			user;
+	int			security,
+				nest;
+
+	if (!IsUnderPostmaster || catalog_api_depth || isAnyTempNamespace(schema) ||
+		dg_system_namespace(name) || !dg_catalog_active())
+		return;
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetLatestSnapshot());
+	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		VersionRef	working;
+
+		nest = begin_api();
+		working = read_ref(branch_ref("working"));
+		if (!catalog_namespace_find(working.target, name))
+		{
+			char	   *definition = namespace_definition(name);
+			Capture		current = capture(true);
+			Datum	   *members;
+			int			count;
+
+			run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
+			count = SPI_processed;
+			members = palloc_array(Datum, count + 1);
+			for (int i = 0; i < count; i++)
+				members[i] = cell(i, 1);
+			members[count] = PointerGetDatum(put("namespace", definition, NULL, 0));
+			run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||jsonb_build_array(jsonb_build_object('kind','namespace','definition',$2::jsonb)))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(definition)), NULL, true);
+			move_ref(branch_ref("working"), working, canonical_database(strcell(0, 1), members, count + 1));
+			advance_snapshot();
+		}
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+}
+
+/* Whether CREATE TABLE makes a prolly table rather than a native one. */
+static bool
+creates_prolly(CreateStmt *stmt)
+{
+	if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP)
+		return false;
+	if (stmt->accessMethod)
+		return strcmp(stmt->accessMethod, "dolt_prolly_table") == 0;
+	return default_table_access_method && strcmp(default_table_access_method, "dolt_prolly_table") == 0;
+}
+
+/*
+ * Make the database a repository. Its prolly objects resolve through branch
+ * schemas from the first one onward; native objects stay unversioned.
+ */
+static void
+catalog_activate(void)
+{
+	Oid			user;
+	int			security,
+				nest;
+	bool		pushed = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	GetUserIdAndSecContext(&user, &security);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		nest = begin_api();
+		LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
+		ensure_repository();
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, security);
+		if (pushed)
+			PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	CommandCounterIncrement();
+}
+
 bool
 dg_catalog_create(Node *statement, const char *query)
 {
@@ -39,6 +149,7 @@ dg_catalog_create(Node *statement, const char *query)
 				nest;
 	bool		pushed = false,
 				skip = false;
+	char	   *adopted = NULL;
 	char	   *name;
 	List	   *commands,
 			   *indexcmds = NIL,
@@ -47,8 +158,11 @@ dg_catalog_create(Node *statement, const char *query)
 	TupleDesc	desc;
 	Acl		   *acl;
 
-	if (!IsA(statement, CreateStmt) || !dg_catalog_active())
+	if (!IsA(statement, CreateStmt) || !IsUnderPostmaster || rangevar_projection_hook || catalog_api_depth ||
+		!creates_prolly((CreateStmt *) statement))
 		return false;
+	if (!dg_catalog_active())
+		catalog_activate();
 	stmt = copyObject((CreateStmt *) statement);
 	if (XactReadOnly)
 		PreventCommandIfReadOnly("CREATE TABLE");
@@ -62,13 +176,39 @@ dg_catalog_create(Node *statement, const char *query)
 	GetUserIdAndSecContext(&user, &security);
 	namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing);
 	stmt->relation->schemaname = get_namespace_name(namespaceid);
-	name = quote_qualified_identifier(stmt->relation->schemaname, stmt->relation->relname);
+	name = dg_qualified_name(stmt->relation->schemaname, stmt->relation->relname);
+	if (OidIsValid(existing) && !CatalogViewIsDurable(existing))
+	{
+		if (!stmt->if_not_exists)
+			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", stmt->relation->relname)));
+		ereport(NOTICE, (errmsg("relation \"%s\" already exists, skipping", stmt->relation->relname)));
+		if (pushed)
+			PopActiveSnapshot();
+		return true;
+	}
 	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
+		char	   *nsdef;
+
 		nest = begin_api();
-		catalog_acl(catalog_namespace(read_ref(branch_ref("working")).target, stmt->relation->schemaname), "CREATE", user);
+		nsdef = catalog_namespace_find(read_ref(branch_ref("working")).target, stmt->relation->schemaname);
+
+		/*
+		 * A schema created since the repository was initialized joins the
+		 * branch with its first versioned object. The physical schema has
+		 * already passed the CREATE privilege check.
+		 */
+		if (nsdef)
+			catalog_acl(nsdef, "CREATE", user);
+		else
+		{
+			MemoryContext caller = MemoryContextSwitchTo(TopTransactionContext);
+
+			adopted = namespace_definition(stmt->relation->schemaname);
+			MemoryContextSwitchTo(caller);
+		}
 		skip = catalog_contains(read_ref(branch_ref("working")).target, name);
 		if (skip && !stmt->if_not_exists)
 			ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", stmt->relation->relname)));
@@ -188,7 +328,7 @@ dg_catalog_create(Node *statement, const char *query)
 				appendStringInfoChar(&constraints, '[');
 				escape_json(&constraints, makeObjectName(stmt->relation->relname, NameStr(a->attname), "not_null"));
 				appendStringInfoChar(&constraints, ',');
-				escape_json(&constraints, psprintf("NOT NULL %s", quote_identifier(NameStr(a->attname))));
+				escape_json(&constraints, psprintf("NOT NULL %s", dg_quote_identifier(NameStr(a->attname))));
 				appendStringInfoChar(&constraints, ']');
 			}
 		}
@@ -221,17 +361,17 @@ dg_catalog_create(Node *statement, const char *query)
 					appendStringInfoString(&keys, ", ");
 					appendStringInfoChar(&icols, ',');
 				}
-				appendStringInfoString(&keys, quote_identifier(element->name));
+				appendStringInfoString(&keys, dg_quote_identifier(element->name));
 				appendStringInfoString(&icols, column_json[att]);
 			}
 			appendStringInfoChar(&icols, ']');
 			indexname = index->idxname ? index->idxname : makeObjectName(stmt->relation->relname, index->primary ? NULL : ((IndexElem *) linitial(index->indexParams))->name, index->primary ? "pkey" : "key");
-			if (!strcmp(indexname, stmt->relation->relname) || catalog_contains(working.target, quote_qualified_identifier(stmt->relation->schemaname, indexname)))
+			if (!strcmp(indexname, stmt->relation->relname) || catalog_contains(working.target, dg_qualified_name(stmt->relation->schemaname, indexname)))
 				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", indexname)));
 			for (int j = 0; j < k; j++)
-				if (!strcmp(index_names[j], quote_qualified_identifier(stmt->relation->schemaname, indexname)))
+				if (!strcmp(index_names[j], dg_qualified_name(stmt->relation->schemaname, indexname)))
 					ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("duplicate canonical index name")));
-			sql = psprintf("CREATE UNIQUE INDEX %s ON %s USING dolt_prolly_index (%s)%s", quote_identifier(indexname), name, keys.data, index->nulls_not_distinct ? " NULLS NOT DISTINCT" : "");
+			sql = psprintf("CREATE UNIQUE INDEX %s ON %s USING dolt_prolly_index (%s)%s", dg_quote_identifier(indexname), name, keys.data, index->nulls_not_distinct ? " NULLS NOT DISTINCT" : "");
 			constraint = psprintf("%s%s (%s)", index->primary ? "PRIMARY KEY" : "UNIQUE", (!index->primary && index->nulls_not_distinct) ? " NULLS NOT DISTINCT" : "", keys.data);
 			if (k)
 				appendStringInfoChar(&indexes, ',');
@@ -243,7 +383,7 @@ dg_catalog_create(Node *statement, const char *query)
 			appendStringInfoChar(&constraints, ',');
 			escape_json(&constraints, constraint);
 			appendStringInfoChar(&constraints, ']');
-			index_names[k] = quote_qualified_identifier(stmt->relation->schemaname, indexname);
+			index_names[k] = dg_qualified_name(stmt->relation->schemaname, indexname);
 			index_columns[k] = icols.data;
 			index_defs[k++] = sql;
 		}
@@ -262,7 +402,7 @@ dg_catalog_create(Node *statement, const char *query)
 		dg_release(empty);
 		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;
-		total = oldcount + k + 1;
+		total = oldcount + k + 1 + (adopted ? 1 : 0);
 		members = palloc_array(Datum, total);
 		for (int i = 0; i < oldcount; i++)
 			members[i] = cell(i, 1);
@@ -274,6 +414,11 @@ dg_catalog_create(Node *statement, const char *query)
 			if (i)
 				appendStringInfoChar(&added, ',');
 			appendStringInfoString(&added, metadata(newmembers[i], i ? "index" : "table"));
+		}
+		if (adopted)
+		{
+			members[total - 1] = PointerGetDatum(put("namespace", adopted, NULL, 0));
+			appendStringInfo(&added, ",{\"kind\":\"namespace\",\"definition\":%s}", adopted);
 		}
 		appendStringInfoChar(&added, ']');
 		run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(added.data)), NULL, true);

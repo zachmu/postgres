@@ -76,51 +76,16 @@ alter_database(Capture current, const char *name, bytea *member)
 	return canonical_database(json, children, n);
 }
 
-/* One-time transition of legacy native schema capture. No user commit is made. */
+/* Whether |rv| names a table on a branch, rather than a native relation. */
 static bool
-alter_activate(const RangeVar *rv, bool missing)
+branch_relation(const RangeVar *rv)
 {
-	Oid			id = RangeVarGetRelid(rv, AccessShareLock, missing);
-	Relation	rel;
-	Oid			user;
-	int			security,
-				nest;
+	Oid			id;
 
-	if (!OidIsValid(id))
-		return false;
-	rel = relation_open(id, NoLock);
-	if (rel->rd_tableam != dg_table_routine())
-	{
-		relation_close(rel, NoLock);
-		return false;
-	}
-	GetUserIdAndSecContext(&user, &security);
-	if (!object_ownercheck(RelationRelationId, id, user))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, rv->relname);
-	relation_close(rel, NoLock);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		Capture		current;
-
-		nest = begin_api();
-		lock_workspace();
-		ensure_repository();
-		if (!read_ref("views/enabled").target)
-		{
-			current = capture(true);
-			move_ref(branch_ref("working"), read_ref(branch_ref("working")), current.hash);
-			move_ref("views/enabled", empty_ref, read_ref(branch_ref("heads")).target);
-			advance_snapshot();
-		}
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-	} PG_END_TRY();
-	UpdateActiveSnapshotCommandId();
-	return true;
+	if (rv->catalogname || rv->dolt_revision)
+		return true;
+	id = RangeVarGetRelid(rv, NoLock, true);
+	return OidIsValid(id) && CatalogViewObjectContext(id) != NULL;
 }
 
 bool
@@ -139,9 +104,11 @@ dg_catalog_alter(Node *statement)
 			   *name;
 	Relation	definition;
 
-	if (rangevar_projection_hook || catalog_api_depth)
+	if (rangevar_projection_hook || catalog_api_depth ||
+		(!IsA(statement, IndexStmt) && !IsA(statement, AlterTableStmt) && !IsA(statement, CommentStmt)) ||
+		!dg_catalog_active())
 		return false;
-	if (IsA(statement, IndexStmt) && dg_catalog_active())
+	if (IsA(statement, IndexStmt))
 	{
 		IndexStmt  *index = copyObject((IndexStmt *) statement);
 		AlterTableStmt *alter = makeNode(AlterTableStmt);
@@ -156,37 +123,14 @@ dg_catalog_alter(Node *statement)
 	}
 	if (!IsA(statement, AlterTableStmt) && !IsA(statement, CommentStmt))
 		return false;
-	if (!dg_catalog_active() && (!IsA(statement, AlterTableStmt) || ((AlterTableStmt *) statement)->objtype != OBJECT_TABLE))
-		return false;
 	if (IsA(statement, AlterTableStmt))
 	{
 		AlterTableStmt *stmt = (AlterTableStmt *) statement;
 
 
-		if (stmt->objtype != OBJECT_TABLE)
+		if (stmt->objtype != OBJECT_TABLE || !branch_relation(stmt->relation))
 			return false;
 		cmd = linitial_node(AlterTableCmd, stmt->cmds);
-		/* Preserve native bootstrap/restore of primary and unique indexes. */
-		if (!dg_catalog_active() && cmd->subtype == AT_AddConstraint &&
-			castNode(Constraint, cmd->def)->contype != CONSTR_CHECK &&
-			castNode(Constraint, cmd->def)->contype != CONSTR_NOTNULL)
-			return false;
-
-
-		if (!dg_catalog_active())
-		{
-			Oid			nativeid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
-			Relation	native;
-			bool		prolly;
-
-			if (!OidIsValid(nativeid))
-				return false;
-			native = relation_open(nativeid, NoLock);
-			prolly = native->rd_tableam == dg_table_routine();
-			relation_close(native, AccessShareLock);
-			if (!prolly)
-				return false;
-		}
 		if (native_alter_action(cmd->subtype))
 		{
 			ListCell   *lc;
@@ -226,6 +170,8 @@ dg_catalog_alter(Node *statement)
 			parts = list_truncate(parts, list_length(parts) - 1);
 		}
 		rv = makeRangeVarFromNameList(parts);
+		if (!branch_relation(rv))
+			return false;
 	}
 	if (rv->catalogname || rv->dolt_revision)
 		unsupported("revision-qualified canonical DDL");
@@ -236,13 +182,9 @@ dg_catalog_alter(Node *statement)
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
 	}
-	if (!dg_catalog_active() && !alter_activate(rv, missing))
-	{
-		if (pushed)
-			PopActiveSnapshot();
-		return false;
-	}
-	id = RangeVarGetRelid(rv, NoLock, missing);
+	/* Lock the branch's relation as PostgreSQL locks the native one. */
+	id = RangeVarGetRelid(rv, comment ? ShareUpdateExclusiveLock :
+						  AlterTableGetLockLevel(((AlterTableStmt *) statement)->cmds), missing);
 	if (!OidIsValid(id))
 	{
 		if (pushed)
@@ -257,7 +199,7 @@ dg_catalog_alter(Node *statement)
 	GetUserIdAndSecContext(&user, &security);
 	if (!object_ownercheck(RelationRelationId, id, user))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, rv->relname);
-	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(definition)), RelationGetRelationName(definition));
+	name = dg_qualified_name(get_namespace_name(RelationGetNamespace(definition)), RelationGetRelationName(definition));
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
@@ -283,7 +225,7 @@ dg_catalog_alter(Node *statement)
 		source = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 		if (RelationGetRelid(source) != id)
 			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("canonical ALTER target changed; retry statement")));
-		resource = source->rd_lockInfo.lockRelId.relId;
+		resource = dg_storage_bound(source) ? source->rd_lockInfo.lockRelId.relId : dg_identity_storage(id);
 		state = dg_load(source, SnapshotSelf);
 		if (column)
 		{
@@ -304,7 +246,7 @@ dg_catalog_alter(Node *statement)
 		}
 		else
 		{
-			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
+			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
 			if (SPI_processed != 1)
 				elog(ERROR, "canonical ALTER member missing");
 			descriptor = DatumGetByteaPCopy(cell(0, 1));
@@ -336,4 +278,31 @@ dg_catalog_alter(Node *statement)
 			PopActiveSnapshot();
 	} PG_END_TRY();
 	return true;
+}
+
+/*
+ * GRANT and REVOKE on tables of the session's branch.
+ *
+ * TODO: ownership and privileges of versioned objects need a design. Like
+ * OIDs, role identities are local to one server and arguably must stay out of
+ * versioned storage, which today records each table's owner and ACL. Until
+ * that design exists, privilege changes on versioned tables are rejected
+ * rather than published into a branch.
+ */
+bool
+dg_catalog_grant(Node *statement)
+{
+	GrantStmt  *grant;
+	ListCell   *lc;
+
+	if (!IsA(statement, GrantStmt) || rangevar_projection_hook || catalog_api_depth)
+		return false;
+	grant = (GrantStmt *) statement;
+	if (grant->targtype != ACL_TARGET_OBJECT || grant->objtype != OBJECT_TABLE || !dg_catalog_active())
+		return false;
+	foreach(lc, grant->objects)
+		if (branch_relation(lfirst_node(RangeVar, lc)))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("%s on versioned tables is not supported yet", grant->is_grant ? "GRANT" : "REVOKE")));
+	return false;
 }

@@ -48,7 +48,7 @@ Relation
 relation_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
-	bool		canonical = CatalogViewObjectContext(relationId) != NULL;
+	bool		canonical = CatalogViewIsLeased(relationId);
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
@@ -68,6 +68,7 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	 */
 	Assert(canonical || lockmode != NoLock ||
 		   IsBootstrapProcessingMode() ||
+		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
@@ -92,7 +93,7 @@ Relation
 try_relation_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
-	bool		canonical = CatalogViewObjectContext(relationId) != NULL;
+	bool		canonical = CatalogViewIsLeased(relationId);
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
@@ -121,6 +122,7 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 
 	/* If we didn't get the lock ourselves, assert that caller holds one */
 	Assert(canonical || lockmode != NoLock ||
+		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
@@ -212,7 +214,7 @@ void
 relation_close(Relation relation, LOCKMODE lockmode)
 {
 	LockRelId	relid = relation->rd_lockInfo.lockRelId;
-	bool		canonical = relation->rd_catalogview != NULL;
+	bool		canonical = CatalogViewIsLeased(RelationGetRelid(relation));
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 

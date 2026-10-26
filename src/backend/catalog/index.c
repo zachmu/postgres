@@ -35,6 +35,7 @@
 #include "bootstrap/bootstrap.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace.h"
 #include "catalog/catalogview.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -892,7 +893,8 @@ index_create(Relation heapRelation,
 	 * catalogs' unique indexes anyway, but we prefer to give a friendlier
 	 * error message.
 	 */
-	if (get_relname_relid(indexRelationName, namespaceId))
+	if (get_relname_relid(indexRelationName, namespaceId) ||
+		BranchRelnameGetRelid(indexRelationName, namespaceId))
 	{
 		if ((flags & INDEX_CREATE_IF_NOT_EXISTS) != 0)
 		{

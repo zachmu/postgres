@@ -16,7 +16,7 @@ validate_working_foreign_keys(const char *branch)
 	Oid			user;
 	int			security;
 
-	if (!database || !read_ref("views/enabled").target)
+	if (!database)
 		return;
 	view = provider_view(database);
 	CatalogViewEnsureLoaded(view);

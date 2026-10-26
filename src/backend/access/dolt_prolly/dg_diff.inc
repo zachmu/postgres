@@ -230,73 +230,35 @@ static DiffTable *
 diff_table_working(const char *name, bool rows)
 {
 	DiffTable  *t = diff_table_absent(name);
-	bool		canonical = read_ref("views/enabled").target != NULL;
+	bytea	   *db = read_ref(branch_ref("working")).target,
+			   *schema,
+			   *chunk;
+	CatalogView *view;
+	Oid			handle,
+				resource;
+	DGStorage  *storage;
+	Relation	rel;
 
-	if (canonical)
-	{
-		bytea	   *db = read_ref(branch_ref("working")).target,
-				   *schema,
-				   *chunk;
-		CatalogView *view;
-		Oid			handle,
-					resource;
-		DGStorage  *storage;
-		Relation	rel;
-
-		if (!db || !database_member(db, name, &schema, &chunk))
-			return t;
-		view = provider_view(db);
-		handle = CatalogViewLookupObject(view, RelationRelationId, name);
-		resource = binding_relation(dg_current_branch(), name, schema);
-		if (!OidIsValid(handle) || !OidIsValid(resource))
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-		t->present = true;
-		t->schema = metadata(schema, "schema");
-		t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
-		rel = relation_open(handle, AccessShareLock);
-		FreeTupleDesc(t->desc);
-		t->desc = CreateTupleDescCopy(RelationGetDescr(rel));
-		relation_close(rel, AccessShareLock);
-		t->keyed = t->nkeys > 0;
-		if (!rows)
-			return t;
-		storage = dg_storage_open(handle, dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-		t->live = dg_storage_load(storage);
-		dg_storage_close(storage);
-	}
-	else
-	{
-		List	   *parts = stringToQualifiedNameList(name, NULL);
-		Oid			ns,
-					relid;
-		Relation	rel;
-
-		if (list_length(parts) != 2)
-			elog(ERROR, "qualified table name required: %s", name);
-		ns = get_namespace_oid(strVal(linitial(parts)), true);
-		relid = OidIsValid(ns) ? get_relname_relid(strVal(lsecond(parts)), ns) : InvalidOid;
-		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
-			return t;
-		rel = relation_open(relid, AccessShareLock);
-		if (rel->rd_tableam != dg_table_routine())
-		{
-			relation_close(rel, AccessShareLock);
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("diff of non-prolly table %s", name)));
-		}
-		t->present = true;
-		t->schema = native_schema_definition(relid);
-		t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
-		FreeTupleDesc(t->desc);
-		t->desc = CreateTupleDescCopy(RelationGetDescr(rel));
-		t->keyed = t->nkeys > 0;
-		if (!rows)
-		{
-			relation_close(rel, AccessShareLock);
-			return t;
-		}
-		t->live = dg_load(rel, GetActiveSnapshot());
-		relation_close(rel, AccessShareLock);
-	}
+	if (!db || !database_member(db, name, &schema, &chunk))
+		return t;
+	view = provider_view(db);
+	handle = CatalogViewLookupObject(view, RelationRelationId, name);
+	resource = binding_relation(dg_current_branch(), name, schema);
+	if (!OidIsValid(handle) || !OidIsValid(resource))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
+	t->present = true;
+	t->schema = metadata(schema, "schema");
+	t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
+	rel = relation_open(handle, AccessShareLock);
+	FreeTupleDesc(t->desc);
+	t->desc = CreateTupleDescCopy(RelationGetDescr(rel));
+	relation_close(rel, AccessShareLock);
+	t->keyed = t->nkeys > 0;
+	if (!rows)
+		return t;
+	storage = dg_storage_open(handle, dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+	t->live = dg_storage_load(storage);
+	dg_storage_close(storage);
 	if (t->live->has_root)
 		t->rows = logical_rows_for(t, &t->live->content);
 	return t;
@@ -476,7 +438,7 @@ resolve_table_argument(const char *arg, const char *json_a, const char *json_b, 
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("table name cannot be empty")));
 	parts = stringToQualifiedNameList(arg, NULL);
 	if (list_length(parts) == 2)
-		qualified = quote_qualified_identifier(strVal(linitial(parts)), strVal(lsecond(parts)));
+		qualified = dg_qualified_name(strVal(linitial(parts)), strVal(lsecond(parts)));
 	else if (list_length(parts) != 1)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid table name: %s", arg)));
 	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind'='table'), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY AS p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND (parse_ident(name))[2]=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json_a), CStringGetTextDatum(json_b), qualified ? CStringGetTextDatum(qualified) : (Datum) 0, CStringGetTextDatum(strVal(llast(parts))), CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
@@ -487,7 +449,7 @@ resolve_table_argument(const char *arg, const char *json_a, const char *json_b, 
 		if (!qualified)
 		{
 			run("SELECT coalesce((SELECT s FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($1,',')) WITH ORDINALITY AS p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s) ORDER BY ord LIMIT 1),'public')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(api_search_path ? api_search_path : "public")), NULL, true);
-			qualified = quote_qualified_identifier(strcell(0, 1), strVal(linitial(parts)));
+			qualified = dg_qualified_name(strcell(0, 1), strVal(linitial(parts)));
 		}
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", qualified)));
 	}

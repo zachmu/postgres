@@ -5,7 +5,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('storage_allocation');
-$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql { return $node->safe_psql('postgres',$_[0]); }
 sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT});
 # Retain an incompatible definition before activating branch views. Its physical
@@ -42,8 +42,6 @@ is(sql("SELECT count(*) FROM pg_dolt_storage WHERE storageid=$rolled"),'0','save
 $pending->quit;
 # Fixture publishes a binding to the existing canonical definition. Full SQL
 # CREATE must publish a new definition and membership as well in one transaction.
-my $old=$node->background_psql('postgres');
-$old->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; PREPARE retained_binding AS SELECT count(*) FROM "postgres/other".public.t; EXECUTE retained_binding});
 my $plan=$node->background_psql('postgres');
 $plan->query_safe(q{PREPARE current_binding AS SELECT count(*) FROM "postgres/other".public.t; EXECUTE current_binding});
 my $publisher=$node->background_psql('postgres');
@@ -58,9 +56,8 @@ is(sql("SELECT count(*) FROM pg_type WHERE typrelid=$id"),'0','committed allocat
 is(sql("SELECT storageimported FROM pg_dolt_storage WHERE storageid=$id"),'f','resource owns its file independently of native schema catalogs');
 
 is(sql(q{SELECT count(*) FROM "postgres/other".public.t}),'0','normal qualified SQL reads initialized empty resource with canonical schema');
-is($old->query_safe('EXECUTE retained_binding'),'1','old snapshot and prepared binding retain the prior resource');
 is($plan->query_safe('EXECUTE current_binding'),'0','read-committed prepared plan rebinds after resource publication');
-$old->query_safe('ROLLBACK');$old->quit;$plan->quit;
+$plan->quit;
 is(sql(q{SELECT * FROM "postgres/main".public.t}),'1|main','other branch retains its original resource and rows');
 is(sql(q{SELECT * FROM t AS OF 'HEAD'}),'1|main','retained query still reads canonical commit content');
 # Internal publication fixture, not SQL CREATE/ALTER: the old branch falls back

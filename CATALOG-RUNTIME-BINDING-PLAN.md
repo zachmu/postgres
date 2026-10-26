@@ -1,5 +1,8 @@
 # Versioned catalog runtime bindings
 
+> Superseded in part (2026-10-25): relation identity, backend-local handles and the
+> read path are replaced by [branch relation identity](BRANCH-RELATION-IDENTITY-PLAN.md).
+
 > Current direction: see [the latest clarification](#current-runtime-contract--2026-10-22).
 > Earlier runtime-name/private-namespace proposals are historical and superseded
 > where they conflict with that clarification.

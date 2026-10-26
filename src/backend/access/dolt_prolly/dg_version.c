@@ -23,6 +23,8 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
+#include "catalog/pg_dolt_identity.h"
+#include "utils/inval.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
@@ -104,9 +106,6 @@ typedef struct Capture
 } Capture;
 
 /* Only set while publishing a freshly created physical relation. */
-static Oid	catalog_new_relation = InvalidOid;
-static bool catalog_creating;
-static bool catalog_new_member(Oid id);
 
 static const VersionRef empty_ref = {NULL, NULL};
 
@@ -237,6 +236,7 @@ begin_api(void)
 	version_calls++;
 	PushCopiedSnapshot(GetActiveSnapshot());
 	set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	set_config_option("quote_all_identifiers", "off", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	return nest;
 }
 static void
@@ -494,14 +494,12 @@ json_field(StringInfo b, const char *key, const char *value, bool comma)
 	escape_json(b, value);
 }
 
-/* Canonical branch membership is authoritative once branch views are active. */
+/* The canonical membership of |branch|: its working schema, else its head's. */
 static bytea *
 catalog_database(const char *branch)
 {
 	VersionRef	ref;
 
-	if (!read_ref("views/enabled").target)
-		return NULL;
 	ref = read_ref(psprintf("working/%s", branch));
 	if (ref.target)
 		return ref.target;
@@ -513,11 +511,12 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 	return SPI_processed != 0;
 }
 
 static CatalogView *provider_view(bytea *database);
+static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static bytea *
@@ -640,203 +639,11 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 	return result;
 }
 
-/* Fixed schema locks make ordinary relcache descriptors safe for this capture.
- * AccessShare relation locks keep DDL out without stopping row writers. */
+/* The working schema of the session's branch, with its tables' live content. */
 static Capture
 capture_inner(bool persist, bool all_catalogs)
 {
-	Oid			catalogs[] = {RelationRelationId, AttributeRelationId, IndexRelationId, NamespaceRelationId, TypeRelationId, ProcedureRelationId, ConstraintRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, CollationRelationId, AuthIdRelationId, DescriptionRelationId, OperatorRelationId};
-	Capture		result = {0};
-	bytea	   *membership = all_catalogs ? NULL : catalog_database(dg_current_branch());
-	Oid		   *relations;
-	char	  **namespaces;
-	int			nrel,
-				nns,
-				i;
-	Datum	   *members;
-	int			used = 0;
-	StringInfoData json;
-
-	if (!catalog_creating && read_ref("views/enabled").target)
-		return capture_canonical(read_ref(branch_ref("working")).target, persist, all_catalogs);
-
-	for (i = 0; i < lengthof(catalogs); i++)
-		LockRelationOid(catalogs[i], ShareLock);
-	if (IsolationUsesXactSnapshot())
-		unsupported("live capture under Repeatable Read or Serializable (historical schema binding is not implemented)");
-	PushActiveSnapshot(GetLatestSnapshot());
-	run("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
-	nrel = SPI_processed;
-	relations = palloc(sizeof(Oid) * Max(nrel, 1));
-	for (i = 0; i < nrel; i++)
-		relations[i] = DatumGetObjectId(cell(i, 1));
-	if (membership)
-	{
-		int			kept = 0;
-
-		for (i = 0; i < nrel; i++)
-		{
-			Oid			id = relations[i];
-			char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(id)), get_rel_name(id));
-
-			if (catalog_new_member(id) || catalog_contains(membership, name))
-				relations[kept++] = id;
-		}
-		nrel = kept;
-	}
-	for (i = 0; i < nrel; i++)
-		LockRelationOid(relations[i], AccessShareLock);
-	PopActiveSnapshot();
-	PushActiveSnapshot(GetLatestSnapshot());
-	/* Reject unsupported definitions instead of producing incomplete commits. */
-	run("SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relam NOT IN (SELECT oid FROM pg_catalog.pg_am WHERE amname IN ('dolt_prolly_table','dolt_prolly_index')) OR c.relrowsecurity OR c.relispartition OR c.reloptions IS NOT NULL) UNION ALL SELECT 1 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE " USER_NAMESPACE " AND t.typtype<>'c' AND t.typelem=0", 0, NULL, NULL, NULL, true);
-	if (SPI_processed)
-		unsupported("database capture containing non-prolly relations, routines, custom types or unsupported relation properties");
-	run("SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE " USER_NAMESPACE " UNION ALL SELECT 1 FROM pg_operator o JOIN pg_namespace n ON n.oid=o.oprnamespace WHERE " USER_NAMESPACE, 0, NULL, NULL, NULL, true);
-	if (SPI_processed)
-		unsupported("capture of custom collations or operators");
-	run("SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence<>'t' AND a.attnum>0 AND (a.attisdropped OR a.attacl IS NOT NULL OR a.attidentity<>'' OR a.attgenerated<>'' OR t.typnamespace<>'pg_catalog'::regnamespace) UNION ALL SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relpersistence<>'t' AND NOT (t.tgisinternal AND EXISTS (SELECT 1 FROM pg_constraint f WHERE f.oid=t.tgconstraint AND f.contype='f')) UNION ALL SELECT 1 FROM pg_catalog.pg_constraint x JOIN pg_catalog.pg_namespace n ON n.oid=x.connamespace WHERE " USER_NAMESPACE " AND x.contype NOT IN ('p','u','n','c','f')", 0, NULL, NULL, NULL, true);
-	if (SPI_processed)
-		unsupported("capture of generated/dropped columns, user types, triggers or unsupported constraints");
-	run(NAMESPACE_DEFINITIONS_SQL, 0, NULL, NULL, NULL, true);
-	nns = SPI_processed;
-	namespaces = palloc(sizeof(char *) * Max(nns, 1));
-	for (i = 0; i < nns; i++)
-		namespaces[i] = strcell(i, 1);
-	members = palloc(sizeof(Datum) * Max(nns + nrel, 1));
-	initStringInfo(&json);
-	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
-	for (i = 0; i < nns; i++)
-	{
-		if (used)
-			appendStringInfoChar(&json, ',');
-		appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", namespaces[i]);
-		if (persist)
-			members[used] = PointerGetDatum(put("namespace", namespaces[i], NULL, 0));
-		used++;
-	}
-	for (i = 0; i < nrel; i++)
-	{
-		Oid			types[] = {OIDOID};
-		Datum		args[] = {ObjectIdGetDatum(relations[i])};
-		char	   *name,
-				   *kind,
-				   *schema,
-				   *schemahash,
-				   *content;
-		bytea	   *chunk = NULL,
-				   *desc = NULL,
-				   *shash = NULL;
-		StringInfoData member;
-		DGState    *state;
-		Relation	rel;
-
-		run("SELECT format('%I.%I',n.nspname,c.relname),CASE WHEN c.relkind='r' THEN 'table' ELSE 'index' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1", 1, types, args, NULL, true);
-		name = strcell(0, 1);
-		kind = strcell(0, 2);
-		run("SELECT adbin FROM pg_attrdef WHERE adrelid=$1 UNION ALL SELECT conbin FROM pg_constraint WHERE conrelid=$1 AND conbin IS NOT NULL", 1, types, args, NULL, true);
-		for (uint64 row = 0; row < SPI_processed; row++)
-			(void) schema_expression_check(stringToNode(strcell(row, 1)), NULL);
-		schema = native_schema_definition(relations[i]);
-		run("SELECT encode(sha256(convert_to($1,'UTF8')),'hex')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(schema)), NULL, true);
-		schemahash = strcell(0, 1);
-		rel = relation_open(relations[i], NoLock);
-		if (all_catalogs)
-			content = pstrdup("");	/* Definition validation never reads
-									 * another branch's rows. */
-		else
-		{
-			state = dg_load(rel, GetActiveSnapshot());
-			{
-				bytea	   *raw = palloc(VARHDRSZ + 32);
-
-				SET_VARSIZE(raw, VARHDRSZ + 32);
-				memcpy(VARDATA(raw), state->content.root.bytes, 32);
-				content = hex(raw);
-			}
-			dg_release(state);
-		}
-		relation_close(rel, NoLock);
-		initStringInfo(&member);
-		appendStringInfoChar(&member, '{');
-		json_field(&member, "kind", kind, false);
-		json_field(&member, "name", name, true);
-		json_field(&member, "schema", schemahash, true);
-		json_field(&member, "content", content, true);
-		appendStringInfoChar(&member, '}');
-		if (persist)
-		{
-			shash = put("schema", schema, NULL, 0);
-			rel = relation_open(relations[i], NoLock);
-			dg_storage_record(rel);
-			relation_close(rel, NoLock);
-			binding_record(dg_current_branch(), name, shash, relations[i]);
-			chunk = DatumGetByteaP(DirectFunctionCall1(dolt_manifest_export, ObjectIdGetDatum(relations[i])));
-			desc = put(kind, member.data, VC_ARGS(PointerGetDatum(shash), PointerGetDatum(chunk)), 2);
-			members[used] = PointerGetDatum(desc);
-		}
-		if (used)
-			appendStringInfoChar(&json, ',');
-		appendStringInfoString(&json, member.data);
-		used++;
-	}
-	run("SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE " USER_NAMESPACE " ORDER BY p.oid", 0, NULL, NULL, NULL, true);
-	{
-		int			nroutines = SPI_processed;
-		Oid		   *ids = palloc_array(Oid, Max(nroutines, 1));
-
-		for (i = 0; i < nroutines; i++)
-			ids[i] = DatumGetObjectId(cell(i, 1));
-		members = repalloc(members, sizeof(Datum) * Max(used + nroutines, 1));
-		for (i = 0; i < nroutines; i++)
-		{
-			HeapTuple	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(ids[i]));
-			Relation	catalog = table_open(ProcedureRelationId, AccessShareLock);
-			char	   *definition = routine_encode(tuple, RelationGetDescr(catalog));
-			char	   *payload = routine_payload(definition);
-
-			ReleaseSysCache(tuple);
-			table_close(catalog, AccessShareLock);
-			if (used)
-				appendStringInfoChar(&json, ',');
-			appendStringInfoString(&json, payload);
-			if (persist)
-				members[used] = PointerGetDatum(routine_member(definition));
-			used++;
-		}
-	}
-	appendStringInfoString(&json, "]}");
-	/* Sort members by symbolic identity, never relation OID / creation order. */
-	run("SELECT jsonb_build_object('format','DGDB1','encoding',current_setting('server_encoding'),'members',COALESCE(jsonb_agg(v ORDER BY v->>'kind' COLLATE \"C\",COALESCE(v->>'name',v->'definition'->>'name') COLLATE \"C\"),'[]'::jsonb))::text FROM jsonb_array_elements($1::jsonb->'members') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
-	result.json = strcell(0, 1);
-	if (persist)
-	{
-		/*
-		 * Hash-sort child addresses as a canonical set; payload carries
-		 * membership names.
-		 */
-		run("SELECT coalesce(array_agg(h ORDER BY h),'{}'::bytea[]) FROM unnest($1::bytea[]) h", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, used))), NULL, true);
-		{
-			ArrayType  *arr = DatumGetArrayTypeP(cell(0, 1));
-			Datum	   *vals;
-			bool	   *nulls;
-			int			n;
-
-			deconstruct_array(arr, BYTEAOID, -1, false, TYPALIGN_INT, &vals, &nulls, &n);
-			result.hash = put("database", result.json, vals, n);
-		}
-	}
-	PopActiveSnapshot();
-
-	/*
-	 * Every historical byte has been copied; no source locator escapes
-	 * capture.
-	 */
-	for (i = nrel - 1; i >= 0; i--)
-		UnlockRelationOid(relations[i], AccessShareLock);
-	for (i = lengthof(catalogs) - 1; i >= 0; i--)
-		UnlockRelationOid(catalogs[i], ShareLock);
-	return result;
+	return capture_canonical(read_ref(branch_ref("working")).target, persist, all_catalogs);
 }
 static Capture
 capture_mode(bool persist, bool all_catalogs)

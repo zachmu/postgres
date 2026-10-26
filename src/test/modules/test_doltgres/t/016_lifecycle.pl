@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('lifecycle');
-$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);
+$node->init(allows_streaming=>1,extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");
 $node->append_conf('postgresql.conf',"dolt_catalog_cache_entries=2\nmax_parallel_workers_per_gather=2\n");
 $node->start;
 like($node->safe_psql('postgres',q{SET debug_parallel_query=on; EXPLAIN (ANALYZE,COSTS OFF,TIMING OFF) SELECT sum(i) FROM generate_series(1,100) i}),qr/Gather/,'ordinary native query still executes through a parallel plan');
@@ -26,15 +26,18 @@ for my $i (1..8) {
  sql("SELECT dolt_commit('-Am','revision $i')");
  push @revisions,sql(q{SELECT commit_hash FROM dolt_log('-n','1')});
 }
-my $resident=q{SELECT count(*) FROM pg_backend_memory_contexts WHERE name='catalog view rows' AND used_bytes>16384};
-cmp_ok(sql($resident),'<=' ,2,'decoded catalog row residency respects cache target');
+# Count in Perl: a function call would resolve through, and reload, the
+# session's branch view, measuring the measurement's own residency.
+my $resident=q{SELECT used_bytes FROM pg_backend_memory_contexts WHERE name='catalog view rows' AND used_bytes>16384};
+sub resident {my $rows=sql($resident);return scalar(grep {length} split(/\n/,$rows));}
+cmp_ok(resident(),'<=' ,2,'decoded catalog row residency respects cache target');
 is(sql('EXECUTE oldrows'),"10\n20",'prepared routine and composite handles survive eviction');
 is(sql('EXECUTE oldarray'),'2','generated array identity survives collisions and eviction');
 is(sql(qq{SELECT oid FROM pg_type AS OF '$base' WHERE typname='t'}),$oldoid,'reload preserves original runtime type identifier');
 for my $i (1..8) {
  is(sql("SELECT attstattarget FROM pg_attribute AS OF '$revisions[$i]' WHERE attname='x'"),100+$i,"cold revision $i reloads its own metadata");
 }
-cmp_ok(sql($resident),'<=' ,2,'repeated reloads reclaim old decoded rows');
+cmp_ok(resident(),'<=' ,2,'repeated reloads reclaim old decoded rows');
 sql(q{SET statement_timeout='15s'; SET debug_parallel_query=on; SET parallel_setup_cost=0; SET parallel_tuple_cost=0; SET min_parallel_table_scan_size=0});
 unlike(sql(qq{EXPLAIN (COSTS OFF) SELECT f(t) FROM t}),qr/Gather/,'canonical function and row context stay in leader');
 unlike(sql(qq{EXPLAIN (COSTS OFF) SELECT oid FROM pg_type AS OF '$base' WHERE typname='t'}),qr/Gather/,'revision-qualified catalogs stay in leader');
@@ -48,22 +51,20 @@ sql(q{BEGIN; DECLARE held CURSOR WITH HOLD FOR SELECT attstattarget FROM pg_attr
 sql('ALTER TABLE t ALTER COLUMN x SET STATISTICS 999');
 is(sql('FETCH ALL FROM held'),'108','held catalog cursor preserves its old definition');
 sql('CLOSE held');
+# A branch head's row type keeps one durable OID across schema versions; an
+# aborted change leaves that OID naming the surviving definition.
+my $durable=sql(q{SELECT 't'::regtype::oid});
 sql('BEGIN; ALTER TABLE t ADD COLUMN ghost int');
-my $aborted=sql(q{SELECT 't'::regtype::oid});
+is(sql(q{SELECT 't'::regtype::oid}),$durable,'schema change keeps the row type OID');
 sql('ROLLBACK');
-my ($ignored,$failed)=$s->query("SELECT format_type($aborted,NULL)");
-is($failed,1,'an aborted schema handle cannot outlive its defining object');
-$s->{stderr}='';
+is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid=(SELECT typrelid FROM pg_type WHERE oid=}.$durable.q{) AND attname='ghost'}),'0','an aborted schema change leaves the durable OID naming the old definition');
 sql('BEGIN; ALTER TABLE t ALTER COLUMN x SET STATISTICS 1000');
-my $parenttype=sql(q{SELECT 't'::regtype::oid});
 sql('SAVEPOINT child; ALTER TABLE t ADD COLUMN ghost int');
-my $childtype=sql(q{SELECT 't'::regtype::oid});
+is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid='t'::regclass AND attname='ghost'}),'1','child schema change is visible inside the child');
 sql('ROLLBACK TO child');
-($ignored,$failed)=$s->query("SELECT format_type($childtype,NULL)");
-is($failed,1,'savepoint rollback invalidates child-created schema handle');
-$s->{stderr}='';
+is(sql(q{SELECT count(*) FROM pg_attribute WHERE attrelid='t'::regclass AND attname='ghost'}),'0','savepoint rollback restores the parent schema');
 sql('ROLLBACK TO child');
-is(sql("SELECT format_type($parenttype,NULL)"),'t','parent-created schema remains usable after child abort');
+is(sql("SELECT format_type($durable,NULL)"),'t','parent schema remains usable after child abort');
 sql('ROLLBACK');
 sql(q{SELECT dolt_checkout('-b','other'); ALTER TABLE t ALTER COLUMN x SET STATISTICS 222; UPDATE t SET x=x+1; SELECT dolt_commit('-Am','other metadata')});
 $s->quit;

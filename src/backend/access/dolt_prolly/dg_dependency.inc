@@ -189,6 +189,41 @@ canonical_drop(Node *statement)
 		return false;
 	if (!dg_catalog_active())
 		return false;
+
+	/* Native objects are unversioned: native DROP removes them. */
+	{
+		int			versioned = 0,
+					native = 0;
+
+		foreach(lc, stmt->objects)
+		{
+			Oid			id = InvalidOid;
+			bool		branch;
+
+			if (constraint_table)
+				branch = branch_relation(constraint_table);
+			else if (stmt->removeType == OBJECT_TABLE || stmt->removeType == OBJECT_INDEX)
+				branch = branch_relation(makeRangeVarFromNameList(lfirst(lc)));
+			else if (stmt->removeType == OBJECT_SCHEMA)
+				branch = true;
+			else
+			{
+				if (stmt->removeType == OBJECT_TYPE)
+					id = LookupTypeNameOid(NULL, lfirst_node(TypeName, lc), true);
+				else
+					id = LookupFuncWithArgs(stmt->removeType, lfirst_node(ObjectWithArgs, lc), true);
+				branch = !(id >= FirstNormalObjectId && id < FirstDurableObjectId);
+			}
+			if (branch)
+				versioned++;
+			else
+				native++;
+		}
+		if (!versioned)
+			return false;
+		if (native)
+			unsupported("DROP of versioned and unversioned objects together");
+	}
 	if (constraint_table)
 	{
 		foreach(lc, stmt->objects)
@@ -306,7 +341,8 @@ canonical_drop(Node *statement)
 			if (CatalogViewObjectContext(object->objectId) != view || object->objectSubId != 0 ||
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&
-				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId))
+				 object->classId != ConstraintRelationId && object->classId != TriggerRelationId &&
+				 object->classId != AttrDefaultRelationId))
 				unsupported("canonical dependency deletion object kind");
 		}
 		CatalogViewSwitch(NULL);

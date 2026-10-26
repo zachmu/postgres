@@ -4,7 +4,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node=PostgreSQL::Test::Cluster->new('revision_views');
-$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->start;
+$node->init(extra=>['--encoding=UTF8','--locale=C']);$node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\n");$node->start;
 sub sql {return $node->safe_psql('postgres',$_[0]);}
 sql(q{CREATE TABLE t(id int PRIMARY KEY,v text) USING dolt_prolly_table; SELECT dolt_commit('-Am','base'); SELECT dolt_checkout('-b','other'); ALTER TABLE t ADD COLUMN extra int; CREATE TABLE other_only(x int PRIMARY KEY); SELECT dolt_commit('-Am','other')});
 my $cols=q{SELECT column_name FROM information_schema.columns AS OF 'other' WHERE table_schema='public' AND table_name='t' ORDER BY ordinal_position};

@@ -35,6 +35,7 @@
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "catalog/catalogview.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -2526,6 +2527,21 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 
 	if (!desc)
 		return NULL;
+
+	/*
+	 * A table is an ordinary relation: on a branch head it has a durable OID,
+	 * in a revision a leased one. Plan and execute it like any other table.
+	 */
+	if (OidIsValid(rte->dolt_rowtype) && !rte->dolt_catalog && rte->relkind != RELKIND_VIEW)
+	{
+		Relation	rel = table_open(get_typ_typrelid(rte->dolt_rowtype), AccessShareLock);
+		ParseNamespaceItem *item;
+
+		item = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, rv->alias, rv->inh, true);
+		table_close(rel, NoLock);
+		FreeTupleDesc(desc);
+		return item;
+	}
 	if (rte->relkind == RELKIND_VIEW)
 	{
 		RangeVar   *native = copyObject(rv);

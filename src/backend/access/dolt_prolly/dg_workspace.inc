@@ -66,7 +66,7 @@ table_index_names(const char *schema_json, const char *table)
 		if (list_length(parsed) != 1 || !IsA(node, IndexStmt))
 			elog(ERROR, "invalid canonical index definition");
 		index = (IndexStmt *) node;
-		result = lappend(result, quote_qualified_identifier(ns, index->idxname));
+		result = lappend(result, dg_qualified_name(ns, index->idxname));
 	}
 	return result;
 }
@@ -230,8 +230,6 @@ replace_working(const char *branch, bytea *database, List *tables)
 		relation_close(definition, NoLock);
 	}
 	move_ref(psprintf("working/%s", branch), working, database);
-	if (!strcmp(branch, dg_current_branch()) && !read_ref("views/enabled").target)
-		move_ref("views/enabled", empty_ref, read_ref(psprintf("heads/%s", branch)).target);
 	advance_snapshot();
 	for (int i = 0; i < count; i++)
 	{
@@ -552,6 +550,7 @@ delete_branch_refs(const char *name)
 			move_ref(psprintf("%s/%s", prefixes[i], name), r, NULL);
 	}
 	run("DELETE FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, false);
+	dg_identity_delete_branch(name);
 }
 
 static void

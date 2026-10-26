@@ -51,6 +51,15 @@ binding_record(const char *branch, const char *name, bytea *schema, Oid relid)
 	table_close(rel, NoLock);
 	if (changed)
 		CommandCounterIncrement();
+
+	/* Every bound object on a branch head has a durable OID. */
+	(void) dg_identity_ensure(branch, DOLT_IDENTITY_RELATION, name);
+	run("SELECT storagekind FROM pg_catalog.pg_dolt_storage WHERE storageid=$1", 1, VC_TYPES(OIDOID), VC_ARGS(ObjectIdGetDatum(relid)), NULL, false);
+	if (SPI_processed == 1 && DatumGetChar(cell(0, 1)) == RELKIND_RELATION)
+	{
+		(void) dg_identity_ensure(branch, DOLT_IDENTITY_ROWTYPE, name);
+		(void) dg_identity_ensure(branch, DOLT_IDENTITY_ARRAYTYPE, name);
+	}
 }
 
 static Oid
@@ -73,7 +82,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 			  **kinds;
 	bytea	  **schemas;
 
-	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	run("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	names = palloc(sizeof(char *) * Max(n, 1));
 	schemas = palloc(sizeof(bytea *) * Max(n, 1));

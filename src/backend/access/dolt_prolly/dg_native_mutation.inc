@@ -356,7 +356,7 @@ mutation_indexes(CatalogView *view, Oid table)
 				ReleaseSysCache(relation);
 			}
 			item->sortname = get_rel_name(item->id);
-			item->name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(item->id)), get_rel_name(item->id));
+			item->name = dg_qualified_name(get_namespace_name(get_rel_namespace(item->id)), get_rel_name(item->id));
 			item->sql = TextDatumGetCString(DirectFunctionCall1(pg_get_indexdef, ObjectIdGetDatum(item->id)));
 			result = lappend(result, item);
 		}
@@ -388,7 +388,7 @@ mutation_index_list(const char *definition, List *indexes)
 		escape_json(&json, item->sql);
 	}
 	appendStringInfoChar(&json, ']');
-	run("SELECT jsonb_set($1::jsonb,'{indexes}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
+	run("SELECT jsonb_set($1::jsonb,'{indexes}',(SELECT coalesce(jsonb_agg(v ORDER BY v #>> '{}' COLLATE \"C\"),'[]'::jsonb) FROM jsonb_array_elements($2::jsonb) v))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
 	return strcell(0, 1);
 }
 
@@ -423,7 +423,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		ListCell   *lc;
 		List	   *commands = statement->cmds;
 
-		provider_populate(view, current.hash);
+		provider_populate(view, current.hash, NULL);
 		CatalogViewBeginMutation(view);
 		CatalogViewSetMutationValidator(view, mutation_validate_tuple);
 		CatalogViewSetStorageHandler(view, mutation_storage);
@@ -446,11 +446,21 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			if (action->subtype == AT_AddIndex)
 			{
 				IndexStmt  *index = castNode(IndexStmt, action->def);
+				ListCell   *cc;
 
 				if (index->concurrent || index->whereClause || index->options || index->tableSpace ||
 					(index->accessMethod && strcmp(index->accessMethod, "btree") && strcmp(index->accessMethod, "dolt_prolly_index")))
 					unsupported("canonical index storage properties");
 				index->accessMethod = pstrdup("dolt_prolly_index");
+				foreach(cc, index->indexParams)
+				{
+					IndexElem  *element = lfirst_node(IndexElem, cc);
+
+					/* A user operator class is local to this server. */
+					if (element->opclass &&
+						get_opclass_oid(DOLT_PROLLY_INDEX_AM_OID, element->opclass, false) >= FirstNormalObjectId)
+						unsupported("canonical index with a user-defined operator class");
+				}
 				action->def = (Node *) transformIndexStmt(id, index, debug_query_string ? debug_query_string : "");
 			}
 			if (action->subtype == AT_AlterColumnType)
@@ -516,7 +526,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		CommandCounterIncrement();
 		indexes = mutation_indexes(view, id);
 		CatalogViewSwitch(NULL);
-		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
+		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		count = SPI_processed;
 		members = palloc_array(bytea *, Max(count, 1));
 		kinds = palloc_array(char *, Max(count, 1));

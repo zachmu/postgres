@@ -34,24 +34,26 @@ static void
 lock_workspace(void)
 {
 	Oid		   *ids;
-	bool		canonical = read_ref("views/enabled").target != NULL;
 	int			n,
 				i;
 
 	LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
-	if (canonical)
-		run("SELECT DISTINCT bindrelid FROM pg_dolt_binding WHERE bindbranch=$1 ORDER BY bindrelid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
-	else
-		run("SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	run("SELECT DISTINCT bindrelid FROM pg_dolt_binding WHERE bindbranch=$1 ORDER BY bindrelid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
 	n = SPI_processed;
 	ids = palloc(sizeof(Oid) * Max(n, 1));
 	for (i = 0; i < n; i++)
 		ids[i] = DatumGetObjectId(cell(i, 1));
 	for (i = 0; i < n; i++)
-		if (canonical)
-			dg_storage_lock_branch(ids[i], dg_current_branch(), ExclusiveLock);
-		else
-			LockRelationOid(ids[i], AccessExclusiveLock);
+		dg_storage_lock_branch(ids[i], dg_current_branch(), ExclusiveLock);
+
+	/* Writers lock the branch's relations by durable OID; wait them out. */
+	run("SELECT identoid FROM pg_dolt_identity WHERE identbranch=$1 AND identkind='r' ORDER BY identoid", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(dg_current_branch())), NULL, true);
+	n = SPI_processed;
+	ids = palloc(sizeof(Oid) * Max(n, 1));
+	for (i = 0; i < n; i++)
+		ids[i] = DatumGetObjectId(cell(i, 1));
+	for (i = 0; i < n; i++)
+		LockRelationOid(ids[i], ExclusiveLock);
 	PopActiveSnapshot();
 	PushCopiedSnapshot(GetLatestSnapshot());
 }
@@ -128,14 +130,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 
 		binding_prepare(name, target ? target : child(commit, 1), true);
 	}
-
-	/*
-	 * A persistent marker freezes shared schemas after branch views are
-	 * enabled.
-	 */
-	ref = read_ref("views/enabled");
-	if (!ref.target)
-		move_ref("views/enabled", ref, commit);
 	dg_select_branch(name);
 	values[0] = Int64GetDatum(0);
 	values[1] = CStringGetTextDatum(psprintf(already ? "Already on branch '%s'" : "Switched to branch '%s'", name));
@@ -650,26 +644,17 @@ static void
 install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations)
 {
 	char	  **names;
-	bool		canonical = (read_ref("views/enabled").target != NULL);
-	Oid		   *ids;
 	int			n,
 				i;
 
-	if (canonical)
-		run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(metadata(theirs, "database"))), NULL, true);
-	else
-		run("SELECT c.oid,format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE " USER_NAMESPACE " AND c.relkind='r' AND c.relpersistence='p' ORDER BY c.oid", 0, NULL, NULL, NULL, true);
+	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(metadata(theirs, "database"))), NULL, true);
 	n = SPI_processed;
-	ids = palloc(sizeof(Oid) * Max(n, 1));
 	names = palloc(sizeof(*names) * Max(n, 1));
 	for (i = 0; i < n; i++)
-	{
-		ids[i] = canonical ? InvalidOid : DatumGetObjectId(cell(i, 1));
-		names[i] = strcell(i, canonical ? 1 : 2);
-	}
+		names[i] = strcell(i, 1);
 	for (i = 0; i < n; i++)
 	{
-		Relation	rel = canonical ? dg_catalog_write_table(dg_current_branch(), names[i], ACL_UPDATE) : relation_open(ids[i], NoLock);
+		Relation	rel = dg_catalog_write_table(dg_current_branch(), names[i], ACL_UPDATE);
 		DGState    *state = dg_load(rel, SnapshotSelf);
 		PLTree		right = dg_history_import(state->store, table_chunk(theirs, names[i])),
 					result = right;
@@ -701,10 +686,7 @@ install_database(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, 
 		}
 		dg_history_install(rel, state, result);
 		dg_release(state);
-		if (canonical)
-			dg_storage_close_relation(rel);
-		else
-			relation_close(rel, NoLock);
+		dg_storage_close_relation(rel);
 		UpdateActiveSnapshotCommandId();
 	}
 	if (base)
@@ -914,10 +896,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		char	   *name = json_value(records[i], "table");
 		bool		selected = false;
 		int			j;
-		Oid			oid;
 
-		run("SELECT to_regclass($1)", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(name)), NULL, true);
-		oid = DatumGetObjectId(cell(0, 1));
 		for (j = 1; j < n; j++)
 		{
 			if (!strcmp(args[j], ".") || !strcmp(args[j], name) || !strcmp(args[j], strVal(llast(stringToQualifiedNameList(name, NULL)))))
@@ -931,7 +910,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 			continue;
 		}
 		{
-			Relation	rel = (read_ref("views/enabled").target != NULL) ? dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE) : relation_open(oid, NoLock);
+			Relation	rel = dg_catalog_write_table(dg_current_branch(), name, ACL_UPDATE);
 			DGState    *state = dg_load(rel, SnapshotSelf);
 			PLTree		result;
 

@@ -20,7 +20,7 @@ sub rejected
 
 # A SQL transaction snapshot does not version ordinary relcache definitions.
 # Establish the snapshot without opening the target (which would lock out DDL).
-sql('CREATE TABLE catalog_control(a int) USING heap');
+sql('CREATE TABLE catalog_control(a int) USING dolt_prolly_table');
 my $reader = $node->background_psql('postgres');
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $reader->query_safe('SELECT count(*) FROM pg_class');
@@ -36,7 +36,7 @@ sql('DROP TABLE catalog_control');
 sql('CREATE TABLE t(id int PRIMARY KEY,v int) USING dolt_prolly_table; INSERT INTO t VALUES(1,10)');
 my $old = sql(q{SELECT dolt_commit('-Am','base')});
 my $before = sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/main'});
-is(sql('BEGIN; ALTER TABLE t ALTER COLUMN v TYPE bigint; SELECT pg_typeof(v)::text FROM t; ROLLBACK'),'bigint','native type changes work before explicit branch activation');
+is(sql('BEGIN; ALTER TABLE t ALTER COLUMN v TYPE bigint; SELECT pg_typeof(v)::text FROM t; ROLLBACK'),'bigint','type changes publish on the branch and roll back');
 is(sql('SELECT * FROM t'), '1|10', 'rolled-back ALTER preserves existing tuple decoding');
 
 # Relation identity can change while canonical history remains valid, but current
@@ -48,13 +48,10 @@ is(sql(q{SELECT encode(reftarget,'hex') FROM pg_dolt_ref WHERE refname='heads/ma
  $before, 'ordinary DDL rollback does not move HEAD');
 
 sql(q{SELECT dolt_branch('other'); SELECT dolt_checkout('other')});
-for my $case (
- ['TRUNCATE t', 'TRUNCATE'])
-{
- rejected(q{SELECT dolt_checkout('other'); } . $case->[0], qr/schema changes with multiple branches/, "$case->[1] remains guarded on activated branches");
-}
-is(sql(q{SELECT * FROM "postgres/other".public.t}), '1|10', 'failed branch DDL leaves selected branch data intact');
-is(sql(q{SELECT * FROM "postgres/main".public.t}), '1|10', 'failed branch DDL leaves other branch intact');
+is(sql(q{SELECT dolt_checkout('other'); BEGIN; TRUNCATE t; SELECT count(*) FROM t; SELECT count(*) FROM "postgres/main".public.t; ROLLBACK}),
+ qq{(0,"Switched to branch 'other'")\n0\n1}, 'TRUNCATE empties only the selected branch');
+is(sql(q{SELECT * FROM "postgres/other".public.t}), '1|10', 'rolled-back TRUNCATE leaves selected branch data intact');
+is(sql(q{SELECT * FROM "postgres/main".public.t}), '1|10', 'TRUNCATE leaves other branch intact');
 
 # A failing DDL statement must release only its subtransaction work, not erase
 # earlier writes; publication still uses the existing transaction outcome.

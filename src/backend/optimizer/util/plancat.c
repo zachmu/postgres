@@ -219,7 +219,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	if ((inhparent && relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		|| (IgnoreSystemIndexes && IsSystemRelation(relation))
 		|| CatalogViewContains(CatalogViewCurrent(), relationObjectId)
-		|| relation->rd_catalogview)
+		|| (relation->rd_catalogview && CatalogViewIsProvisional(relation->rd_catalogview)))
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;
@@ -475,7 +475,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			{
 				if (info->indpred == NIL)
 				{
-					info->pages = RelationGetNumberOfBlocks(indexRelation);
+					/* A revision's index has content but no file of its own. */
+					info->pages = RelFileNumberIsValid(indexRelation->rd_locator.relNumber) ?
+						RelationGetNumberOfBlocks(indexRelation) : 1;
 					info->tuples = rel->tuples;
 				}
 				else

@@ -28,6 +28,11 @@ for future detailed planning work.
 - [Prolly write performance](WRITE-PERF-PLAN.md) — measured insert costs, root
   causes and a four-step plan (chunk cache, packed appends, statement-level
   deferred flush, batched inserts). Deferred until the chunk index is designed.
+- [Branch relation identity and resolution](BRANCH-RELATION-IDENTITY-PLAN.md) —
+  durable OIDs per (branch, table), leased OIDs for revisions, resolution of every
+  prolly reference through a ref's canonical schema to an ordinary relation, and
+  branch-scoped locks that replay on hot standbys. Supersedes runtime handles and
+  DoltVersionedScan.
 
 ### Planning record — 2026-10-22
 

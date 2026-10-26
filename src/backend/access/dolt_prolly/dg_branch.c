@@ -1,4 +1,6 @@
 #include "dg.h"
+#include "catalog/catalogview.h"
+#include "utils/inval.h"
 #include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 #include "access/xact.h"
@@ -99,11 +101,69 @@ dg_branch_cache_id(void)
 	return id;
 }
 
-/* Keep the AM's binding entrypoint relation-specific for future qualified RTEs. */
+/*
+ * The branch whose roots |rel| reads and writes: a private storage descriptor's
+ * own branch, a branch head relation's branch, or else the session's.
+ */
+static HTAB *durable_branches;
+
+typedef struct DurableBranch
+{
+	Oid			oid;
+	char		branch[NAMEDATALEN * 2];
+} DurableBranch;
+
+static void
+durable_branches_reset(Datum arg, Oid relid)
+{
+	if (durable_branches && (!OidIsValid(relid) || CatalogViewIsDurable(relid)))
+	{
+		hash_destroy(durable_branches);
+		durable_branches = NULL;
+	}
+}
+
 const char *
 dg_relation_branch(Relation rel)
 {
-	return rel->rd_catalogview ? dg_storage_branch(rel) : dg_current_branch();
+	Oid			relid = RelationGetRelid(rel);
+	DurableBranch *entry;
+	bool		found;
+
+	if (dg_storage_bound(rel))
+		return dg_storage_branch(rel);
+	if (!CatalogViewIsDurable(relid))
+		return dg_current_branch();
+	if (!durable_branches)
+	{
+		HASHCTL		ctl = {0};
+		static bool registered = false;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DurableBranch);
+		ctl.hcxt = TopMemoryContext;
+		durable_branches = hash_create("durable relation branches", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		if (!registered)
+		{
+			CacheRegisterRelcacheCallback(durable_branches_reset, (Datum) 0);
+			registered = true;
+		}
+	}
+	entry = hash_search(durable_branches, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		char	   *branch,
+				   *name;
+		char		kind;
+
+		if (!dg_identity_describe(relid, &branch, &kind, &name))
+		{
+			hash_search(durable_branches, &relid, HASH_REMOVE, NULL);
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("relation %u no longer belongs to a branch", relid)));
+		}
+		strlcpy(entry->branch, branch, sizeof(entry->branch));
+	}
+	return entry->branch;
 }
 
 static void
@@ -172,7 +232,7 @@ dg_branch_base(Relation rel, DGState *state)
 	bytea	   *address = NULL;
 	bool		isnull;
 
-	if (dg_catalog_creating_relation(rel) || !strcmp(dg_relation_branch(rel), "main"))
+	if (!strcmp(dg_relation_branch(rel), "main"))
 		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "cannot connect branch SPI");
@@ -189,43 +249,26 @@ dg_branch_base(Relation rel, DGState *state)
 		dg_history_handles(state);
 }
 
-/* Catalogs are shared until branch-aware schema binding is implemented. Freeze
- * schema once a second branch exists, rather than silently changing other views. */
-void
-dg_guard_branch_ddl(Node *statement)
+const char *
+dg_quote_identifier(const char *ident)
 {
-	bool		guard,
-				found = false;
-	Relation	refs;
-	TableScanDesc scan;
-	HeapTuple	tuple;
+	bool		saved = quote_all_identifiers;
+	const char *result;
 
-	if (!IsUnderPostmaster)
-		return;
-	guard = GetCommandLogLevel(statement) == LOGSTMT_DDL || IsA(statement, TruncateStmt);
-	if (!guard)
-		return;
-	/* Creating a schema that exists fails the same way on every branch. */
-	if (IsA(statement, CreateSchemaStmt) && ((CreateSchemaStmt *) statement)->schemaname &&
-		OidIsValid(get_namespace_oid(((CreateSchemaStmt *) statement)->schemaname, true)))
-		return;
-	LockDatabaseObject(DoltRefRelationId, 0, 0, ShareLock);
-	refs = table_open(DoltRefRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(refs, 0, NULL);
-	while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
-	{
-		bool		isnull;
-		Datum		value = heap_getattr(tuple, Anum_pg_dolt_ref_refname, RelationGetDescr(refs), &isnull);
-		char	   *name = TextDatumGetCString(value);
+	quote_all_identifiers = false;
+	result = quote_identifier(ident);
+	quote_all_identifiers = saved;
+	return result;
+}
 
-		if (!strncmp(name, "views/", 6))
-			found = true;
-		pfree(name);
-		if (found)
-			break;
-	}
-	table_endscan(scan);
-	table_close(refs, NoLock);
-	if (found)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("schema changes with multiple branches are not supported yet"), errhint("This slice shares schema catalogs and supports data-only branch changes.")));
+char *
+dg_qualified_name(const char *qualifier, const char *ident)
+{
+	bool		saved = quote_all_identifiers;
+	char	   *result;
+
+	quote_all_identifiers = false;
+	result = quote_qualified_identifier(qualifier, ident);
+	quote_all_identifiers = saved;
+	return result;
 }

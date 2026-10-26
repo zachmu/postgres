@@ -61,6 +61,7 @@ extern List *dg_storage_indexes(Relation rel);
 extern Relation dg_storage_index(Relation rel, Oid id);
 extern const char *dg_storage_branch(Relation rel);
 extern void dg_storage_require_write(Relation rel);
+extern bool dg_storage_bound(Relation rel);
 extern DGState *dg_storage_am_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_storage_am_load_tid(Relation rel, uint64 id);
 extern DGState *dg_load_bound_tid(Relation rel, uint64 id, const char *branch);
@@ -77,6 +78,12 @@ extern DGState *dg_load_branch(Relation rel, Snapshot snapshot, const char *bran
 extern DGState *dg_load_tid(Relation rel, uint64 id);
 extern void dg_save(Relation rel, DGState *state, CommandId cid);
 extern uint64 dg_allocate_handle(Relation rel);
+extern Oid	dg_identity_lookup(const char *branch, char kind, const char *name);
+extern bool dg_identity_describe(Oid oid, char **branch, char *kind, char **name);
+extern Oid	dg_identity_ensure(const char *branch, char kind, const char *name);
+extern void dg_identity_invalidate_branch(const char *branch);
+extern void dg_identity_delete_branch(const char *branch);
+extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
 extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode,
@@ -113,4 +120,11 @@ extern void dg_rebuild_indexes(Relation rel);
 extern void dg_index_rebuild(Relation table, Relation index);
 extern const TableAmRoutine *dg_table_routine(void);
 extern pg_noreturn void dg_unsupported(const char *operation);
+
+/*
+ * Identifier quoting for canonical names and SQL. Unlike quote_identifier,
+ * these ignore quote_all_identifiers: canonical bytes never depend on a GUC.
+ */
+extern const char *dg_quote_identifier(const char *ident);
+extern char *dg_qualified_name(const char *qualifier, const char *ident);
 #endif

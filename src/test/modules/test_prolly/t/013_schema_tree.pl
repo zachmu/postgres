@@ -13,7 +13,7 @@ sub schema_hash
  my $server = shift // $node;
  return $server->safe_psql('postgres', q{SELECT encode(s.objhash,'hex') FROM pg_dolt_ref r JOIN pg_dolt_object c ON c.objhash=r.reftarget JOIN pg_dolt_object db ON db.objhash=c.objchildren[1] CROSS JOIN LATERAL unnest(db.objchildren) ch JOIN pg_dolt_object t ON t.objhash=ch JOIN pg_dolt_object s ON s.objhash=t.objchildren[1] WHERE r.refname='heads/main' AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'='public.t'});
 }
-sql(q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'first'); GRANT SELECT ON t TO reader});
+sql(q{CREATE ROLE reader IN ROLE pg_read_all_data; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'first')});
 my $first = sql(q{SELECT dolt_commit('-Am','first')});
 my $schema = schema_hash();
 is(sql("SELECT convert_from(objpayload,'UTF8'),cardinality(objchildren) FROM pg_dolt_object WHERE objhash=decode('$schema','hex')"), 'DGSCHEMA2|1', 'schema envelope names one retained prolly root');
@@ -23,7 +23,7 @@ sql(q{UPDATE t SET v='second'});
 my $second = sql(q{SELECT dolt_commit('-am','data only')});
 is(schema_hash(), $schema, 'data-only edits reuse identical schema tree');
 my $old_oid = sql(q{SELECT 't'::regclass::oid});
-sql(q{DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'second'); GRANT SELECT ON t TO reader});
+sql(q{DROP TABLE t; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'second')});
 sql(q{SELECT dolt_commit('--allow-empty','-Am','same schema different physical OID')});
 isnt(sql(q{SELECT 't'::regclass::oid}), $old_oid, 'replacement has a different physical OID');
 is(schema_hash(), $schema, 'schema tree identity excludes allocation history');
@@ -57,7 +57,7 @@ my $utf8_schema = schema_hash();
 my $latin = PostgreSQL::Test::Cluster->new('schema_latin1');
 $latin->init(extra => ['--encoding=LATIN1', '--locale=C']);
 $latin->start;
-$latin->safe_psql('postgres', q{CREATE ROLE reader; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; GRANT SELECT ON t TO reader; COMMENT ON COLUMN t.v IS U&'caf\00e9'; SELECT dolt_commit('-Am','latin1 schema')});
+$latin->safe_psql('postgres', q{CREATE ROLE reader IN ROLE pg_read_all_data; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; COMMENT ON COLUMN t.v IS U&'caf\00e9'; SELECT dolt_commit('-Am','latin1 schema')});
 is(schema_hash($latin), $utf8_schema, 'schema properties have canonical UTF8 bytes across database encodings');
 $latin->stop;
 sql('DROP TABLE t');

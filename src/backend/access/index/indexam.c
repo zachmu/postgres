@@ -179,7 +179,7 @@ void
 index_close(Relation relation, LOCKMODE lockmode)
 {
 	LockRelId	relid = relation->rd_lockInfo.lockRelId;
-	bool		canonical = CatalogViewObjectContext(RelationGetRelid(relation)) != NULL;
+	bool		canonical = CatalogViewIsLeased(RelationGetRelid(relation));
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 

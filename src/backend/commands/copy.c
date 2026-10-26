@@ -36,6 +36,7 @@
 #include "parser/parse_relation.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "catalog/catalogview.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -123,13 +124,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		/* Open and lock the relation, using the appropriate lock type. */
 		rel = table_openrv(stmt->relation, lockmode);
-		if (rel->rd_catalogview)
-		{
-			Relation	definition = rel;
-
-			rel = dg_catalog_copy_relation(definition, is_from);
-			table_close(definition, NoLock);
-		}
 
 		relid = RelationGetRelid(rel);
 
@@ -321,7 +315,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			 *
 			 * We'll reopen it later as part of the query-based COPY.
 			 */
-			if (rel->rd_catalogview)
+			if (dg_storage_bound(rel))
 				dg_storage_close_relation(rel);
 			else
 				table_close(rel, NoLock);
@@ -370,7 +364,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 	if (rel != NULL)
 	{
-		if (rel->rd_catalogview)
+		if (dg_storage_bound(rel))
 			dg_storage_close_relation(rel);
 		else
 			table_close(rel, NoLock);

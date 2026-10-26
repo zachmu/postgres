@@ -21,7 +21,9 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/transam.h"
 #include "catalog/catalogview.h"
+#include "access/doltcatalog.h"
 #include "catalog/pg_db_role_setting_d.h"
 #include "catalog/pg_depend_d.h"
 #include "catalog/pg_description_d.h"
@@ -214,7 +216,9 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 	int			i;
 
 	for (i = 0; i < nkeys; i++)
-		if ((keys[i] <= UINT32_MAX || (int64) keys[i] < 0) && DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId)
+		if ((keys[i] <= UINT32_MAX || (int64) keys[i] < 0) &&
+			(DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId ||
+			 (CatalogViewIsDurable(DatumGetObjectId(keys[i])) && dg_catalog_provides(cache->cc_reloid))))
 			bound = true;
 	if (bound)
 	{
@@ -239,6 +243,21 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 			view = selected;
 		if (selected && !CatalogViewContains(view, cache->cc_reloid))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog %u does not support this revision-bound lookup", cache->cc_reloid)));
+	}
+	else if (view && cache->cc_tupdesc)
+	{
+		/*
+		 * Views hold built-in rows and branch objects only. A native user
+		 * object, unversioned, is always in the physical catalogs.
+		 */
+		for (i = 0; i < nkeys; i++)
+		{
+			Oid			key = DatumGetObjectId(keys[i]);
+
+			if (TupleDescAttr(cache->cc_tupdesc, cache->cc_keyno[i] - 1)->atttypid == OIDOID &&
+				key >= FirstNormalObjectId && key < FirstDurableObjectId)
+				return NULL;
+		}
 	}
 	return view;
 }
