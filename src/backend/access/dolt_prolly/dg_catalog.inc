@@ -960,10 +960,13 @@ bool
 dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait)
 {
 	Relation	definition;
-	Oid			user;
-	int			security,
-				nest;
 	bool		pushed = false;
+	const char *branch = dg_current_branch();
+	char	   *name;
+	bytea	   *db;
+	CatalogView *view;
+	Oid			handle,
+				resource;
 
 	if (!CatalogViewIsLeased(id))
 		return false;
@@ -978,38 +981,21 @@ dg_catalog_lock_relation(Oid id, LOCKMODE mode, bool nowait)
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed = true;
 	}
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		char	   *name = dg_qualified_name(get_namespace_name(RelationGetNamespace(definition)), RelationGetRelationName(definition));
-		bytea	   *db,
-				   *descriptor,
-				   *schema;
-		Oid			resource;
-
-		nest = begin_api();
-		db = read_ref(branch_ref("working")).target;
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed != 1)
-			elog(ERROR, "canonical lock target disappeared");
-		descriptor = DatumGetByteaPCopy(cell(0, 1));
-		schema = child(descriptor, 1);
-		resource = binding_relation(dg_current_branch(), name, schema);
-		if (!OidIsValid(resource))
-			elog(ERROR, "canonical lock resource unavailable");
-		if (!nowait)
-			LockRelationOid(resource, mode);
-		else if (!ConditionalLockRelationOid(resource, mode))
-			ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("could not obtain lock on relation \"%s\"", RelationGetRelationName(definition))));
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-		if (pushed)
-			PopActiveSnapshot();
-	} PG_END_TRY();
+	name = dg_qualified_name(get_namespace_name(RelationGetNamespace(definition)), RelationGetRelationName(definition));
+	db = read_ref(branch_ref("working")).target;
+	view = db ? provider_branch_view(branch, db) : NULL;
+	handle = view ? CatalogViewFindObject(view, RelationRelationId, name) : InvalidOid;
+	if (!OidIsValid(handle))
+		elog(ERROR, "canonical lock target disappeared");
+	resource = CatalogViewObjectStorage(handle);
+	if (!binding_current(branch, name, resource, CatalogViewObjectSchema(handle), GetActiveSnapshot()))
+		elog(ERROR, "canonical lock resource unavailable");
+	if (!nowait)
+		LockRelationOid(resource, mode);
+	else if (!ConditionalLockRelationOid(resource, mode))
+		ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("could not obtain lock on relation \"%s\"", RelationGetRelationName(definition))));
+	if (pushed)
+		PopActiveSnapshot();
 	relation_close(definition, NoLock);
 	return true;
 }
@@ -1302,9 +1288,6 @@ dg_catalog_trigger_relation(Oid id, const char *branch)
 	CatalogView *previous = CatalogViewSwitch(NULL);
 	DGProvider *provider;
 	Relation	result = NULL;
-	Oid			user;
-	int			security,
-				nest;
 	const char *name = CatalogViewObjectIdentity(id, RelationRelationId);
 
 	if (!view || !branch)
@@ -1314,34 +1297,36 @@ dg_catalog_trigger_relation(Oid id, const char *branch)
 	}
 	if (!provider)
 		elog(ERROR, "queued trigger catalog provider disappeared");
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
 	{
 		bytea	   *database,
 				   *schema,
 				   *content;
-		Oid			resource;
+		CatalogView *current;
+		Oid			handle,
+					resource;
 		DGStorage  *storage;
 
-		nest = begin_api();
+		/* The relation as the branch has it now ... */
 		database = read_ref(psprintf("working/%s", branch)).target;
-		run("SELECT t.objchildren[1],t.objchildren[2] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(database), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed != 1)
+		current = database ? provider_branch_view(branch, database) : NULL;
+		handle = current ? CatalogViewFindObject(current, RelationRelationId, name) : InvalidOid;
+		if (!OidIsValid(handle))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("queued trigger relation disappeared")));
-		schema = DatumGetByteaPCopy(cell(0, 1));
-		content = DatumGetByteaPCopy(cell(0, 2));
-		run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2 AND t.objchildren[1]=$3", 3, VC_TYPES(BYTEAOID, TEXTOID, BYTEAOID), VC_ARGS(PointerGetDatum(unhex(provider->database)), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
-		if (SPI_processed != 1)
+		schema = CatalogViewObjectSchema(handle);
+		content = CatalogViewObjectContent(handle);
+
+		/* ... must keep the schema the event's revision had. */
+		if (!schema || !same(schema, CatalogViewObjectSchema(id)))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("cannot change a relation with pending versioned trigger events")));
-		resource = binding_relation(branch, name, schema);
+		resource = CatalogViewObjectStorage(handle);
+		if (!binding_current(branch, name, resource, schema, GetActiveSnapshot()))
+			resource = InvalidOid;
 		storage = dg_storage_open(id, branch, name, schema, resource, GetActiveSnapshot());
 		result = dg_storage_enable_write(storage, content);
-		end_api(nest);
 	}
 	PG_FINALLY();
 	{
-		SetUserIdAndSecContext(user, security);
 		CatalogViewSwitch(previous);
 	}
 	PG_END_TRY();

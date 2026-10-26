@@ -32,7 +32,7 @@ sub no_lookup_sql {
 }
 no_lookup_sql(q{SELECT v FROM t WHERE id=1},'branch table');
 no_lookup_sql(q{SELECT v FROM app.t WHERE id=1},'qualified branch table');
-is($s->query_safe(q{SELECT v FROM t AS OF 'HEAD' WHERE id=1}),'v1','revision table');
+no_lookup_sql(q{SELECT v FROM t AS OF 'HEAD' WHERE id=1},'revision table');
 no_lookup_sql(q{SELECT v FROM tv},'versioned view');
 no_lookup_sql(q{SELECT v FROM h WHERE id=1},'heap table beside branch tables');
 no_lookup_sql(q{SELECT 't'::regclass::oid > 0},'regclass lookup');

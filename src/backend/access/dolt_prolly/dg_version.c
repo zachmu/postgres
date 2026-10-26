@@ -468,40 +468,10 @@ read_ref(const char *name)
 	return r;
 }
 
-/*
- * The retained object |hash| of |kind| (any kind if NULL) visible under the
- * active snapshot. Identical objects may have several rows; any one serves.
- * Returns false if there is none; fills only the requested parts.
- */
 static bool
 object_read(bytea *hash, const char *kind, char **actual, bytea **payload, ArrayType **children)
 {
-	Relation	catalog = table_open(DoltObjectRelationId, AccessShareLock);
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	bool		found = false;
-
-	ScanKeyInit(&key, Anum_pg_dolt_object_objhash, BTEqualStrategyNumber, F_BYTEAEQ, PointerGetDatum(hash));
-	scan = systable_beginscan(catalog, DoltObjectKeyIndexId, true, api_snapshot(), 1, &key);
-	while (!found && HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		bool		isnull;
-		char	   *objkind = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_object_objkind, RelationGetDescr(catalog), &isnull));
-
-		if (kind && strcmp(objkind, kind))
-			continue;
-		found = true;
-		if (actual)
-			*actual = objkind;
-		if (payload)
-			*payload = DatumGetByteaPCopy(heap_getattr(tuple, Anum_pg_dolt_object_objpayload, RelationGetDescr(catalog), &isnull));
-		if (children)
-			*children = DatumGetArrayTypePCopy(heap_getattr(tuple, Anum_pg_dolt_object_objchildren, RelationGetDescr(catalog), &isnull));
-	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return found;
+	return dg_object_read(hash, kind, actual, payload, children);
 }
 
 /*

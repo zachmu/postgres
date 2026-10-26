@@ -775,7 +775,7 @@ provider_has_type(DGProviderRows *rows, Oid namespaceid, const char *name)
  */
 static Oid
 provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
-			  const char *name, const char *identity, bytea *schema)
+			  const char *name, const char *identity)
 {
 	Oid			existing = CatalogViewFindObject(view, objectclass, identity);
 	Oid			oid;
@@ -793,7 +793,7 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 			if (SPI_processed == 1)
 				storage = DatumGetObjectId(cell(0, 1));
 		}
-		CatalogViewBindDurable(view, objectclass, identity, oid, storage, schema);
+		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
 		return oid;
 	}
 	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
@@ -804,7 +804,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
 	bytea	  **addresses,
-			  **schemas;
+			  **schemas,
+			  **contents;
 	char	  **kinds,
 			  **definitions;
 	int			n,
@@ -829,6 +830,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	n = SPI_processed;
 	addresses = palloc_array(bytea *, Max(n, 1));
 	schemas = palloc0_array(bytea *, Max(n, 1));
+	contents = palloc0_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	definitions = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
@@ -844,6 +846,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		{
 			schemas[i] = child(addresses[i], 1);
 			definitions[i] = metadata(schemas[i], "schema");
+			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+				contents[i] = child(addresses[i], 2);
 		}
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
@@ -872,7 +876,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 			(void) provider_bind(view, branch, RelationRelationId, DOLT_IDENTITY_RELATION,
-								 json_value(definitions[i], "name"), json_value(definitions[i], "name"), schemas[i]);
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
 
 	/*
 	 * Types, tables and routines name one another's types: bind them all,
@@ -881,7 +885,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table"))
 			(void) provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE,
-								 json_value(definitions[i], "name"), json_value(definitions[i], "name"), NULL);
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_bind(&rows, view, definitions[i]);
@@ -915,10 +919,11 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			if (list_length(parts) != 2)
 				elog(ERROR, "canonical relation name is not qualified");
 			form.oid = CatalogViewFindObject(view, RelationRelationId, name);
+			CatalogViewObjectSetRetained(view, form.oid, schemas[i], contents[i]);
 			form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 			namestrcpy(&form.relname, strVal(lsecond(parts)));
 			form.relowner = get_role_oid(owner, false);
-			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name, NULL);
+			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
 			matview = index ? NULL : json_value(definition, "matview");
@@ -981,7 +986,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 					pfree(arrayname);
 					arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
 				}
-				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity, NULL);
+				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity);
 				type.typarray = array.oid;
 
 				type.oid = form.reltype;
@@ -1284,35 +1289,10 @@ dg_catalog_durable_content(Oid oid)
 	char	   *branch,
 			   *name;
 	char		kind;
-	bytea	   *working,
-			   *result = NULL;
-	Oid			user;
-	int			security,
-				nest;
 
 	if (!dg_identity_describe(oid, &branch, &kind, &name) || kind != DOLT_IDENTITY_RELATION)
 		return NULL;
-	working = catalog_working_schema(branch);
-	if (!working)
-		return NULL;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PushActiveSnapshot(GetLatestSnapshot());
-	PG_TRY();
-	{
-		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed == 1)
-			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		PopActiveSnapshot();
-		SetUserIdAndSecContext(user, security);
-	}
-	PG_END_TRY();
-	return result;
+	return CatalogViewObjectContent(oid);
 }
 
 /*
@@ -1322,34 +1302,7 @@ dg_catalog_durable_content(Oid oid)
 bytea *
 dg_catalog_revision_content(Oid handle)
 {
-	CatalogView *view = CatalogViewObjectContext(handle);
-	const char *name = CatalogViewObjectIdentity(handle, RelationRelationId);
-	DGProvider *entry;
-	bytea	   *result = NULL;
-	Oid			user;
-	int			security,
-				nest;
-
-	for (entry = providers; entry && entry->view != view; entry = entry->next)
-		;
-	if (!entry || !name)
-		return NULL;
-	GetUserIdAndSecContext(&user, &security);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(unhex(entry->database)), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed == 1)
-			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
-		end_api(nest);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(user, security);
-	}
-	PG_END_TRY();
-	return result;
+	return CatalogViewObjectContent(handle);
 }
 
 /*
