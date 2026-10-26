@@ -169,3 +169,51 @@ Doltgres revision tests pass.
   backend holds a cached entry for a reused OID.
 - Logical replication of prolly tables, which needs a decoder for root changes
   and publications keyed by logical identity. Out of scope here.
+
+## Status — 2026-10-26
+
+Milestones 1 to 5 are implemented and merged; milestone 6 is partial. The
+isolation suite gives byte-identical results with and without an extra
+branch (39 of 121 specs pass with prolly as the default AM, against 58 before
+the marker was removed). Core regression passes on heap.
+
+Decisions made during implementation:
+
+- Branch-head schemas, storage bindings and names resolve under the latest
+  committed catalog state, as PostgreSQL catalogs do; SQL queries of catalogs
+  and revision references use the query's snapshot. Same-branch DDL takes
+  PostgreSQL's lock levels on durable OIDs instead of preserving old schemas
+  for open snapshots.
+- A branch's identities always equal the tables and indexes of its working
+  schema; they are synchronized whenever a working ref moves.
+- Expedient for now: a database becomes versioned at its first prolly table
+  (any storage binding), not at initdb, so heap-only databases are plain
+  PostgreSQL and core regression passes. The goal remains versioned by
+  default, with core regression passing on prolly storage.
+- Native objects (heap tables, C functions, types) coexist unversioned.
+  Native DDL may not write physical catalog rows for, or depending on,
+  versioned objects; it fails cleanly instead.
+
+Outstanding from this plan:
+
+- Shared registry for leased revision OIDs. They are backend-local, which is
+  harmless for locks but keeps revision relations out of parallel query.
+- Statistics per durable OID. ANALYZE and VACUUM skip branch tables.
+- Catalog consumer coverage: SQL catalog scans on a versioned database omit
+  native objects (pg_class, \d, information_schema, dolt_statistics), lack
+  system columns such as tableoid (pg_dump fails), and do not route by
+  revision OIDs in their quals.
+
+Versioned DDL that does not exist yet, each needing a design checkpoint;
+these statements fail cleanly on versioned tables today:
+
+- Ownership and ACLs (GRANT/REVOKE, OWNER TO, privilege checks). Role
+  identities should likely stay out of versioned storage, like OIDs.
+- CREATE TABLE features: defaults and CHECK inline (ALTER works), serial,
+  identity, generated columns, reloptions, non-unique and expression indexes.
+- Partitioned and inherited tables; temporary and unlogged prolly tables.
+- User-defined types (enum, domain, composite, range) in versioned tables.
+- Versioned views, procedures and triggers; routines with parsed bodies or
+  argument defaults.
+- CREATE TABLE AS, SELECT INTO, SET ACCESS METHOD to prolly, RENAME.
+- pg_dump and pg_restore of a repository.
