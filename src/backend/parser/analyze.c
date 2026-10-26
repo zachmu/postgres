@@ -3527,7 +3527,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 					}
 					break;
 				case RTE_DOLT:
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("row locking on versioned relations is not supported")));
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("row locking on the catalogs of a branch or revision is not supported")));
 					break;
 				case RTE_SUBQUERY:
 					applyLockingClause(qry, i, lc->strength, lc->waitPolicy,
