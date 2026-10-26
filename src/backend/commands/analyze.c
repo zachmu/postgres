@@ -147,6 +147,16 @@ analyze_rel(Oid relid, RangeVar *relation,
 		return;
 
 	/*
+	 * TODO: statistics for a branch's tables, stored per durable OID. Until
+	 * then a versioned table has none; its physical catalogs hold no rows.
+	 */
+	if (onerel->rd_catalogview)
+	{
+		relation_close(onerel, ShareUpdateExclusiveLock);
+		return;
+	}
+
+	/*
 	 * Check if relation needs to be skipped based on privileges.  This check
 	 * happens also when building the relation list to analyze for a manual
 	 * operation, and needs to be done additionally here as ANALYZE could

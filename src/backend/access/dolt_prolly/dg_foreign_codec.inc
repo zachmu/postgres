@@ -11,7 +11,7 @@ foreign_metadata(HeapTuple tuple)
 		unsupported("partitioned, temporal or unenforced foreign key codec");
 	initStringInfo(&json);
 	appendStringInfoString(&json, "{\"index\":");
-	escape_json(&json, quote_qualified_identifier(get_namespace_name(get_rel_namespace(con->conindid)), get_rel_name(con->conindid)));
+	escape_json(&json, dg_qualified_name(get_namespace_name(get_rel_namespace(con->conindid)), get_rel_name(con->conindid)));
 	for (int i = 0; i < lengthof(fields); i++)
 	{
 		bool		isnull;

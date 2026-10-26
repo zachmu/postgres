@@ -267,7 +267,7 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 	if (intVal(lthird(plan->custom_private)))
 	{
 		Oid			definition = (Oid) intVal(list_nth(plan->custom_private, 5));
-		char	   *name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(definition)), get_rel_name(definition));
+		char	   *name = dg_qualified_name(get_namespace_name(get_rel_namespace(definition)), get_rel_name(definition));
 
 		s->storage = dg_storage_open(definition, strVal(lsecond(plan->custom_private)), name,
 									 DatumGetByteaP(children[0]), (Oid) intVal(lthird(plan->custom_private)), s->snapshot);

@@ -130,7 +130,7 @@ schema_ignore_patterns(const char *schema, int *count)
 	*count = 0;
 	if (!schema_has_ignore_table(schema))
 		return NULL;
-	run_context(psprintf("SELECT pattern,ignored FROM %s.dolt_ignore ORDER BY pattern COLLATE \"C\"", quote_identifier(schema)), 0, NULL, NULL, NULL, true);
+	run_context(psprintf("SELECT pattern,ignored FROM %s.dolt_ignore ORDER BY pattern COLLATE \"C\"", dg_quote_identifier(schema)), 0, NULL, NULL, NULL, true);
 	*count = SPI_processed;
 	result = palloc0(sizeof(IgnorePattern) * (*count + 1));
 	for (i = 0; i < *count; i++)
@@ -207,7 +207,7 @@ dg_ensure_ignore_table(const char *schema)
 		dg_internal_system_ddl = true;
 		if (!schema_has_ignore_table(schema))
 		{
-			run_context(psprintf("CREATE TABLE %s.dolt_ignore (pattern text PRIMARY KEY, ignored boolean NOT NULL) USING dolt_prolly_table", quote_identifier(schema)), 0, NULL, NULL, NULL, false);
+			run_context(psprintf("CREATE TABLE %s.dolt_ignore (pattern text PRIMARY KEY, ignored boolean NOT NULL) USING dolt_prolly_table", dg_quote_identifier(schema)), 0, NULL, NULL, NULL, false);
 			CommandCounterIncrement();
 		}
 	}

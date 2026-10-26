@@ -18,7 +18,7 @@ routine_type_name(Oid id)
 	type = (Form_pg_type) GETSTRUCT(tuple);
 	if (type->typnamespace != PG_CATALOG_NAMESPACE && type->typtype != TYPTYPE_COMPOSITE)
 		unsupported("routine signature with a noncanonical user type");
-	result = quote_qualified_identifier(get_namespace_name(type->typnamespace), NameStr(type->typname));
+	result = dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname));
 	ReleaseSysCache(tuple);
 	return result;
 }
@@ -39,7 +39,7 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	if (proc->prokind != PROKIND_FUNCTION || proc->prosupport || proc->pronargdefaults)
 		unsupported("canonical routine kind, support function or parameter defaults");
 	initStringInfo(&identity);
-	appendStringInfo(&identity, "%s(", quote_qualified_identifier(get_namespace_name(proc->pronamespace), NameStr(proc->proname)));
+	appendStringInfo(&identity, "%s(", dg_qualified_name(get_namespace_name(proc->pronamespace), NameStr(proc->proname)));
 	for (i = 0; i < proc->pronargs; i++)
 		appendStringInfo(&identity, "%s%s", i ? "," : "", routine_type_name(proc->proargtypes.values[i]));
 	appendStringInfoChar(&identity, ')');

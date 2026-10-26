@@ -71,9 +71,9 @@ for my $crash (0, 1)
 }
 # Errors inside capture must unwind snapshots, SPI, GUCs and lock acquisitions.
 $session = $node->background_psql('postgres', on_error_stop => 0);
-$session->query_safe(q{SET search_path=public,pg_catalog; SET quote_all_identifiers=on; BEGIN; SAVEPOINT bad; CREATE TABLE unsupported(id int)});
-my ($out, $err) = $session->query(q{SELECT dolt_add('.')});
-is($err, 1, 'unsupported capture fails');
+$session->query_safe(q{SET search_path=public,pg_catalog; SET quote_all_identifiers=on; BEGIN; SAVEPOINT bad; CREATE TABLE damaged(id int) USING dolt_prolly_table});
+my ($out, $err) = $session->query(q{DELETE FROM pg_dolt_binding WHERE bindname='public.damaged'; SELECT dolt_add('.')});
+is($err, 1, 'capture of a table with a damaged binding fails');
 $session->{stderr} = ''; # BackgroundPsql retains diagnostics until cleared.
 $session->query_safe('ROLLBACK TO bad');
 is($session->query_safe('SHOW search_path'), 'public, pg_catalog', 'error restores search path');

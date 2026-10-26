@@ -20,7 +20,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 	PG_TRY();
 	{
 		bytea	   *db;
-		char	   *name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+		char	   *name = dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 
 		nest = begin_api();
 		db = catalog_database(branch);
@@ -31,7 +31,7 @@ dg_catalog_check_relation(Relation rel, const char *branch, Snapshot snapshot)
 			Oid			bound;
 			bytea	   *schema;
 
-			run("SELECT t.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+			run("SELECT t.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
 			schema = DatumGetByteaPCopy(cell(0, 1));
 			bound = binding_relation(branch, name, schema);
 			if (bound != RelationGetRelid(rel))

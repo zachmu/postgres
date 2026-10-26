@@ -42,6 +42,8 @@ typedef struct IdentityCounter
 
 static IdentityCounter *counter;
 
+static void identity_retain(const char *branch, List *members);
+
 static void
 counter_init(void *ptr)
 {
@@ -189,6 +191,7 @@ dg_identity_ensure(const char *branch, char kind, const char *name)
 	CatalogTupleInsert(catalog, tuple);
 	heap_freetuple(tuple);
 	table_close(catalog, RowExclusiveLock);
+	CacheInvalidateRelcacheByRelid(DoltIdentityRelationId);
 	CommandCounterIncrement();
 	return oid;
 }
@@ -237,34 +240,66 @@ void
 dg_identity_delete_branch(const char *branch)
 {
 	branch_identities(branch, true);
+	CacheInvalidateRelcacheByRelid(DoltIdentityRelationId);
 	CommandCounterIncrement();
 }
 
-/* Remove the identities of one object, when it is dropped from |branch|. */
+/*
+ * Make |branch|'s identities name exactly |members|, its schema's tables and
+ * indexes: delete the others' and create missing ones, with row and array
+ * types for |tables|.
+ */
 void
-dg_identity_delete(const char *branch, const char *name)
+dg_identity_sync(const char *branch, List *members, List *tables)
+{
+	ListCell   *lc;
+
+	identity_retain(branch, members);
+	foreach(lc, members)
+		(void) dg_identity_ensure(branch, DOLT_IDENTITY_RELATION, lfirst(lc));
+	foreach(lc, tables)
+	{
+		(void) dg_identity_ensure(branch, DOLT_IDENTITY_ROWTYPE, lfirst(lc));
+		(void) dg_identity_ensure(branch, DOLT_IDENTITY_ARRAYTYPE, lfirst(lc));
+	}
+}
+
+/* Delete the identities of |branch|'s objects whose names are not in |members|. */
+static void
+identity_retain(const char *branch, List *members)
 {
 	Relation	catalog = table_open(DoltIdentityRelationId, RowExclusiveLock);
-	char		kinds[] = {DOLT_IDENTITY_RELATION, DOLT_IDENTITY_ROWTYPE, DOLT_IDENTITY_ARRAYTYPE};
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		removed = false;
 
-	for (int i = 0; i < lengthof(kinds); i++)
+	InvalidateCatalogSnapshot();
+	ScanKeyInit(&key, Anum_pg_dolt_identity_identbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	scan = systable_beginscan(catalog, DoltIdentityNameIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
-		ScanKeyData keys[3];
-		SysScanDesc scan;
-		HeapTuple	tuple;
+		bool		isnull;
+		char	   *name = TextDatumGetCString(heap_getattr(tuple, Anum_pg_dolt_identity_identname, RelationGetDescr(catalog), &isnull));
+		ListCell   *lc;
 
-		name_keys(keys, branch, kinds[i], name);
-		scan = systable_beginscan(catalog, DoltIdentityNameIndexId, true, NULL, 3, keys);
-		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-		{
-			if (kinds[i] == DOLT_IDENTITY_RELATION)
-				CacheInvalidateRelcacheInDatabase(((Form_pg_dolt_identity) GETSTRUCT(tuple))->identoid);
-			CatalogTupleDelete(catalog, &tuple->t_self);
-		}
-		systable_endscan(scan);
+		foreach(lc, members)
+			if (!strcmp(lfirst(lc), name))
+				break;
+		if (lc)
+			continue;
+		if (((Form_pg_dolt_identity) GETSTRUCT(tuple))->identkind == DOLT_IDENTITY_RELATION)
+			CacheInvalidateRelcacheInDatabase(((Form_pg_dolt_identity) GETSTRUCT(tuple))->identoid);
+		CatalogTupleDelete(catalog, &tuple->t_self);
+		removed = true;
 	}
+	systable_endscan(scan);
 	table_close(catalog, RowExclusiveLock);
-	CommandCounterIncrement();
+	if (removed)
+	{
+		CacheInvalidateRelcacheByRelid(DoltIdentityRelationId);
+		CommandCounterIncrement();
+	}
 }
 
 /* The durable OID of the relation a pg_dolt_binding row supplies storage for. */

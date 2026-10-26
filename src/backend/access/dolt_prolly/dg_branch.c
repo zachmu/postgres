@@ -249,3 +249,26 @@ dg_branch_base(Relation rel, DGState *state)
 		dg_history_handles(state);
 }
 
+const char *
+dg_quote_identifier(const char *ident)
+{
+	bool		saved = quote_all_identifiers;
+	const char *result;
+
+	quote_all_identifiers = false;
+	result = quote_identifier(ident);
+	quote_all_identifiers = saved;
+	return result;
+}
+
+char *
+dg_qualified_name(const char *qualifier, const char *ident)
+{
+	bool		saved = quote_all_identifiers;
+	char	   *result;
+
+	quote_all_identifiers = false;
+	result = quote_qualified_identifier(qualifier, ident);
+	quote_all_identifiers = saved;
+	return result;
+}

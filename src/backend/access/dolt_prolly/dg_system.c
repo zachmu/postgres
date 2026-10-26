@@ -232,10 +232,10 @@ generated_base(const RangeVar *rv, const char *base, bool optional)
 		Oid			relid = RangeVarGetRelidExtended(candidate, NoLock, RVR_MISSING_OK, NULL, NULL);
 
 		if (OidIsValid(relid) && get_rel_relkind(relid) == RELKIND_RELATION)
-			return quote_qualified_identifier((char *) lfirst(lc), base);
+			return dg_qualified_name((char *) lfirst(lc), base);
 	}
 	if (optional)
-		return quote_qualified_identifier((char *) linitial(schemas), base);
+		return dg_qualified_name((char *) linitial(schemas), base);
 	return NULL;
 }
 

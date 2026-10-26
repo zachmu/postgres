@@ -7,9 +7,33 @@ typedef struct DGProvider
 	char	   *branch;			/* branch head; NULL for a revision */
 	char	   *database;
 	CatalogView *view;
+	uint64		generation;		/* identity generation a branch view binds */
 	struct DGProvider *next;
 } DGProvider;
 static DGProvider *providers;
+
+/*
+ * A branch view binds its objects' durable OIDs. Any change to the identity
+ * catalog may rebind a name, so it retires every branch view built before.
+ */
+static uint64 identity_generation = 1;
+static bool identity_callback;
+
+static void
+provider_identities_changed(Datum arg, Oid relid)
+{
+	if (!OidIsValid(relid) || relid == DoltIdentityRelationId)
+		identity_generation++;
+}
+
+/* Whether |entry| may serve lookups of |branch|'s views, or revision views. */
+static bool
+provider_current(DGProvider *entry, const char *branch)
+{
+	if (!branch)
+		return !entry->branch;
+	return entry->branch && !strcmp(entry->branch, branch) && entry->generation == identity_generation;
+}
 
 static const Oid provider_catalogs[] = {
 	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
@@ -345,7 +369,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	}
 	for (i = 0; i < n; i++)
 	{
-		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", quote_identifier(names[i]), defs[i]));
+		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", dg_quote_identifier(names[i]), defs[i]));
 		Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
 		AlterTableStmt *alter;
 		Constraint *constraint;
@@ -399,7 +423,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		form.confdeltype = ' ';
 		form.confmatchtype = ' ';
 		if (form.contype == CONSTRAINT_PRIMARY || form.contype == CONSTRAINT_UNIQUE)
-			form.conindid = CatalogViewLookupObject(view, RelationRelationId, quote_qualified_identifier(strVal(linitial(parts)), names[i]));
+			form.conindid = CatalogViewLookupObject(view, RelationRelationId, dg_qualified_name(strVal(linitial(parts)), names[i]));
 		keys = palloc_array(Datum, Max(desc->natts, 1));
 		if (expression)
 		{
@@ -466,7 +490,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical index properties")));
 	if (!stmt->relation->schemaname)
 		elog(ERROR, "unqualified canonical index table");
-	table = quote_qualified_identifier(stmt->relation->schemaname, stmt->relation->relname);
+	table = dg_qualified_name(stmt->relation->schemaname, stmt->relation->relname);
 	for (i = 0; i < count; i++)
 		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), table))
 		{
@@ -627,9 +651,9 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 		{
 			run("SELECT bindrelid FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1 AND bindname=$2", 2,
 				VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name)), NULL, true);
-			if (SPI_processed != 1)
-				elog(ERROR, "branch object %s on %s has no storage binding", name, branch);
-			storage = DatumGetObjectId(cell(0, 1));
+			/* A relation without a binding fails when accessed, not here. */
+			if (SPI_processed == 1)
+				storage = DatumGetObjectId(cell(0, 1));
 		}
 		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
 		return oid;
@@ -769,7 +793,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 
 				for (;;)
 				{
-					arrayidentity = quote_qualified_identifier(strVal(linitial(parts)), arrayname);
+					arrayidentity = dg_qualified_name(strVal(linitial(parts)), arrayname);
 					if (!catalog_contains(database, arrayidentity) &&
 						!provider_has_type(&rows, form.relnamespace, arrayname))
 						break;
@@ -930,10 +954,14 @@ provider_lookup(const char *branch, bytea *database)
 	 * survive through a backend cache.
 	 */
 	(void) metadata(database, "database");
+	if (!identity_callback)
+	{
+		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);
+		identity_callback = true;
+	}
 	for (entry = providers; entry; entry = entry->next)
 	{
-		if (!strcmp(entry->database, key) &&
-			(branch ? entry->branch && !strcmp(entry->branch, branch) : !entry->branch))
+		if (!strcmp(entry->database, key) && provider_current(entry, branch))
 		{
 			if (CatalogViewCreatorAborted(entry->view))
 				CatalogViewSetCreator(entry->view, provider_creator(database));
@@ -951,6 +979,7 @@ provider_lookup(const char *branch, bytea *database)
 	entry->database = MemoryContextStrdup(TopMemoryContext, key);
 	entry->branch = branch ? MemoryContextStrdup(TopMemoryContext, branch) : NULL;
 	entry->view = view;
+	entry->generation = identity_generation;
 	entry->next = providers;
 	providers = entry;
 	PG_TRY();
@@ -990,7 +1019,7 @@ provider_schema_view(bytea *database)
 	char	   *key = hex(database);
 
 	for (DGProvider *entry = providers; entry; entry = entry->next)
-		if (entry->branch && !strcmp(entry->database, key))
+		if (entry->branch && !strcmp(entry->database, key) && provider_current(entry, entry->branch))
 			return provider_lookup(entry->branch, database);
 	return provider_view(database);
 }
@@ -1061,7 +1090,7 @@ dg_catalog_durable_content(Oid oid)
 	PG_TRY();
 	{
 		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
+		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(working), CStringGetTextDatum(name)), NULL, true);
 		if (SPI_processed == 1)
 			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
 		end_api(nest);
@@ -1099,7 +1128,7 @@ dg_catalog_revision_content(Oid handle)
 	PG_TRY();
 	{
 		nest = begin_api();
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(unhex(entry->database)), CStringGetTextDatum(name)), NULL, true);
+		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(unhex(entry->database)), CStringGetTextDatum(name)), NULL, true);
 		if (SPI_processed == 1)
 			result = child(DatumGetByteaPCopy(cell(0, 1)), 2);
 		end_api(nest);

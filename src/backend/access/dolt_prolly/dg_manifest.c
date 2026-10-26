@@ -314,7 +314,33 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	 * branch's objects everywhere, including on standbys.
 	 */
 	if (strncmp(text_to_cstring(name), "working/", 8) == 0)
-		dg_identity_invalidate_branch(text_to_cstring(name) + 8);
+	{
+		const char *branch = text_to_cstring(name) + 8;
+
+		dg_identity_invalidate_branch(branch);
+
+		/* The branch's OIDs name exactly the objects of its new schema. */
+		if (!PG_ARGISNULL(2))
+		{
+			Oid			membertypes[] = {BYTEAOID};
+			Datum		memberargs[] = {PG_GETARG_DATUM(2)};
+			List	   *members = NIL,
+					   *tables = NIL;
+
+			if (SPI_execute_with_args("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objkind FROM pg_catalog.pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_catalog.pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')",
+									  1, membertypes, memberargs, NULL, false, 0) != SPI_OK_SELECT)
+				elog(ERROR, "could not read working schema members");
+			for (uint64 i = 0; i < SPI_processed; i++)
+			{
+				char	   *member = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+
+				members = lappend(members, member);
+				if (!strcmp(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2), "table"))
+					tables = lappend(tables, member);
+			}
+			dg_identity_sync(branch, members, tables);
+		}
+	}
 	SPI_finish();
 	if (PG_ARGISNULL(2))
 		PG_RETURN_NULL();

@@ -66,7 +66,7 @@ table_index_names(const char *schema_json, const char *table)
 		if (list_length(parsed) != 1 || !IsA(node, IndexStmt))
 			elog(ERROR, "invalid canonical index definition");
 		index = (IndexStmt *) node;
-		result = lappend(result, quote_qualified_identifier(ns, index->idxname));
+		result = lappend(result, dg_qualified_name(ns, index->idxname));
 	}
 	return result;
 }

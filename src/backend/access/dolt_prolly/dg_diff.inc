@@ -438,7 +438,7 @@ resolve_table_argument(const char *arg, const char *json_a, const char *json_b, 
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("table name cannot be empty")));
 	parts = stringToQualifiedNameList(arg, NULL);
 	if (list_length(parts) == 2)
-		qualified = quote_qualified_identifier(strVal(linitial(parts)), strVal(lsecond(parts)));
+		qualified = dg_qualified_name(strVal(linitial(parts)), strVal(lsecond(parts)));
 	else if (list_length(parts) != 1)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid table name: %s", arg)));
 	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind'='table'), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY AS p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND (parse_ident(name))[2]=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json_a), CStringGetTextDatum(json_b), qualified ? CStringGetTextDatum(qualified) : (Datum) 0, CStringGetTextDatum(strVal(llast(parts))), CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
@@ -449,7 +449,7 @@ resolve_table_argument(const char *arg, const char *json_a, const char *json_b, 
 		if (!qualified)
 		{
 			run("SELECT coalesce((SELECT s FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($1,',')) WITH ORDINALITY AS p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s) ORDER BY ord LIMIT 1),'public')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(api_search_path ? api_search_path : "public")), NULL, true);
-			qualified = quote_qualified_identifier(strcell(0, 1), strVal(linitial(parts)));
+			qualified = dg_qualified_name(strcell(0, 1), strVal(linitial(parts)));
 		}
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: %s", qualified)));
 	}

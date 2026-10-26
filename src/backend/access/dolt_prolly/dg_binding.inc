@@ -82,7 +82,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 			  **kinds;
 	bytea	  **schemas;
 
-	run("SELECT convert_from(t.objpayload,'UTF8')::jsonb->>'name',t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
+	run("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	names = palloc(sizeof(char *) * Max(n, 1));
 	schemas = palloc(sizeof(bytea *) * Max(n, 1));

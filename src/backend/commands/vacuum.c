@@ -2104,6 +2104,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 		return false;
 	}
 
+	/* A branch's table keeps no dead tuples or physical statistics to vacuum. */
+	if (rel->rd_catalogview)
+	{
+		relation_close(rel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return true;
+	}
+
 	/*
 	 * When recursing to a TOAST table, check privileges on the parent.  NB:
 	 * This is only safe to do because we hold a session lock on the main

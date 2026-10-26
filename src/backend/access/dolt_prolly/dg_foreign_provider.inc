@@ -75,7 +75,7 @@ provider_foreign(DGProviderRows *rows, CatalogView *view, HeapTuple tuple,
 
 	if (!metadata || !constraint->pktable->schemaname)
 		elog(ERROR, "foreign key metadata requires qualified identities");
-	name = quote_qualified_identifier(constraint->pktable->schemaname, constraint->pktable->relname);
+	name = dg_qualified_name(constraint->pktable->schemaname, constraint->pktable->relname);
 	for (int i = 0; i < count; i++)
 		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), name))
 			referenced = provider_columns(definitions[i]);

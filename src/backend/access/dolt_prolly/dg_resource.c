@@ -392,7 +392,7 @@ dg_storage_enable_write(DGStorage *storage, bytea *base)
 	if (CatalogViewIsDurable(RelationGetRelid(storage->definition)))
 		LockRelationOid(RelationGetRelid(storage->definition), RowExclusiveLock);
 	dg_storage_lock_branch(rel->rd_lockInfo.lockRelId.relId, storage->branch, RowExclusiveLock);
-	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+	name = dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
 	catalog = table_open(DoltBindingRelationId, RowShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
 	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
@@ -558,6 +558,9 @@ dg_storage_locator(Oid resource, RelFileLocator *locator)
 	HeapTuple	tuple;
 	Form_pg_dolt_storage form;
 
+	if (!OidIsValid(resource))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("runtime catalog binding unavailable")));
 	ScanKeyInit(&key, Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
 	scan = systable_beginscan(catalog, DoltStorageKeyIndexId, true, NULL, 1, &key);
 	tuple = systable_getnext(scan);

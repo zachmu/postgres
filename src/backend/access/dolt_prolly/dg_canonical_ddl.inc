@@ -176,7 +176,7 @@ dg_catalog_create(Node *statement, const char *query)
 	GetUserIdAndSecContext(&user, &security);
 	namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing);
 	stmt->relation->schemaname = get_namespace_name(namespaceid);
-	name = quote_qualified_identifier(stmt->relation->schemaname, stmt->relation->relname);
+	name = dg_qualified_name(stmt->relation->schemaname, stmt->relation->relname);
 	if (OidIsValid(existing) && !CatalogViewIsDurable(existing))
 	{
 		if (!stmt->if_not_exists)
@@ -328,7 +328,7 @@ dg_catalog_create(Node *statement, const char *query)
 				appendStringInfoChar(&constraints, '[');
 				escape_json(&constraints, makeObjectName(stmt->relation->relname, NameStr(a->attname), "not_null"));
 				appendStringInfoChar(&constraints, ',');
-				escape_json(&constraints, psprintf("NOT NULL %s", quote_identifier(NameStr(a->attname))));
+				escape_json(&constraints, psprintf("NOT NULL %s", dg_quote_identifier(NameStr(a->attname))));
 				appendStringInfoChar(&constraints, ']');
 			}
 		}
@@ -361,17 +361,17 @@ dg_catalog_create(Node *statement, const char *query)
 					appendStringInfoString(&keys, ", ");
 					appendStringInfoChar(&icols, ',');
 				}
-				appendStringInfoString(&keys, quote_identifier(element->name));
+				appendStringInfoString(&keys, dg_quote_identifier(element->name));
 				appendStringInfoString(&icols, column_json[att]);
 			}
 			appendStringInfoChar(&icols, ']');
 			indexname = index->idxname ? index->idxname : makeObjectName(stmt->relation->relname, index->primary ? NULL : ((IndexElem *) linitial(index->indexParams))->name, index->primary ? "pkey" : "key");
-			if (!strcmp(indexname, stmt->relation->relname) || catalog_contains(working.target, quote_qualified_identifier(stmt->relation->schemaname, indexname)))
+			if (!strcmp(indexname, stmt->relation->relname) || catalog_contains(working.target, dg_qualified_name(stmt->relation->schemaname, indexname)))
 				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE), errmsg("relation \"%s\" already exists", indexname)));
 			for (int j = 0; j < k; j++)
-				if (!strcmp(index_names[j], quote_qualified_identifier(stmt->relation->schemaname, indexname)))
+				if (!strcmp(index_names[j], dg_qualified_name(stmt->relation->schemaname, indexname)))
 					ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("duplicate canonical index name")));
-			sql = psprintf("CREATE UNIQUE INDEX %s ON %s USING dolt_prolly_index (%s)%s", quote_identifier(indexname), name, keys.data, index->nulls_not_distinct ? " NULLS NOT DISTINCT" : "");
+			sql = psprintf("CREATE UNIQUE INDEX %s ON %s USING dolt_prolly_index (%s)%s", dg_quote_identifier(indexname), name, keys.data, index->nulls_not_distinct ? " NULLS NOT DISTINCT" : "");
 			constraint = psprintf("%s%s (%s)", index->primary ? "PRIMARY KEY" : "UNIQUE", (!index->primary && index->nulls_not_distinct) ? " NULLS NOT DISTINCT" : "", keys.data);
 			if (k)
 				appendStringInfoChar(&indexes, ',');
@@ -383,7 +383,7 @@ dg_catalog_create(Node *statement, const char *query)
 			appendStringInfoChar(&constraints, ',');
 			escape_json(&constraints, constraint);
 			appendStringInfoChar(&constraints, ']');
-			index_names[k] = quote_qualified_identifier(stmt->relation->schemaname, indexname);
+			index_names[k] = dg_qualified_name(stmt->relation->schemaname, indexname);
 			index_columns[k] = icols.data;
 			index_defs[k++] = sql;
 		}
