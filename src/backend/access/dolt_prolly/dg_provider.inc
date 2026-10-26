@@ -903,6 +903,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			FormData_pg_class form = {0};
 			TupleDesc	desc = provider_columns(definition);
 			bool		index = !strcmp(kinds[i], "index");
+			char	   *matview;
 			HeapTuple	tuple;
 			int			slot = provider_catalog_index(RelationRelationId);
 
@@ -915,12 +916,19 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			form.reltype = index ? InvalidOid : provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE, name, name);
 			form.relam = index ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 			form.relkind = index ? RELKIND_INDEX : RELKIND_RELATION;
+			matview = index ? NULL : json_value(definition, "matview");
+			if (matview)
+			{
+				/* A materialized view is a table with its view's rule. */
+				form.relkind = RELKIND_MATVIEW;
+				form.relhasrules = true;
+			}
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
 			run("SELECT count(*) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1 LIKE 'CHECK %'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			form.relchecks = DatumGetInt64(cell(0, 1));
 			form.reltuples = -1;
-			form.relispopulated = true;
+			form.relispopulated = !matview || !strcmp(json_value(matview, "populated"), "true");
 			form.relreplident = REPLICA_IDENTITY_DEFAULT;
 			run("SELECT jsonb_array_length(COALESCE($1::jsonb->'indexes','[]'::jsonb))>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			form.relhasindex = DatumGetBool(cell(0, 1));
@@ -1022,6 +1030,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			run("SELECT ord::int,v->>'comment' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'comment' IS NOT NULL", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 			for (j = 0; j < SPI_processed; j++)
 				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
+			if (matview)
+				provider_view_rule(&rows, view, name, form.oid, matview);
 		}
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "view"))

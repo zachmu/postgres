@@ -28,6 +28,12 @@ rename_encode(CatalogView *view, const char *kind, const char *name, const char 
 			{
 				result = mutation_constraints(view, relid, result);
 				result = mutation_index_list(result, mutation_indexes(view, relid));
+				if (json_value(result, "matview"))
+				{
+					run("SELECT jsonb_set($1::jsonb,'{matview}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID),
+						VC_ARGS(CStringGetTextDatum(result), CStringGetTextDatum(matview_encode(relid, json_value(result, "matview")))), NULL, true);
+					result = strcell(0, 1);
+				}
 			}
 			else
 			{
@@ -300,6 +306,7 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 		case OBJECT_TABLE:
 		case OBJECT_INDEX:
 		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
 			{
 				Oid			relid = RangeVarGetRelid(relation, NoLock, true);
 

@@ -1777,7 +1777,7 @@ ApplyRetrieveRule(Query *parsetree,
 	RowMarkClause *rc;
 	int			numCols;
 
-	if (list_length(rule->actions) != 1)
+	if (list_length(RewriteRuleActions(relation, rule)) != 1)
 		elog(ERROR, "expected just one rule action");
 	if (rule->qual != NULL)
 		elog(ERROR, "cannot handle qualified ON SELECT rule");
@@ -2566,6 +2566,32 @@ fireRules(Query *parsetree,
 
 
 /*
+ * RewriteRuleActions - the actions of |relation|'s rule |rule|.
+ *
+ * A versioned view's rule holds the view's SQL until analyzed; analyze it
+ * now, as the relcache would have, and keep the result with the relation.
+ */
+List *
+RewriteRuleActions(Relation relation, RewriteRule *rule)
+{
+	List	   *actions;
+	MemoryContext previous;
+
+	if (!(list_length(rule->actions) == 1 && IsA(linitial(rule->actions), String)))
+		return rule->actions;
+	actions = dg_rule_actions(RelationGetRelid(relation), rule->actions);
+	if (rule->event == CMD_SELECT && relation->rd_rel->relkind == RELKIND_VIEW &&
+		RelationHasSecurityInvoker(relation))
+		setRuleCheckAsUser((Node *) actions, InvalidOid);
+	else
+		setRuleCheckAsUser((Node *) actions, relation->rd_rel->relowner);
+	previous = MemoryContextSwitchTo(relation->rd_rulescxt);
+	rule->actions = copyObject(actions);
+	MemoryContextSwitchTo(previous);
+	return rule->actions;
+}
+
+/*
  * get_view_query - get the Query from a view's _RETURN rule.
  *
  * Caller should have verified that the relation is a view, and therefore
@@ -2588,7 +2614,7 @@ get_view_query(Relation view)
 		if (rule->event == CMD_SELECT)
 		{
 			/* A _RETURN rule should have only one action */
-			if (list_length(rule->actions) != 1)
+			if (list_length(RewriteRuleActions(view, rule)) != 1)
 				elog(ERROR, "invalid _RETURN rule action specification");
 
 			return (Query *) linitial(rule->actions);

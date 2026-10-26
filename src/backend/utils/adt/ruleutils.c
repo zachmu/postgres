@@ -12421,6 +12421,15 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 								 generate_relation_name(rte->relid,
 														context->namespaces));
 				break;
+			case RTE_DOLT:
+				/* A branch head's table, by its relation's name. */
+				if (!rte->dolt_branch || rte->dolt_catalog)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot deparse a revision-qualified relation")));
+				appendStringInfoString(buf, generate_relation_name(get_typ_typrelid(rte->dolt_rowtype),
+																   context->namespaces));
+				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
 				appendStringInfoChar(buf, '(');

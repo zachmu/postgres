@@ -53,17 +53,12 @@ view_dependency_name(Oid classid, Oid objid)
 	pg_unreachable();
 }
 
+/* The SQL of view or materialized view |relid|'s query, every name qualified. */
 static char *
-view_encode(Oid relid)
+view_query(Oid relid, HeapTuple rule)
 {
-	Relation	rel = relation_open(relid, AccessShareLock);
-	TupleDesc	desc = RelationGetDescr(rel);
-	HeapTuple	rule = view_rule(relid);
-	Oid			ruleid = ((Form_pg_rewrite) GETSTRUCT(rule))->oid;
-	StringInfoData json;
 	char	   *sql = NULL;
 	int			nest = NewGUCNestLevel();
-	List	   *dependencies = NIL;
 
 	PG_TRY();
 	{
@@ -83,13 +78,68 @@ view_encode(Oid relid)
 		AtEOXact_GUC(true, nest);
 	}
 	PG_END_TRY();
+	return sql;
+}
+
+/* As rule |ruleid|'s native dependencies, by name: [kind, name, column], as JSON. */
+static char *
+view_dependencies(Oid relid, Oid ruleid)
+{
+	Relation	catalog = table_open(DependRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple	tuple;
+	List	   *dependencies = NIL;
+	StringInfoData json;
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+		char	   *name;
+		StringInfoData entry;
+
+		if (dep->classid != RewriteRelationId || dep->objid != ruleid || dep->refobjid == relid ||
+			!(name = view_dependency_name(dep->refclassid, dep->refobjid)))
+			continue;
+		initStringInfo(&entry);
+		appendStringInfoChar(&entry, '[');
+		escape_json(&entry, dep->refclassid == RelationRelationId ? "table" : dep->refclassid == ProcedureRelationId ? "routine" : "type");
+		appendStringInfoChar(&entry, ',');
+		escape_json(&entry, name);
+		appendStringInfoChar(&entry, ',');
+		if (dep->refclassid == RelationRelationId && dep->refobjsubid > 0)
+			escape_json(&entry, get_attname(dep->refobjid, dep->refobjsubid, false));
+		else
+			appendStringInfoString(&entry, "null");
+		appendStringInfoChar(&entry, ']');
+		if (!list_member(dependencies, makeString(entry.data)))
+			dependencies = lappend(dependencies, makeString(entry.data));
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	list_sort(dependencies, view_entry_compare);
+	initStringInfo(&json);
+	appendStringInfoChar(&json, '[');
+	foreach_node(String, entry, dependencies)
+		appendStringInfo(&json, "%s%s", foreach_current_index(entry) ? "," : "", strVal(entry));
+	appendStringInfoChar(&json, ']');
+	return json.data;
+}
+
+static char *
+view_encode(Oid relid)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	HeapTuple	rule = view_rule(relid);
+	StringInfoData json;
+
 	initStringInfo(&json);
 	appendStringInfoString(&json, "{\"format\":\"DGVIEW1\",");
 	json_field(&json, "name", dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel)), false);
 	appendStringInfoChar(&json, ',');
 	json_field(&json, "owner", GetUserNameFromId(rel->rd_rel->relowner, false), false);
 	appendStringInfoChar(&json, ',');
-	json_field(&json, "query", sql, false);
+	json_field(&json, "query", view_query(relid, rule), false);
 	appendStringInfoString(&json, ",\"options\":[");
 	{
 		bool		isnull;
@@ -130,45 +180,26 @@ view_encode(Oid relid)
 		}
 		appendStringInfoChar(&json, '}');
 	}
-	appendStringInfoString(&json, "],\"dependencies\":[");
-
-	/* As the rule's native dependencies, by name: [kind, name, column]. */
-	{
-		Relation	catalog = table_open(DependRelationId, AccessShareLock);
-		SysScanDesc scan = systable_beginscan(catalog, InvalidOid, false, NULL, 0, NULL);
-		HeapTuple	tuple;
-
-		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-		{
-			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
-			char	   *name;
-			StringInfoData entry;
-
-			if (dep->classid != RewriteRelationId || dep->objid != ruleid || dep->refobjid == relid ||
-				!(name = view_dependency_name(dep->refclassid, dep->refobjid)))
-				continue;
-			initStringInfo(&entry);
-			appendStringInfoChar(&entry, '[');
-			escape_json(&entry, dep->refclassid == RelationRelationId ? "table" : dep->refclassid == ProcedureRelationId ? "routine" : "type");
-			appendStringInfoChar(&entry, ',');
-			escape_json(&entry, name);
-			appendStringInfoChar(&entry, ',');
-			if (dep->refclassid == RelationRelationId && dep->refobjsubid > 0)
-				escape_json(&entry, get_attname(dep->refobjid, dep->refobjsubid, false));
-			else
-				appendStringInfoString(&entry, "null");
-			appendStringInfoChar(&entry, ']');
-			if (!list_member(dependencies, makeString(entry.data)))
-				dependencies = lappend(dependencies, makeString(entry.data));
-		}
-		systable_endscan(scan);
-		table_close(catalog, AccessShareLock);
-	}
-	list_sort(dependencies, view_entry_compare);
-	foreach_node(String, entry, dependencies)
-		appendStringInfo(&json, "%s%s", foreach_current_index(entry) ? "," : "", strVal(entry));
-	appendStringInfoString(&json, "]}");
+	appendStringInfo(&json, "],\"dependencies\":%s}", view_dependencies(relid, ((Form_pg_rewrite) GETSTRUCT(rule))->oid));
 	relation_close(rel, AccessShareLock);
+	return json.data;
+}
+
+/*
+ * A materialized view's "matview" definition, encoded again from its rule in
+ * the current catalog view; |old| gives whether it is populated.
+ */
+static char *
+matview_encode(Oid relid, const char *old)
+{
+	HeapTuple	rule = view_rule(relid);
+	StringInfoData json;
+
+	initStringInfo(&json);
+	appendStringInfoChar(&json, '{');
+	json_field(&json, "query", view_query(relid, rule), false);
+	appendStringInfo(&json, ",\"populated\":%s,\"dependencies\":%s}", json_value(old, "populated") ? json_value(old, "populated") : "false",
+					 view_dependencies(relid, ((Form_pg_rewrite) GETSTRUCT(rule))->oid));
 	return json.data;
 }
 
@@ -187,9 +218,18 @@ dg_rule_actions(Oid relid, List *actions)
 
 	if (list_length(actions) != 1 || !IsA(linitial(actions), String))
 		return actions;
+
+	/*
+	 * Names cannot be bound within a version-control API scope, as when the
+	 * relation is opened there: the rule's user analyzes it later.
+	 */
+	if (catalog_api_depth)
+		return actions;
 	sql = strVal(linitial(actions));
 	nest = NewGUCNestLevel();
 	previous = CatalogViewSwitch(CatalogViewObjectContext(relid) ? CatalogViewObjectContext(relid) : CatalogViewCurrent());
+	/* Names resolve against the latest catalog state, as for any query. */
+	PushActiveSnapshot(GetLatestSnapshot());
 	PG_TRY();
 	{
 		schema_expression_gucs();
@@ -201,6 +241,7 @@ dg_rule_actions(Oid relid, List *actions)
 	}
 	PG_FINALLY();
 	{
+		PopActiveSnapshot();
 		CatalogViewSwitch(previous);
 		AtEOXact_GUC(true, nest);
 	}
@@ -230,9 +271,11 @@ view_materialize_rules(CatalogView *view, List *views)
 		bool		replace[Natts_pg_rewrite] = {0};
 		List	   *actions;
 
-		if (strcmp(linitial(target), "view"))
+		if (strcmp(linitial(target), "view") && strcmp(linitial(target), "table"))
 			continue;
 		relid = CatalogViewLookupObject(view, RelationRelationId, lsecond(target));
+		if (!strcmp(linitial(target), "table") && get_rel_relkind(relid) != RELKIND_MATVIEW)
+			continue;
 		rule = view_rule(relid);
 		actions = (List *) stringToNode(TextDatumGetCString(heap_getattr(rule, Anum_pg_rewrite_ev_action, RelationGetDescr(catalog), &isnull)));
 		values[Anum_pg_rewrite_ev_action - 1] = CStringGetTextDatum(nodeToString(dg_rule_actions(relid, actions)));
@@ -338,4 +381,156 @@ dg_catalog_view_ddl(ParseState *pstate, Node *statement, int location, int lengt
 	if (pushed)
 		PopActiveSnapshot();
 	return true;
+}
+
+typedef struct MatviewDependencies
+{
+	List	   *entries;		/* of String: [kind, name, null] */
+} MatviewDependencies;
+
+static void
+matview_dependency(MatviewDependencies *found, Oid classid, Oid objid)
+{
+	char	   *name = view_dependency_name(classid, objid);
+	StringInfoData entry;
+
+	if (!name)
+		return;
+	initStringInfo(&entry);
+	appendStringInfoChar(&entry, '[');
+	escape_json(&entry, classid == RelationRelationId ? "table" : classid == ProcedureRelationId ? "routine" : "type");
+	appendStringInfoChar(&entry, ',');
+	escape_json(&entry, name);
+	appendStringInfoString(&entry, ",null]");
+	if (!list_member(found->entries, makeString(entry.data)))
+		found->entries = lappend(found->entries, makeString(entry.data));
+}
+
+static bool
+matview_dependencies_walker(Node *node, MatviewDependencies *found)
+{
+	if (!node)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_RELATION)
+			matview_dependency(found, RelationRelationId, rte->relid);
+		else if (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_rowtype))
+			matview_dependency(found, RelationRelationId, get_typ_typrelid(rte->dolt_rowtype));
+		return false;
+	}
+	if (IsA(node, FuncExpr))
+		matview_dependency(found, ProcedureRelationId, ((FuncExpr *) node)->funcid);
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, matview_dependencies_walker, found, QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, matview_dependencies_walker, found);
+}
+
+/*
+ * Create materialized view |create|, of |query|, as a versioned table whose
+ * definition also holds its query and dependencies; REFRESH fills it.
+ */
+bool
+dg_catalog_create_matview(CreateStmt *create, Query *query)
+{
+	MatviewDependencies found = {0};
+	StringInfoData json;
+	char	   *sql = NULL;
+	int			nest = NewGUCNestLevel();
+	bool		result;
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		sql = pg_get_querydef(query, false);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+	}
+	PG_END_TRY();
+	(void) matview_dependencies_walker((Node *) query, &found);
+	list_sort(found.entries, view_entry_compare);
+	initStringInfo(&json);
+	appendStringInfoChar(&json, '{');
+	json_field(&json, "query", sql, false);
+	appendStringInfoString(&json, ",\"populated\":false,\"dependencies\":[");
+	foreach_node(String, entry, found.entries)
+		appendStringInfo(&json, "%s%s", foreach_current_index(entry) ? "," : "", strVal(entry));
+	appendStringInfoString(&json, "]}");
+	matview_pending = json.data;
+	PG_TRY();
+	{
+		result = dg_catalog_create((Node *) create, NULL);
+	}
+	PG_FINALLY();
+	{
+		matview_pending = NULL;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
+ * Empty versioned materialized view |rel| for REFRESH, and mark it populated
+ * or not; its "matview" definition records which.
+ */
+void
+dg_catalog_matview_refresh(Relation rel, bool populated)
+{
+	Oid			user;
+	int			security,
+				nest;
+
+	if (rel->rd_rel->relispopulated != populated)
+	{
+		char	   *name = dg_qualified_name(get_namespace_name(RelationGetNamespace(rel)), RelationGetRelationName(rel));
+
+		GetUserIdAndSecContext(&user, &security);
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+
+		/* The view may have been created by this very statement. */
+		PushActiveSnapshot(GetLatestSnapshot());
+		PG_TRY();
+		{
+			VersionRef	working;
+			Capture		current;
+			bytea	   *member = NULL;
+
+			nest = begin_api();
+			working = read_ref(branch_ref("working"));
+			current = capture(true);
+			run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND convert_from(t.objpayload,'UTF8')::jsonb->>'name'=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(current.hash), CStringGetTextDatum(name)), NULL, true);
+			if (SPI_processed != 1)
+				elog(ERROR, "versioned materialized view %s is missing", name);
+			member = DatumGetByteaPCopy(cell(0, 1));
+			{
+				bytea	   *oldschema = child(member, 1);
+				char	   *definition;
+				bytea	   *schema;
+				char	   *payload = metadata(member, "table");
+				Oid			resource = binding_relation(dg_current_branch(), name, oldschema);
+
+				run("SELECT jsonb_set($1::jsonb,'{matview,populated}',to_jsonb($2::bool))::text", 2, VC_TYPES(TEXTOID, BOOLOID), VC_ARGS(CStringGetTextDatum(metadata(oldschema, "schema")), BoolGetDatum(populated)), NULL, true);
+				definition = strcell(0, 1);
+				schema = put("schema", definition, NULL, 0);
+				run("SELECT jsonb_set($1::jsonb,'{schema}',to_jsonb(encode(sha256(convert_to($2,'UTF8')),'hex')))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(definition)), NULL, true);
+				member = put("table", strcell(0, 1), VC_ARGS(PointerGetDatum(schema), PointerGetDatum(child(member, 2))), 2);
+				binding_record(dg_current_branch(), name, schema, resource);
+			}
+			move_ref(branch_ref("working"), working, alter_database(current, name, member));
+			advance_snapshot();
+			end_api(nest);
+		}
+		PG_FINALLY();
+		{
+			PopActiveSnapshot();
+			SetUserIdAndSecContext(user, security);
+		}
+		PG_END_TRY();
+	}
+	dg_truncate(rel);
+	CommandCounterIncrement();
 }

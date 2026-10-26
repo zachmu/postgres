@@ -168,9 +168,10 @@ definition_references(const char *kind, const char *definition)
 				references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
 		}
 	}
-	else if (!strcmp(kind, "view"))
+	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")))
 	{
-		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+		/* A view's query, or a materialized view's, lists what it uses. */
+		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies',$1::jsonb->'matview'->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 		{
 			uint64		n = SPI_processed;
 			char	  **kinds = palloc_array(char *, Max(n, 1));

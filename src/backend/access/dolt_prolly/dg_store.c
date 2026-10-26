@@ -1291,7 +1291,7 @@ import_content(Relation rel, DGState *state, bytea *content)
 	PG_TRY();
 	{
 		state->content = dg_history_import(state->store, content);
-		if (rel->rd_rel->relkind == RELKIND_RELATION)
+		if (DG_ROWS_KIND(rel->rd_rel->relkind))
 			dg_history_handles(state);
 	}
 	PG_FINALLY();

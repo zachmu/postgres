@@ -885,7 +885,9 @@ RelationBuildRuleLock(Relation relation)
 		 * the rule tree during load is relatively cheap (compared to
 		 * constructing it in the first place), so we do it here.
 		 */
-		setRuleCheckAsUser((Node *) rule->actions, check_as_user);
+		/* A versioned view's rule not yet analyzed is analyzed when used. */
+		if (!(list_length(rule->actions) == 1 && IsA(linitial(rule->actions), String)))
+			setRuleCheckAsUser((Node *) rule->actions, check_as_user);
 		setRuleCheckAsUser(rule->qual, check_as_user);
 
 		if (numlocks >= maxlocks)

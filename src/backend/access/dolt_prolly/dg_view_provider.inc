@@ -31,6 +31,87 @@ provider_view_dependency(CatalogView *view, const char *kind, const char *name)
 	return oid;
 }
 
+/*
+ * The rewrite rule of a versioned view or materialized view |relation|: its
+ * SQL, from |definition|'s "query", analyzed when the rule is first read, and
+ * the dependencies "dependencies" names.
+ */
+static void
+provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oid relation, const char *definition)
+{
+	FormData_pg_rewrite rule = {0};
+	int			rslot = provider_catalog_index(RewriteRelationId);
+	HeapTuple	tuple;
+
+	rule.oid = CatalogViewBindObject(view, RewriteRelationId, psprintf("%s/%s", name, ViewSelectRuleName), InvalidOid);
+	namestrcpy(&rule.rulename, ViewSelectRuleName);
+	rule.ev_class = relation;
+	rule.ev_type = '0' + CMD_SELECT;
+	rule.ev_enabled = RULE_FIRES_ON_ORIGIN;
+	rule.is_instead = true;
+	tuple = provider_fixed(rows->relations[rslot], &rule, sizeof(rule), Anum_pg_rewrite_is_instead);
+	tuple = provider_set(rows->relations[rslot], tuple, Anum_pg_rewrite_ev_qual, CStringGetTextDatum("<>"));
+	tuple = provider_set(rows->relations[rslot], tuple, Anum_pg_rewrite_ev_action,
+						 CStringGetTextDatum(nodeToString(list_make1(makeString(json_value(definition, "query"))))));
+	rows->rows[rslot] = lappend(rows->rows[rslot], tuple);
+	provider_dependency(rows, RewriteRelationId, rule.oid, 0, RelationRelationId, relation, 0, DEPENDENCY_INTERNAL);
+	run("SELECT v->>0,v->>1,v->>2 FROM jsonb_array_elements($1::jsonb->'dependencies') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	{
+		uint64		n = SPI_processed;
+		char	  **kinds = palloc_array(char *, Max(n, 1));
+		char	  **targets = palloc_array(char *, Max(n, 1));
+		char	  **columns = palloc_array(char *, Max(n, 1));
+
+		for (uint64 i = 0; i < n; i++)
+		{
+			kinds[i] = strcell(i, 1);
+			targets[i] = strcell(i, 2);
+			columns[i] = strcell(i, 3);
+		}
+		for (uint64 i = 0; i < n; i++)
+		{
+			Oid			target = provider_view_dependency(view, kinds[i], targets[i]);
+			int			column = 0;
+
+			if (!OidIsValid(target))
+				elog(ERROR, "versioned view %s depends on missing %s %s", name, kinds[i], targets[i]);
+			if (columns[i])
+			{
+				/* A versioned table's columns are numbered as its definition lists them. */
+				bool		versioned = false;
+
+				for (int j = 0; j < provider_definition_count; j++)
+				{
+					if (strcmp(json_value(provider_definition_list[j], "name"), targets[i]))
+						continue;
+					if (!strcmp(provider_definition_kinds[j], "table"))
+						column = provider_attribute(provider_columns(provider_definition_list[j]), columns[i]);
+					else if (!strcmp(provider_definition_kinds[j], "view"))
+					{
+						run("SELECT ord::int FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(provider_definition_list[j]), CStringGetTextDatum(columns[i])), NULL, true);
+						if (SPI_processed)
+							column = DatumGetInt32(cell(0, 1));
+					}
+					else
+						continue;
+					versioned = true;
+				}
+				if (!versioned)
+				{
+					/* A native relation's column, which is physical. */
+					CatalogView *previous = CatalogViewSwitch(NULL);
+
+					column = get_attnum(target, columns[i]);
+					CatalogViewSwitch(previous);
+				}
+			}
+			provider_dependency(rows, RewriteRelationId, rule.oid, 0,
+								!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : TypeRelationId,
+								target, column, DEPENDENCY_NORMAL);
+		}
+	}
+}
+
 static void
 provider_view_member(DGProviderRows *rows, CatalogView *view, const char *definition)
 {
@@ -39,9 +120,7 @@ provider_view_member(DGProviderRows *rows, CatalogView *view, const char *defini
 	FormData_pg_class form = {0};
 	FormData_pg_type type = {0};
 	FormData_pg_type array = {0};
-	FormData_pg_rewrite rule = {0};
 	int			slot = provider_catalog_index(RelationRelationId);
-	int			rslot = provider_catalog_index(RewriteRelationId);
 	HeapTuple	tuple;
 	char	   *arrayname;
 	uint64		ncolumns;
@@ -127,72 +206,5 @@ provider_view_member(DGProviderRows *rows, CatalogView *view, const char *defini
 	provider_dependency(rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
 	provider_type_array(rows, &type, arrayname);
 
-	/* Its rule: the view's SQL, analyzed when the rule is first read. */
-	rule.oid = CatalogViewBindObject(view, RewriteRelationId, psprintf("%s/%s", name, ViewSelectRuleName), InvalidOid);
-	namestrcpy(&rule.rulename, ViewSelectRuleName);
-	rule.ev_class = form.oid;
-	rule.ev_type = '0' + CMD_SELECT;
-	rule.ev_enabled = RULE_FIRES_ON_ORIGIN;
-	rule.is_instead = true;
-	tuple = provider_fixed(rows->relations[rslot], &rule, sizeof(rule), Anum_pg_rewrite_is_instead);
-	tuple = provider_set(rows->relations[rslot], tuple, Anum_pg_rewrite_ev_qual, CStringGetTextDatum("<>"));
-	tuple = provider_set(rows->relations[rslot], tuple, Anum_pg_rewrite_ev_action,
-						 CStringGetTextDatum(nodeToString(list_make1(makeString(json_value(definition, "query"))))));
-	rows->rows[rslot] = lappend(rows->rows[rslot], tuple);
-	provider_dependency(rows, RewriteRelationId, rule.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
-	run("SELECT v->>0,v->>1,v->>2 FROM jsonb_array_elements($1::jsonb->'dependencies') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	{
-		uint64		n = SPI_processed;
-		char	  **kinds = palloc_array(char *, Max(n, 1));
-		char	  **targets = palloc_array(char *, Max(n, 1));
-		char	  **columns = palloc_array(char *, Max(n, 1));
-
-		for (uint64 i = 0; i < n; i++)
-		{
-			kinds[i] = strcell(i, 1);
-			targets[i] = strcell(i, 2);
-			columns[i] = strcell(i, 3);
-		}
-		for (uint64 i = 0; i < n; i++)
-		{
-			Oid			target = provider_view_dependency(view, kinds[i], targets[i]);
-			int			column = 0;
-
-			if (!OidIsValid(target))
-				elog(ERROR, "versioned view %s depends on missing %s %s", name, kinds[i], targets[i]);
-			if (columns[i])
-			{
-				/* A versioned table's columns are numbered as its definition lists them. */
-				bool		versioned = false;
-
-				for (int j = 0; j < provider_definition_count; j++)
-				{
-					if (strcmp(json_value(provider_definition_list[j], "name"), targets[i]))
-						continue;
-					if (!strcmp(provider_definition_kinds[j], "table"))
-						column = provider_attribute(provider_columns(provider_definition_list[j]), columns[i]);
-					else if (!strcmp(provider_definition_kinds[j], "view"))
-					{
-						run("SELECT ord::int FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(provider_definition_list[j]), CStringGetTextDatum(columns[i])), NULL, true);
-						if (SPI_processed)
-							column = DatumGetInt32(cell(0, 1));
-					}
-					else
-						continue;
-					versioned = true;
-				}
-				if (!versioned)
-				{
-					/* A native relation's column, which is physical. */
-					CatalogView *previous = CatalogViewSwitch(NULL);
-
-					column = get_attnum(target, columns[i]);
-					CatalogViewSwitch(previous);
-				}
-			}
-			provider_dependency(rows, RewriteRelationId, rule.oid, 0,
-								!strcmp(kinds[i], "table") ? RelationRelationId : !strcmp(kinds[i], "routine") ? ProcedureRelationId : TypeRelationId,
-								target, column, DEPENDENCY_NORMAL);
-		}
-	}
+	provider_view_rule(rows, view, name, form.oid, definition);
 }

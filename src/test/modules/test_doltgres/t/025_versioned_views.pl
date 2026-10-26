@@ -56,6 +56,24 @@ sql(q{DROP VIEW named; DROP TABLE base CASCADE});
 is(sql(q{SELECT count(*) FROM pg_views WHERE viewname IN ('pos','named','checked')}),'0','DROP VIEW and DROP TABLE CASCADE');
 is(sql(q{SELECT count(*) FROM pos AS OF 'HEAD'}),'2','history keeps dropped views');
 
+# Materialized views are tables whose definitions also hold their queries.
+sql(q{CREATE TABLE src(a int PRIMARY KEY, b text); INSERT INTO src VALUES (1,'x'),(2,'y');
+	CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM src WHERE a > 0;
+	CREATE MATERIALIZED VIEW lazy AS SELECT 1 AS one WITH NO DATA});
+is(sql(q{SELECT count(*) FROM mv}),'2','a materialized view holds its rows');
+fails(q{SELECT * FROM lazy},qr/has not been populated/,'WITH NO DATA');
+sql(q{INSERT INTO src VALUES (3,'z'); REFRESH MATERIALIZED VIEW mv; REFRESH MATERIALIZED VIEW lazy});
+is(sql(q{SELECT count(*) FROM mv}).':'.sql(q{SELECT one FROM lazy}),'3:1','REFRESH MATERIALIZED VIEW');
+sql(q{ALTER TABLE src RENAME TO src2; ALTER TABLE src2 RENAME COLUMN b TO bb; ALTER MATERIALIZED VIEW mv RENAME TO mv2});
+is(sql(q{SELECT pg_get_viewdef('mv2'::regclass)})," SELECT a,\n    bb AS b\n   FROM src2\n  WHERE (a > 0);",'renames rewrite a materialized view\'s query');
+sql(q{SELECT dolt_commit('-Am','materialized')});
+is(sql(q{SELECT dolt_checkout('-b','refreshed'); INSERT INTO src2 VALUES (4,'w'); REFRESH MATERIALIZED VIEW mv2;
+	SELECT count(*) FROM mv2; SELECT dolt_checkout('main'); SELECT count(*) FROM mv2}),
+	"(0,\"Switched to branch 'refreshed'\")\n4\n(0,\"Switched to branch 'main'\")\n3",'a refresh on a branch stays on it');
+sql(q{DROP MATERIALIZED VIEW lazy; DROP TABLE src2 CASCADE});
+is(sql(q{SELECT count(*) FROM pg_matviews}),'0','DROP MATERIALIZED VIEW and DROP TABLE CASCADE');
+is(sql(q{SELECT count(*) FROM mv2 AS OF 'HEAD'}),'3','history keeps materialized views');
+
 # ---- not versioned ----
 is(sql(q{CREATE TEMP VIEW tv AS SELECT 1 AS one; SELECT one FROM tv}),'1','temporary views stay native');
 $node->stop;
