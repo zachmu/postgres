@@ -160,6 +160,124 @@ compose_database(bytea *base, bytea *source, List *tables)
 	return canonical_database(json.data, hashes, used);
 }
 
+/* ---- Schema merge ----
+ *
+ * A three-way merge of database states, object by object: a namespace,
+ * routine or trigger is keyed by kind and name, and a table together with
+ * its indexes, which its definition lists. An object changed (added, altered
+ * or dropped) on one side only takes that side. A table whose definition is
+ * the same on all three sides but whose rows changed on both is returned in
+ * |row_merges|, for its rows to be merged. Any other object changed on both
+ * sides is a schema conflict. */
+
+static Member *
+merge_member(Member * members, int count, const char *kind, const char *name)
+{
+	for (int i = 0; i < count; i++)
+		if (!strcmp(members[i].kind, kind) && !strcmp(members[i].name, name))
+			return &members[i];
+	return NULL;
+}
+
+static bool
+merge_same(Member * a, Member * b)
+{
+	return (!a && !b) || (a && b && same(a->hash, b->hash));
+}
+
+static bytea *
+merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
+{
+	int			counts[3];
+	Member	   *sides[3] = {
+		database_members(base, &counts[0]),
+		database_members(ours, &counts[1]),
+		database_members(theirs, &counts[2]),
+	};
+	List	   *seen = NIL;
+	Datum	   *hashes;
+	StringInfoData json;
+	int			used = 0;
+
+	*row_merges = NIL;
+	hashes = palloc(sizeof(Datum) * (counts[0] + counts[1] + counts[2] + 1));
+	initStringInfo(&json);
+	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
+	for (int side = 0; side < 3; side++)
+		for (int i = 0; i < counts[side]; i++)
+		{
+			Member	   *key = &sides[side][i];
+			char	   *identity = psprintf("%s %s", key->kind, key->name);
+			Member	   *b,
+					   *o,
+					   *t,
+					   *chosen;
+			Member	   *from;
+			int			fromcount;
+
+			/* Indexes follow their tables. */
+			if (!strcmp(key->kind, "index") || list_member(seen, makeString(identity)))
+				continue;
+			seen = lappend(seen, makeString(identity));
+			b = merge_member(sides[0], counts[0], key->kind, key->name);
+			o = merge_member(sides[1], counts[1], key->kind, key->name);
+			t = merge_member(sides[2], counts[2], key->kind, key->name);
+			if (merge_same(o, t) || merge_same(b, t))
+				chosen = o, from = sides[1], fromcount = counts[1];
+			else if (merge_same(b, o))
+				chosen = t, from = sides[2], fromcount = counts[2];
+			else if (!strcmp(key->kind, "table") && b && o && t &&
+					 same(child(b->hash, 1), child(o->hash, 1)) && same(child(o->hash, 1), child(t->hash, 1)))
+			{
+				chosen = o, from = sides[1], fromcount = counts[1];
+				*row_merges = lappend(*row_merges, key->name);
+			}
+			else
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("merge conflict in the definition of %s %s", key->kind, key->name),
+								errdetail("Both branches changed it. Merging such schema changes is not supported yet.")));
+			if (!chosen)
+				continue;
+			if (used)
+				appendStringInfoChar(&json, ',');
+			if (!strcmp(chosen->kind, "namespace"))
+				appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", chosen->payload);
+			else
+				appendStringInfoString(&json, chosen->payload);
+			hashes[used++] = PointerGetDatum(chosen->hash);
+			if (!strcmp(chosen->kind, "table"))
+				foreach_ptr(char, index, table_index_names(metadata(child(chosen->hash, 1), "schema"), chosen->name))
+				{
+					Member	   *member = merge_member(from, fromcount, "index", index);
+
+					if (!member)
+						elog(ERROR, "canonical index %s of %s is missing", index, chosen->name);
+					appendStringInfo(&json, ",%s", member->payload);
+					hashes[used++] = PointerGetDatum(member->hash);
+				}
+		}
+	appendStringInfoString(&json, "]}");
+	return canonical_database(json.data, hashes, used);
+}
+
+/*
+ * Merge |theirs| into the working set, whose state is |ours|, from their
+ * common |base|: the merged schema is installed, then the rows of tables
+ * changed on both sides are merged.
+ */
+static void
+merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations)
+{
+	List	   *row_merges;
+	bytea	   *merged = merge_schemas(base, ours, theirs, &row_merges);
+
+	replace_working(dg_current_branch(), merged, NIL);
+	if (row_merges)
+		install_database(base, ours, theirs, row_merges, conflicts, violations);
+	else
+		validate_working_foreign_keys(dg_current_branch());
+}
+
 /* Resolve table arguments of a workspace command against the given states. */
 static List *
 table_arguments(char **args, int n, int first, const char *json_a, const char *json_b)
@@ -899,14 +1017,12 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		targetdb = child(target, 1);
 		parentdb = child(parent, 1);
 		head = read_ref(branch_ref("heads"));
-		same_schema(metadata(child(head.target, 1), "database"), metadata(targetdb, "database"));
-		same_schema(metadata(child(head.target, 1), "database"), metadata(parentdb, "database"));
 		initStringInfo(&conflicts);
 		initStringInfo(&violations);
 		if (revert)
-			install_database(targetdb, child(head.target, 1), parentdb, &conflicts, &violations);
+			merge_databases(targetdb, child(head.target, 1), parentdb, &conflicts, &violations);
 		else
-			install_database(parentdb, child(head.target, 1), targetdb, &conflicts, &violations);
+			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations);
 		if (conflicts.len || violations.len)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s resulted in conflicts; resolve them with dolt_merge", revert ? "revert" : "cherry-pick")));
 		database = capture_visible().hash;

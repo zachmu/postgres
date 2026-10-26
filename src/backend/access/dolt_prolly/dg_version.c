@@ -127,6 +127,7 @@ static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
 static void replace_working(const char *branch, bytea *database, List *tables);
+static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations);
 static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
