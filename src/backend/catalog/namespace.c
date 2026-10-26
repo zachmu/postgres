@@ -459,8 +459,11 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		if (callback)
 			callback(relation, relId, InvalidOid, callback_arg);
 
-		/* Branch-head relations have durable OIDs and lock like any other. */
-		if (CatalogViewIsDurable(relId) && lockmode != NoLock)
+		/*
+		 * Branch-head relations have durable OIDs and lock like any other, as
+		 * do native relations found from a provisional view.
+		 */
+		if (OidIsValid(relId) && !CatalogViewIsLeased(relId) && lockmode != NoLock)
 		{
 			if (flags & (RVR_NOWAIT | RVR_SKIP_LOCKED))
 			{

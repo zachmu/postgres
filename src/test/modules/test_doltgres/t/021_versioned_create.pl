@@ -57,6 +57,7 @@ is($node->safe_psql($fresh,q{SET default_table_access_method=dolt_prolly_table; 
 # ---- still unsupported ----
 fails(q{CREATE TABLE p(id int) PARTITION BY RANGE (id)},qr/partitioned and inherited versioned tables/,'partitioning is rejected');
 fails(q{CREATE UNLOGGED TABLE u(id int)},qr/unlogged versioned tables/,'unlogged is rejected');
+fails(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE ct(v pair)},qr/user-defined type codec/,'composite columns are rejected by the codec, not the catalog lookup');
 fails(q{CREATE TABLE ctas AS SELECT 1 AS a},qr/prolly tables can only be created with CREATE TABLE/,'CREATE TABLE AS is rejected');
 $node->stop;
 done_testing();

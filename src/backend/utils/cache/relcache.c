@@ -2127,7 +2127,14 @@ RelationIdGetRelation(Oid relationId)
 	CatalogView *previous;
 	Relation	result;
 
-	if (!view)
+	/*
+	 * As for the syscaches, a native user relation, such as the type relation
+	 * of a composite column, is always in the physical catalogs.
+	 */
+	if (!view && CatalogViewCurrent() &&
+		relationId >= FirstNormalObjectId && relationId < FirstDurableObjectId)
+		view = NULL;
+	else if (!view)
 		return RelationIdGetRelationInContext(relationId);
 	previous = CatalogViewSwitch(view);
 	PG_TRY();
