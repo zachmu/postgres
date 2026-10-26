@@ -62,7 +62,8 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 	{
 		HeapTuple	tuple = attributes[ordinal];
 		Form_pg_attribute attr;
-		char	   *column;
+		char	   *column,
+				   *typename;
 
 		bool		statsnull,
 					optionsnull;
@@ -82,9 +83,19 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 			continue;
 		if (attr->atthasmissing && !native_mutation_destination)
 			unsupported("canonical native column expression codec");
-		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',t.typname,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text FROM pg_type t WHERE t.oid=$4 AND t.typnamespace='pg_catalog'::regnamespace", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, OIDOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), ObjectIdGetDatum(attr->atttypid), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
-		if (SPI_processed != 1)
-			unsupported("canonical native column user-defined type codec");
+		/* A built-in type by its name, a versioned one qualified. */
+		{
+			HeapTuple	type = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
+
+			if (!HeapTupleIsValid(type))
+				elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
+			if (((Form_pg_type) GETSTRUCT(type))->typnamespace == PG_CATALOG_NAMESPACE)
+				typename = pstrdup(NameStr(((Form_pg_type) GETSTRUCT(type))->typname));
+			else
+				typename = routine_type_name(attr->atttypid);
+			ReleaseSysCache(type);
+		}
+		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',$4::text,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, TEXTOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), CStringGetTextDatum(typename), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
 		column = strcell(0, 1);
 		{
 			ListCell   *dc;

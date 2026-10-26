@@ -4,19 +4,6 @@
  * portable form is the CREATE TRIGGER statement PostgreSQL deparses for it,
  * with every name qualified, plus its enabled state.
  */
-static bool
-trigger_native_function(Node *node, void *context)
-{
-	if (!node)
-		return false;
-	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
-		((FuncExpr *) node)->funcid < FirstDurableObjectId)
-		return true;
-	if (IsA(node, OpExpr) && ((OpExpr *) node)->opno >= FirstNormalObjectId)
-		return true;
-	return expression_tree_walker(node, trigger_native_function, context);
-}
-
 static char *
 trigger_encode(HeapTuple tuple, TupleDesc desc)
 {
@@ -34,7 +21,7 @@ trigger_encode(HeapTuple tuple, TupleDesc desc)
 		unsupported("versioned constraint triggers");
 	if (trigger->tgfoid >= FirstNormalObjectId && trigger->tgfoid < FirstDurableObjectId)
 		unsupported("versioned trigger calling an unversioned function");
-	if (!isnull && trigger_native_function(stringToNode(TextDatumGetCString(qual)), NULL))
+	if (!isnull && expression_calls_native(stringToNode(TextDatumGetCString(qual)), NULL))
 		unsupported("versioned trigger condition calling an unversioned function");
 	PG_TRY();
 	{

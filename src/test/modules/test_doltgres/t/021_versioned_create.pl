@@ -70,9 +70,11 @@ my $fresh='fresh';
 $node->safe_psql('postgres',"CREATE DATABASE $fresh");
 is($node->safe_psql($fresh,q{SET default_table_access_method=dolt_prolly_table; CREATE SCHEMA early; CREATE TABLE early.t(v int DEFAULT 3); INSERT INTO early.t DEFAULT VALUES; SELECT v FROM early.t}),'3','a schema made before the first versioned table joins the branch with it');
 
+sql(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE cpair(v pair); INSERT INTO cpair VALUES (ROW(1,2))});
+is(sql(q{SELECT (v).b FROM cpair}),'2','columns of a versioned composite type');
+
 # ---- still unsupported ----
 fails(q{CREATE TABLE p(id int) PARTITION BY RANGE (id)},qr/partitioned and inherited versioned tables/,'partitioning is rejected');
 fails(q{CREATE UNLOGGED TABLE u(id int)},qr/unlogged versioned tables/,'unlogged is rejected');
-fails(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE cpair(v pair)},qr/user-defined type codec/,'composite columns are rejected by the codec, not the catalog lookup');
 $node->stop;
 done_testing();

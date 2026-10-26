@@ -62,7 +62,7 @@ schema_expression_check(Node *node, void *context)
 		default:
 			unsupported("canonical scalar expression node codec");
 	}
-	if (exprType(node) >= FirstNormalObjectId)
+	if (exprType(node) >= FirstNormalObjectId && exprType(node) < FirstDurableObjectId)
 		unsupported("canonical expression user-defined result type");
 	if (!context || exprType(node) != VOIDOID)
 	{
@@ -156,6 +156,10 @@ schema_expression_calls_routine(Node *node, void *context)
 		return false;
 	if (IsA(node, FuncCall) && list_length(((FuncCall *) node)->funcname) > 1 &&
 		strcmp(strVal(linitial(((FuncCall *) node)->funcname)), "pg_catalog"))
+		return true;
+	/* Versioned types are named the same way. */
+	if (IsA(node, TypeName) && list_length(((TypeName *) node)->names) > 1 &&
+		strcmp(strVal(linitial(((TypeName *) node)->names)), "pg_catalog"))
 		return true;
 	return raw_expression_tree_walker(node, schema_expression_calls_routine, context);
 }
@@ -294,6 +298,89 @@ schema_expression_bind_trigger(CatalogView *view, Oid relation, const char *name
 			CatalogViewSwitch(view);
 		result = transformWhereClause(pstate, raw, EXPR_KIND_TRIGGER_WHEN, "WHEN");
 		assign_expr_collations(pstate, result);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+		AtEOXact_GUC(true, nest);
+		free_parsestate(pstate);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* Whether a stored expression calls a native, unversioned user function or operator. */
+static bool
+expression_calls_native(Node *node, void *context)
+{
+	if (!node)
+		return false;
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstNormalObjectId &&
+		((FuncExpr *) node)->funcid < FirstDurableObjectId)
+		return true;
+	if (IsA(node, OpExpr) && ((OpExpr *) node)->opno >= FirstNormalObjectId)
+		return true;
+	return expression_tree_walker(node, expression_calls_native, context);
+}
+
+typedef struct DomainValue
+{
+	Oid			type;
+	int32		typmod;
+	Oid			collation;
+} DomainValue;
+
+/* As DefineDomain: VALUE in a domain constraint is the value being checked. */
+static Node *
+schema_expression_domain_value(ParseState *pstate, ColumnRef *ref)
+{
+	DomainValue *value = pstate->p_ref_hook_state;
+	CoerceToDomainValue *result;
+
+	if (list_length(ref->fields) != 1 || !IsA(linitial(ref->fields), String) ||
+		strcmp(strVal(linitial(ref->fields)), "value"))
+		return NULL;
+	result = makeNode(CoerceToDomainValue);
+	result->typeId = value->type;
+	result->typeMod = value->typmod;
+	result->collation = value->collation;
+	result->location = ref->location;
+	return (Node *) result;
+}
+
+/*
+ * Bind a domain's default, or with |check| one of its CHECK constraints,
+ * against its base type, as DefineDomain does.
+ */
+static Node *
+schema_expression_bind_domain(CatalogView *view, Node *raw, const char *name, Oid base,
+							  int32 typmod, Oid collation, bool check)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	DomainValue value = {
+		.type = base,
+		.typmod = typmod,
+		.collation = collation,
+	};
+	Node	   *result = NULL;
+	int			nest = NewGUCNestLevel();
+	CatalogView *previous = CatalogViewCurrent();
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		if (schema_expression_calls_routine(raw, NULL))
+			CatalogViewSwitch(view);
+		if (check)
+		{
+			pstate->p_pre_columnref_hook = schema_expression_domain_value;
+			pstate->p_ref_hook_state = &value;
+			result = transformExpr(pstate, raw, EXPR_KIND_DOMAIN_CHECK);
+			result = coerce_to_boolean(pstate, result, "CHECK");
+			assign_expr_collations(pstate, result);
+		}
+		else
+			result = cookDefault(pstate, raw, base, typmod, name, 0);
 	}
 	PG_FINALLY();
 	{

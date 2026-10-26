@@ -1008,6 +1008,48 @@ dg_catalog_lookup_type(const char *schema, const char *name, bool temp_ok, Oid *
 	RangeVar   *rv = makeRangeVar((char *) schema, (char *) name, -1);
 	char	   *search_path;
 
+	/*
+	 * In a provisional copy of a branch's catalogs, as for relations, or in a
+	 * view still being built: names resolve to its own types, else to native
+	 * types, which are physical.
+	 */
+	if (CatalogViewIsProvisional(CatalogViewCurrent()) || CatalogViewIsPartial(CatalogViewCurrent()))
+	{
+		List	   *path = NIL;
+		CatalogView *previous;
+
+		if ((!schema || dg_system_namespace(schema)) &&
+			OidIsValid(GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(name), ObjectIdGetDatum(PG_CATALOG_NAMESPACE))))
+			return false;
+		*result = InvalidOid;
+		if (schema)
+			path = list_make1(pstrdup(schema));
+		else if (!SplitIdentifierString(pstrdup(GetConfigOption("search_path", false, false)), ',', &path))
+			elog(ERROR, "invalid search_path");
+		foreach_ptr(char, ns, path)
+		{
+			if (!strcmp(ns, "$user"))
+				ns = GetUserNameFromId(GetUserId(), false);
+			*result = CatalogViewFindObject(CatalogViewCurrent(), TypeRelationId, dg_qualified_name(ns, name));
+			if (OidIsValid(*result))
+				return true;
+		}
+		previous = CatalogViewSwitch(NULL);
+		foreach_ptr(char, ns, path)
+		{
+			Oid			namespace;
+
+			if (!strcmp(ns, "$user"))
+				ns = GetUserNameFromId(GetUserId(), false);
+			namespace = get_namespace_oid(ns, true);
+			if (OidIsValid(namespace))
+				*result = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(name), ObjectIdGetDatum(namespace));
+			if (OidIsValid(*result))
+				break;
+		}
+		CatalogViewSwitch(previous);
+		return true;
+	}
 	if (!dg_catalog_active())
 		return false;
 	search_path = pstrdup(GetConfigOption("search_path", false, false));
