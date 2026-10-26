@@ -3573,7 +3573,7 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 	dpns.argnames = argnames;
 
 	tmp = SysCacheGetAttrNotNull(PROCOID, proctup, Anum_pg_proc_prosqlbody);
-	n = stringToNode(TextDatumGetCString(tmp));
+	n = dg_routine_body(proctup, stringToNode(TextDatumGetCString(tmp)));
 
 	if (IsA(n, List))
 	{
@@ -3607,6 +3607,17 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 		get_query_def(query, buf, list_make1(&dpns), NULL, false,
 					  0, WRAP_COLUMN_DEFAULT, 0);
 	}
+}
+
+/* The SQL-standard body of function |proctup|, as pg_get_function_sqlbody prints it. */
+char *
+pg_get_function_sqlbody_tuple(HeapTuple proctup)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	print_function_sqlbody(&buf, proctup);
+	return buf.data;
 }
 
 Datum

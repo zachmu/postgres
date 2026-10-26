@@ -1064,6 +1064,19 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "trigger"))
 			provider_trigger(&rows, view, definitions[i], n, definitions, kinds);
+	for (i = 0; i < n; i++)
+	{
+		/* Comments on schema objects kept apart from tables. */
+		Oid			catalog = !strcmp(kinds[i], "routine") ? ProcedureRelationId :
+			!strcmp(kinds[i], "type") ? TypeRelationId :
+			!strcmp(kinds[i], "trigger") ? TriggerRelationId :
+			!strcmp(kinds[i], "view") ? RelationRelationId : InvalidOid;
+		char	   *comment = OidIsValid(catalog) ? json_value(definitions[i], "comment") : NULL;
+
+		if (comment)
+			provider_description(&rows, CatalogViewLookupObject(view, catalog, json_value(definitions[i], "name")),
+								 catalog, 0, comment);
+	}
 	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{

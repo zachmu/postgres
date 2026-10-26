@@ -23,13 +23,26 @@ creates_versioned_type(Node *statement)
 	return !isAnyTempNamespace(namespace) && !dg_system_namespace(get_namespace_name(namespace));
 }
 
+/* The type ALTER TYPE names with |relation|, as ALTER TABLE names a relation. */
+static Oid
+type_relation_type(RangeVar *relation, bool missing_ok)
+{
+	List	   *names = relation->schemaname ?
+		list_make2(makeString(relation->schemaname), makeString(relation->relname)) :
+		list_make1(makeString(relation->relname));
+
+	return LookupTypeNameOid(NULL, makeTypeNameFromNameList(names), missing_ok);
+}
+
 /* Whether a type DDL statement changes a versioned type. */
 static bool
 alters_versioned_type(Node *statement)
 {
 	Oid			type = InvalidOid;
 
-	if (IsA(statement, AlterEnumStmt))
+	if (IsA(statement, AlterTableStmt) && ((AlterTableStmt *) statement)->objtype == OBJECT_TYPE)
+		type = type_relation_type(((AlterTableStmt *) statement)->relation, true);
+	else if (IsA(statement, AlterEnumStmt))
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 	else if (IsA(statement, AlterDomainStmt))
 		type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterDomainStmt *) statement)->typeName));
@@ -77,30 +90,41 @@ type_tables(const char *root, const char *type)
 	return tables;
 }
 
-typedef struct EnumLabel
+/*
+ * A change to user type |name| that stored values follow: an enum's label
+ * |old| renamed to |renamed|, or a composite type's fields laid out again,
+ * new field i being old field |mapping|[i], or absent if that is -1.
+ */
+typedef struct TypeRecode
 {
-	TupleDesc	desc;
-	Oid			type;
+	const char *name;
 	const char *old;
 	const char *renamed;
-} EnumLabel;
+	int			count;
+	int		   *mapping;
+	TupleDesc	desc;			/* of the table being rewritten */
+	Oid			type;			/* the type, in its catalogs */
+} TypeRecode;
 
 static PLSlice
-enum_label_field(int field, PLSlice bytes, void *arg)
+type_recode_field(int field, PLSlice bytes, void *arg)
 {
-	EnumLabel  *label = arg;
+	TypeRecode *recode = arg;
+	Oid			type = TupleDescAttr(recode->desc, field)->atttypid;
 
-	return dg_recode_label(TupleDescAttr(label->desc, field)->atttypid, bytes, label->type, label->old, label->renamed);
+	if (recode->mapping)
+		return dg_recode_composite(type, bytes, recode->type, recode->count, recode->mapping);
+	return dg_recode_label(type, bytes, recode->type, recode->old, recode->renamed);
 }
 
 /*
- * Install the rows of every table that can hold a value of enum |type| again
- * on the working branch, with label |old| renamed to |renamed| if given. Rows
- * hold labels, and index keys label positions, which an added label shifts;
- * installing rows rebuilds their indexes.
+ * Install the rows of every table of database root |root| that can hold a
+ * value of type |type| again on the working branch, changed as |recode| says
+ * if given. Rows hold enum labels, and index keys label positions, which an
+ * added label shifts; installing rows rebuilds their indexes.
  */
 static void
-enum_tables_rewrite(const char *root, const char *type, const char *old, const char *renamed)
+type_tables_rewrite(const char *root, const char *type, TypeRecode *recode)
 {
 	List	   *tables = type_tables(root, type);
 
@@ -111,19 +135,24 @@ enum_tables_rewrite(const char *root, const char *type, const char *old, const c
 		TupleDesc	desc = RelationGetDescr(rel);
 		PLTree		tree = state->content;
 
-		if (old)
+		if (recode)
 		{
 			int		   *mapping = palloc_array(int, Max(desc->natts, 1));
-			EnumLabel	label = {
-				.desc = desc,
-				.type = CatalogViewLookupObject(rel->rd_catalogview, TypeRelationId, type),
-				.old = old,
-				.renamed = renamed,
-			};
+			CatalogView *previous = CatalogViewSwitch(rel->rd_catalogview);
 
 			for (int i = 0; i < desc->natts; i++)
 				mapping[i] = i;
-			tree = alter_rows(state, desc->natts, desc->natts, mapping, enum_label_field, &label);
+			recode->desc = desc;
+			recode->type = CatalogViewLookupObject(rel->rd_catalogview, TypeRelationId, type);
+			PG_TRY();
+			{
+				tree = alter_rows(state, desc->natts, desc->natts, mapping, type_recode_field, recode);
+			}
+			PG_FINALLY();
+			{
+				CatalogViewSwitch(previous);
+			}
+			PG_END_TRY();
 		}
 		dg_history_install(rel, state, tree);
 		dg_release(state);
@@ -133,6 +162,23 @@ enum_tables_rewrite(const char *root, const char *type, const char *old, const c
 	if (tables)
 		move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
 	advance_snapshot();
+}
+
+/*
+ * The attribute numbers of composite type relation |relid|'s attributes, in
+ * the order its definition lists them: dropped ones are not encoded.
+ */
+static List *
+type_attribute_numbers(Oid relid)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	List	   *numbers = NIL;
+
+	for (int i = 0; i < RelationGetDescr(rel)->natts; i++)
+		if (!TupleDescAttr(RelationGetDescr(rel), i)->attisdropped)
+			numbers = lappend_int(numbers, TupleDescAttr(RelationGetDescr(rel), i)->attnum);
+	relation_close(rel, AccessShareLock);
+	return numbers;
 }
 
 /* Type DDL makes no storage; a composite type's relation has none. */
@@ -149,7 +195,9 @@ type_ddl(ParseState *pstate, Node *statement)
 	CatalogView *view = CatalogViewCreate("provisional type DDL");
 	CatalogView *previous = CatalogViewCurrent();
 	CatalogView *saved_mutation = native_mutation_view;
-	Oid			enum_type = InvalidOid;
+	Oid			altered = InvalidOid;
+	List	   *before = NIL,
+			   *after = NIL;
 	Oid			caller,
 				privileged;
 	int			security,
@@ -189,7 +237,7 @@ type_ddl(ParseState *pstate, Node *statement)
 									((CompositeTypeStmt *) statement)->coldeflist);
 				break;
 			case T_AlterEnumStmt:
-				enum_type = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
+				altered = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
 				AlterEnum((AlterEnumStmt *) statement);
 				break;
 			case T_AlterDomainStmt:
@@ -221,6 +269,26 @@ type_ddl(ParseState *pstate, Node *statement)
 					}
 					break;
 				}
+			case T_AlterTableStmt:
+				{
+					/* ALTER TYPE ... ATTRIBUTE, as ProcessUtilitySlow runs it. */
+					AlterTableStmt *stmt = (AlterTableStmt *) statement;
+					AlterTableUtilityContext context = {0};
+					PlannedStmt *plan = makeNode(PlannedStmt);
+					LOCKMODE	lockmode = AlterTableGetLockLevel(stmt->cmds);
+
+					altered = type_relation_type(stmt->relation, false);
+					before = type_attribute_numbers(typeidTypeRelid(altered));
+					plan->commandType = CMD_UTILITY;
+					plan->utilityStmt = statement;
+					context.pstmt = plan;
+					context.queryString = pstate->p_sourcetext;
+					context.relid = AlterTableLookupRelation(stmt, lockmode);
+					AlterTable(stmt, lockmode, &context);
+					CommandCounterIncrement();
+					after = type_attribute_numbers(typeidTypeRelid(altered));
+					break;
+				}
 			default:
 				elog(ERROR, "unrecognized versioned type statement");
 		}
@@ -241,8 +309,27 @@ type_ddl(ParseState *pstate, Node *statement)
 
 			/* An added label shifts the positions that index keys hold. */
 			if (IsA(statement, AlterEnumStmt))
-				enum_tables_rewrite(metadata(database, "database"),
-									CatalogViewObjectIdentity(enum_type, TypeRelationId), NULL, NULL);
+				type_tables_rewrite(metadata(database, "database"),
+									CatalogViewObjectIdentity(altered, TypeRelationId), NULL);
+
+			/* Stored composite values hold fields by position. */
+			if (IsA(statement, AlterTableStmt) && !equal(before, after))
+			{
+				TypeRecode	recode = {
+					.count = list_length(after),
+					.mapping = palloc_array(int, Max(list_length(after), 1)),
+				};
+
+				foreach_int(attnum, after)
+				{
+					recode.mapping[foreach_current_index(attnum)] = -1;
+					foreach_int(old, before)
+						if (old == attnum)
+						recode.mapping[foreach_current_index(attnum)] = foreach_current_index(old);
+				}
+				type_tables_rewrite(metadata(database, "database"),
+									CatalogViewObjectIdentity(altered, TypeRelationId), &recode);
+			}
 		}
 		end_api(nest);
 		UpdateActiveSnapshotCommandId();
@@ -263,7 +350,7 @@ dg_catalog_type_ddl(ParseState *pstate, Node *statement)
 
 	if (!IsA(statement, CreateEnumStmt) && !IsA(statement, CreateDomainStmt) &&
 		!IsA(statement, CompositeTypeStmt) && !IsA(statement, AlterEnumStmt) &&
-		!IsA(statement, AlterDomainStmt))
+		!IsA(statement, AlterDomainStmt) && !IsA(statement, AlterTableStmt))
 		return false;
 	if (!dg_catalog_active() || !(creates_versioned_type(statement) || alters_versioned_type(statement)))
 		return false;

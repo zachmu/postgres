@@ -4,7 +4,8 @@
  * where every object still refers to the renamed one by OID, and then
  * encodes again from that copy exactly the renamed object and the members
  * the database's dependency record lists as referring to it. Tables and
- * indexes keep their rows and storage under their new names.
+ * indexes keep their rows and storage under their new names. COMMENT on a
+ * member stored apart from tables changes it in place the same way.
  */
 
 /* A versioned object's definition, encoded again from provisional |view|. */
@@ -150,9 +151,12 @@ rename_publish(CatalogView *view, Capture current, List *targets)
 			Oid			namespace = CatalogViewLookupObject(view, NamespaceRelationId, names[i]);
 			CatalogView *previous = CatalogViewSwitch(view);
 			char	   *name = get_namespace_name(namespace);
+			char	   *comment = GetComment(namespace, NamespaceRelationId, 0);
 
 			CatalogViewSwitch(previous);
-			run("SELECT jsonb_set($1::jsonb,'{name}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(name)), NULL, true);
+			run("SELECT jsonb_set(jsonb_set($1::jsonb,'{name}',to_jsonb($2::text)),'{comment}',coalesce(to_jsonb($3::text),'null'))::text", 3,
+				VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(name), comment ? CStringGetTextDatum(comment) : (Datum) 0),
+				comment ? NULL : "  n", true);
 			payload = strcell(0, 1);
 			member = put("namespace", payload, NULL, 0);
 		}
@@ -257,6 +261,82 @@ rename_schema_members(List *targets, const char *root, const char *schema)
 }
 
 /*
+ * The versioned object a COMMENT statement describes, if it is a member
+ * stored apart from tables: tables and their columns keep their comments in
+ * their definitions, which ALTER TABLE changes.
+ */
+static bool
+comment_subject(CommentStmt *stmt, char **kind, char **name, List **references)
+{
+	Oid			id;
+
+	*references = NIL;
+	switch (stmt->objtype)
+	{
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			id = LookupFuncWithArgs(stmt->objtype, castNode(ObjectWithArgs, stmt->object), true);
+			if (!OidIsValid(id) || id < FirstDurableObjectId)
+				return false;
+			*kind = "routine";
+			*name = CatalogViewObjectIdentity(id, ProcedureRelationId);
+			return true;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			{
+				HeapTuple	tuple;
+				bool		member;
+
+				id = LookupTypeNameOid(NULL, castNode(TypeName, stmt->object), true);
+				if (!OidIsValid(id) || id < FirstDurableObjectId)
+					return false;
+				tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(id));
+				member = type_versioned_row((Form_pg_type) GETSTRUCT(tuple));
+				ReleaseSysCache(tuple);
+				if (!member)
+					unsupported("comments on a versioned table's row type");
+				*kind = "type";
+				*name = CatalogViewObjectIdentity(id, TypeRelationId);
+				return true;
+			}
+		case OBJECT_VIEW:
+			id = RangeVarGetRelid(makeRangeVarFromNameList(castNode(List, stmt->object)), NoLock, true);
+			if (!OidIsValid(id) || id < FirstDurableObjectId || get_rel_relkind(id) != RELKIND_VIEW)
+				return false;
+			*kind = "view";
+			*name = CatalogViewObjectIdentity(id, RelationRelationId);
+			return true;
+		case OBJECT_SCHEMA:
+			{
+				char	   *schema = strVal(stmt->object);
+				int			nest = begin_api();
+				bool		versioned = catalog_namespace_find(read_ref(branch_ref("working")).target, schema) != NULL;
+
+				end_api(nest);
+				if (!versioned)
+					return false;
+				*kind = "namespace";
+				*name = pstrdup(schema);
+				return true;
+			}
+		case OBJECT_TRIGGER:
+			{
+				List	   *names = castNode(List, stmt->object);
+
+				id = RangeVarGetRelid(makeRangeVarFromNameList(list_copy_head(names, list_length(names) - 1)), NoLock, true);
+				if (!OidIsValid(id) || id < FirstDurableObjectId)
+					return false;
+				*kind = "trigger";
+				*name = psprintf("%s/%s", CatalogViewObjectIdentity(id, RelationRelationId), strVal(llast(names)));
+				return true;
+			}
+		default:
+			return false;
+	}
+}
+
+/*
  * The versioned object a rename statement renames, in provisional |view|:
  * its kind and old name, and the references by which members name it.
  * Returns false if the statement renames no versioned object.
@@ -287,6 +367,8 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 		object = ((AlterObjectSchemaStmt *) statement)->object;
 		relation = ((AlterObjectSchemaStmt *) statement)->relation;
 	}
+	else if (IsA(statement, CommentStmt))
+		return comment_subject((CommentStmt *) statement, kind, name, references);
 	else if (IsA(statement, AlterEnumStmt) && ((AlterEnumStmt *) statement)->oldVal)
 	{
 		Oid			id = typenameTypeId(NULL, makeTypeNameFromNameList(((AlterEnumStmt *) statement)->typeName));
@@ -410,7 +492,8 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 			   *name;
 	List	   *references;
 
-	if ((!IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt) && !IsA(statement, AlterEnumStmt)) ||
+	if ((!IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt) && !IsA(statement, AlterEnumStmt) &&
+		 !IsA(statement, CommentStmt)) ||
 		!dg_catalog_active())
 		return false;
 	if (!ActiveSnapshotSet())
@@ -474,14 +557,16 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		CatalogViewSetStorageHandler(view, rename_storage);
 		native_mutation_view = view;
 
-		/* Views' queries name what they use; bind them before it is renamed. */
-		view_materialize_rules(view, targets);
+		/* Stored queries name what they use; bind them before it is renamed. */
+		materialize_queries(view, targets);
 		CatalogViewSwitch(view);
 		SetUserIdAndSecContext(caller, security);
 		if (IsA(statement, RenameStmt))
 			ExecRenameStmt((RenameStmt *) statement);
 		else if (IsA(statement, AlterEnumStmt))
 			AlterEnum((AlterEnumStmt *) statement);
+		else if (IsA(statement, CommentStmt))
+			(void) CommentObject((CommentStmt *) statement);
 		else
 			ExecAlterObjectSchemaStmt((AlterObjectSchemaStmt *) statement, NULL);
 		CommandCounterIncrement();
@@ -499,15 +584,21 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 		root = metadata(current.hash, "database");
 		rename_publish(view, current, targets);
 		if (IsA(statement, AlterEnumStmt))
-			enum_tables_rewrite(root, name, ((AlterEnumStmt *) statement)->oldVal,
-								((AlterEnumStmt *) statement)->newVal);
+		{
+			TypeRecode	recode = {
+				.old = ((AlterEnumStmt *) statement)->oldVal,
+				.renamed = ((AlterEnumStmt *) statement)->newVal,
+			};
+
+			type_tables_rewrite(root, name, &recode);
+		}
 		end_api(nest);
 
 		/*
 		 * Physical schemas are shared by every branch and by native objects:
 		 * the old one stays, and the new name has one too.
 		 */
-		if (!strcmp(kind, "namespace") && !OidIsValid(get_namespace_oid(((RenameStmt *) statement)->newname, true)))
+		if (!strcmp(kind, "namespace") && IsA(statement, RenameStmt) && !OidIsValid(get_namespace_oid(((RenameStmt *) statement)->newname, true)))
 		{
 			HeapTuple	old = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(get_namespace_oid(name, false)));
 

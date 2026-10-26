@@ -57,7 +57,28 @@ is($s->query_safe(q{SELECT provolatile::text||array_to_string(proconfig,',') FRO
 $s->query_safe(q{CREATE SCHEMA moved; ALTER FUNCTION altered(int) SET SCHEMA moved; ALTER FUNCTION moved.altered(int) RENAME TO renamed; ALTER FUNCTION moved.renamed(int) RESET ALL});
 is($s->query_safe(q{SELECT moved.renamed(6)||','||(SELECT count(*) FROM pg_proc WHERE proname='altered')||','||(SELECT proconfig IS NULL FROM pg_proc WHERE proname='renamed')}),'12,0,true','SET SCHEMA, RENAME and RESET of a versioned routine');
 is($s->query_safe(q{SELECT count(*) FROM pg_proc AS OF 'main' WHERE proname IN ('altered','renamed')}),'0','routine ALTER leaves another branch unchanged');
-my ($badout,$bad)=$s->query(q{CREATE OR REPLACE FUNCTION f(input text) RETURNS int LANGUAGE sql AS $$SELECT 1$$});
+my ($badout,$bad);
+$s->query_safe(q{COMMENT ON FUNCTION moved.renamed(int) IS 'doubles'; COMMENT ON PROCEDURE add_row(int, text) IS 'adds'});
+is($s->query_safe(q{SELECT obj_description('moved.renamed'::regproc, 'pg_proc')||','||obj_description('add_row'::regproc, 'pg_proc')}),'doubles,adds','COMMENT ON FUNCTION and PROCEDURE');
+$s->query_safe(q{ALTER FUNCTION moved.renamed(int) RENAME TO commented});
+is($s->query_safe(q{SELECT obj_description('moved.commented'::regproc, 'pg_proc')}),'doubles','a routine keeps its comment when renamed');
+is($s->query_safe(q{SELECT (SELECT count(*) FROM pg_description WHERE description='adds')||','||(SELECT count(*) FROM pg_description AS OF 'main' WHERE description='adds')}),'1,0','a comment is branched');
+
+# ---- SQL-standard bodies ----
+$s->query_safe(q{CREATE FUNCTION plus_one(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x + 1;
+CREATE FUNCTION named_rows(m int) RETURNS bigint LANGUAGE sql STABLE BEGIN ATOMIC SELECT count(*) * m FROM t; END;
+CREATE PROCEDURE add_next(i int) LANGUAGE sql BEGIN ATOMIC INSERT INTO t VALUES (plus_one(i), 'atomic'); END});
+$s->query_safe(q{CALL add_next(40)});
+is($s->query_safe(q{SELECT plus_one(1)||','||named_rows(10)||','||(SELECT v FROM t WHERE id=41)}),'2,30,atomic','RETURN and BEGIN ATOMIC bodies run');
+is($s->query_safe(q{SELECT pg_get_function_sqlbody('add_next'::regproc)}),"BEGIN ATOMIC\n INSERT INTO t (id, v)\n   VALUES (plus_one(add_next.i), 'atomic'::text);\nEND",'a SQL-standard body deparses as native');
+($badout,$bad)=$s->query(q{DROP FUNCTION plus_one(int)});
+is($bad,1,'a SQL-standard body protects the routines it calls');like($s->{stderr},qr/function add_next\(integer\) depends on function plus_one\(integer\)/,'a SQL-standard body protects the routines it calls diagnostic');$s->{stderr}='';
+$s->query_safe(q{ALTER FUNCTION plus_one(int) RENAME TO incremented; ALTER TABLE t RENAME COLUMN v TO w});
+is($s->query_safe(q{SELECT pg_get_function_sqlbody('add_next'::regproc)}),"BEGIN ATOMIC\n INSERT INTO t (id, w)\n   VALUES (incremented(add_next.i), 'atomic'::text);\nEND",'renames rewrite a SQL-standard body');
+$s->query_safe(q{CALL add_next(42); ALTER TABLE t RENAME COLUMN w TO v});
+is($s->query_safe(q{SELECT count(*) FROM t WHERE v='atomic'}),'2','a rewritten body runs');
+is($s->query_safe(q{SELECT count(*) FROM pg_proc AS OF 'main' WHERE proname IN ('plus_one','named_rows','add_next')}),'0','SQL-standard routines are branched');
+($badout,$bad)=$s->query(q{CREATE OR REPLACE FUNCTION f(input text) RETURNS int LANGUAGE sql AS $$SELECT 1$$});
 is($bad,1,'native replacement rejects changing return type');$s->{stderr}='';
 is($s->query_safe(q{SELECT f('x')}),'x_other','failed replacement leaves definition intact');
 ($badout,$bad)=$s->query(q{DROP TABLE t});

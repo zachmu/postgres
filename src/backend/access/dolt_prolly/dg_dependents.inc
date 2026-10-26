@@ -168,9 +168,10 @@ definition_references(const char *kind, const char *definition)
 				references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
 		}
 	}
-	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")))
+	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")) ||
+		(!strcmp(kind, "routine") && json_value(definition, "dependencies")))
 	{
-		/* A view's query, or a materialized view's, lists what it uses. */
+		/* A view's query, a materialized view's, or a SQL-standard body lists what it uses. */
 		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies',$1::jsonb->'matview'->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 		{
 			uint64		n = SPI_processed;
@@ -193,7 +194,7 @@ definition_references(const char *kind, const char *definition)
 			}
 		}
 	}
-	else if (!strcmp(kind, "routine"))
+	if (!strcmp(kind, "routine"))
 	{
 		references_type(&references, json_value(definition, "prorettype"));
 		references_type(&references, json_value(definition, "provariadic"));
@@ -221,6 +222,8 @@ definition_references(const char *kind, const char *definition)
 		char	   *name;
 
 		references_add(&references, "table", json_value(definition, "table"));
+		if (trigger->constrrel)
+			references_add(&references, "table", dg_qualified_name(trigger->constrrel->schemaname, trigger->constrrel->relname));
 		if ((name = references_name(trigger->funcname)))
 			references_add(&references, "routine", name);
 		(void) references_walker(trigger->whenClause, &references);

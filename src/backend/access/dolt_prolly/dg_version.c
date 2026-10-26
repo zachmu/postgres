@@ -29,6 +29,7 @@
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
 #include "commands/alter.h"
+#include "commands/comment.h"
 #include "rewrite/rewriteSupport.h"
 #include "parser/analyze.h"
 #include "commands/view.h"
@@ -43,6 +44,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
+#include "executor/functions.h"
 #include "commands/defrem.h"
 #include "commands/proclang.h"
 #include "parser/parse_coerce.h"
@@ -506,6 +508,16 @@ json_field(StringInfo b, const char *key, const char *value, bool comma)
 	escape_json(b, value);
 }
 
+/* A schema object's comment, as a "comment" field following others, if it has one. */
+static void
+json_comment(StringInfo b, Oid object, Oid catalog)
+{
+	char	   *comment = GetComment(object, catalog, 0);
+
+	if (comment)
+		json_field(b, "comment", comment, true);
+}
+
 /* The canonical membership of |branch|: its working schema, else its head's. */
 static bytea *
 catalog_database(const char *branch)
@@ -532,6 +544,8 @@ static CatalogView *provider_schema_view(bytea *database);
 static char *json_value(const char *json, const char *key);
 
 static char *database_dependents(const char *json, Datum *members, int count);
+static char *routine_body_encode(HeapTuple tuple, char **dependencies);
+static Oid	provider_view_dependency(CatalogView *view, const char *kind, const char *name);
 
 static bytea *
 canonical_database(const char *json, Datum *members, int count)

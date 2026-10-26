@@ -114,6 +114,7 @@ extern PLSlice dg_encode(Relation rel, TupleTableSlot *slot);
 
 extern PLSlice dg_encode_value(Oid type, Datum value);
 extern PLSlice dg_recode_label(Oid type, PLSlice bytes, Oid target, const char *old, const char *renamed);
+extern PLSlice dg_recode_composite(Oid type, PLSlice bytes, Oid target, int count, const int *mapping);
 extern bool dg_key_ordered(Oid type);
 extern PLSlice dg_key_value(Oid type, Datum value);
 extern PLSlice dg_key_field(Oid type, PLSlice bytes);

@@ -50,6 +50,9 @@ is(sql(q{SELECT ww FROM pos WHERE id=1}),'24','CREATE OR REPLACE VIEW');
 is(sql(q{SELECT ww FROM pos AS OF 'HEAD' WHERE id=1}),'10','AS OF reads a view as its revision defines it, over its revision\'s rows');
 is(sql(q{SELECT a FROM "postgres/other".public.named WHERE b=1}),'10','another branch\'s view');
 is(sql(q{SELECT count(*) FROM pg_views WHERE viewname IN ('pos','named','checked')}),'3','pg_views lists versioned views');
+sql(q{COMMENT ON VIEW pos IS 'positive rows'; CREATE OR REPLACE VIEW pos AS SELECT id, twice(twice(val)) AS ww, val FROM base WHERE val > 0});
+is(sql(q{SELECT obj_description('pos'::regclass, 'pg_class')}),'positive rows','COMMENT ON VIEW, kept by CREATE OR REPLACE');
+fails(q{CREATE OR REPLACE VIEW pos AS SELECT id FROM base},qr/cannot drop columns from view/,'CREATE OR REPLACE replaces a versioned view, as native');
 
 # ---- drops ----
 sql(q{DROP VIEW named; DROP TABLE base CASCADE});
@@ -64,6 +67,8 @@ is(sql(q{SELECT count(*) FROM mv}),'2','a materialized view holds its rows');
 fails(q{SELECT * FROM lazy},qr/has not been populated/,'WITH NO DATA');
 sql(q{INSERT INTO src VALUES (3,'z'); REFRESH MATERIALIZED VIEW mv; REFRESH MATERIALIZED VIEW lazy});
 is(sql(q{SELECT count(*) FROM mv}).':'.sql(q{SELECT one FROM lazy}),'3:1','REFRESH MATERIALIZED VIEW');
+sql(q{COMMENT ON MATERIALIZED VIEW mv IS 'materialized'});
+is(sql(q{SELECT obj_description('mv'::regclass, 'pg_class')}),'materialized','COMMENT ON MATERIALIZED VIEW');
 sql(q{ALTER TABLE src RENAME TO src2; ALTER TABLE src2 RENAME COLUMN b TO bb; ALTER MATERIALIZED VIEW mv RENAME TO mv2});
 is(sql(q{SELECT pg_get_viewdef('mv2'::regclass)})," SELECT a,\n    bb AS b\n   FROM src2\n  WHERE (a > 0);",'renames rewrite a materialized view\'s query');
 sql(q{SELECT dolt_commit('-Am','materialized')});

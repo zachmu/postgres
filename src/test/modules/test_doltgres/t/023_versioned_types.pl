@@ -59,6 +59,16 @@ sql(q{CREATE TYPE spare AS ENUM ('a'); ALTER TYPE spare RENAME TO extra});
 is(sql(q{SELECT enum_range(NULL::extra)}),'{a}','an unused type renames');
 sql(q{ALTER TYPE mood RENAME TO feeling; ALTER TYPE feeling RENAME TO mood});
 is(sql(q{SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid='e'::regclass AND attname='m'}),'mood','renaming a used type rewrites its users');
+sql(q{CREATE TYPE wrap AS (inner_p pair, n int); CREATE TABLE w(id int PRIMARY KEY, v wrap); INSERT INTO w VALUES (1, ROW(ROW(5,'ok')::pair, 9))});
+sql(q{ALTER TYPE pair ADD ATTRIBUTE z int});
+is(sql(q{SELECT p::text||ps::text||(SELECT v::text FROM w) FROM c}),'(1,glad,){"(2,ok,)"}("(5,ok,)",9)','ADD ATTRIBUTE extends stored values, arrays and nested values');
+sql(q{INSERT INTO c VALUES (2, ROW(3,'sad',4), NULL); ALTER TYPE pair DROP ATTRIBUTE b});
+is(sql(q{SELECT string_agg(p::text, ',' ORDER BY id) FROM c}).sql(q{SELECT v::text FROM w}),'(1,),(3,4)("(5,)",9)','DROP ATTRIBUTE removes stored fields');
+fails(q{ALTER TYPE pair ALTER ATTRIBUTE x TYPE bigint},qr/cannot alter type "pair" because column "c\.(p|ps)" uses it/,'ALTER ATTRIBUTE TYPE of a used type is rejected, as native');
+sql(q{DROP TABLE w; DROP TYPE wrap; CREATE TYPE loose AS (a int); ALTER TYPE loose ALTER ATTRIBUTE a TYPE text, ADD ATTRIBUTE b int});
+is(sql(q{SELECT string_agg(attname||':'||format_type(atttypid, NULL), ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid=(SELECT typrelid FROM pg_type WHERE typname='loose') AND attnum>0}),'a:text,b:integer','ALTER ATTRIBUTE TYPE of an unused type');
+sql(q{COMMENT ON TYPE loose IS 'loose ends'; COMMENT ON DOMAIN upbeat IS 'cheerful'});
+is(sql(q{SELECT obj_description('loose'::regtype, 'pg_type')||','||obj_description('upbeat'::regtype, 'pg_type')}),'loose ends,cheerful','COMMENT ON TYPE and DOMAIN');
 
 # ---- routines and dependencies ----
 sql(q{CREATE FUNCTION cheer(f mood) RETURNS mood LANGUAGE sql AS $$SELECT 'glad'::mood$$});
@@ -79,8 +89,8 @@ sql(q{SELECT dolt_merge('b1')});
 fails(q{SELECT dolt_merge('b2')},qr/merge conflict in the definition of type public\.mood/,'a type changed on both branches conflicts');
 
 # ---- drops ----
-sql(q{DROP TABLE c, d; DROP TYPE pair; DROP DOMAIN upbeat});
-is(sql(q{SELECT count(*) FROM pg_type WHERE typname IN ('pair','_pair','upbeat')}),'0','DROP TYPE and DROP DOMAIN');
+sql(q{DROP TABLE c, d; DROP TYPE pair; DROP DOMAIN upbeat; DROP TYPE loose});
+is(sql(q{SELECT count(*) FROM pg_type WHERE typname IN ('pair','_pair','upbeat','loose')}),'0','DROP TYPE and DROP DOMAIN');
 is(sql(q{SELECT count(*) FROM pg_type AS OF 'HEAD' WHERE typname='pair'}),'1','history keeps dropped types');
 $node->stop;
 done_testing();

@@ -32,6 +32,7 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 	Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tuple);
 	StringInfoData json,
 				identity;
+	char	   *dependencies = NULL;
 	HeapTuple	language = SearchSysCache1(LANGOID, ObjectIdGetDatum(proc->prolang));
 	char	   *lang = pstrdup(NameStr(((Form_pg_language) GETSTRUCT(language))->lanname));
 	int			i;
@@ -122,9 +123,12 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 					encoded = OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(construct_array(sql, n, TEXTOID, -1, false, TYPALIGN_INT)));
 					break;
 				}
-			case Anum_pg_proc_protrftypes:
 			case Anum_pg_proc_prosqlbody:
-				unsupported("canonical routine parsed bodies or transforms");
+				/* A SQL-standard body is its SQL, analyzed again when read. */
+				encoded = routine_body_encode(tuple, &dependencies);
+				break;
+			case Anum_pg_proc_protrftypes:
+				unsupported("canonical routine transforms");
 				pg_unreachable();
 			default:
 				getTypeOutputInfo(attr->atttypid, &output, &varlena);
@@ -133,6 +137,9 @@ routine_encode(HeapTuple tuple, TupleDesc desc)
 		}
 		escape_json(&json, encoded);
 	}
+	if (dependencies)
+		appendStringInfo(&json, ",\"dependencies\":%s", dependencies);
+	json_comment(&json, proc->oid, ProcedureRelationId);
 	appendStringInfoChar(&json, '}');
 	run("SELECT $1::jsonb::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json.data)), NULL, true);
 	return strcell(0, 1);

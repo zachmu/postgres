@@ -14,6 +14,25 @@ deletion_contains(List *objects, Oid classid, Oid id)
 	return false;
 }
 
+/* Rows of a table whose columns a deletion removed, to be laid out again. */
+typedef struct DeletedColumns
+{
+	char	   *table;
+	int			oldcount;
+	int			count;
+	int		   *mapping;
+} DeletedColumns;
+
+/* Whether |objects| deletes column |attnum| of relation |relid|. */
+static bool
+deletion_contains_column(List *objects, Oid relid, int attnum)
+{
+	foreach_ptr(ObjectAddress, object, objects)
+		if (object->classId == RelationRelationId && object->objectId == relid && object->objectSubId == attnum)
+		return true;
+	return false;
+}
+
 static void
 publish_deletions(List *objects, CatalogView *view)
 {
@@ -30,6 +49,7 @@ publish_deletions(List *objects, CatalogView *view)
 	int			n,
 				used = 0;
 	bytea	   *database;
+	List	   *deleted_columns = NIL;
 
 	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) h JOIN pg_dolt_object_visible o ON o.objhash=h WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 	n = SPI_processed;
@@ -98,7 +118,7 @@ publish_deletions(List *objects, CatalogView *view)
 				{
 					ObjectAddress column = GetAttrDefaultColumnAddress(object->objectId);
 
-					if (column.objectId == tableid)
+					if (column.objectId == tableid && !deletion_contains_column(objects, tableid, column.objectSubId))
 					{
 						if (get_attgenerated(tableid, column.objectSubId))
 							unsupported("dropping a generation expression with a routine it calls");
@@ -127,6 +147,36 @@ publish_deletions(List *objects, CatalogView *view)
 					changed = true;
 				}
 				ReleaseSysCache(tuple);
+			}
+
+			/*
+			 * Columns go last, as the edits above find columns by position.
+			 * Rows hold fields by position too: they are laid out again once
+			 * the definition is published.
+			 */
+			{
+				DeletedColumns *columns = palloc0(sizeof(DeletedColumns));
+				ArrayBuildState *positions = initArrayResult(INT4OID, CurrentMemoryContext, false);
+
+				run("SELECT jsonb_array_length($1::jsonb->'columns')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+				columns->oldcount = DatumGetInt32(cell(0, 1));
+				columns->mapping = palloc_array(int, Max(columns->oldcount, 1));
+				for (int attnum = 1; attnum <= columns->oldcount; attnum++)
+				{
+					if (deletion_contains_column(objects, tableid, attnum))
+						accumArrayResult(positions, Int32GetDatum(attnum), false, INT4OID, CurrentMemoryContext);
+					else
+						columns->mapping[columns->count++] = attnum - 1;
+				}
+				if (columns->count < columns->oldcount)
+				{
+					run("SELECT jsonb_set($1::jsonb,'{columns}',(SELECT coalesce(jsonb_agg(v ORDER BY ord),'[]'::jsonb) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE ord <> ALL($2::int[])))::text", 2,
+						VC_TYPES(TEXTOID, INT4ARRAYOID), VC_ARGS(CStringGetTextDatum(definition), makeArrayResult(positions, CurrentMemoryContext)), NULL, true);
+					definition = strcell(0, 1);
+					columns->table = names[i];
+					deleted_columns = lappend(deleted_columns, columns);
+					changed = true;
+				}
 			}
 			if (changed)
 			{
@@ -157,6 +207,23 @@ publish_deletions(List *objects, CatalogView *view)
 	(void) provider_view(database);
 	move_ref(branch_ref("working"), working, database);
 	advance_snapshot();
+
+	/* Installing rows rebuilds the table's surviving indexes. */
+	foreach_ptr(DeletedColumns, columns, deleted_columns)
+	{
+		Relation	rel = dg_catalog_write_table(dg_current_branch(), columns->table, ACL_UPDATE);
+		DGState    *state = dg_load(rel, SnapshotSelf);
+
+		dg_history_install(rel, state, alter_rows(state, columns->oldcount, columns->count, columns->mapping, NULL, NULL));
+		dg_release(state);
+		dg_storage_close_relation(rel);
+		UpdateActiveSnapshotCommandId();
+	}
+	if (deleted_columns)
+	{
+		move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture(true).hash);
+		advance_snapshot();
+	}
 }
 
 static bool
@@ -184,13 +251,32 @@ canonical_drop(Node *statement)
 	{
 		AlterTableStmt *alter = (AlterTableStmt *) statement;
 
+		AlterTableType subtype;
+
 		if (!alter->cmds)
 			return false;
+		subtype = linitial_node(AlterTableCmd, alter->cmds)->subtype;
 		foreach(lc, alter->cmds)
-			if (lfirst_node(AlterTableCmd, lc)->subtype != AT_DropConstraint)
+			if (lfirst_node(AlterTableCmd, lc)->subtype != subtype)
+			return false;
+
+		/*
+		 * Columns are dropped here only with what depends on them; native
+		 * ALTER drops a column alone.
+		 */
+		if (subtype == AT_DropColumn)
+		{
+			bool		cascade = false;
+
+			foreach(lc, alter->cmds)
+				cascade |= lfirst_node(AlterTableCmd, lc)->behavior == DROP_CASCADE;
+			if (!cascade)
+				return false;
+		}
+		else if (subtype != AT_DropConstraint)
 			return false;
 		stmt = makeNode(DropStmt);
-		stmt->removeType = OBJECT_TABCONSTRAINT;
+		stmt->removeType = subtype == AT_DropColumn ? OBJECT_COLUMN : OBJECT_TABCONSTRAINT;
 		stmt->objects = alter->cmds;
 		stmt->behavior = linitial_node(AlterTableCmd, alter->cmds)->behavior;
 		constraint_table = alter->relation;
@@ -204,7 +290,7 @@ canonical_drop(Node *statement)
 		stmt->removeType != OBJECT_SCHEMA && stmt->removeType != OBJECT_TYPE &&
 		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER &&
 		stmt->removeType != OBJECT_DOMAIN && stmt->removeType != OBJECT_VIEW &&
-		stmt->removeType != OBJECT_MATVIEW)
+		stmt->removeType != OBJECT_MATVIEW && stmt->removeType != OBJECT_COLUMN)
 		return false;
 	if (!dg_catalog_active())
 		return false;
@@ -274,7 +360,30 @@ canonical_drop(Node *statement)
 			Oid			namespaceid = InvalidOid,
 						owning_table = InvalidOid;
 
-			if (stmt->removeType == OBJECT_TABCONSTRAINT)
+			if (stmt->removeType == OBJECT_COLUMN)
+			{
+				AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+				if (!dg_catalog_lookup_relation(constraint_table, false, &owning_table))
+					unsupported("column deletion on a shared relation");
+				namespaceid = get_rel_namespace(owning_table);
+				object.classId = RelationRelationId;
+				object.objectSubId = get_attnum(owning_table, cmd->name);
+				if (object.objectSubId == InvalidAttrNumber)
+				{
+					if (!cmd->missing_ok)
+						ereport(ERROR,
+								(errcode(ERRCODE_UNDEFINED_COLUMN),
+								 errmsg("column \"%s\" of relation \"%s\" does not exist",
+										cmd->name, get_rel_name(owning_table))));
+					ereport(NOTICE,
+							(errmsg("column \"%s\" of relation \"%s\" does not exist, skipping",
+									cmd->name, get_rel_name(owning_table))));
+					continue;
+				}
+				object.objectId = owning_table;
+			}
+			else if (stmt->removeType == OBJECT_TABCONSTRAINT)
 			{
 				AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
 
@@ -383,6 +492,18 @@ canonical_drop(Node *statement)
 			if (OidIsValid(relation) && AfterTriggerPendingOnRel(relation))
 				ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE), errmsg("cannot alter a relation with pending trigger events")));
 
+			/* A column goes with its relation, or alone from a table. */
+			if (object->classId == RelationRelationId && object->objectSubId != 0 &&
+				CatalogViewObjectContext(object->objectId) == view)
+			{
+				if (deletion_contains(targets, RelationRelationId, object->objectId))
+				{
+					targets = foreach_delete_current(targets, lc);
+					continue;
+				}
+				if (get_rel_relkind(object->objectId) == RELKIND_RELATION)
+					continue;
+			}
 			if (CatalogViewObjectContext(object->objectId) != view || object->objectSubId != 0 ||
 				(object->classId != RelationRelationId && object->classId != NamespaceRelationId &&
 				 object->classId != ProcedureRelationId && object->classId != TypeRelationId &&

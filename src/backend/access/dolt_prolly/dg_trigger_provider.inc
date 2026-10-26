@@ -51,6 +51,38 @@ provider_trigger(DGProviderRows *rows, CatalogView *view, const char *definition
 	trigger.tgtype |= stmt->timing;
 	trigger.tgtype |= stmt->events;
 	trigger.tgenabled = enabled[0];
+	if (stmt->isconstraint)
+	{
+		/* As CreateTrigger: the trigger's constraint, named after it. */
+		int			cslot = provider_catalog_index(ConstraintRelationId);
+		FormData_pg_constraint con = {0};
+		HeapTuple	contuple;
+
+		con.oid = CatalogViewBindObject(view, ConstraintRelationId, psprintf("%s/%s", table, stmt->trigname), InvalidOid);
+		namestrcpy(&con.conname, stmt->trigname);
+		con.connamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(stringToQualifiedNameList(table, NULL))));
+		con.contype = CONSTRAINT_TRIGGER;
+		con.condeferrable = stmt->deferrable;
+		con.condeferred = stmt->initdeferred;
+		con.conenforced = true;
+		con.convalidated = true;
+		con.conrelid = trigger.tgrelid;
+		con.confupdtype = ' ';
+		con.confdeltype = ' ';
+		con.confmatchtype = ' ';
+		con.conislocal = true;
+		con.connoinherit = true;
+		contuple = provider_fixed(rows->relations[cslot], &con, sizeof(con), Anum_pg_constraint_conperiod);
+		rows->rows[cslot] = lappend(rows->rows[cslot], contuple);
+		provider_dependency(rows, ConstraintRelationId, con.oid, 0, RelationRelationId, trigger.tgrelid, 0, DEPENDENCY_AUTO);
+		provider_dependency(rows, ConstraintRelationId, con.oid, 0, TriggerRelationId, trigger.oid, 0, DEPENDENCY_INTERNAL);
+		trigger.tgconstraint = con.oid;
+		trigger.tgdeferrable = stmt->deferrable;
+		trigger.tginitdeferred = stmt->initdeferred;
+		if (stmt->constrrel)
+			trigger.tgconstrrelid = CatalogViewLookupObject(view, RelationRelationId,
+															dg_qualified_name(stmt->constrrel->schemaname, stmt->constrrel->relname));
+	}
 	foreach_ptr(String, column, stmt->columns)
 		columns[ncolumns++] = provider_attribute(desc, strVal(column));
 	initStringInfo(&args);
@@ -80,6 +112,8 @@ provider_trigger(DGProviderRows *rows, CatalogView *view, const char *definition
 	/* The dependencies CreateTrigger records for a user trigger. */
 	provider_dependency(rows, TriggerRelationId, trigger.oid, 0, ProcedureRelationId, trigger.tgfoid, 0, DEPENDENCY_NORMAL);
 	provider_dependency(rows, TriggerRelationId, trigger.oid, 0, RelationRelationId, trigger.tgrelid, 0, DEPENDENCY_AUTO);
+	if (OidIsValid(trigger.tgconstrrelid))
+		provider_dependency(rows, TriggerRelationId, trigger.oid, 0, RelationRelationId, trigger.tgconstrrelid, 0, DEPENDENCY_AUTO);
 	for (int i = 0; i < ncolumns; i++)
 		provider_dependency(rows, TriggerRelationId, trigger.oid, 0, RelationRelationId, trigger.tgrelid, columns[i], DEPENDENCY_NORMAL);
 	if (when)

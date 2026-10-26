@@ -264,6 +264,7 @@ type_encode(HeapTuple tuple, TupleDesc desc)
 		type_encode_attributes(&json, type->typrelid);
 	else
 		type_encode_constraints(&json, type->oid);
+	json_comment(&json, type->oid, TypeRelationId);
 	appendStringInfoChar(&json, '}');
 	return json.data;
 }

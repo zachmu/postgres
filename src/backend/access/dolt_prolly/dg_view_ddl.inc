@@ -180,7 +180,9 @@ view_encode(Oid relid)
 		}
 		appendStringInfoChar(&json, '}');
 	}
-	appendStringInfo(&json, "],\"dependencies\":%s}", view_dependencies(relid, ((Form_pg_rewrite) GETSTRUCT(rule))->oid));
+	appendStringInfo(&json, "],\"dependencies\":%s", view_dependencies(relid, ((Form_pg_rewrite) GETSTRUCT(rule))->oid));
+	json_comment(&json, relid, RelationRelationId);
+	appendStringInfoChar(&json, '}');
 	relation_close(rel, AccessShareLock);
 	return json.data;
 }
@@ -250,27 +252,45 @@ dg_rule_actions(Oid relid, List *actions)
 }
 
 /*
- * Store the analyzed rules of |views|, (kind, name) pairs, in mutable
- * provisional view |view|, so that native DDL that renames what they refer to
- * changes their queries as it changes any other definition.
+ * Store the analyzed rules of the views and materialized views among
+ * |targets|, (kind, name) pairs, and the analyzed bodies of their SQL-standard
+ * routines, in mutable provisional view |view|, so that native DDL that
+ * renames what they refer to changes their queries as it changes any other
+ * definition.
  */
 static void
-view_materialize_rules(CatalogView *view, List *views)
+materialize_queries(CatalogView *view, List *targets)
 {
 	CatalogView *previous = CatalogViewSwitch(view);
 	Relation	catalog = table_open(RewriteRelationId, RowExclusiveLock);
+	Relation	routines = table_open(ProcedureRelationId, RowExclusiveLock);
 
-	foreach_ptr(List, target, views)
+	foreach_ptr(List, target, targets)
 	{
 		Oid			relid;
 		HeapTuple	rule,
 					updated;
 		bool		isnull;
-		Datum		values[Natts_pg_rewrite] = {0};
-		bool		nulls[Natts_pg_rewrite] = {0};
-		bool		replace[Natts_pg_rewrite] = {0};
+		Datum		values[Max(Natts_pg_rewrite, Natts_pg_proc)] = {0};
+		bool		nulls[Max(Natts_pg_rewrite, Natts_pg_proc)] = {0};
+		bool		replace[Max(Natts_pg_rewrite, Natts_pg_proc)] = {0};
 		List	   *actions;
 
+		if (!strcmp(linitial(target), "routine"))
+		{
+			HeapTuple	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(CatalogViewLookupObject(view, ProcedureRelationId, lsecond(target))));
+			Datum		body = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prosqlbody, &isnull);
+
+			if (!isnull)
+			{
+				values[Anum_pg_proc_prosqlbody - 1] = CStringGetTextDatum(nodeToString(dg_routine_body(tuple, stringToNode(TextDatumGetCString(body)))));
+				replace[Anum_pg_proc_prosqlbody - 1] = true;
+				updated = heap_modify_tuple(tuple, RelationGetDescr(routines), values, nulls, replace);
+				CatalogTupleUpdate(routines, &tuple->t_self, updated);
+			}
+			ReleaseSysCache(tuple);
+			continue;
+		}
 		if (strcmp(linitial(target), "view") && strcmp(linitial(target), "table"))
 			continue;
 		relid = CatalogViewLookupObject(view, RelationRelationId, lsecond(target));
@@ -283,6 +303,7 @@ view_materialize_rules(CatalogView *view, List *views)
 		updated = heap_modify_tuple(rule, RelationGetDescr(catalog), values, nulls, replace);
 		CatalogTupleUpdate(catalog, &rule->t_self, updated);
 	}
+	table_close(routines, RowExclusiveLock);
 	table_close(catalog, RowExclusiveLock);
 	CommandCounterIncrement();
 	CatalogViewSwitch(previous);
@@ -340,7 +361,7 @@ view_create(ParseState *pstate, ViewStmt *stmt, int location, int length)
 			Oid			existing = RangeVarGetRelid(stmt->view, NoLock, true);
 
 			if (OidIsValid(existing) && get_rel_relkind(existing) == RELKIND_VIEW)
-				view_materialize_rules(view, list_make1(list_make2("view", CatalogViewObjectIdentity(existing, RelationRelationId))));
+				materialize_queries(view, list_make1(list_make2("view", CatalogViewObjectIdentity(existing, RelationRelationId))));
 		}
 		relid = DefineView(stmt, pstate->p_sourcetext, location, length).objectId;
 		CommandCounterIncrement();
@@ -383,13 +404,13 @@ dg_catalog_view_ddl(ParseState *pstate, Node *statement, int location, int lengt
 	return true;
 }
 
-typedef struct MatviewDependencies
+typedef struct QueryDependencies
 {
 	List	   *entries;		/* of String: [kind, name, null] */
-} MatviewDependencies;
+} QueryDependencies;
 
 static void
-matview_dependency(MatviewDependencies *found, Oid classid, Oid objid)
+query_dependency(QueryDependencies *found, Oid classid, Oid objid)
 {
 	char	   *name = view_dependency_name(classid, objid);
 	StringInfoData entry;
@@ -407,7 +428,7 @@ matview_dependency(MatviewDependencies *found, Oid classid, Oid objid)
 }
 
 static bool
-matview_dependencies_walker(Node *node, MatviewDependencies *found)
+query_dependencies_walker(Node *node, QueryDependencies *found)
 {
 	if (!node)
 		return false;
@@ -416,16 +437,112 @@ matview_dependencies_walker(Node *node, MatviewDependencies *found)
 		RangeTblEntry *rte = (RangeTblEntry *) node;
 
 		if (rte->rtekind == RTE_RELATION)
-			matview_dependency(found, RelationRelationId, rte->relid);
+			query_dependency(found, RelationRelationId, rte->relid);
 		else if (rte->rtekind == RTE_DOLT && OidIsValid(rte->dolt_rowtype))
-			matview_dependency(found, RelationRelationId, get_typ_typrelid(rte->dolt_rowtype));
+			query_dependency(found, RelationRelationId, get_typ_typrelid(rte->dolt_rowtype));
 		return false;
 	}
 	if (IsA(node, FuncExpr))
-		matview_dependency(found, ProcedureRelationId, ((FuncExpr *) node)->funcid);
+		query_dependency(found, ProcedureRelationId, ((FuncExpr *) node)->funcid);
 	if (IsA(node, Query))
-		return query_tree_walker((Query *) node, matview_dependencies_walker, found, QTW_EXAMINE_RTES_BEFORE);
-	return expression_tree_walker(node, matview_dependencies_walker, found);
+		return query_tree_walker((Query *) node, query_dependencies_walker, found, QTW_EXAMINE_RTES_BEFORE);
+	return expression_tree_walker(node, query_dependencies_walker, found);
+}
+
+/* One statement of a SQL-standard body, analyzed as interpret_AS_clause does. */
+static Query *
+routine_body_statement(Node *statement, SQLFunctionParseInfoPtr info, const char *sql)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	Query	   *query;
+
+	pstate->p_sourcetext = sql;
+	sql_fn_parser_setup(pstate, info);
+	query = transformStmt(pstate, statement);
+	free_parsestate(pstate);
+	return query;
+}
+
+/*
+ * The parse-analyzed SQL-standard body of routine |proctup|, given its stored
+ * |body|. A versioned routine's body is stored as its SQL, a String, analyzed
+ * here in the catalogs of the routine's revision whenever it is read, as a
+ * view's query is.
+ */
+Node *
+dg_routine_body(HeapTuple proctup, Node *body)
+{
+	Oid			id = ((Form_pg_proc) GETSTRUCT(proctup))->oid;
+	CatalogView *previous;
+	Node	   *result = NULL;
+	int			nest;
+
+	if (!body || !IsA(body, String))
+		return body;
+	PushActiveSnapshot(GetLatestSnapshot());
+	previous = CatalogViewSwitch(CatalogViewObjectContext(id));
+	nest = NewGUCNestLevel();
+	PG_TRY();
+	{
+		char	   *sql = psprintf("CREATE FUNCTION pg_catalog.dg_body() RETURNS void LANGUAGE sql %s", strVal(body));
+		RawStmt    *raw = linitial_node(RawStmt, raw_parser(sql, RAW_PARSE_DEFAULT));
+		Node	   *statements = castNode(CreateFunctionStmt, raw->stmt)->sql_body;
+		SQLFunctionParseInfoPtr info = prepare_sql_fn_parse_info(proctup, NULL, InvalidOid);
+
+		schema_expression_gucs();
+		if (IsA(statements, List))
+		{
+			List	   *queries = NIL;
+
+			foreach_ptr(Node, statement, linitial_node(List, castNode(List, statements)))
+				queries = lappend(queries, routine_body_statement(statement, info, sql));
+			result = (Node *) list_make1(queries);
+		}
+		else
+			result = (Node *) routine_body_statement(statements, info, sql);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+		CatalogViewSwitch(previous);
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
+ * Routine |tuple|'s SQL-standard body as SQL, every name qualified, and as
+ * |dependencies|, what it uses, as JSON.
+ */
+static char *
+routine_body_encode(HeapTuple tuple, char **dependencies)
+{
+	Node	   *body = dg_routine_body(tuple, stringToNode(TextDatumGetCString(SysCacheGetAttrNotNull(PROCOID, tuple, Anum_pg_proc_prosqlbody))));
+	QueryDependencies found = {0};
+	StringInfoData json;
+	char	   *sql = NULL;
+	int			nest = NewGUCNestLevel();
+
+	PG_TRY();
+	{
+		schema_expression_gucs();
+		sql = pg_get_function_sqlbody_tuple(tuple);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(true, nest);
+	}
+	PG_END_TRY();
+	(void) query_dependencies_walker(body, &found);
+	list_sort(found.entries, view_entry_compare);
+	initStringInfo(&json);
+	appendStringInfoChar(&json, '[');
+	foreach_node(String, entry, found.entries)
+		appendStringInfo(&json, "%s%s", foreach_current_index(entry) ? "," : "", strVal(entry));
+	appendStringInfoChar(&json, ']');
+	*dependencies = json.data;
+	return sql;
 }
 
 /*
@@ -435,7 +552,7 @@ matview_dependencies_walker(Node *node, MatviewDependencies *found)
 bool
 dg_catalog_create_matview(CreateStmt *create, Query *query)
 {
-	MatviewDependencies found = {0};
+	QueryDependencies found = {0};
 	StringInfoData json;
 	char	   *sql = NULL;
 	int			nest = NewGUCNestLevel();
@@ -451,7 +568,7 @@ dg_catalog_create_matview(CreateStmt *create, Query *query)
 		AtEOXact_GUC(true, nest);
 	}
 	PG_END_TRY();
-	(void) matview_dependencies_walker((Node *) query, &found);
+	(void) query_dependencies_walker((Node *) query, &found);
 	list_sort(found.entries, view_entry_compare);
 	initStringInfo(&json);
 	appendStringInfoChar(&json, '{');

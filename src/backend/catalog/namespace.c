@@ -826,6 +826,10 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 		else
 			relid = InvalidOid;
 
+		/* A catalog view names its schemas with OIDs of its own. */
+		if (existing_relation_id != NULL && !OidIsValid(relid) && CatalogViewCurrent())
+			relid = get_relname_relid(relation->relname, CatalogViewNamespace(CatalogViewCurrent(), nspid));
+
 		/* A native relation must not shadow a table on the session's branch. */
 		if (existing_relation_id != NULL && !OidIsValid(relid))
 			relid = BranchRelnameGetRelid(relation->relname, nspid);

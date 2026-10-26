@@ -18,6 +18,7 @@ extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_rename(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_view_ddl(struct ParseState *pstate, Node *statement, int location, int length);
 extern List *dg_rule_actions(Oid relid, List *actions);
+extern Node *dg_routine_body(HeapTuple proctup, Node *body);
 extern bool dg_catalog_create_matview(struct CreateStmt *create, struct Query *query);
 extern void dg_catalog_matview_refresh(Relation rel, bool populated);
 extern bool dg_catalog_creating_routine(void);
