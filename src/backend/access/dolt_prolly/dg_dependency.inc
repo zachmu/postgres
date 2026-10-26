@@ -55,7 +55,8 @@ publish_deletions(List *objects, CatalogView *view)
 		names[i] = json_value(definitions[i], "name");
 		classid = !strcmp(kinds[i], "namespace") ? NamespaceRelationId :
 			!strcmp(kinds[i], "routine") ? ProcedureRelationId :
-			!strcmp(kinds[i], "trigger") ? TriggerRelationId : RelationRelationId;
+			!strcmp(kinds[i], "trigger") ? TriggerRelationId :
+			!strcmp(kinds[i], "type") ? TypeRelationId : RelationRelationId;
 		id = CatalogViewLookupObject(view, classid, names[i]);
 		removed[i] = deletion_contains(objects, classid, id);
 	}
@@ -201,7 +202,8 @@ canonical_drop(Node *statement)
 	if (stmt->removeType != OBJECT_TABLE && stmt->removeType != OBJECT_INDEX &&
 		stmt->removeType != OBJECT_FUNCTION && stmt->removeType != OBJECT_ROUTINE &&
 		stmt->removeType != OBJECT_SCHEMA && stmt->removeType != OBJECT_TYPE &&
-		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER)
+		stmt->removeType != OBJECT_TABCONSTRAINT && stmt->removeType != OBJECT_TRIGGER &&
+		stmt->removeType != OBJECT_DOMAIN)
 		return false;
 	if (!dg_catalog_active())
 		return false;
@@ -226,7 +228,7 @@ canonical_drop(Node *statement)
 				branch = true;
 			else
 			{
-				if (stmt->removeType == OBJECT_TYPE)
+				if (stmt->removeType == OBJECT_TYPE || stmt->removeType == OBJECT_DOMAIN)
 					id = LookupTypeNameOid(NULL, lfirst_node(TypeName, lc), true);
 				else
 					id = LookupFuncWithArgs(stmt->removeType, lfirst_node(ObjectWithArgs, lc), true);
@@ -330,7 +332,7 @@ canonical_drop(Node *statement)
 				object.classId = NamespaceRelationId;
 				object.objectId = get_namespace_oid(strVal(lfirst(lc)), stmt->missing_ok);
 			}
-			else if (stmt->removeType == OBJECT_TYPE)
+			else if (stmt->removeType == OBJECT_TYPE || stmt->removeType == OBJECT_DOMAIN)
 			{
 				object.classId = TypeRelationId;
 				object.objectId = LookupTypeNameOid(NULL, lfirst_node(TypeName, lc), stmt->missing_ok);

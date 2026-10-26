@@ -37,7 +37,7 @@ provider_current(DGProvider *entry, const char *branch)
 
 static const Oid provider_catalogs[] = {
 	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
-	TypeRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
+	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
 /* Whether branch and revision views supply rows of |catalog|. */
@@ -54,7 +54,14 @@ typedef struct DGProviderRows
 {
 	Relation	relations[lengthof(provider_catalogs)];
 	List	   *rows[lengthof(provider_catalogs)];
+	List	   *elements;		/* versioned types with array types */
+	List	   *arrays;			/* and those array types */
 } DGProviderRows;
+
+/* The view and rows being built, against which column types resolve. */
+static CatalogView *provider_current_view;
+static DGProviderRows *provider_current_rows;
+static Oid routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name);
 
 static int
 provider_catalog_index(Oid id)
@@ -200,6 +207,41 @@ provider_dependency(DGProviderRows *rows, Oid objectclass, Oid object, int subid
 	provider_add(rows, DependRelationId, &form, sizeof(form), Natts_pg_depend);
 }
 
+/* The pg_type row of a type being rebuilt, if it is one. */
+static Form_pg_type
+provider_row_type(DGProviderRows *rows, Oid type)
+{
+	if (!rows)
+		return NULL;
+	foreach_ptr(HeapTupleData, tuple, rows->rows[provider_catalog_index(TypeRelationId)])
+		if (((Form_pg_type) GETSTRUCT(tuple))->oid == type)
+		return (Form_pg_type) GETSTRUCT(tuple);
+	return NULL;
+}
+
+/* As TupleDescInitEntry, also for a type whose row the view does not hold yet. */
+static void
+provider_init_entry(TupleDesc desc, int attno, const char *name, Oid type, int32 typmod)
+{
+	Form_pg_type form = type >= FirstNormalObjectId ? provider_row_type(provider_current_rows, type) : NULL;
+	Form_pg_attribute att;
+
+	if (!form)
+	{
+		TupleDescInitEntry(desc, attno, name, type, typmod, 0);
+		return;
+	}
+	TupleDescInitEntry(desc, attno, name, INT4OID, typmod, 0);
+	att = TupleDescAttr(desc, attno - 1);
+	att->atttypid = type;
+	att->attlen = form->typlen;
+	att->attbyval = form->typbyval;
+	att->attalign = form->typalign;
+	att->attstorage = form->typstorage;
+	att->attcollation = form->typcollation;
+	populate_compact_attribute(desc, attno - 1);
+}
+
 static TupleDesc
 provider_columns(const char *definition)
 {
@@ -230,11 +272,16 @@ provider_columns(const char *definition)
 	desc = CreateTemplateTupleDesc(n);
 	for (i = 0; i < n; i++)
 	{
-		Oid			type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(types[i]), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+		Oid			type;
 
+		/* A versioned type is qualified; a built-in one is not. */
+		if (strchr(types[i], '.') || strstr(types[i], "[]"))
+			type = routine_type_oid(provider_current_rows, provider_current_view, types[i]);
+		else
+			type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum(types[i]), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
 		if (!OidIsValid(type))
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("unknown canonical built-in type %s", types[i])));
-		TupleDescInitEntry(desc, i + 1, names[i], type, mods[i], 0);
+		provider_init_entry(desc, i + 1, names[i], type, mods[i]);
 		if (collations[i])
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
@@ -262,7 +309,25 @@ provider_columns(const char *definition)
 				TupleDescAttr(desc, i)->attcompression = compression[0];
 		}
 	}
-	dg_validate_descriptor(desc);
+
+	/*
+	 * Versioned types are validated by their DDL, in the view that defines
+	 * them; while this view is built, their rows are not yet visible.
+	 */
+	if (!provider_current_rows)
+		dg_validate_descriptor(desc);
+	else
+		for (i = 0; i < desc->natts; i++)
+		{
+			TupleDesc	one;
+
+			if (TupleDescAttr(desc, i)->atttypid >= FirstNormalObjectId)
+				continue;
+			one = CreateTemplateTupleDesc(1);
+			TupleDescCopyEntry(one, 1, desc, i + 1);
+			dg_validate_descriptor(one);
+			FreeTupleDesc(one);
+		}
 	return desc;
 }
 
@@ -619,6 +684,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 }
 
 #include "dg_routine_provider.inc"
+#include "dg_type_provider.inc"
 #include "dg_trigger_provider.inc"
 
 /* Shared role references are derived from canonical owners and ACLs. They
@@ -738,6 +804,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 				i,
 				j;
 
+	provider_current_view = view;
+	provider_current_rows = &rows;
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
 		TableScanDesc scan;
@@ -764,7 +832,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger"))
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
 			definitions[i] = metadata(child(addresses[i], 1), "schema");
 		else
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical catalog member %s", kinds[i])));
@@ -791,6 +859,24 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 			(void) provider_bind(view, branch, RelationRelationId, DOLT_IDENTITY_RELATION,
 								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
+
+	/*
+	 * Types, tables and routines name one another's types: bind them all,
+	 * then build user-defined types before the tables that use them.
+	 */
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+			(void) provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ROWTYPE,
+								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "type"))
+			provider_type_bind(&rows, view, definitions[i]);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "type"))
+			provider_type(&rows, view, definitions[i]);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "type"))
+			provider_type_relation(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
 		{
@@ -931,7 +1017,12 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	 */
 	CatalogViewAddRows(view, NamespaceRelationId, rows.rows[provider_catalog_index(NamespaceRelationId)]);
 	CatalogViewAddRows(view, ProcedureRelationId, rows.rows[provider_catalog_index(ProcedureRelationId)]);
+	CatalogViewAddRows(view, EnumRelationId, rows.rows[provider_catalog_index(EnumRelationId)]);
+	CatalogViewAddRows(view, TypeRelationId, rows.rows[provider_catalog_index(TypeRelationId)]);
 	CatalogViewSetPartial(view, true);
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "type") && !strcmp(json_value(definitions[i], "kind"), "d"))
+			provider_domain(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "table"))
 		{
@@ -947,10 +1038,14 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	provider_role_dependencies(&rows);
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 	{
-		if (provider_catalogs[i] != NamespaceRelationId && provider_catalogs[i] != ProcedureRelationId)
+		/* Domain defaults have since been bound into their pg_type rows. */
+		if (provider_catalogs[i] != NamespaceRelationId && provider_catalogs[i] != ProcedureRelationId &&
+			provider_catalogs[i] != EnumRelationId)
 			CatalogViewAddRows(view, provider_catalogs[i], rows.rows[i]);
 		table_close(rows.relations[i], AccessShareLock);
 	}
+	provider_current_view = NULL;
+	provider_current_rows = NULL;
 	CatalogViewSeal(view);
 }
 

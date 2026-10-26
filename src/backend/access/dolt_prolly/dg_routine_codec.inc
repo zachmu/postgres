@@ -1,4 +1,6 @@
 /* Portable pg_proc values. Local object identifiers never enter schema bytes. */
+
+/* A type's portable name: qualified, with [] for an array. */
 static char *
 routine_type_name(Oid id)
 {
@@ -16,8 +18,9 @@ routine_type_name(Oid id)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for type %u", id);
 	type = (Form_pg_type) GETSTRUCT(tuple);
-	if (type->typnamespace != PG_CATALOG_NAMESPACE && type->typtype != TYPTYPE_COMPOSITE)
-		unsupported("routine signature with a noncanonical user type");
+	/* A user type is portable once versioned: a table's row type or a type of its own. */
+	if (type->typnamespace != PG_CATALOG_NAMESPACE && id < FirstDurableObjectId)
+		unsupported("versioned object referring to an unversioned type");
 	result = dg_qualified_name(get_namespace_name(type->typnamespace), NameStr(type->typname));
 	ReleaseSysCache(tuple);
 	return result;

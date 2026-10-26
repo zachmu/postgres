@@ -29,6 +29,7 @@
 #include "access/htup_details.h"
 #include "utils/fmgroids.h"
 #include "commands/alter.h"
+#include "commands/typecmds.h"
 #include "commands/dbcommands.h"
 #include "utils/acl.h"
 #include "utils/syscache.h"
@@ -78,6 +79,7 @@
 #include "parser/parse_utilcmd.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_collation.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -544,6 +546,7 @@ canonical_database(const char *json, Datum *members, int count)
 #include "dg_expression_codec.inc"
 #include "dg_foreign_codec.inc"
 #include "dg_routine_codec.inc"
+#include "dg_type_codec.inc"
 
 /* Capture and working-tree diff must use exactly the same portable schema codec. */
 static char *
@@ -602,7 +605,7 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
-		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger"))
+		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type"))
 			appendStringInfoString(&json, payload);
 		else
 		{
@@ -1301,6 +1304,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_alter.inc"
 #include "dg_dependency.inc"
 #include "dg_trigger_ddl.inc"
+#include "dg_type_ddl.inc"
 #include "dg_tables.inc"
 #include "dg_diff.inc"
 #include "dg_patch.inc"

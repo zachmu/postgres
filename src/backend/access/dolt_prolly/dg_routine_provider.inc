@@ -1,3 +1,5 @@
+static Oid provider_array_of(DGProviderRows *rows, Oid element);
+
 /* Resolve symbolic signatures against the view under construction. */
 static Oid
 routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name)
@@ -11,8 +13,13 @@ routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name)
 	if (len >= 2 && !strcmp(name + len - 2, "[]"))
 	{
 		Oid			element = routine_type_oid(rows, view, pnstrdup(name, len - 2));
+		Oid			array = provider_array_of(rows, element);
 		ListCell   *lc;
 
+		if (OidIsValid(array))
+			return array;
+		if (element < FirstNormalObjectId)
+			return get_array_type(element);
 		foreach(lc, rows->rows[provider_catalog_index(TypeRelationId)])
 		{
 			Form_pg_type type = (Form_pg_type) GETSTRUCT((HeapTuple) lfirst(lc));

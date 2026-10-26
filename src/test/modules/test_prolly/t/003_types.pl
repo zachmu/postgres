@@ -151,9 +151,11 @@ for my $case (@cases)
 }
 @cases = @portable;
 
-# TODO: user-defined types (enums, domains, composites) in versioned tables.
-# Their definitions are native and unversioned, so the canonical codec cannot
-# yet name them; CREATE rejects such columns.
+# These types were made before the database had a versioned table, so they
+# are native and unversioned, and versioned tables cannot use them. Types
+# created in a versioned database are versioned: see test_doltgres
+# 023_versioned_types. (A heap table, as this test compares against, cannot
+# use a versioned type.)
 my %user_defined = map { $_ => 1 } qw(mood positive payload);
 @portable = ();
 for my $case (@cases)
@@ -162,8 +164,8 @@ for my $case (@cases)
  if ($user_defined{$base})
  {
   my ($status, $out, $err) = $node->psql('postgres', "CREATE TABLE rejected(v $case->[0]) USING dolt_prolly_table");
-  isnt($status, 0, "$case->[0] rejected until user-defined types are versioned");
-  like($err, qr/user-defined (column )?type/, "$case->[0] diagnostic");
+  isnt($status, 0, "native $case->[0] rejected by versioned tables");
+  like($err, qr/unversioned type/, "$case->[0] diagnostic");
  }
  else { push @portable, $case; }
 }

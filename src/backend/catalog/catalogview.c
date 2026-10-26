@@ -163,8 +163,16 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 		elog(ERROR, "cannot modify published catalog view");
 	foreach(lc, view->catalogs)
 	{
-		if (((CatalogViewRows *) lfirst(lc))->catalog == catalog)
+		if (((CatalogViewRows *) lfirst(lc))->catalog != catalog)
+			continue;
+
+		/* A view still being built may replace rows it published early. */
+		if (!view->partial)
 			elog(ERROR, "duplicate catalog rows in view");
+		view->catalogs = foreach_delete_current(view->catalogs, lc);
+		foreach_ptr(CatCache, cache, view->caches)
+			ResetCatalogCache(cache, false);
+		break;
 	}
 	previous = MemoryContextSwitchTo(view->memory);
 	if (!list_member_oid(view->catalog_ids, catalog))
@@ -369,7 +377,8 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 	}
 	if (!CatalogViewContains(view, RelationGetRelid(relation)))
 	{
-		if (has_bound_key)
+		/* A view still being built has only some catalogs as yet. */
+		if (has_bound_key && !(view && view->partial))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("catalog scan of %u cannot follow this revision-bound handle", RelationGetRelid(relation))));
 		return NULL;
 	}
