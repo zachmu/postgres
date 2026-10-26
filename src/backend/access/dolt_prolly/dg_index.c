@@ -1,6 +1,7 @@
 #include "dg.h"
 #include "access/doltbranch.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "access/amapi.h"
 #include "access/nbtree.h"
 #include "access/htup_details.h"
@@ -12,6 +13,7 @@
 #include "catalog/pg_namespace_d.h"
 #include "lib/stringinfo.h"
 #include "nodes/pathnodes.h"
+#include "nodes/tidbitmap.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -32,6 +34,7 @@ typedef struct DGIndexEntry
 typedef struct DGIndexScan
 {
 	MemoryContext context;
+	Relation	bitmap_table;
 	ItemPointerData *tids;
 	HeapTuple  *tuples;
 	size_t		count;
@@ -787,6 +790,14 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	size_t		capacity = 16;
 	TupleTableSlot *slot;
 
+	/* Bitmap scans do not supply heapRelation; the parent holds its lock.
+	 * indrelid is the revision-bound relation handle, not a storage OID.
+	 */
+	if (!scan->heapRelation)
+	{
+		s->bitmap_table = table_open(scan->indexRelation->rd_index->indrelid, NoLock);
+		scan->heapRelation = s->bitmap_table;
+	}
 	if (keys && nkeys)
 		memcpy(scan->keyData, keys, sizeof(ScanKeyData) * nkeys);
 	MemoryContextReset(s->context);
@@ -795,6 +806,9 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	table = dg_load(scan->heapRelation, scan->xs_snapshot);
 	initStringInfo(&lower);
 	initStringInfo(&upper);
+	pgstat_count_index_scan(scan->indexRelation);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 	scan_bounds(scan, &lower, &upper, &has_lower, &has_upper);
 	lo.data = (uint8 *) lower.data;
 	lo.len = lower.len;
@@ -811,6 +825,22 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	{
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
 		HandleList	handles = handles_of(table, dg_rowhash(row));
+		ItemPointerData first_tid;
+
+		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
+		if (handles.count == 0)
+			continue;
+		/* Bitmap bounds are conservative. Defer the qualification to the
+		 * table scan so that it decodes each candidate only once, even when
+		 * several index searches select the same occurrence.
+		 */
+		if (!s->bitmap_table)
+		{
+			dg_tid(handles.items[0], &first_tid);
+			dg_decode(scan->heapRelation, row, &first_tid, slot);
+			if (!matches(scan, slot))
+				continue;
+		}
 
 		for (int j = 0; j < handles.count; j++)
 		{
@@ -818,9 +848,6 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 
 			CHECK_FOR_INTERRUPTS();
 			dg_tid(handles.items[j], &tid);
-			dg_decode(scan->heapRelation, row, &tid, slot);
-			if (!matches(scan, slot))
-				continue;
 			if (s->count == capacity)
 			{
 				capacity *= 2;
@@ -865,11 +892,26 @@ gettuple(IndexScanDesc scan, ScanDirection dir)
 	scan->xs_hitupdesc = RelationGetDescr(scan->indexRelation);
 	return true;
 }
+/* The executor expands array keys and unions/intersects bitmap results. */
+static int64
+getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
+{
+	DGIndexScan *s = scan->opaque;
+
+	for (size_t i = 0; i < s->count; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		tbm_add_tuples(bitmap, &s->tids[i], 1, true);
+	}
+	return s->count;
+}
 static void
 endscan(IndexScanDesc scan)
 {
 	DGIndexScan *s = scan->opaque;
 
+	if (s->bitmap_table)
+		table_close(s->bitmap_table, NoLock);
 	MemoryContextDelete(s->context);
 	pfree(s);
 }
@@ -920,6 +962,7 @@ dolt_prolly_index_handler(PG_FUNCTION_ARGS)
 	am->ambeginscan = beginscan;
 	am->amrescan = rescan;
 	am->amgettuple = gettuple;
+	am->amgetbitmap = getbitmap;
 	am->amendscan = endscan;
 	am->ammarkpos = markpos;
 	am->amrestrpos = restorepos;

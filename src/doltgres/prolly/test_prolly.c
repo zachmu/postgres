@@ -83,6 +83,41 @@ test_tuples(void)
 	free(data);
 }
 
+/* Bulk decoding validates every field, including fields never requested. */
+static void
+test_tuple_view(void)
+{
+	PLValue fields[64], value;
+	PLTupleView view;
+	uint8_t *data;
+	size_t size;
+
+	for (size_t i = 0; i < 64; i++)
+		fields[i] = (PLValue) {i % 3 != 0, slice(i % 2 ? "" : "payload")};
+	OK(pl_tuple_pack(fields, 64, &data, &size));
+	OK(pl_tuple_open(bytes(data, size), &view));
+	CHECK(view.count == 64);
+	for (size_t i = 0; i < 64; i++)
+	{
+		OK(pl_tuple_field(&view, i, &value));
+		CHECK(value.present == fields[i].present);
+		if (value.present)
+			CHECK(pl_compare(value.bytes, fields[i].bytes) == 0);
+	}
+	CHECK(pl_tuple_field(&view, 64, &value) == PL_NOT_FOUND);
+	for (size_t i = 0; i < size; i++)
+		CHECK(pl_tuple_open(bytes(data, i), &view) == PL_CORRUPT);
+	/* A corrupt offset late in the row must fail even a field-zero lookup. */
+	data[12 + 8 + 4 * 63] = 255;
+	CHECK(pl_tuple_open(bytes(data, size), &view) == PL_CORRUPT);
+	CHECK(pl_tuple_get(bytes(data, size), 0, &value) == PL_CORRUPT);
+	free(data);
+	OK(pl_tuple_pack(NULL, 0, &data, &size));
+	OK(pl_tuple_open(bytes(data, size), &view));
+	CHECK(pl_tuple_field(&view, 0, &value) == PL_NOT_FOUND);
+	free(data);
+}
+
 static void
 test_tree(void)
 {
@@ -928,6 +963,7 @@ main(int argc, char **argv)
 {
 	file_mode = argc == 2 && strcmp(argv[1], "--file") == 0;
 	test_tuples();
+	test_tuple_view();
 	test_tree();
 	test_versions();
 	test_random_history();

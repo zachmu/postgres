@@ -1,4 +1,7 @@
 #include "dg.h"
+#include <math.h>
+#include "nodes/tidbitmap.h"
+#include "optimizer/plancat.h"
 #include "access/doltbranch.h"
 #include "miscadmin.h"
 #include "catalog/catalogview.h"
@@ -31,6 +34,10 @@ typedef struct DGScan
 	DGState    *state;
 	DGRows		rows;
 	int64		position;
+	TBMIterateResult bitmap_page;
+	OffsetNumber bitmap_offsets[TBM_MAX_TUPLES_PER_PAGE];
+	int			bitmap_count;
+	int			bitmap_position;
 }			DGScan;
 
 PLHash
@@ -82,7 +89,8 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->context = AllocSetContextCreate(CurrentMemoryContext, "prolly scan", ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(scan->context);
 	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
-	scan->rows = dg_rows(&scan->state->handles);
+	if (!(flags & SO_TYPE_BITMAPSCAN))
+		scan->rows = dg_rows(&scan->state->handles);
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
 	return &scan->base;
@@ -101,6 +109,8 @@ static void
 rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pagemode)
 {
 	((DGScan *) base)->position = -1;
+	((DGScan *) base)->bitmap_count = 0;
+	((DGScan *) base)->bitmap_position = 0;
 }
 static bool
 next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
@@ -129,6 +139,57 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	else
 		dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
 	return true;
+}
+/* Bitmap blocks are logical handle ranges, not physical relation pages. */
+static bool
+bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
+			uint64 *lossy_pages, uint64 *exact_pages)
+{
+	DGScan	   *scan = (DGScan *) base;
+
+	for (;;)
+	{
+		ItemPointerData tid;
+		uint8		key[8];
+		PLValue		value;
+
+		CHECK_FOR_INTERRUPTS();
+		if (scan->bitmap_position >= scan->bitmap_count)
+		{
+			if (!tbm_iterate(&base->st.rs_tbmiterator, &scan->bitmap_page))
+			{
+				ExecClearTuple(slot);
+				return false;
+			}
+			scan->bitmap_position = 0;
+			if (scan->bitmap_page.lossy)
+			{
+				/* Visit every possible handle on a lossy logical page. */
+				scan->bitmap_count = TBM_MAX_TUPLES_PER_PAGE;
+				++*lossy_pages;
+			}
+			else
+			{
+				scan->bitmap_count = tbm_extract_page_tuple(&scan->bitmap_page,
+					scan->bitmap_offsets, TBM_MAX_TUPLES_PER_PAGE);
+				++*exact_pages;
+			}
+		}
+		ItemPointerSet(&tid, scan->bitmap_page.blockno,
+			scan->bitmap_page.lossy ? scan->bitmap_position + 1 :
+			scan->bitmap_offsets[scan->bitmap_position]);
+		++scan->bitmap_position;
+		pl_write64(key, dg_id(&tid));
+		dg_check(pl_get(&scan->state->handles, (PLSlice) {key, sizeof(key)}, &value));
+		if (!value.present)
+			continue;
+		*recheck = scan->bitmap_page.lossy || scan->bitmap_page.recheck;
+		if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
+			dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, value.bytes), &tid, slot);
+		else
+			dg_decode(base->rs_rd, row_for_handle(scan->state, value.bytes), &tid, slot);
+		return true;
+	}
 }
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
@@ -680,9 +741,22 @@ toast(Relation rel)
 static void
 estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double *allvis)
 {
-	*pages = rel->rd_catalogview ? 1 : RelationGetNumberOfBlocks(rel);
-	*tuples = Max(1000, *pages);
+	DGState *state = CatalogViewIsProvisional(rel->rd_catalogview) ?
+		dg_catalog_mutation_load(rel, GetActiveSnapshot()) :
+		dg_load(rel, GetActiveSnapshot());
+	int32 width = get_rel_data_width(rel, widths);
+	double bytes;
+
+	/* Physical adapter pages do not describe a revision's row count. The
+	 * handle root carries the exact count, including duplicate occurrences.
+	 * Use logical row volume for costing until chunk statistics are exposed.
+	 */
+	*tuples = pl_count(&state->handles);
+	bytes = *tuples * (Max(width, 1) + sizeof(ItemPointerData));
+	*pages = (BlockNumber) Min((double) MaxBlockNumber,
+		Max(1.0, ceil(bytes / BLCKSZ)));
 	*allvis = 0;
+	dg_release(state);
 }
 static bool
 sample_block(TableScanDesc s, struct SampleScanState *state)
@@ -786,7 +860,7 @@ dg_table_routine(void)
 		methods.index_validate_scan = validate_index;
 		methods.relation_needs_toast_table = toast;
 		methods.relation_estimate_size = estimate;
-		methods.scan_bitmap_next_tuple = NULL;
+		methods.scan_bitmap_next_tuple = bitmap_next;
 		methods.scan_sample_next_block = sample_block;
 		methods.scan_sample_next_tuple = sample_tuple;
 		initialized = true;
