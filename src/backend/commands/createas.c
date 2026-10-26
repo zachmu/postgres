@@ -24,6 +24,7 @@
  */
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/heapam.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
@@ -106,6 +107,18 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	create->tablespacename = into->tableSpaceName;
 	create->if_not_exists = false;
 	create->accessMethod = into->accessMethod;
+
+	/*
+	 * A versioned table is created in its branch's schema, like any other
+	 * CREATE TABLE; its rows are then inserted as usual.
+	 */
+	if (!is_matview && dg_catalog_create((Node *) create, NULL))
+	{
+		CommandCounterIncrement();
+		ObjectAddressSet(intoRelationAddr, RelationRelationId,
+						 RangeVarGetRelid(into->rel, NoLock, false));
+		return intoRelationAddr;
+	}
 
 	/*
 	 * Create the relation.  (This will error out if there's an existing view,
@@ -400,6 +413,10 @@ CreateTableAsRelExists(CreateTableAsStmt *ctas)
 	nspid = RangeVarGetCreationNamespace(into->rel);
 
 	oldrelid = get_relname_relid(into->rel->relname, nspid);
+
+	/* A versioned table is found in its branch's schema, by name. */
+	if (!OidIsValid(oldrelid))
+		(void) RangeVarGetAndCheckCreationNamespace(into->rel, NoLock, &oldrelid);
 	if (OidIsValid(oldrelid))
 	{
 		if (!ctas->if_not_exists)

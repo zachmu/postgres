@@ -130,6 +130,27 @@ dg_catalog_alter(Node *statement)
 
 		if (stmt->objtype != OBJECT_TABLE || !branch_relation(stmt->relation))
 			return false;
+
+		/* Storage options mean nothing to prolly storage; as at CREATE, ignore them. */
+		stmt = copyObject(stmt);
+		foreach_node(AlterTableCmd, action, stmt->cmds)
+		{
+			if (action->subtype == AT_SetRelOptions || action->subtype == AT_ReplaceRelOptions)
+			{
+				const char *const namespaces[] = HEAP_RELOPT_NAMESPACES;
+
+				(void) heap_reloptions(RELKIND_RELATION,
+									   transformRelOptions((Datum) 0, (List *) action->def, NULL,
+														   namespaces, false, false),
+									   true);
+			}
+			if (action->subtype == AT_SetRelOptions || action->subtype == AT_ResetRelOptions ||
+				action->subtype == AT_ReplaceRelOptions)
+				stmt->cmds = foreach_delete_current(stmt->cmds, action);
+		}
+		if (stmt->cmds == NIL)
+			return true;
+		statement = (Node *) stmt;
 		cmd = linitial_node(AlterTableCmd, stmt->cmds);
 		if (native_alter_action(cmd->subtype))
 		{

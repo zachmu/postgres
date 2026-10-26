@@ -21,6 +21,9 @@ sql(q{CREATE TABLE c(id int, x int, y text, CONSTRAINT cpk PRIMARY KEY (id), CON
 sql(q{CREATE INDEX c_y ON c(y DESC NULLS LAST)});
 is(sql(q{SELECT string_agg(indexname,',' ORDER BY indexname) FROM pg_indexes WHERE tablename='c'}),'c_x_y_key,c_y,cpk','named, composite unique and non-unique indexes');
 is(sql(q{SELECT reloptions IS NULL FROM pg_class WHERE relname='c'}),'t','storage options are ignored');
+sql(q{ALTER TABLE c SET (fillfactor=50, autovacuum_enabled=off); ALTER TABLE c RESET (fillfactor); ALTER TABLE c SET (parallel_workers=2), ADD COLUMN z int});
+is(sql(q{SELECT reloptions IS NULL, (SELECT count(*) FROM pg_attribute WHERE attrelid='c'::regclass AND attname='z') FROM pg_class WHERE relname='c'}),'t|1','ALTER TABLE ignores storage options and applies the rest');
+fails(q{ALTER TABLE c SET (bogus=1)},qr/unrecognized parameter "bogus"/,'ignored storage options are still validated');
 fails(q{INSERT INTO c VALUES (1,-1,'a')},qr/xpos/,'named CHECK constraint is enforced');
 sql(q{CREATE TABLE lk (LIKE d INCLUDING ALL)});
 is(sql(q{SELECT count(*) FROM pg_constraint WHERE conrelid='lk'::regclass AND contype IN ('c','p')}),'2','LIKE INCLUDING ALL copies constraints');
@@ -49,6 +52,19 @@ is(sql(q{SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef WHERE adrelid='d'::re
 is(sql(q{SELECT pg_get_expr(a.adbin,a.adrelid) FROM "postgres/other".pg_catalog.pg_attrdef a JOIN "postgres/other".pg_catalog.pg_class r ON r.oid=a.adrelid WHERE r.relname='d' AND a.adnum=2}),'8','the other branch sees its changed default');
 is(sql(q{SELECT s,v FROM g AS OF 'HEAD'}),'20|11','generated columns read in revisions');
 
+# ---- CREATE TABLE AS and SELECT INTO ----
+sql(q{CREATE TABLE ct AS SELECT id, v, w FROM d});
+is(sql(q{SELECT id,v,w FROM ct}),'1|7|x','CREATE TABLE AS copies the query result');
+is(sql(q{SELECT amname FROM pg_class c JOIN pg_am a ON a.oid=c.relam WHERE relname='ct'}),'dolt_prolly_table','CREATE TABLE AS makes a versioned table');
+sql(q{CREATE TABLE ct_empty AS SELECT id, w FROM d WITH NO DATA; SELECT id, v INTO si FROM d WHERE id = 1});
+is(sql(q{SELECT (SELECT count(*) FROM ct_empty)||','||(SELECT v FROM si)}),'0,7','WITH NO DATA and SELECT INTO');
+my (undef,undef,$notice)=$node->psql('postgres',q{CREATE TABLE IF NOT EXISTS ct AS SELECT 1 AS x});
+like($notice,qr/already exists, skipping/,'IF NOT EXISTS skips an existing versioned table');
+sql(q{SELECT dolt_checkout('other'); CREATE TABLE ct_other AS SELECT g AS n FROM generate_series(1,3) g});
+is(sql(q{SELECT sum(n) FROM "postgres/other".public.ct_other}),'6','CREATE TABLE AS on another branch');
+is(sql(q{SELECT count(*) FROM pg_class WHERE relname='ct_other'}),'0','main does not see the other branch\'s table');
+fails(q{CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a},qr/prolly tables can only be created with CREATE TABLE/,'materialized views are rejected');
+
 # ---- schemas created before the first versioned table ----
 my $fresh='fresh';
 $node->safe_psql('postgres',"CREATE DATABASE $fresh");
@@ -57,7 +73,6 @@ is($node->safe_psql($fresh,q{SET default_table_access_method=dolt_prolly_table; 
 # ---- still unsupported ----
 fails(q{CREATE TABLE p(id int) PARTITION BY RANGE (id)},qr/partitioned and inherited versioned tables/,'partitioning is rejected');
 fails(q{CREATE UNLOGGED TABLE u(id int)},qr/unlogged versioned tables/,'unlogged is rejected');
-fails(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE ct(v pair)},qr/user-defined type codec/,'composite columns are rejected by the codec, not the catalog lookup');
-fails(q{CREATE TABLE ctas AS SELECT 1 AS a},qr/prolly tables can only be created with CREATE TABLE/,'CREATE TABLE AS is rejected');
+fails(q{CREATE TYPE pair AS (a int, b int); CREATE TABLE cpair(v pair)},qr/user-defined type codec/,'composite columns are rejected by the codec, not the catalog lookup');
 $node->stop;
 done_testing();

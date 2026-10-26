@@ -47,6 +47,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "access/relation.h"
+#include "access/reloptions.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_operator.h"
