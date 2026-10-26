@@ -706,6 +706,22 @@ typedef struct RowMerge
 	char	   *definitions[3];
 } RowMerge;
 
+/* Row merges of |tables|, whose definitions are the same on every side. */
+static List *
+row_merges(List *tables)
+{
+	List	   *merges = NIL;
+
+	foreach_ptr(char, table, tables)
+	{
+		RowMerge   *merge = palloc0(sizeof(RowMerge));
+
+		merge->table = table;
+		merges = lappend(merges, merge);
+	}
+	return merges;
+}
+
 static void
 install_database(bytea *base, bytea *ours, bytea *theirs, List *merges, StringInfo conflicts, StringInfo violations)
 {

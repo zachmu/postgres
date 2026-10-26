@@ -459,7 +459,7 @@ stash_apply(const char *name, int idx)
 	same_schema(metadata(ours, "database"), metadata(stashdb, "database"));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(stashheaddb, ours, stashdb, state_tables(metadata(stashdb, "database")), &conflicts, &violations);
+	install_database(stashheaddb, ours, stashdb, row_merges(state_tables(metadata(stashdb, "database"))), &conflicts, &violations);
 	if (conflicts.len || violations.len)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: Your local changes to the following tables would be overwritten by applying stash@{%d}:\n%s", idx, conflicts.len ? conflicts.data : violations.data)));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);

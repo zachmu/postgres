@@ -322,7 +322,8 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, String
 					   *chosen;
 			Member	   *from;
 			int			fromcount;
-			bool		table;
+			bool		table,
+						both;
 
 			/* Indexes follow their tables. */
 			if (!strcmp(key->kind, "index") || list_member(seen, makeString(identity)))
@@ -333,9 +334,14 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, String
 			t = merge_member(sides[2], counts[2], key->kind, key->name);
 			table = !strcmp(key->kind, "table");
 
-			if (merge_same(o, t) || merge_same(b, t))
+			/*
+			 * A table changed on both sides merges row by row even when the
+			 * results agree, as a keyless table's matching changes conflict.
+			 */
+			both = table && b && o && t && !merge_same(b, o) && !merge_same(b, t);
+			if (!both && (merge_same(o, t) || merge_same(b, t)))
 				chosen = o, from = sides[1], fromcount = counts[1];
-			else if (merge_same(b, o))
+			else if (!both && merge_same(b, o))
 				chosen = t, from = sides[2], fromcount = counts[2];
 			else if (table && o && t)
 			{
