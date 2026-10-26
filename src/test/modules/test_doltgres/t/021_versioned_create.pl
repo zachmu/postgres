@@ -21,6 +21,9 @@ sql(q{CREATE TABLE c(id int, x int, y text, CONSTRAINT cpk PRIMARY KEY (id), CON
 sql(q{CREATE INDEX c_y ON c(y DESC NULLS LAST)});
 is(sql(q{SELECT string_agg(indexname,',' ORDER BY indexname) FROM pg_indexes WHERE tablename='c'}),'c_x_y_key,c_y,cpk','named, composite unique and non-unique indexes');
 is(sql(q{SELECT reloptions IS NULL FROM pg_class WHERE relname='c'}),'t','storage options are ignored');
+sql(q{ALTER TABLE c SET (fillfactor=50, autovacuum_enabled=off); ALTER TABLE c RESET (fillfactor); ALTER TABLE c SET (parallel_workers=2), ADD COLUMN z int});
+is(sql(q{SELECT reloptions IS NULL, (SELECT count(*) FROM pg_attribute WHERE attrelid='c'::regclass AND attname='z') FROM pg_class WHERE relname='c'}),'t|1','ALTER TABLE ignores storage options and applies the rest');
+fails(q{ALTER TABLE c SET (bogus=1)},qr/unrecognized parameter "bogus"/,'ignored storage options are still validated');
 fails(q{INSERT INTO c VALUES (1,-1,'a')},qr/xpos/,'named CHECK constraint is enforced');
 sql(q{CREATE TABLE lk (LIKE d INCLUDING ALL)});
 is(sql(q{SELECT count(*) FROM pg_constraint WHERE conrelid='lk'::regclass AND contype IN ('c','p')}),'2','LIKE INCLUDING ALL copies constraints');
