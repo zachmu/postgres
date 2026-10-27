@@ -33,6 +33,7 @@
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/table.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -41,11 +42,16 @@
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "lib/dshash.h"
 #include "storage/bufmgr.h"
+#include "storage/dsm_registry.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/dsa.h"
 #include "utils/fmgroids.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 typedef struct Records
@@ -123,10 +129,11 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 	return found;
 }
 
-/* Add index entries for a new record tuple. */
+/* Add index entries for a new record tuple. The catalog's index descriptions are fixed. */
 static void
 index_record(Records *r, HeapTuple tuple, bool key_too)
 {
+	static IndexInfo *infos[2];
 	Relation	indexes[2] = {r->handle, r->key};
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(r->heap), &TTSOpsHeapTuple);
 	EState	   *estate = CreateExecutorState();
@@ -134,13 +141,19 @@ index_record(Records *r, HeapTuple tuple, bool key_too)
 	ExecStoreHeapTuple(tuple, slot, false);
 	for (int i = 0; i < (key_too ? 2 : 1); i++)
 	{
-		IndexInfo  *info = BuildIndexInfo(indexes[i]);
 		Datum		values[INDEX_MAX_KEYS];
 		bool		nulls[INDEX_MAX_KEYS];
 
-		FormIndexDatum(info, slot, estate, values, nulls);
+		if (!infos[i])
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			infos[i] = BuildIndexInfo(indexes[i]);
+			MemoryContextSwitchTo(old);
+		}
+		FormIndexDatum(infos[i], slot, estate, values, nulls);
 		index_insert(indexes[i], values, nulls, &tuple->t_self, r->heap,
-					 indexes[i]->rd_index->indisunique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO, false, info);
+					 indexes[i]->rd_index->indisunique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO, false, infos[i]);
 	}
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
@@ -408,4 +421,271 @@ dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool
 	successor(&r, result, tmfd, id, next);
 	records_close(&r);
 	return result;
+}
+
+/* ---------------------------------------------------------------------------
+ * Unique-key reservations
+ * ---------------------------------------------------------------------------
+ *
+ * Two transactions inserting the same key into a unique index cannot see
+ * each other's rows, so the first to check reserves the key until it ends and
+ * the second waits for it. A reservation was a lock record, costing a heap row
+ * and two index entries per key; now it is an entry in a shared hash table
+ * naming its transaction, and a waiter waits for that transaction as heap
+ * waits for an inserting transaction. A transaction releases its reservations
+ * when it ends. A server that allows prepared transactions keeps using lock
+ * records, which outlive a prepared transaction's backend and a restart.
+ */
+typedef struct ReservationKey
+{
+	RelFileNumber index;
+	uint64		branch;			/* hash of the branch name */
+	uint64		key;			/* hash of the key prefix */
+} ReservationKey;
+
+typedef struct Reservation
+{
+	ReservationKey key;
+	FullTransactionId owner;
+} Reservation;
+
+typedef struct ReservationTable
+{
+	int			tranche;
+	dsa_handle	area;
+	dshash_table_handle table;
+} ReservationTable;
+
+/* What this transaction reserved, to release when it ends. */
+typedef struct Reserved
+{
+	ReservationKey key;
+	SubTransactionId subxid;
+} Reserved;
+
+static dshash_table *reservations;
+static Reserved *reserved;
+static int	reserved_count,
+			reserved_capacity;
+
+static const dshash_parameters reservation_params = {
+	sizeof(ReservationKey), sizeof(Reservation), dshash_memcmp, dshash_memhash, dshash_memcpy, 0
+};
+
+static void
+reservations_init(void *p)
+{
+	ReservationTable *t = p;
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	dshash_parameters params = reservation_params;
+	dsa_area   *area;
+
+	t->tranche = LWLockNewTrancheId();
+	LWLockRegisterTranche(t->tranche, "dolt key reservations");
+	area = dsa_create(t->tranche);
+	dsa_pin(area);
+	dsa_pin_mapping(area);
+	params.tranche_id = t->tranche;
+	reservations = dshash_create(area, &params, NULL);
+	t->area = dsa_get_handle(area);
+	t->table = dshash_get_hash_table_handle(reservations);
+	MemoryContextSwitchTo(old);
+}
+
+static void reservations_xact(XactEvent event, void *arg);
+static void reservations_subxact(SubXactEvent event, SubTransactionId subxid, SubTransactionId parent, void *arg);
+
+static void
+reservations_attach(void)
+{
+	static bool registered;
+	ReservationTable *t;
+	bool		found;
+
+	if (!registered)
+	{
+		RegisterXactCallback(reservations_xact, NULL);
+		RegisterSubXactCallback(reservations_subxact, NULL);
+		registered = true;
+	}
+	if (reservations)
+		return;
+	t = GetNamedDSMSegment("dolt key reservations", sizeof(ReservationTable), reservations_init, &found);
+	if (!reservations)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+		dshash_parameters params = reservation_params;
+		dsa_area   *area;
+
+		LWLockRegisterTranche(t->tranche, "dolt key reservations");
+		area = dsa_attach(t->area);
+		dsa_pin_mapping(area);
+		params.tranche_id = t->tranche;
+		reservations = dshash_attach(area, &params, t->table, NULL);
+		MemoryContextSwitchTo(old);
+	}
+}
+
+static void
+remember_reservation(const ReservationKey *key)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+	if (reserved_count == reserved_capacity)
+	{
+		reserved_capacity = reserved_capacity ? reserved_capacity * 2 : 64;
+		reserved = reserved ? repalloc(reserved, reserved_capacity * sizeof(Reserved)) :
+			palloc(reserved_capacity * sizeof(Reserved));
+	}
+	reserved[reserved_count].key = *key;
+	reserved[reserved_count].subxid = GetCurrentSubTransactionId();
+	reserved_count++;
+	MemoryContextSwitchTo(old);
+}
+
+static ReservationKey
+reservation_key(Relation index, const char *branch, uint64 hash)
+{
+	ReservationKey key;
+
+	key.index = index->rd_locator.relNumber;
+	key.branch = hash_bytes_extended((const unsigned char *) branch, strlen(branch), 0);
+	key.key = hash;
+	return key;
+}
+
+/*
+ * Reserve key |hash| of |index| on |branch| for this transaction, waiting for
+ * any other transaction holding it to end, as heap waits for a concurrent
+ * inserter of a unique key. Without |wait|, return false instead of waiting.
+ */
+bool
+dg_key_reserve(Relation index, const char *branch, uint64 hash, bool wait)
+{
+	ReservationKey key;
+	FullTransactionId me;
+
+	if (max_prepared_xacts > 0)
+	{
+		TM_FailureData tmfd;
+		int64		next;
+
+		return dg_record_lock(index, branch, (int64) hash, GetCurrentCommandId(true), LockTupleExclusive,
+							  wait ? LockWaitBlock : LockWaitSkip, false, &tmfd, &next) != TM_WouldBlock;
+	}
+	me = GetTopFullTransactionId();
+	reservations_attach();
+	key = reservation_key(index, branch, hash);
+	for (;;)
+	{
+		bool		found;
+		Reservation *r = dshash_find_or_insert(reservations, &key, &found);
+		TransactionId other = found ? XidFromFullTransactionId(r->owner) : InvalidTransactionId;
+
+		if (!found || FullTransactionIdEquals(r->owner, me) ||
+			!TransactionIdIsInProgress(other))
+		{
+			bool		held = found && FullTransactionIdEquals(r->owner, me);
+
+			r->owner = me;
+			dshash_release_lock(reservations, r);
+			if (!held)
+				remember_reservation(&key);
+			return true;
+		}
+		dshash_release_lock(reservations, r);
+		if (!wait)
+			return false;
+		XactLockTableWait(other, NULL, NULL, XLTW_None);
+	}
+}
+
+/*
+ * The running transaction, other than this one, holding key |hash| of |index|
+ * on |branch|, or InvalidTransactionId: whom a dirty-snapshot reader of the key
+ * waits for, as for an inserter heap's dirty snapshot reports.
+ */
+TransactionId
+dg_key_reserver(Relation index, const char *branch, uint64 hash)
+{
+	ReservationKey key;
+	Reservation *r;
+	TransactionId owner = InvalidTransactionId;
+
+	if (max_prepared_xacts > 0)
+		return dg_record_xwait(index, branch, (int64) hash, true);
+	reservations_attach();
+	key = reservation_key(index, branch, hash);
+	r = dshash_find(reservations, &key, false);
+	if (r)
+	{
+		owner = XidFromFullTransactionId(r->owner);
+		dshash_release_lock(reservations, r);
+	}
+	if (TransactionIdIsValid(owner) &&
+		(TransactionIdIsCurrentTransactionId(owner) || !TransactionIdIsInProgress(owner)))
+		owner = InvalidTransactionId;
+	return owner;
+}
+
+/* Drop this transaction's reservations recorded under |subxid|, or all of them. */
+static void
+release_reservations(SubTransactionId subxid)
+{
+	FullTransactionId me = GetTopFullTransactionIdIfAny();
+	int			kept = 0;
+
+	if (!reservations)
+		reserved_count = 0;
+	for (int i = 0; i < reserved_count; i++)
+	{
+		Reservation *r;
+
+		if (subxid != InvalidSubTransactionId && reserved[i].subxid != subxid)
+		{
+			reserved[kept++] = reserved[i];
+			continue;
+		}
+		r = dshash_find(reservations, &reserved[i].key, true);
+		if (r && FullTransactionIdEquals(r->owner, me))
+			dshash_delete_entry(reservations, r);
+		else if (r)
+			dshash_release_lock(reservations, r);
+	}
+	reserved_count = kept;
+	if (!kept)
+	{
+		reserved = NULL;
+		reserved_capacity = 0;
+	}
+}
+
+static void
+reservations_xact(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			if (reserved_count)
+				release_reservations(InvalidSubTransactionId);
+			else
+			{
+				reserved = NULL;
+				reserved_capacity = 0;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+reservations_subxact(SubXactEvent event, SubTransactionId subxid, SubTransactionId parent, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB && reserved_count)
+		release_reservations(subxid);
 }

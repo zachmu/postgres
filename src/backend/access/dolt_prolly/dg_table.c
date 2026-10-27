@@ -24,6 +24,9 @@
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
 
+/* Planner page accounting: rows per 8 kB "page" of a prolly table. */
+#define DG_ESTIMATE_BYTES_PER_ROW 32
+
 static TableAmRoutine methods;
 static bool initialized;
 
@@ -77,7 +80,7 @@ row_for_handle(DGState *state, PLSlice hash)
 static const TupleTableSlotOps *
 slots(Relation rel)
 {
-	return &TTSOpsVirtual;
+	return &TTSOpsProlly;
 }
 static TableScanDesc
 begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc parallel, uint32 flags)
@@ -238,6 +241,7 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 		ItemPointerData tid;
 		uint8		key[8];
 		PLValue		value;
+		PLSlice		row;
 
 		CHECK_FOR_INTERRUPTS();
 		if (scan->bitmap_position >= scan->bitmap_count)
@@ -265,11 +269,17 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 			scan->bitmap_page.lossy ? scan->bitmap_position + 1 :
 			scan->bitmap_offsets[scan->bitmap_position]);
 		++scan->bitmap_position;
+		*recheck = scan->bitmap_page.lossy || scan->bitmap_page.recheck;
+		if (!CatalogViewIsProvisional(base->rs_rd->rd_catalogview) &&
+			dg_stash_get(RelationGetRelid(base->rs_rd), scan->state, dg_id(&tid), &row))
+		{
+			dg_decode(base->rs_rd, row, &tid, slot);
+			return true;
+		}
 		pl_write64(key, dg_id(&tid));
 		dg_check(pl_get(&scan->state->handles, (PLSlice) {key, sizeof(key)}, &value));
 		if (!value.present)
 			continue;
-		*recheck = scan->bitmap_page.lossy || scan->bitmap_page.recheck;
 		if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
 			dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, value.bytes), &tid, slot);
 		else
@@ -319,6 +329,97 @@ typedef struct DGFetch
 	DGState    *state;
 } DGFetch;
 
+/* ---------------------------------------------------------------------------
+ * The row stash
+ * ---------------------------------------------------------------------------
+ *
+ * An index entry's value holds its row, and the index scan finds the row's
+ * handles to return them as TIDs. The table fetch for each TID would then
+ * descend the handle tree and the content tree again to reach the same
+ * bytes. The scan stashes each row under its handle instead, tagged with
+ * the content and handle roots it was read under; a fetch under the same
+ * roots takes the row from the stash. The stash is bounded, and cleared as
+ * a whole when it fills.
+ */
+typedef struct StashKey
+{
+	uint64		handle;
+	Oid			relid;
+	uint32		pad;			/* zeroed: the hash covers every byte */
+} StashKey;
+
+typedef struct StashEntry
+{
+	StashKey	key;
+	PLHash		content,
+				handles;
+	PLSlice		row;
+} StashEntry;
+
+#define DG_STASH_BYTES ((Size) 16 * 1024 * 1024)
+
+static HTAB *stash;
+static MemoryContext stash_memory;
+static Size stash_bytes;
+
+static void
+stash_reset(void)
+{
+	HASHCTL		ctl = {0};
+
+	if (stash_memory)
+		MemoryContextReset(stash_memory);
+	else
+		stash_memory = AllocSetContextCreate(TopMemoryContext, "prolly row stash", ALLOCSET_DEFAULT_SIZES);
+	ctl.keysize = sizeof(StashKey);
+	ctl.entrysize = sizeof(StashEntry);
+	ctl.hcxt = stash_memory;
+	stash = hash_create("prolly row stash", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	stash_bytes = 0;
+}
+
+void
+dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
+{
+	StashKey	key = {handle, relid, 0};
+	StashEntry *entry;
+	uint8	   *copy;
+	bool		found;
+
+	if (!stash || stash_bytes + row.len > DG_STASH_BYTES)
+		stash_reset();
+	entry = hash_search(stash, &key, HASH_ENTER, &found);
+	if (found)
+	{
+		if (pl_hash_equal(entry->content, state->content.root) && pl_hash_equal(entry->handles, state->handles.root))
+			return;
+		stash_bytes -= entry->row.len;
+		pfree(unconstify(uint8 *, entry->row.data));
+	}
+	copy = MemoryContextAlloc(stash_memory, Max(row.len, 1));
+	memcpy(copy, row.data, row.len);
+	entry->content = state->content.root;
+	entry->handles = state->handles.root;
+	entry->row.data = copy;
+	entry->row.len = row.len;
+	stash_bytes += row.len;
+}
+
+bool
+dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row)
+{
+	StashKey	key = {handle, relid, 0};
+	StashEntry *entry;
+
+	if (!stash)
+		return false;
+	entry = hash_search(stash, &key, HASH_FIND, NULL);
+	if (!entry || !pl_hash_equal(entry->content, state->content.root) || !pl_hash_equal(entry->handles, state->handles.root))
+		return false;
+	*row = entry->row;
+	return true;
+}
+
 static IndexFetchTableData *
 fetch_begin(Relation rel)
 {
@@ -347,7 +448,8 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 	DGFetch    *f = (DGFetch *) base;
 	Relation	rel = base->rel;
 	uint8		key[8];
-	PLSlice		k = {key, 8};
+	PLSlice		k = {key, 8},
+				row;
 	PLValue		value;
 
 	*again = false;
@@ -372,6 +474,11 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 		f->state = dg_load(rel, snap);
 		f->snapshot = snap;
 		MemoryContextSwitchTo(old);
+	}
+	if (dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
+	{
+		dg_decode(rel, row, tid, slot);
+		return true;
 	}
 	pl_write64(key, dg_id(tid));
 	dg_check(pl_get(&f->state->handles, k, &value));
@@ -1006,7 +1113,6 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	DGState *state = CatalogViewIsProvisional(rel->rd_catalogview) ?
 		dg_catalog_mutation_load(rel, GetActiveSnapshot()) :
 		dg_load(rel, GetActiveSnapshot());
-	int32 width = get_rel_data_width(rel, widths);
 	double bytes;
 
 	/* Physical adapter pages do not describe a revision's row count. The
@@ -1014,7 +1120,14 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	 * Use logical row volume for costing until chunk statistics are exposed.
 	 */
 	*tuples = pl_count(&state->handles);
-	bytes = *tuples * (Max(width, 1) + sizeof(ItemPointerData));
+
+	/*
+	 * A row costs about the same to reach by handle as in sequence: there are
+	 * no pages to seek, and the type-declared width the planner would size
+	 * pages by overstates stored rows several times over. Report few pages,
+	 * so that plans are chosen on per-row costs rather than on page fetches.
+	 */
+	bytes = *tuples * DG_ESTIMATE_BYTES_PER_ROW;
 	*pages = (BlockNumber) Min((double) MaxBlockNumber,
 		Max(1.0, ceil(bytes / BLCKSZ)));
 
@@ -1025,7 +1138,9 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	 * keep using their indexes.
 	 */
 	*tuples = Max(*tuples, 1000);
-	*allvis = 0;
+
+	/* Index entries are versioned with the rows: index-only scans fetch nothing. */
+	*allvis = 1;
 	release_state(rel, state);
 }
 static bool
@@ -1117,6 +1232,7 @@ dg_table_routine(void)
 		methods.tuple_insert = insert_row;
 		methods.multi_insert = multi_insert;
 		methods.finish_bulk_insert = finish_bulk_insert;
+		methods.index_only_visible = true;
 		methods.tuple_insert_speculative = speculative;
 		methods.tuple_complete_speculative = complete;
 		methods.tuple_delete = delete_row;

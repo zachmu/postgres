@@ -99,6 +99,7 @@
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "common/hashfn.h"
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"

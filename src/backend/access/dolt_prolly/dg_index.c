@@ -434,6 +434,66 @@ collect_handles(void *arg, PLSlice key, PLSlice value)
 	return PL_OK;
 }
 
+/*
+ * The handles of many rows in one ordered walk of the key tree. A scan
+ * that selects a large part of a table would otherwise descend the tree once
+ * per row; walking it once and merging against the rows' sorted digests
+ * visits each node once.
+ */
+typedef struct DigestOrder
+{
+	uint64		prefix;			/* the digest's first bytes, compared first */
+	int			row;
+} DigestOrder;
+
+typedef struct MergeHandles
+{
+	DigestOrder *order;
+	PLHash	   *digests;		/* by row */
+	int			count,
+				position;
+	HandleList *lists;
+} MergeHandles;
+
+static const PLHash *sort_digests;
+
+static int
+compare_digest_order(const void *a, const void *b)
+{
+	const DigestOrder *x = a,
+			   *y = b;
+
+	if (x->prefix != y->prefix)
+		return x->prefix < y->prefix ? -1 : 1;
+	return memcmp(sort_digests[x->row].bytes, sort_digests[y->row].bytes, PL_HASH_SIZE);
+}
+
+static PLStatus
+merge_handles(void *arg, PLSlice key, PLSlice value)
+{
+	MergeHandles *m = arg;
+	int			cmp = 1;
+
+	while (m->position < m->count &&
+		   (cmp = memcmp(m->digests[m->order[m->position].row].bytes, key.data, PL_HASH_SIZE)) < 0)
+		m->position++;
+	if (m->position >= m->count)
+		return PL_STOP;
+	if (cmp == 0)
+	{
+		HandleList *list = &m->lists[m->order[m->position].row];
+
+		if (list->count == list->capacity)
+		{
+			list->capacity = list->capacity ? list->capacity * 2 : 2;
+			list->items = list->items ? repalloc_array(list->items, uint64, list->capacity) :
+				palloc_array(uint64, list->capacity);
+		}
+		list->items[list->count++] = pl_read64(key.data + PL_HASH_SIZE);
+	}
+	return PL_OK;
+}
+
 /* The handles of every occurrence of row |digest| in |table|'s key tree. */
 static HandleList
 handles_of(DGState *table, PLHash digest)
@@ -627,10 +687,8 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 	bool		deferred = check == UNIQUE_CHECK_PARTIAL && !index->rd_index->indimmediate;
 
-	if (dg_record_lock(index, dg_relation_branch(index),
-					   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
-					   GetCurrentCommandId(true), LockTupleExclusive, deferred ? LockWaitSkip : LockWaitBlock,
-					   false, &failure, &next) == TM_WouldBlock)
+	if (!dg_key_reserve(index, dg_relation_branch(index),
+						hash_bytes_extended((const unsigned char *) key->data, key->len, 0), !deferred))
 		return false;
 	while ((conflict = unique_conflict(table, index, self, key)) != 0)
 	{
@@ -906,7 +964,7 @@ wait_for_reservation(IndexScanDesc scan)
 		append_key_value(scan, j, equal, &key);
 	}
 	id = (int64) hash_bytes_extended((const unsigned char *) key.data, key.len, 0);
-	while (TransactionIdIsValid(xwait = dg_record_xwait(index, dg_relation_branch(index), id, true)))
+	while (TransactionIdIsValid(xwait = dg_key_reserver(index, dg_relation_branch(index), (uint64) id)))
 		XactLockTableWait(xwait, NULL, NULL, XLTW_None);
 }
 
@@ -926,6 +984,7 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 				hi;
 	size_t		capacity = 16;
 	TupleTableSlot *slot;
+	HandleList *lists = NULL;
 
 	/* Bitmap scans do not supply heapRelation; the parent holds its lock.
 	 * indrelid is the revision-bound relation handle, not a storage OID.
@@ -959,17 +1018,63 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	s->count = 0;
 	s->position = -1;
 	s->mark = -1;
+
+	/*
+	 * An index-only scan returns entries, not rows: it needs no handles,
+	 * only each entry's number of occurrences, and its TIDs are never
+	 * fetched. Other scans find the rows' handles, which name the TIDs:
+	 * one tree descent per row, or one walk of the key tree merged against
+	 * the sorted digests when the rows are a large part of the table.
+	 */
+	if (!scan->xs_want_itup && rows.count)
+	{
+		MergeHandles merge = {palloc(rows.count * sizeof(DigestOrder)), palloc(rows.count * sizeof(PLHash)),
+		(int) rows.count, 0, palloc0(rows.count * sizeof(HandleList))};
+
+		lists = merge.lists;
+		for (size_t i = 0; i < rows.count; i++)
+		{
+			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+
+			if (!key_digest(scan->indexRelation, rows.items[i].key, &merge.digests[i]))
+				merge.digests[i] = dg_rowhash(row);
+			merge.order[i].prefix = pl_read64(merge.digests[i].bytes);
+			merge.order[i].row = (int) i;
+		}
+		if (rows.count * 8 >= pl_count(&table->keys))
+		{
+			uint8		lower[DG_KEY_SIZE],
+						upper[DG_KEY_SIZE];
+			PLSlice		klo = {lower, DG_KEY_SIZE},
+						khi = {upper, DG_KEY_SIZE};
+			PLStatus	status;
+
+			sort_digests = merge.digests;
+			qsort(merge.order, rows.count, sizeof(DigestOrder), compare_digest_order);
+			dg_handle_key(merge.digests[merge.order[0].row], 0, lower);
+			dg_handle_key(merge.digests[merge.order[rows.count - 1].row], PG_UINT64_MAX, upper);
+			status = pl_scan(&table->keys, &klo, &khi, merge_handles, &merge);
+			if (status != PL_STOP)
+				dg_check(status);
+		}
+		else
+			for (size_t i = 0; i < rows.count; i++)
+				lists[i] = handles_of(table, merge.digests[i]);
+	}
 	slot = table_slot_create(scan->heapRelation, NULL);
 	for (size_t i = 0; i < rows.count; i++)
 	{
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-		PLHash		digest;
 		HandleList	handles;
 		ItemPointerData first_tid;
 
-		if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
-			digest = dg_rowhash(row);
-		handles = handles_of(table, digest);
+		if (scan->xs_want_itup)
+		{
+			handles.count = (int) Min(pl_read64(rows.items[i].value.data), (uint64) INT_MAX);
+			handles.items = NULL;
+		}
+		else
+			handles = lists[i];
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)
@@ -980,7 +1085,10 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		 */
 		if (!s->bitmap_table)
 		{
-			dg_tid(handles.items[0], &first_tid);
+			if (handles.items)
+				dg_tid(handles.items[0], &first_tid);
+			else
+				ItemPointerSet(&first_tid, 0, FirstOffsetNumber);
 			dg_decode(scan->heapRelation, row, &first_tid, slot);
 			if (!matches(scan, slot))
 				continue;
@@ -991,7 +1099,13 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 			ItemPointerData tid;
 
 			CHECK_FOR_INTERRUPTS();
-			dg_tid(handles.items[j], &tid);
+			if (handles.items)
+			{
+				dg_tid(handles.items[j], &tid);
+				dg_stash_put(RelationGetRelid(scan->heapRelation), table, handles.items[j], row);
+			}
+			else
+				tid = first_tid;
 			if (s->count == capacity)
 			{
 				capacity *= 2;

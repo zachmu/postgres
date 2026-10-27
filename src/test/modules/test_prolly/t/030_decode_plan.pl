@@ -23,6 +23,30 @@ is(sql(q{SET timezone='UTC'; SET client_encoding='LATIN1'; SELECT id, c, vc, n, 
 is(sql(q{SET client_encoding='LATIN1'; SELECT octet_length(vc), length(vc) FROM t WHERE id = 1}), '6|5', 'stored bytes are decoded as database encoding under a different client encoding');
 is(sql(q{SELECT sum(id), count(ts), max(vc) FROM t}), '3|1|héllo', 'aggregates over decoded rows');
 
+# Values the direct decoders must reproduce exactly: numeric specials and
+# scales, float specials, date and timestamp infinities, padded multibyte
+# bpchar, money.
+sql(q{CREATE TABLE edge(id int PRIMARY KEY, n numeric, f8 double precision, f4 real, d date, ts timestamp, c char(4), vc varchar(10), mo money, u uuid, j json);
+ SET timezone='UTC';
+ INSERT INTO edge VALUES
+  (1, 'NaN', 'NaN', 'Infinity', 'infinity', 'infinity', 'é', 'ab', '-12.34', '00000000-0000-0000-0000-000000000000', '[1, {"a": null}]'),
+  (2, '-Infinity', '-Infinity', '-0', '-infinity', '-infinity', 'ü1', '', '922337203685.47', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '"x"'),
+  (3, '-0.000000000000000000001', '-0', '1.5e-45', '1899-12-31', '0001-01-01 00:00:00', '', 'ünïcødé', '0', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'null'),
+  (4, '123456789012345678901234567890.123456789', '1.7976931348623157e308', '3.4028235e38', '2024-02-29', '294276-12-31 23:59:59', 'abcd', 'z', '1.01', NULL, '{}'),
+  (5, '0', '0', '0', '2000-01-01', '2000-01-01 00:00:00', 'a', 'é', '0.01', NULL, '{"k":   "v"}'),
+  (6, '1e100', '2.5e-310', '-1', '1000000-01-01', '1999-12-31 23:59:59.999999', 'ab', 'abcdefghij', '-0.01', NULL, '[]'),
+  (7, '-999999.9999999999999', '-1.5', '-3.25', '0001-01-01', '2024-02-29 13:14:15.5', 'ab c', 'é é', '21474836.47', NULL, '1')});
+my $edge = sql(q{SET timezone='UTC'; SELECT id, n, f8, f4, d, ts, c, octet_length(c), vc, mo, u, j FROM edge ORDER BY id});
+is($edge, q{1|NaN|NaN|Infinity|infinity|infinity|é   |5|ab|-$12.34|00000000-0000-0000-0000-000000000000|[1, {"a": null}]
+2|-Infinity|-Infinity|-0|-infinity|-infinity|ü1  |5||$922,337,203,685.47|ffffffff-ffff-ffff-ffff-ffffffffffff|"x"
+3|-0.000000000000000000001|-0|1e-45|1899-12-31|0001-01-01 00:00:00|    |4|ünïcødé|$0.00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|null
+4|123456789012345678901234567890.123456789|1.7976931348623157e+308|3.4028235e+38|2024-02-29|294276-12-31 23:59:59|abcd|4|z|$1.01||{}
+5|0|0|0|2000-01-01|2000-01-01 00:00:00|a   |4|é|$0.01||{"k":   "v"}
+6|10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000|2.5e-310|-1|1000000-01-01|1999-12-31 23:59:59.999999|ab  |4|abcdefghij|-$0.01||[]
+7|-999999.9999999999999|-1.5|-3.25|0001-01-01|2024-02-29 13:14:15.5|ab c|4|é é|$21,474,836.47||1}, 'edge values decode exactly');
+is(sql(q{SELECT sum(n) FILTER (WHERE id IN (4, 5)), sum(f8) FILTER (WHERE id IN (3, 5, 7)), max(d), min(ts), count(DISTINCT c), sum(mo) FROM edge}),
+	'123456789012345678901234567890.123456789|-1.5|infinity|-infinity|7|$922,358,678,510.61', 'decoded values compute');
+
 # The plan follows the relation's descriptor.
 sql(q{ALTER TABLE t ADD COLUMN extra numeric DEFAULT 0.5; UPDATE t SET extra = id * 1.25});
 is(sql(q{SELECT id, extra FROM t ORDER BY id}), "1|1.25\n2|2.50", 'added column decodes after the plan is rebuilt');

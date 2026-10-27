@@ -1,0 +1,124 @@
+# Rows an index scan found reach the table fetch through the row stash, index
+# entries satisfy index-only scans without a visibility check, and unique-key
+# reservations live in shared memory. Each must give the same answers as
+# before, as rows change, across transactions, sessions and branches.
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+my $node = PostgreSQL::Test::Cluster->new('fetches');
+$node->init;
+$node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nmax_parallel_workers_per_gather=0\n");
+$node->start;
+sub sql { $node->safe_psql('postgres', $_[0]); }
+sub idx { sql("SET enable_seqscan=off; SET enable_bitmapscan=off; $_[0]"); }
+sub bitmap { sql("SET enable_seqscan=off; SET enable_indexscan=off; SET enable_indexonlyscan=off; $_[0]"); }
+sub plan_of { my $p = sql("EXPLAIN (COSTS OFF) $_[0]"); $p =~ /(Index Only Scan|Index Scan|Bitmap Heap Scan|Seq Scan)/ ? $1 : $p; }
+sql(q{CREATE TABLE t(id int PRIMARY KEY, k int NOT NULL, v text); CREATE INDEX t_k ON t(k);
+ INSERT INTO t SELECT g, g % 50, 'v'||g FROM generate_series(1, 3000) g});
+
+# Index and bitmap fetches agree with a sequential scan, before and after changes.
+my $seq = sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7});
+is(idx(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'index scan fetches every row');
+is(bitmap(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'bitmap scan fetches every row');
+sql(q{UPDATE t SET v = v || '!' WHERE k = 7 AND id < 1000; DELETE FROM t WHERE k = 7 AND id > 2500});
+$seq = sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7});
+is(idx(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'index scan sees updates and deletes');
+is(bitmap(q{SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM t WHERE k = 7}), $seq, 'bitmap scan sees updates and deletes');
+like($seq, qr/^7:v7!,/, 'the updated rows are in the answer');
+is(idx(q{BEGIN; UPDATE t SET v = 'pending' WHERE id = 57; SELECT v FROM t WHERE k = 7 AND id = 57; ROLLBACK}), 'pending', 'index fetch in the writing transaction sees its pending version');
+is(idx(q{SELECT v FROM t WHERE k = 7 AND id = 57}), 'v57!', 'and the rolled back version is gone');
+
+# A nested loop fetches the same rows again and again, across changes.
+is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=off; SELECT count(*), sum(b.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= 50}), sql(q{SELECT count(*), sum(b.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= 50}), 'index nested loop join matches');
+sql(q{UPDATE t SET k = k + 100 WHERE id <= 50});
+is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=off; SELECT count(*), sum(b.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= 50}), '50|1275', 'and after the join keys change');
+
+# Index-only scans are chosen for covering queries and need no heap visit.
+is(plan_of(q{SELECT count(k) FROM t WHERE k > 10}), 'Index Only Scan', 'covering query uses an index-only scan');
+is(sql(q{SELECT count(k) FROM t WHERE k > 10}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(k) FROM t WHERE k > 10}), 'index-only count matches');
+is(sql(q{SELECT sum(k) FROM t WHERE k BETWEEN 20 AND 30}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT sum(k) FROM t WHERE k BETWEEN 20 AND 30}), 'index-only sum matches');
+is(sql(q{BEGIN; UPDATE t SET k = 25 WHERE id BETWEEN 2000 AND 2010; DELETE FROM t WHERE k = 21; SELECT count(*), sum(k) FROM t WHERE k BETWEEN 20 AND 30; ROLLBACK}),
+   sql(q{BEGIN; UPDATE t SET k = 25 WHERE id BETWEEN 2000 AND 2010; DELETE FROM t WHERE k = 21; SET LOCAL enable_indexonlyscan=off; SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; SELECT count(*), sum(k) FROM t WHERE k BETWEEN 20 AND 30; ROLLBACK}), 'index-only scan sees the transaction\'s own changes');
+my $other = $node->background_psql('postgres');
+$other->query_safe(q{BEGIN; UPDATE t SET k = 29 WHERE id = 1500; DELETE FROM t WHERE id = 1501});
+is(sql(q{SELECT count(*) FROM t WHERE k = 29}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(*) FROM t WHERE k = 29}), 'index-only scan ignores another session\'s uncommitted changes');
+$other->query_safe('COMMIT');
+is(sql(q{SELECT count(*) FROM t WHERE k = 29}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(*) FROM t WHERE k = 29}), 'and sees them once committed');
+$other->quit;
+sql(q{CREATE INDEX t_k_v ON t(k) INCLUDE (v)});
+is(plan_of(q{SELECT v FROM t WHERE k = 3}), 'Index Only Scan', 'included column makes the query covering');
+is(sql(q{SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT string_agg(v, ',' ORDER BY v) FROM t WHERE k = 3}), 'included column values match');
+
+# Another branch with the same relation and different rows is fetched correctly.
+sql(q{SELECT dolt_commit('-Am', 'base'); SELECT dolt_branch('other')});
+sql(q{SELECT dolt_checkout('other'); UPDATE t SET v = 'branched' WHERE k = 7});
+is(idx(q{SELECT dolt_checkout('other'); SELECT count(*) FILTER (WHERE v = 'branched'), count(*) FROM t WHERE k = 7}), idx(q{SELECT dolt_checkout('other'); SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(*) FILTER (WHERE v = 'branched'), count(*) FROM t WHERE k = 7}), 'fetches on the other branch');
+is(idx(q{SELECT count(*) FILTER (WHERE v = 'branched') FROM t WHERE k = 7}), '0', 'fetches on main are untouched');
+
+# Unique-key reservations: the second inserter waits for the first.
+sub blocked { my ($pid, $label) = @_; ok($node->poll_query_until('postgres', "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $pid"), $label); }
+my $a = $node->background_psql('postgres', on_error_stop => 0);
+my $b = $node->background_psql('postgres', on_error_stop => 0);
+my $bpid = $b->query_safe('SELECT pg_backend_pid()');
+$a->query_safe('BEGIN; INSERT INTO t VALUES (10001, 1, $$a$$)');
+$b->query_until(qr/started/, "\\echo started\nINSERT INTO t VALUES (10001, 1, 'b');\n");
+blocked($bpid, 'second inserter waits');
+$a->query_safe('COMMIT');
+$b->query('SELECT 1');
+like($b->{stderr}, qr/duplicate key value/, 'and fails once the first commits');
+$b->{stderr} = '';
+$a->query_safe('BEGIN; SAVEPOINT s; INSERT INTO t VALUES (10002, 1, $$a$$); ROLLBACK TO s');
+is($b->query_safe(q{INSERT INTO t VALUES (10002, 1, 'b') RETURNING v}), 'b', 'a reservation rolled back with its savepoint is released');
+$a->query_safe('COMMIT');
+$a->query_safe('BEGIN; INSERT INTO t VALUES (10004, 1, $$a$$)');
+$b->query_until(qr/started/, "\\echo started\nINSERT INTO t VALUES (10004, 1, 'b');\n");
+blocked($bpid, 'waits again');
+$a->query_safe('ROLLBACK');
+$b->query_safe('SELECT 1');
+is(sql(q{SELECT v FROM t WHERE id = 10004}), 'b', 'the waiter succeeds after the first aborts');
+$a->quit;
+$b->quit;
+
+# With prepared transactions allowed, reservations are lock records that
+# outlive the preparing backend, and a waiter sees what COMMIT PREPARED made
+# visible.
+$node->append_conf('postgresql.conf', "max_prepared_transactions=5\n");
+$node->restart;
+$a = $node->background_psql('postgres', on_error_stop => 0);
+$b = $node->background_psql('postgres', on_error_stop => 0);
+$bpid = $b->query_safe('SELECT pg_backend_pid()');
+$a->query_safe('BEGIN; INSERT INTO t VALUES (10003, 1, $$a$$); PREPARE TRANSACTION $$reserved$$');
+$b->query_until(qr/started/, "\\echo started\nINSERT INTO t VALUES (10003, 1, 'b');\n");
+blocked($bpid, 'a prepared transaction keeps its reservation');
+sql(q{COMMIT PREPARED 'reserved'});
+$b->query('SELECT 1');
+like($b->{stderr}, qr/duplicate key value/, 'and the waiter fails after it commits');
+$b->{stderr} = '';
+$a->quit;
+$b->quit;
+
+# A warm session binds names through a cache that must follow schema changes,
+# branch switches, search paths and dropped and recreated tables.
+my $w = $node->background_psql('postgres', on_error_stop => 0);
+is($w->query_safe(q{SELECT count(*) FROM t WHERE k = 29}), sql(q{SELECT count(*) FROM t WHERE k = 29}), 'warm session binds t');
+$w->query_safe(q{ALTER TABLE t ADD COLUMN extra int DEFAULT 7});
+is($w->query_safe(q{SELECT max(extra) FROM t}), '7', 'an added column is bound after ALTER');
+$w->query_safe(q{CREATE SCHEMA other; CREATE TABLE other.t(id int PRIMARY KEY, note text); INSERT INTO other.t VALUES (1, 'other')});
+is($w->query_safe(q{SET search_path = other, public; SELECT note FROM t}), 'other', 'search_path selects the other table');
+is($w->query_safe(q{SET search_path = public; SELECT count(*) FROM t WHERE k = 29}), sql(q{SELECT count(*) FROM t WHERE k = 29}), 'and back');
+$w->query_safe(q{SELECT dolt_checkout('other')});
+is($w->query_safe(q{SELECT count(*) FROM t WHERE v = 'branched'}), sql(q{SELECT count(*) FROM "postgres/other".public.t WHERE v = 'branched'}), 'the other branch binds its own t');
+$w->query_safe(q{UPDATE t SET v = 'branched' WHERE k = 7; SELECT dolt_checkout('main')});
+is($w->query_safe(q{SELECT count(*) FROM t WHERE v = 'branched'}), '0', 'main after switching back');
+$w->query_safe(q{DROP TABLE t; CREATE TABLE t(a text); INSERT INTO t VALUES ('new')});
+is($w->query_safe(q{SELECT a FROM t}), 'new', 'a recreated table binds to its new definition');
+$w->query_safe(q{BEGIN; ALTER TABLE t ADD COLUMN b int DEFAULT 1});
+is($w->query_safe(q{SELECT a, b FROM t}), 'new|1', 'uncommitted DDL binds in its transaction');
+$w->query_safe('ROLLBACK');
+is($w->query_safe(q{SELECT * FROM t}), 'new', 'and not after rollback');
+is(sql(q{SELECT * FROM t}), 'new', 'another session agrees');
+$w->quit;
+$node->stop;
+done_testing();
