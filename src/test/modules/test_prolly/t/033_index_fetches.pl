@@ -98,5 +98,27 @@ like($b->{stderr}, qr/duplicate key value/, 'and the waiter fails after it commi
 $b->{stderr} = '';
 $a->quit;
 $b->quit;
+
+# A warm session binds names through a cache that must follow schema changes,
+# branch switches, search paths and dropped and recreated tables.
+my $w = $node->background_psql('postgres', on_error_stop => 0);
+is($w->query_safe(q{SELECT count(*) FROM t WHERE k = 29}), sql(q{SELECT count(*) FROM t WHERE k = 29}), 'warm session binds t');
+$w->query_safe(q{ALTER TABLE t ADD COLUMN extra int DEFAULT 7});
+is($w->query_safe(q{SELECT max(extra) FROM t}), '7', 'an added column is bound after ALTER');
+$w->query_safe(q{CREATE SCHEMA other; CREATE TABLE other.t(id int PRIMARY KEY, note text); INSERT INTO other.t VALUES (1, 'other')});
+is($w->query_safe(q{SET search_path = other, public; SELECT note FROM t}), 'other', 'search_path selects the other table');
+is($w->query_safe(q{SET search_path = public; SELECT count(*) FROM t WHERE k = 29}), sql(q{SELECT count(*) FROM t WHERE k = 29}), 'and back');
+$w->query_safe(q{SELECT dolt_checkout('other')});
+is($w->query_safe(q{SELECT count(*) FROM t WHERE v = 'branched'}), sql(q{SELECT count(*) FROM "postgres/other".public.t WHERE v = 'branched'}), 'the other branch binds its own t');
+$w->query_safe(q{UPDATE t SET v = 'branched' WHERE k = 7; SELECT dolt_checkout('main')});
+is($w->query_safe(q{SELECT count(*) FROM t WHERE v = 'branched'}), '0', 'main after switching back');
+$w->query_safe(q{DROP TABLE t; CREATE TABLE t(a text); INSERT INTO t VALUES ('new')});
+is($w->query_safe(q{SELECT a FROM t}), 'new', 'a recreated table binds to its new definition');
+$w->query_safe(q{BEGIN; ALTER TABLE t ADD COLUMN b int DEFAULT 1});
+is($w->query_safe(q{SELECT a, b FROM t}), 'new|1', 'uncommitted DDL binds in its transaction');
+$w->query_safe('ROLLBACK');
+is($w->query_safe(q{SELECT * FROM t}), 'new', 'and not after rollback');
+is(sql(q{SELECT * FROM t}), 'new', 'another session agrees');
+$w->quit;
 $node->stop;
 done_testing();

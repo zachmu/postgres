@@ -80,7 +80,7 @@ row_for_handle(DGState *state, PLSlice hash)
 static const TupleTableSlotOps *
 slots(Relation rel)
 {
-	return &TTSOpsVirtual;
+	return &TTSOpsProlly;
 }
 static TableScanDesc
 begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc parallel, uint32 flags)
@@ -385,6 +385,7 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 {
 	StashKey	key = {handle, relid, 0};
 	StashEntry *entry;
+	uint8	   *copy;
 	bool		found;
 
 	if (!stash || stash_bytes + row.len > DG_STASH_BYTES)
@@ -395,13 +396,14 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 		if (pl_hash_equal(entry->content, state->content.root) && pl_hash_equal(entry->handles, state->handles.root))
 			return;
 		stash_bytes -= entry->row.len;
-		pfree(entry->row.data);
+		pfree(unconstify(uint8 *, entry->row.data));
 	}
+	copy = MemoryContextAlloc(stash_memory, Max(row.len, 1));
+	memcpy(copy, row.data, row.len);
 	entry->content = state->content.root;
 	entry->handles = state->handles.root;
-	entry->row.data = MemoryContextAlloc(stash_memory, Max(row.len, 1));
+	entry->row.data = copy;
 	entry->row.len = row.len;
-	memcpy(entry->row.data, row.data, row.len);
 	stash_bytes += row.len;
 }
 

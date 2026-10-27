@@ -24,6 +24,7 @@
 #include "utils/uuid.h"
 #include "utils/inet.h"
 #include "executor/executor.h"
+#include "utils/expandeddatum.h"
 #include "nodes/makefuncs.h"
 #include "nodes/params.h"
 #include "optimizer/optimizer.h"
@@ -603,6 +604,7 @@ typedef struct DecodePlan
 {
 	Oid			relid;			/* hash key */
 	TupleDesc	desc;
+	bool		relcache;		/* desc is the relation's cached descriptor */
 	uint32		fingerprint;
 	int			natts;
 	DecodeColumn *columns;
@@ -610,6 +612,7 @@ typedef struct DecodePlan
 } DecodePlan;
 
 static HTAB *decode_plans;
+static DecodePlan *last_plan;	/* the plan last returned, checked first */
 static bool decode_callback;
 
 static void
@@ -624,6 +627,8 @@ decode_plans_changed(Datum arg, Oid relid)
 	while ((plan = hash_seq_search(&status)) != NULL)
 		if (!OidIsValid(relid) || plan->relid == relid)
 		{
+			if (plan == last_plan)
+				last_plan = NULL;
 			pfree(plan->columns);
 			hash_search(decode_plans, &plan->relid, HASH_REMOVE, NULL);
 		}
@@ -719,15 +724,28 @@ decode_plan(Relation rel)
 		CacheRegisterRelcacheCallback(decode_plans_changed, (Datum) 0);
 		decode_callback = true;
 	}
+	if (last_plan && last_plan->relid == relid && last_plan->desc == desc && last_plan->relcache && desc == rel->rd_att)
+		return last_plan;
 	plan = hash_search(decode_plans, &relid, HASH_ENTER, &found);
-	if (found && plan->desc == desc && plan->natts == desc->natts && plan->fingerprint == descriptor_fingerprint(desc))
+
+	/*
+	 * The relation's own descriptor is replaced only with an invalidation,
+	 * which drops the plan, so its identity suffices. A private descriptor
+	 * may share an OID, and an address, with another: those are fingerprinted.
+	 */
+	if (found && plan->desc == desc && plan->natts == desc->natts &&
+		((plan->relcache && desc == rel->rd_att) || plan->fingerprint == descriptor_fingerprint(desc)))
+	{
+		last_plan = plan;
 		return plan;
+	}
 	if (found)
 		pfree(plan->columns);
 	plan->columns = NULL;
 	PG_TRY();
 	{
 		decode_plan_build(plan, desc);
+		plan->relcache = desc == rel->rd_att;
 	}
 	PG_CATCH();
 	{
@@ -819,22 +837,401 @@ receive_planned(DecodeColumn *column, PLSlice bytes)
 	return result;
 }
 
+/* One column's datum from its stored field, by its plan. */
+static void
+decode_column(DecodeColumn *column, PLValue field, Datum *value)
+{
+	switch (column->kind)
+			{
+	case DECODE_BYTES:
+		*value = PointerGetDatum(cstring_to_text_with_len((const char *) field.bytes.data, field.bytes.len));
+		break;
+	case DECODE_INTEGER:
+		{
+			int64		n;
+
+			if (field.bytes.len != 8)
+				elog(ERROR, "invalid prolly integer encoding");
+			n = (int64) (pl_read64(field.bytes.data) ^ UINT64CONST(0x8000000000000000));
+			*value = column->base == BOOLOID ? BoolGetDatum(n != 0) :
+				column->base == INT2OID ? Int16GetDatum(n) :
+				column->base == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
+			break;
+		}
+	case DECODE_ENVELOPE_BYTES:
+		{
+			PLSlice		wire = envelope_contents(field.bytes);
+
+			*value = PointerGetDatum(cstring_to_text_with_len((const char *) wire.data, wire.len));
+			break;
+		}
+	case DECODE_WIRE8:
+		{
+			PLSlice		wire = envelope_contents(field.bytes);
+			int64		n;
+
+			if (wire.len != 8)
+				elog(ERROR, "invalid prolly 8-byte encoding");
+			n = (int64) pl_read64(wire.data);
+			if (column->base == FLOAT8OID)
+			{
+				union
+				{
+					int64		i;
+					float8		f;
+				}			swap = {n};
+
+				*value = Float8GetDatum(swap.f);
+			}
+			else
+				*value = Int64GetDatum(n);
+			break;
+		}
+	case DECODE_WIRE4:
+		{
+			PLSlice		wire = envelope_contents(field.bytes);
+			int32		n;
+
+			if (wire.len != 4)
+				elog(ERROR, "invalid prolly 4-byte encoding");
+			n = (int32) pl_read32(wire.data);
+			if (column->base == FLOAT4OID)
+			{
+				union
+				{
+					int32		i;
+					float4		f;
+				}			swap = {n};
+
+				*value = Float4GetDatum(swap.f);
+			}
+			else
+				*value = DateADTGetDatum((DateADT) n);
+			break;
+		}
+	case DECODE_UUID:
+		{
+			PLSlice		wire = envelope_contents(field.bytes);
+			pg_uuid_t  *uuid;
+
+			if (wire.len != UUID_LEN)
+				elog(ERROR, "invalid prolly uuid encoding");
+			uuid = palloc(UUID_LEN);
+			memcpy(uuid->data, wire.data, UUID_LEN);
+			*value = UUIDPGetDatum(uuid);
+			break;
+		}
+	case DECODE_NUMERIC:
+		*value = decode_numeric(envelope_contents(field.bytes));
+		break;
+	case DECODE_GENERAL:
+		*value = decode_value(column->type, field.bytes);
+		break;
+	case DECODE_RECEIVE:
+		*value = receive_planned(column, field.bytes);
+		break;
+			}
+}
+
+/* Whether decoding under |plan| must run with the client encoding set to the database's. */
+static bool
+decode_switches_encoding(DecodePlan *plan)
+{
+	return plan->xml || pg_get_client_encoding() != GetDatabaseEncoding();
+}
+
 /*
- * Decode |bytes| into |slot| by |rel|'s plan: values land in the slot as a
- * virtual tuple, in the caller's memory, with no heap tuple in between.
- * Receive functions convert from the client encoding, so the row is decoded
- * under the database encoding when the two differ.
+ * Decode columns [from, to) of |view| into |values| and |isnull| by |plan|,
+ * under the database encoding when the client's differs.
+ */
+static void
+decode_range(DecodePlan *plan, const PLTupleView *view, int from, int to, Datum *values, bool *isnull)
+{
+	bool		switched = decode_switches_encoding(plan);
+	int			encoding = pg_get_client_encoding();
+	int			saved_xmloption = xmloption;
+
+	if (switched)
+	{
+		if (SetClientEncoding(GetDatabaseEncoding()) < 0)
+			elog(ERROR, "could not select storage encoding");
+		xmloption = XMLOPTION_CONTENT;
+	}
+	PG_TRY();
+	{
+		for (int i = from; i < to; i++)
+		{
+			DecodeColumn *column = &plan->columns[i];
+			PLValue		field;
+
+			dg_check(pl_tuple_field(view, i, &field));
+			isnull[i] = !field.present || column->dropped;
+			values[i] = (Datum) 0;
+			if (!isnull[i])
+				decode_column(column, field, &values[i]);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (switched)
+		{
+			xmloption = saved_xmloption;
+			if (SetClientEncoding(encoding) < 0)
+				elog(FATAL, "could not restore client encoding");
+		}
+	}
+	PG_END_TRY();
+}
+
+/* ---------------------------------------------------------------------------
+ * The prolly slot: a row's bytes, decoded a column at a time as asked for
+ * ---------------------------------------------------------------------------
+ *
+ * A scan stores a row's bytes in the slot and decodes nothing. The executor
+ * asks for the columns it needs, in attribute order, and only those are
+ * decoded, into memory the slot owns and frees with the row. A heap slot
+ * deforms its tuple the same way.
+ */
+typedef struct DGSlot
+{
+	VirtualTupleTableSlot base;
+	MemoryContext row_memory;	/* decoded values; reset with each row */
+	DecodePlan *plan;
+	uint8	   *row;			/* the row's bytes, copied; grows as needed */
+	Size		row_capacity;
+	PLTupleView view;
+	bool		open;			/* a row is stored and not yet fully decoded */
+} DGSlot;
+
+static void
+prolly_slot_init(TupleTableSlot *slot)
+{
+	DGSlot	   *s = (DGSlot *) slot;
+
+	s->row_memory = AllocSetContextCreate(slot->tts_mcxt, "prolly slot row", ALLOCSET_SMALL_SIZES);
+}
+
+static void
+prolly_slot_release(TupleTableSlot *slot)
+{
+	DGSlot	   *s = (DGSlot *) slot;
+
+	MemoryContextDelete(s->row_memory);
+	if (s->row)
+		pfree(s->row);
+}
+
+static void
+prolly_slot_clear(TupleTableSlot *slot)
+{
+	DGSlot	   *s = (DGSlot *) slot;
+
+	if (unlikely(TTS_SHOULDFREE(slot)))
+	{
+		pfree(s->base.data);
+		s->base.data = NULL;
+		slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+	}
+	if (s->open || slot->tts_nvalid)
+		MemoryContextReset(s->row_memory);
+	s->open = false;
+	slot->tts_nvalid = 0;
+	slot->tts_flags |= TTS_FLAG_EMPTY;
+	ItemPointerSetInvalid(&slot->tts_tid);
+}
+
+static void
+prolly_slot_getsomeattrs(TupleTableSlot *slot, int natts)
+{
+	DGSlot	   *s = (DGSlot *) slot;
+	MemoryContext old;
+
+	if (!s->open)
+		elog(ERROR, "prolly slot holds no row to decode");
+	old = MemoryContextSwitchTo(s->row_memory);
+	decode_range(s->plan, &s->view, slot->tts_nvalid, Min(natts, s->plan->natts), slot->tts_values, slot->tts_isnull);
+	MemoryContextSwitchTo(old);
+	slot->tts_nvalid = Max(slot->tts_nvalid, Min(natts, s->plan->natts));
+}
+
+static Datum
+prolly_slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
+{
+	Assert(!TTS_EMPTY(slot));
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot retrieve a system column in this context")));
+	return 0;
+}
+
+static bool
+prolly_slot_is_current_xact_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("don't have a storage tuple in this context")));
+	return false;
+}
+
+/* As tts_virtual_materialize: copy every by-reference value into one allocation the slot owns. */
+static void
+prolly_slot_materialize(TupleTableSlot *slot)
+{
+	DGSlot	   *s = (DGSlot *) slot;
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	Size		sz = 0;
+	char	   *data;
+
+	if (TTS_SHOULDFREE(slot))
+		return;
+	slot_getallattrs(slot);
+	for (int natt = 0; natt < desc->natts; natt++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, natt);
+		Datum		val;
+
+		if (att->attbyval || slot->tts_isnull[natt])
+			continue;
+		val = slot->tts_values[natt];
+		if (att->attlen == -1 && VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+		{
+			sz = att_nominal_alignby(sz, att->attalignby);
+			sz += EOH_get_flat_size(DatumGetEOHP(val));
+		}
+		else
+		{
+			sz = att_nominal_alignby(sz, att->attalignby);
+			sz = att_addlength_datum(sz, att->attlen, val);
+		}
+	}
+	if (sz == 0)
+		return;
+	s->base.data = data = MemoryContextAlloc(slot->tts_mcxt, sz);
+	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+	for (int natt = 0; natt < desc->natts; natt++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, natt);
+		Datum		val;
+
+		if (att->attbyval || slot->tts_isnull[natt])
+			continue;
+		val = slot->tts_values[natt];
+		if (att->attlen == -1 && VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+		{
+			ExpandedObjectHeader *eoh = DatumGetEOHP(val);
+			Size		data_length;
+
+			data = (char *) att_nominal_alignby(data, att->attalignby);
+			data_length = EOH_get_flat_size(eoh);
+			EOH_flatten_into(eoh, data, data_length);
+			slot->tts_values[natt] = PointerGetDatum(data);
+			data += data_length;
+		}
+		else
+		{
+			Size		data_length = 0;
+
+			data = (char *) att_nominal_alignby(data, att->attalignby);
+			data_length = att_addlength_datum(data_length, att->attlen, val);
+			memcpy(data, DatumGetPointer(val), data_length);
+			slot->tts_values[natt] = PointerGetDatum(data);
+			data += data_length;
+		}
+	}
+
+	/* The values no longer refer to the row's memory. */
+	if (s->open)
+	{
+		s->open = false;
+		MemoryContextReset(s->row_memory);
+	}
+}
+
+static void
+prolly_slot_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
+{
+	TupleDesc	srcdesc = srcslot->tts_tupleDescriptor;
+
+	prolly_slot_clear(dstslot);
+	slot_getallattrs(srcslot);
+	for (int natt = 0; natt < srcdesc->natts; natt++)
+	{
+		dstslot->tts_values[natt] = srcslot->tts_values[natt];
+		dstslot->tts_isnull[natt] = srcslot->tts_isnull[natt];
+	}
+	dstslot->tts_nvalid = srcdesc->natts;
+	dstslot->tts_flags &= ~TTS_FLAG_EMPTY;
+	prolly_slot_materialize(dstslot);
+}
+
+static HeapTuple
+prolly_slot_copy_heap_tuple(TupleTableSlot *slot)
+{
+	Assert(!TTS_EMPTY(slot));
+	slot_getallattrs(slot);
+	return heap_form_tuple(slot->tts_tupleDescriptor, slot->tts_values, slot->tts_isnull);
+}
+
+static MinimalTuple
+prolly_slot_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+{
+	Assert(!TTS_EMPTY(slot));
+	slot_getallattrs(slot);
+	return heap_form_minimal_tuple(slot->tts_tupleDescriptor, slot->tts_values, slot->tts_isnull, extra);
+}
+
+const TupleTableSlotOps TTSOpsProlly = {
+	.base_slot_size = sizeof(DGSlot),
+	.init = prolly_slot_init,
+	.release = prolly_slot_release,
+	.clear = prolly_slot_clear,
+	.getsomeattrs = prolly_slot_getsomeattrs,
+	.getsysattr = prolly_slot_getsysattr,
+	.is_current_xact_tuple = prolly_slot_is_current_xact_tuple,
+	.materialize = prolly_slot_materialize,
+	.copyslot = prolly_slot_copyslot,
+	.get_heap_tuple = NULL,
+	.get_minimal_tuple = NULL,
+	.copy_heap_tuple = prolly_slot_copy_heap_tuple,
+	.copy_minimal_tuple = prolly_slot_copy_minimal_tuple,
+};
+
+/*
+ * Decode |bytes| into |slot| by |rel|'s plan. A prolly slot takes the bytes
+ * and decodes columns as the executor asks for them; a virtual slot gets
+ * every value now, in the caller's memory; any other slot a heap tuple.
  */
 void
 dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 {
 	DecodePlan *plan = decode_plan(rel);
 	PLTupleView view;
-	int			encoding = pg_get_client_encoding();
-	bool		switched = plan->xml || encoding != GetDatabaseEncoding();
-	int			saved_xmloption = xmloption;
-	int			i;
 
+	if (slot->tts_ops == &TTSOpsProlly)
+	{
+		DGSlot	   *s = (DGSlot *) slot;
+
+		ExecClearTuple(slot);
+		if (bytes.len > s->row_capacity)
+		{
+			Size		capacity = Max(bytes.len, s->row_capacity * 2);
+
+			s->row = s->row ? repalloc(s->row, capacity) : MemoryContextAlloc(slot->tts_mcxt, capacity);
+			s->row_capacity = capacity;
+		}
+		memcpy(s->row, bytes.data, bytes.len);
+		dg_check(pl_tuple_open((PLSlice) {s->row, bytes.len}, &s->view));
+		if (s->view.count != (size_t) plan->natts)
+			dg_unsupported("schema changes to stored tuples");
+		s->plan = plan;
+		s->open = true;
+		slot->tts_nvalid = 0;
+		slot->tts_flags &= ~TTS_FLAG_EMPTY;
+		slot->tts_tid = *tid;
+		slot->tts_tableOid = RelationGetRelid(rel);
+		return;
+	}
 	if (!TTS_IS_VIRTUAL(slot))
 	{
 		HeapTuple	tuple = decode_fields(RelationGetDescr(rel), bytes);
@@ -850,126 +1247,7 @@ dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 	if (view.count != (size_t) plan->natts)
 		dg_unsupported("schema changes to stored tuples");
 	ExecClearTuple(slot);
-	if (switched)
-	{
-		if (SetClientEncoding(GetDatabaseEncoding()) < 0)
-			elog(ERROR, "could not select storage encoding");
-		xmloption = XMLOPTION_CONTENT;
-	}
-	PG_TRY();
-	{
-		for (i = 0; i < plan->natts; i++)
-		{
-			DecodeColumn *column = &plan->columns[i];
-			PLValue		field;
-
-			dg_check(pl_tuple_field(&view, i, &field));
-			slot->tts_isnull[i] = !field.present || column->dropped;
-			slot->tts_values[i] = (Datum) 0;
-			if (slot->tts_isnull[i])
-				continue;
-			switch (column->kind)
-			{
-				case DECODE_BYTES:
-					slot->tts_values[i] = PointerGetDatum(cstring_to_text_with_len((const char *) field.bytes.data, field.bytes.len));
-					break;
-				case DECODE_INTEGER:
-					{
-						int64		n;
-
-						if (field.bytes.len != 8)
-							elog(ERROR, "invalid prolly integer encoding");
-						n = (int64) (pl_read64(field.bytes.data) ^ UINT64CONST(0x8000000000000000));
-						slot->tts_values[i] = column->base == BOOLOID ? BoolGetDatum(n != 0) :
-							column->base == INT2OID ? Int16GetDatum(n) :
-							column->base == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
-						break;
-					}
-				case DECODE_ENVELOPE_BYTES:
-					{
-						PLSlice		wire = envelope_contents(field.bytes);
-
-						slot->tts_values[i] = PointerGetDatum(cstring_to_text_with_len((const char *) wire.data, wire.len));
-						break;
-					}
-				case DECODE_WIRE8:
-					{
-						PLSlice		wire = envelope_contents(field.bytes);
-						int64		n;
-
-						if (wire.len != 8)
-							elog(ERROR, "invalid prolly 8-byte encoding");
-						n = (int64) pl_read64(wire.data);
-						if (column->base == FLOAT8OID)
-						{
-							union
-							{
-								int64		i;
-								float8		f;
-							}			swap = {n};
-
-							slot->tts_values[i] = Float8GetDatum(swap.f);
-						}
-						else
-							slot->tts_values[i] = Int64GetDatum(n);
-						break;
-					}
-				case DECODE_WIRE4:
-					{
-						PLSlice		wire = envelope_contents(field.bytes);
-						int32		n;
-
-						if (wire.len != 4)
-							elog(ERROR, "invalid prolly 4-byte encoding");
-						n = (int32) pl_read32(wire.data);
-						if (column->base == FLOAT4OID)
-						{
-							union
-							{
-								int32		i;
-								float4		f;
-							}			swap = {n};
-
-							slot->tts_values[i] = Float4GetDatum(swap.f);
-						}
-						else
-							slot->tts_values[i] = DateADTGetDatum((DateADT) n);
-						break;
-					}
-				case DECODE_UUID:
-					{
-						PLSlice		wire = envelope_contents(field.bytes);
-						pg_uuid_t  *uuid;
-
-						if (wire.len != UUID_LEN)
-							elog(ERROR, "invalid prolly uuid encoding");
-						uuid = palloc(UUID_LEN);
-						memcpy(uuid->data, wire.data, UUID_LEN);
-						slot->tts_values[i] = UUIDPGetDatum(uuid);
-						break;
-					}
-				case DECODE_NUMERIC:
-					slot->tts_values[i] = decode_numeric(envelope_contents(field.bytes));
-					break;
-				case DECODE_GENERAL:
-					slot->tts_values[i] = decode_value(column->type, field.bytes);
-					break;
-				case DECODE_RECEIVE:
-					slot->tts_values[i] = receive_planned(column, field.bytes);
-					break;
-			}
-		}
-	}
-	PG_FINALLY();
-	{
-		if (switched)
-		{
-			xmloption = saved_xmloption;
-			if (SetClientEncoding(encoding) < 0)
-				elog(FATAL, "could not restore client encoding");
-		}
-	}
-	PG_END_TRY();
+	decode_range(plan, &view, 0, plan->natts, slot->tts_values, slot->tts_isnull);
 	ExecStoreVirtualTuple(slot);
 	slot->tts_tid = *tid;
 	slot->tts_tableOid = RelationGetRelid(rel);

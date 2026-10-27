@@ -100,6 +100,9 @@ extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
 /* Unique-key reservations; see dg_lock.c. */
 extern void dg_key_reserve(Relation index, const char *branch, uint64 hash);
 
+/* The table slot: rows decoded a column at a time as asked for; see dg_codec.c. */
+extern const TupleTableSlotOps TTSOpsProlly;
+
 /* Rows an index scan found, for the table fetches that follow; see dg_table.c. */
 extern void dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row);
 extern bool dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row);
