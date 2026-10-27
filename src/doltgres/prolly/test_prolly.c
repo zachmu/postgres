@@ -730,6 +730,33 @@ test_apply_batches(void)
 		CHECK(fetch.fetches > 0 && fetch.fetches < 12);
 		CHECK(fetch.fetches * 20 < stats.chunks);
 		printf("fetch-backed edit: %u fetches of %zu chunks\n", fetch.fetches, stats.chunks);
+
+		/* Dropping unbacked nodes removes exactly the edit's new nodes and keeps the fetched ones. */
+		stats = pl_store_stats(backed);
+		CHECK(stats.chunks > stats.fetched);
+		CHECK(pl_store_drop_unbacked(backed) == stats.chunks - stats.fetched);
+		CHECK(pl_store_stats(backed).chunks == stats.fetched);
+		CHECK(pl_store_drop_unbacked(backed) == 0);
+		CHECK(pl_store_stats(backed).chunks == stats.fetched);
+
+		/* Unbacked nodes that retain frees are forgotten, not freed again. */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						again;
+			uint8_t		other[4] = {5, 6, 7, 8};
+			PLEdit		edit2 = {{keys[SLOTS / 3], 8}, {true, {other, 4}}};
+			PLStats		before = pl_store_stats(backed),
+						after;
+			size_t		built;
+
+			OK(pl_apply(&base_remote, &edit2, 1, &again));
+			after = pl_store_stats(backed);
+			built = (after.chunks - before.chunks) - (after.fetched - before.fetched);
+			CHECK(built > 0);
+			CHECK(pl_store_retain(backed, &tree.root, 1) == built);
+			CHECK(pl_store_drop_unbacked(backed) == 0);
+			CHECK(pl_store_stats(backed).chunks == after.fetched);
+		}
 		pl_store_free(backed);
 	}
 

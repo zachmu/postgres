@@ -199,6 +199,9 @@ roots_latest(const RootKey *key)
  */
 
 static PLStore *working_store;
+
+/* Parsed nodes kept across transactions, at most. */
+#define DG_NODE_CACHE_BYTES ((size_t) 64 * 1024 * 1024)
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
@@ -336,7 +339,7 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	}
 	if (node->backed)
 		return;					/* reached twice through shared subtrees */
-	node->backed = true;
+	pl_node_set_backed(node);
 	if (pending->count == pending->capacity)
 	{
 		pending->capacity = pending->capacity ? pending->capacity * 2 : 64;
@@ -496,6 +499,17 @@ typedef struct Overlay
 static HTAB *overlays;
 static bool callbacks_registered;
 
+/* Pending edits, in dg_batch.inc. */
+static bool loading_for_batch;
+static HTAB *batches;
+static void batch_flush_key(const RootKey *key);
+static void batch_flush_all(void);
+static void batch_discard(SubTransactionId subxid);
+static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid);
+static uint64 roots_generation(void);
+static void roots_generation_bump(void);
+static void handle_table_init(void *ptr);
+
 /*
  * Rows this transaction updated or deleted, by handle, with the command and
  * subtransaction that did it. A row changed by the current command must be
@@ -575,13 +589,13 @@ overlay_entry(Overlay *overlay, Snapshot snapshot)
 }
 
 static void
-overlay_push(const RootKey *key, CommandId cid, const Roots *base, const Roots *roots)
+overlay_push(const RootKey *key, CommandId cid, SubTransactionId subxid, const Roots *base, const Roots *roots)
 {
 	Overlay    *overlay = overlay_find(key, true);
 	OverlayEntry *top;
 
 	if (overlay->count && overlay->entries[overlay->count - 1].cid == cid &&
-		overlay->entries[overlay->count - 1].subxid == GetCurrentSubTransactionId())
+		overlay->entries[overlay->count - 1].subxid == subxid)
 		top = &overlay->entries[overlay->count - 1];
 	else
 	{
@@ -595,7 +609,7 @@ overlay_push(const RootKey *key, CommandId cid, const Roots *base, const Roots *
 		top = &overlay->entries[overlay->count++];
 	}
 	top->cid = cid;
-	top->subxid = GetCurrentSubTransactionId();
+	top->subxid = subxid;
 	top->base = *base;
 	top->roots = *roots;
 }
@@ -685,6 +699,7 @@ roots_write(Relation catalog, const RootKey *key, ItemPointer tid, const Roots *
 	else
 		CatalogTupleInsert(catalog, tuple);
 	heap_freetuple(tuple);
+	roots_generation_bump();
 }
 
 /* Publish every written relation, in a fixed order to avoid deadlocks. */
@@ -758,6 +773,7 @@ store_xact(XactEvent event, void *arg)
 				CurrentResourceOwner = TopTransactionResourceOwner;
 				PG_TRY();
 				{
+					batch_flush_all();
 					publish_all();
 					working_close(true);
 				}
@@ -781,14 +797,24 @@ store_xact(XactEvent event, void *arg)
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
 			overlays = NULL;	/* in TopTransactionContext */
+			batches = NULL;
 			modified = NULL;
 			live_states = NULL;
 			live_count = live_capacity = 0;
 			collect_threshold = DG_COLLECT_MINIMUM;
+			/*
+			 * Parsed nodes are content-addressed, so those the chunk store
+			 * holds stay valid for the next transaction: keep them, up to a
+			 * bound, and drop only this transaction's own unwritten nodes.
+			 */
 			if (working_store)
 			{
-				pl_store_free(working_store);
-				working_store = NULL;
+				pl_store_drop_unbacked(working_store);
+				if (pl_store_stats(working_store).bytes > DG_NODE_CACHE_BYTES)
+				{
+					pl_store_free(working_store);
+					working_store = NULL;
+				}
 			}
 			break;
 		default:
@@ -802,6 +828,14 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	HASH_SEQ_STATUS status;
 	Overlay    *overlay;
 
+	/*
+	 * Pending edits belong to one subtransaction: applied before a nested one
+	 * starts or as their own commits, forgotten as it aborts.
+	 */
+	if (event == SUBXACT_EVENT_START_SUB || event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		batch_flush_all();
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+		batch_discard(mySubid);
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
 		return;
 
@@ -898,10 +932,38 @@ typedef struct HandleSlot
 typedef struct HandleTable
 {
 	slock_t		mutex;
+	pg_atomic_uint64 roots_generation;	/* bumped by every roots write */
 	HandleSlot	slots[DG_HANDLE_SLOTS];
 } HandleTable;
 
 static HandleTable *handle_table;
+
+static HandleTable *
+shared_handles(void)
+{
+	bool		found;
+
+	if (!handle_table)
+		handle_table = GetNamedDSMSegment("dolt prolly handles", sizeof(HandleTable), handle_table_init, &found);
+	return handle_table;
+}
+
+/*
+ * A counter every roots write advances before its commit: while it stands
+ * still, no transaction has published roots, so trees loaded under it are
+ * still the latest.
+ */
+static uint64
+roots_generation(void)
+{
+	return pg_atomic_read_u64(&shared_handles()->roots_generation);
+}
+
+static void
+roots_generation_bump(void)
+{
+	pg_atomic_fetch_add_u64(&shared_handles()->roots_generation, 1);
+}
 
 static void
 handle_table_init(void *ptr)
@@ -914,6 +976,7 @@ handle_table_init(void *ptr)
 		pg_atomic_init_u32(&table->slots[i].used, 0);
 		pg_atomic_init_u64(&table->slots[i].next, 0);
 	}
+	pg_atomic_init_u64(&table->roots_generation, 1);
 }
 
 static uint32
@@ -995,10 +1058,8 @@ dg_allocate_handle(Relation rel)
 				space = rel->rd_locator.spcOid;
 	RelFileNumber file = rel->rd_locator.relNumber;
 	HandleSlot *slot;
-	bool		found;
 
-	if (!handle_table)
-		handle_table = GetNamedDSMSegment("dolt prolly handles", sizeof(HandleTable), handle_table_init, &found);
+	shared_handles();
 	slot = handle_slot_find(db, space, file);
 	if (!slot)
 	{
@@ -1219,8 +1280,12 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		dg_unsupported("SERIALIZABLE isolation");
 	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && !wanted)
 		dg_unsupported("non-MVCC snapshots");
-	s = new_state(rel);
 	key = root_key(rel, branch);
+
+	/* Any other reader of these roots sees the current command's edits applied. */
+	if (!loading_for_batch)
+		batch_flush_key(&key);
+	s = new_state(rel);
 	overlay = overlay_find(&key, false);
 	if (snap && IsMVCCSnapshot(snap))
 		committed = roots_read(&key, snap);
@@ -1397,16 +1462,15 @@ dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 }
 
 static void
-save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
+save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid)
 {
-	RootKey		key = root_key(rel, branch);
 	Roots		base = {0},
 				roots = {.present = true};
 
 	register_callbacks();
 	if (s->store != dg_working_store())
 		elog(ERROR, "prolly state does not belong to this transaction");
-	roots.table = rel->rd_rel->relkind != RELKIND_INDEX;
+	roots.table = table;
 	roots.content = s->content.root;
 	if (roots.table)
 	{
@@ -1421,7 +1485,14 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 		base.handles = s->base[1];
 		base.keys = s->base[2];
 	}
-	overlay_push(&key, cid, &base, &roots);
+	overlay_push(key, cid, subxid, &base, &roots);
+}
+static void
+save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
+{
+	RootKey		key = root_key(rel, branch);
+
+	save_roots(&key, rel->rd_rel->relkind != RELKIND_INDEX, s, cid, GetCurrentSubTransactionId());
 }
 void
 dg_save(Relation rel, DGState *s, CommandId cid)
@@ -1430,6 +1501,8 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 		dg_storage_require_write(rel);
 	save_state(rel, s, cid, dg_relation_branch(rel));
 }
+
+#include "dg_batch.inc"
 
 /* Only the transactional resource allocator calls this, before publishing any
  * branch binding: the new storage starts empty on its branch. */

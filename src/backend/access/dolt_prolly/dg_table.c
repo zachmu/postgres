@@ -32,7 +32,17 @@ typedef struct DGScan
 	TableScanDescData base;
 	MemoryContext context;
 	DGState    *state;
+
+	/*
+	 * A forward scan walks the content tree and the key tree in step: both
+	 * are ordered by row digest, so each row's handles follow its bytes
+	 * without a lookup. Backward scans materialize the handles instead.
+	 */
+	bool		streaming;
+	PLCursor	content;
+	PLCursor	keys;
 	DGRows		rows;
+	bool		materialized;
 	int64		position;
 	TBMIterateResult bitmap_page;
 	OffsetNumber bitmap_offsets[TBM_MAX_TUPLES_PER_PAGE];
@@ -89,11 +99,35 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->context = AllocSetContextCreate(CurrentMemoryContext, "prolly scan", ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(scan->context);
 	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
-	if (!(flags & SO_TYPE_BITMAPSCAN))
+	scan->streaming = !(flags & SO_TYPE_BITMAPSCAN) && !CatalogViewIsProvisional(rel->rd_catalogview) && scan->state->has_root;
+	if (scan->streaming)
+	{
+		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
+		dg_check(pl_cursor_init(&scan->keys, &scan->state->keys, NULL));
+	}
+	else if (!(flags & SO_TYPE_BITMAPSCAN))
+	{
 		scan->rows = dg_rows(&scan->state->handles);
+		scan->materialized = true;
+	}
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
 	return &scan->base;
+}
+
+/* The handles of a scan, for the directions the merged walk does not serve. */
+static void
+materialize(DGScan *scan)
+{
+	MemoryContext old = MemoryContextSwitchTo(scan->context);
+
+	if (!scan->materialized)
+	{
+		scan->rows = dg_rows(&scan->state->handles);
+		scan->materialized = true;
+	}
+	scan->streaming = false;
+	MemoryContextSwitchTo(old);
 }
 static void
 end(TableScanDesc base)
@@ -108,10 +142,60 @@ end(TableScanDesc base)
 static void
 rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pagemode)
 {
-	((DGScan *) base)->position = -1;
-	((DGScan *) base)->bitmap_count = 0;
-	((DGScan *) base)->bitmap_position = 0;
+	DGScan	   *scan = (DGScan *) base;
+
+	scan->position = -1;
+	scan->bitmap_count = 0;
+	scan->bitmap_position = 0;
+	if (scan->streaming)
+	{
+		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
+		dg_check(pl_cursor_init(&scan->keys, &scan->state->keys, NULL));
+	}
 }
+
+/* The next row of the merged walk: the content entry each key entry names. */
+static bool
+next_streamed(DGScan *scan, TupleTableSlot *slot)
+{
+	for (;;)
+	{
+		PLEntry		content,
+					key;
+		int			order;
+		ItemPointerData tid;
+		PLSlice		row;
+
+		if (!scan->keys.valid || !scan->content.valid)
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		key = pl_cursor_entry(&scan->keys);
+		content = pl_cursor_entry(&scan->content);
+		if (key.key.len != DG_KEY_SIZE || content.key.len != PL_HASH_SIZE || content.value.len < 8)
+			elog(ERROR, "invalid prolly scan entry");
+		order = memcmp(key.key.data, content.key.data, PL_HASH_SIZE);
+		if (order > 0)
+		{
+			dg_check(pl_cursor_next(&scan->content));
+			continue;
+		}
+		if (order < 0)
+		{
+			/* A key without its row: stale, as a handle-only tree never is. */
+			dg_check(pl_cursor_next(&scan->keys));
+			continue;
+		}
+		dg_tid(pl_read64(key.key.data + PL_HASH_SIZE), &tid);
+		row.data = content.value.data + 8;
+		row.len = content.value.len - 8;
+		dg_check(pl_cursor_next(&scan->keys));
+		dg_decode(scan->base.rs_rd, row, &tid, slot);
+		return true;
+	}
+}
+
 static bool
 next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 {
@@ -119,6 +203,10 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	PLEntry    *entry;
 	ItemPointerData tid;
 
+	if (scan->streaming && ScanDirectionIsForward(dir))
+		return next_streamed(scan, slot);
+	if (scan->streaming)
+		materialize(scan);
 	if (ScanDirectionIsBackward(dir))
 	{
 		if (scan->position < 0)
@@ -224,30 +312,73 @@ fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 	release_state(rel, s);
 	return true;
 }
+/* An index scan's fetches share one state, loaded under the scan's snapshot. */
+typedef struct DGFetch
+{
+	IndexFetchTableData base;
+	MemoryContext memory;		/* the scan's, where the state lives */
+	Snapshot	snapshot;
+	DGState    *state;
+} DGFetch;
+
 static IndexFetchTableData *
 fetch_begin(Relation rel)
 {
-	IndexFetchTableData *f = palloc0(sizeof(*f));
+	DGFetch    *f = palloc0(sizeof(*f));
 
-	f->rel = rel;
-	return f;
+	f->base.rel = rel;
+	f->memory = CurrentMemoryContext;
+	return &f->base;
 }
 static void
 fetch_reset(IndexFetchTableData *f)
 {
 }
 static void
-fetch_end(IndexFetchTableData *f)
+fetch_end(IndexFetchTableData *base)
 {
+	DGFetch    *f = (DGFetch *) base;
+
+	if (f->state)
+		dg_release(f->state);
 	pfree(f);
 }
 static bool
-fetch_index(IndexFetchTableData *f, ItemPointer tid, Snapshot snap, TupleTableSlot *slot, bool *again, bool *dead)
+fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTableSlot *slot, bool *again, bool *dead)
 {
+	DGFetch    *f = (DGFetch *) base;
+	Relation	rel = base->rel;
+	uint8		key[8];
+	PLSlice		k = {key, 8};
+	PLValue		value;
+
 	*again = false;
 	if (dead)
 		*dead = false;
-	return fetch(f->rel, tid, snap, slot);
+	if (CatalogViewIsProvisional(rel->rd_catalogview) || snap == SnapshotAny)
+		return fetch(rel, tid, snap, slot);
+	if (f->state && f->snapshot != snap)
+	{
+		dg_release(f->state);
+		f->state = NULL;
+	}
+	if (!f->state)
+	{
+		MemoryContext old = MemoryContextSwitchTo(f->memory);
+
+		f->state = dg_load(rel, snap);
+		f->snapshot = snap;
+		MemoryContextSwitchTo(old);
+	}
+	pl_write64(key, dg_id(tid));
+	dg_check(pl_get(&f->state->handles, k, &value));
+	if (!value.present)
+	{
+		ExecClearTuple(slot);
+		return false;
+	}
+	dg_decode(rel, row_for_handle(f->state, value.bytes), tid, slot);
+	return true;
 }
 static bool
 tid_valid(TableScanDesc s, ItemPointer tid)
@@ -348,37 +479,48 @@ next_handle(Relation rel, DGState *s)
 {
 	return s->nextid ? s->nextid++ : dg_allocate_handle(rel);
 }
+/*
+ * An ordinary insert records its edits in the command's batch, applied to
+ * the trees in one pass when something else reads them; a rewrite's state
+ * is private and takes each edit directly.
+ */
 static void
 insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate)
 {
-	DGState    *s;
 	PLSlice		row;
 	uint64		handle;
-	bool		rewriting = CatalogViewIsProvisional(rel->rd_catalogview);
 
-	if (rewriting)
-		s = dg_catalog_rewrite_state(rel);
+	if (CatalogViewIsProvisional(rel->rd_catalogview))
+	{
+		DGState    *s = dg_catalog_rewrite_state(rel);
+
+		row = dg_encode(rel, slot);
+		multiplicity(s, row, 1);
+		handle = next_handle(rel, s);
+		handle_edit(s, handle, dg_rowhash(row), true);
+	}
 	else
 	{
+		DGBatch    *batch;
+
 		writer(rel);
-		s = dg_load(rel, SnapshotSelf);
-	}
-	row = dg_encode(rel, slot);
-	multiplicity(s, row, 1);
-	handle = next_handle(rel, s);
-	handle_edit(s, handle, dg_rowhash(row), true);
-	dg_tid(handle, &slot->tts_tid);
-	if (!rewriting)
-	{
-		dg_save(rel, s, cid);
-		dg_release(s);
-	}
-	if (!rewriting)
+		batch = dg_batch(rel, cid);
+		row = dg_encode(rel, slot);
+		handle = next_handle(rel, dg_batch_state(batch));
+		dg_batch_insert(batch, row, handle);
 		dg_index_apply(rel, row, 1, handle);
+		dg_collect();
+	}
+	dg_tid(handle, &slot->tts_tid);
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
-	if (!rewriting)
-		dg_collect();
+}
+/* The end of a COPY or multi-row INSERT: apply what the command recorded. */
+static void
+finish_bulk_insert(Relation rel, int options)
+{
+	if (!CatalogViewIsProvisional(rel->rd_catalogview))
+		dg_batch_finish(rel);
 }
 static void
 multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int opts, BulkInsertState state)
@@ -863,6 +1005,7 @@ dg_table_routine(void)
 		methods.index_delete_tuples = index_delete;
 		methods.tuple_insert = insert_row;
 		methods.multi_insert = multi_insert;
+		methods.finish_bulk_insert = finish_bulk_insert;
 		methods.tuple_insert_speculative = speculative;
 		methods.tuple_complete_speculative = complete;
 		methods.tuple_delete = delete_row;

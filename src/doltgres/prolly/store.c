@@ -127,7 +127,43 @@ pl_store_free(PLStore *store)
 	if (store->fd >= 0)
 		close(store->fd);
 	free(store->buckets);
+	free(store->unbacked);
 	free(store);
+}
+
+/* Free the nodes not known to be in the backing store: a transaction's own. */
+size_t
+pl_store_drop_unbacked(PLStore *store)
+{
+	size_t		freed = 0;
+
+	if (!store)
+		return 0;
+	for (size_t i = 0; i < store->unbacked_count; i++)
+	{
+		PLNode	   *node = store->unbacked[i];
+		PLNode	  **link;
+
+		if (node->backed)
+			continue;
+		link = &store->buckets[pl_read64(node->hash.bytes) % store->capacity];
+		while (*link != node)
+			link = &(*link)->next;
+		*link = node->next;
+		store->stats.chunks--;
+		store->stats.bytes -= node->size;
+		free(node->data);
+		free(node);
+		freed++;
+	}
+	store->unbacked_count = 0;
+	if (store->unbacked_capacity > 4096)
+	{
+		free(store->unbacked);
+		store->unbacked = NULL;
+		store->unbacked_capacity = 0;
+	}
+	return freed;
 }
 
 PLStats
@@ -162,6 +198,16 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 		return 0;
 	for (size_t i = 0; i < count; i++)
 		mark_reachable(store, roots[i]);
+
+	/* Unreachable nodes are about to be freed: forget them first. */
+	{
+		size_t		kept = 0;
+
+		for (size_t i = 0; i < store->unbacked_count; i++)
+			if (store->unbacked[i]->marked)
+				store->unbacked[kept++] = store->unbacked[i];
+		store->unbacked_count = kept;
+	}
 	for (size_t i = 0; i < store->capacity; i++)
 	{
 		PLNode	  **link = &store->buckets[i];
@@ -187,6 +233,13 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 	return freed;
 }
 
+/* Record that |node| is now in the backing store; it stays listed until dropped. */
+void
+pl_node_set_backed(PLNode *node)
+{
+	node->backed = true;
+}
+
 /* Find a node already in this store, without consulting a backing store. */
 PLNode *
 pl_find_local(PLStore *store, PLHash hash)
@@ -202,7 +255,7 @@ pl_find_local(PLStore *store, PLHash hash)
 	return NULL;
 }
 
-static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, PLNode **out);
+static PLStatus store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out);
 
 PLNode *
 pl_find(PLStore *store, PLHash hash)
@@ -213,9 +266,8 @@ pl_find(PLStore *store, PLHash hash)
 	if (node || !store || !store->fetch)
 		return node;
 	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
-		store_buffer(store, hash, bytes.data, bytes.len, &node) != PL_OK)
+		store_buffer(store, hash, bytes.data, bytes.len, true, &node) != PL_OK)
 		return NULL;
-	node->backed = true;
 	store->stats.fetched++;
 	return node;
 }
@@ -317,7 +369,7 @@ parse_node(PLNode *node)
 }
 
 static PLStatus
-store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, PLNode **out)
+store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, bool backed, PLNode **out)
 {
 	PLNode	   *node = pl_find_local(store, hash);
 	size_t		bucket;
@@ -382,6 +434,20 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 		store->buckets = buckets;
 		store->capacity = capacity;
 	}
+	if (!backed && store->unbacked_count == store->unbacked_capacity)
+	{
+		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;
+		PLNode	  **grown = realloc(store->unbacked, capacity * sizeof(*grown));
+
+		if (!grown)
+		{
+			free(node->data);
+			free(node);
+			return PL_NOMEM;
+		}
+		store->unbacked = grown;
+		store->unbacked_capacity = capacity;
+	}
 	if (store->fd >= 0 && !store->loading)
 	{
 		PLSlice		data = {bytes, length};
@@ -399,6 +465,9 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 	store->buckets[bucket] = node;
 	store->stats.chunks++;
 	store->stats.bytes += length;
+	node->backed = backed;
+	if (!backed)
+		store->unbacked[store->unbacked_count++] = node;
 	*out = node;
 	return PL_OK;
 }
@@ -427,7 +496,7 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 		return PL_INVALID;
 	if (!pl_hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
 		return PL_CORRUPT;
-	return store_buffer(store, hash, bytes.data, bytes.len, &node);
+	return store_buffer(store, hash, bytes.data, bytes.len, false, &node);
 }
 
 PLStatus
@@ -483,7 +552,7 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 		return PL_CORRUPT;
 	}
 	store->stats.writes++;
-	status = store_buffer(store, hash, data, length, out);
+	status = store_buffer(store, hash, data, length, false, out);
 	free(data);
 	return status;
 }

@@ -93,6 +93,7 @@ void		pl_store_free(PLStore *store);
 
 /* Load missing nodes on demand. Fetched nodes are marked as backed. */
 void		pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg);
+size_t		pl_store_drop_unbacked(PLStore *store);
 PLStats		pl_store_stats(const PLStore *store);
 
 /*

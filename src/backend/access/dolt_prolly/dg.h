@@ -96,6 +96,20 @@ extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, in
 extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bool wait,
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
+
+/* A command's pending edits to one relation's trees; see dg_batch.inc. */
+typedef struct DGBatch DGBatch;
+extern DGBatch *dg_batch(Relation rel, CommandId cid);
+extern DGBatch *dg_batch_current(Relation rel);
+extern DGState *dg_batch_state(DGBatch *batch);
+extern void dg_batch_insert(DGBatch *batch, PLSlice row, uint64 handle);
+extern void dg_batch_index(DGBatch *batch, PLSlice key, size_t prefix, PLHash digest, PLSlice row, int64 delta);
+extern void dg_batch_index_prefix(DGBatch *batch, PLSlice prefix, List **added, List **removed);
+extern bool dg_batch_handle_digest(DGBatch *batch, uint64 handle, PLHash *digest);
+extern bool dg_batch_row(DGBatch *batch, PLHash digest, PLSlice *row);
+extern int	dg_batch_handles(DGBatch *batch, PLHash digest, uint64 **handles);
+extern void dg_batch_finish(Relation rel);
+extern DGState *dg_batch_load(Relation rel);
 extern PLStore *dg_working_store(void);
 extern void dg_collect(void);
 extern bool dg_version_call_active(void);

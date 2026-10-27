@@ -62,6 +62,50 @@ escaped(StringInfo out, PLSlice bytes, bool descending)
 	appendStringInfoCharMacro(out, 0 ^ xor);
 }
 /*
+ * The row digest an index key of |index| ends with, read back from its
+ * escaped bytes: cheaper than hashing the row the value holds.
+ */
+static bool
+key_digest(Relation index, PLSlice key, PLHash *digest)
+{
+	size_t		i = 0;
+	int			j;
+
+	for (j = 0; j < index->rd_index->indnkeyatts; j++)
+	{
+		bool		desc = (index->rd_indoption[j] & INDOPTION_DESC) != 0;
+		uint8		xor = desc ? 255 : 0;
+
+		if (i >= key.len)
+			return false;
+		if (key.data[i++] != 1)
+			continue;			/* a null: its tag alone */
+		for (;;)
+		{
+			if (i + 1 >= key.len)
+				return false;
+			if ((key.data[i] ^ xor) == 0)
+			{
+				i++;
+				if ((key.data[i++] ^ xor) == 0)
+					break;		/* the terminator */
+				continue;		/* an escaped zero byte */
+			}
+			i++;
+		}
+	}
+	for (j = 0; j < PL_HASH_SIZE; j++)
+	{
+		if (i >= key.len)
+			return false;
+		digest->bytes[j] = key.data[i++];
+		if (!digest->bytes[j])
+			i++;				/* the escape of a zero byte */
+	}
+	return i + 2 == key.len;
+}
+
+/*
  * The index entry key for table row |row| with digest |digest|: each key
  * column as a null tag and escaped canonical bytes, then the escaped digest.
  * *prefix receives the length of the key-column part, and *nullkey whether
@@ -318,34 +362,14 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 	foreach(cell, indexes)
 	{
 		Relation	index = lfirst(cell);
-		DGState    *state = dg_load(index, SnapshotSelf);
+		DGBatch    *batch = dg_batch(index, GetCurrentCommandId(true));
 		StringInfoData key;
 		size_t		prefix;
 		bool		nullkey;
-		PLSlice		k;
-		PLValue		old;
-		int64		count;
-		PLEdit		edit = {0};
-		uint8	   *value;
 
 		initStringInfo(&key);
 		index_entry(index, row, digest_bytes, &key, &prefix, &nullkey);
-		k.data = (uint8 *) key.data;
-		k.len = key.len;
-		dg_check(pl_get(&state->content, k, &old));
-		count = (old.present ? (int64) pl_read64(old.bytes.data) : 0) + delta;
-		if (count < 0)
-			elog(ERROR, "prolly index \"%s\" is missing an entry", RelationGetRelationName(index));
-		value = palloc(8 + row.len);
-		pl_write64(value, (uint64) count);
-		memcpy(value + 8, row.data, row.len);
-		edit.key = k;
-		edit.value.present = count > 0;
-		edit.value.bytes.data = value;
-		edit.value.bytes.len = 8 + row.len;
-		dg_check(pl_apply(&state->content, &edit, 1, &state->content));
-		dg_save(index, state, GetCurrentCommandId(true));
-		dg_release(state);
+		dg_batch_index(batch, (PLSlice) {(uint8 *) key.data, key.len}, prefix, digest, row, delta);
 		/*
 		 * Writers of bound canonical storage may bypass the executor's index
 		 * insertion, so the AM checks their unique indexes itself.
@@ -356,7 +380,6 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 			key.len = prefix;
 			check_key(table, index, handle, &key, row);
 		}
-		pfree(value);
 		pfree(key.data);
 	}
 	close_indexes(indexes, opened);
@@ -429,6 +452,7 @@ handles_of(DGState *table, PLHash digest)
 
 typedef struct KeyRows
 {
+	Relation	index;
 	PLHash	   *digests;
 	int			count;
 	int			capacity;
@@ -445,8 +469,35 @@ collect_key_rows(void *arg, PLSlice key, PLSlice value)
 		rows->digests = rows->digests ? repalloc_array(rows->digests, PLHash, rows->capacity) :
 			palloc_array(PLHash, rows->capacity);
 	}
-	rows->digests[rows->count++] = dg_rowhash((PLSlice) {value.data + 8, value.len - 8});
+	if (!key_digest(rows->index, key, &rows->digests[rows->count]))
+		rows->digests[rows->count] = dg_rowhash((PLSlice) {value.data + 8, value.len - 8});
+	rows->count++;
 	return PL_OK;
+}
+
+/* The digest row |handle| maps to in |s|, and the row |digest| names. */
+static bool
+handle_digest_of(DGState *s, uint64 handle, PLHash *digest)
+{
+	uint8		id[8];
+	PLValue		value;
+
+	pl_write64(id, handle);
+	dg_check(pl_get(&s->handles, (PLSlice) {id, 8}, &value));
+	if (value.present)
+		memcpy(digest->bytes, value.bytes.data, PL_HASH_SIZE);
+	return value.present;
+}
+static bool
+row_of(DGState *s, PLHash digest, PLSlice *row)
+{
+	PLValue		value;
+
+	dg_check(pl_get(&s->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
+	if (!value.present || value.bytes.len < 8)
+		return false;
+	*row = (PLSlice) {value.bytes.data + 8, value.bytes.len - 8};
+	return true;
 }
 
 /*
@@ -456,12 +507,19 @@ collect_key_rows(void *arg, PLSlice key, PLSlice value)
 static uint64
 unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 {
-	DGState    *rows = dg_load(table, SnapshotSelf);
-	DGState    *entries = dg_load(index, SnapshotSelf);
+	DGBatch    *rows_batch = dg_batch_current(table),
+			   *entries_batch = dg_batch_current(index);
+
+	/* The latest trees, as another inserter of the key may just have committed. */
+	DGState    *rows = rows_batch ? dg_batch_load(table) : dg_load(table, SnapshotSelf);
+	DGState    *entries = entries_batch ? dg_batch_load(index) : dg_load(index, SnapshotSelf);
 	StringInfoData upper;
 	PLSlice		lo = {(uint8 *) prefix->data, prefix->len},
 				hi;
-	KeyRows		found = {0};
+	KeyRows		found = {index};
+	List	   *added = NIL,
+			   *removed = NIL;
+	ListCell   *lc;
 	uint64		conflict = 0;
 
 	initStringInfo(&upper);
@@ -471,13 +529,39 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 	hi.data = (uint8 *) upper.data;
 	hi.len = upper.len;
 	dg_check(pl_scan(&entries->content, &lo, &hi, collect_key_rows, &found));
+
+	/* The command's own entries, not yet in the trees, count too. */
+	if (entries_batch)
+		dg_batch_index_prefix(entries_batch, lo, &added, &removed);
+	foreach(lc, added)
+	{
+		PLHash	   *digest = lfirst(lc);
+
+		if (found.count == found.capacity)
+		{
+			found.capacity = found.capacity ? found.capacity * 2 : 4;
+			found.digests = found.digests ? repalloc_array(found.digests, PLHash, found.capacity) :
+				palloc_array(PLHash, found.capacity);
+		}
+		found.digests[found.count++] = *digest;
+	}
 	for (int i = 0; i < found.count && !conflict; i++)
 	{
 		HandleList	handles = handles_of(rows, found.digests[i]);
+		uint64	   *pending;
+		int			n = rows_batch ? dg_batch_handles(rows_batch, found.digests[i], &pending) : 0;
+		bool		gone = false;
 
-		for (int j = 0; j < handles.count && !conflict; j++)
+		/* An entry the command removed no longer names a live row. */
+		foreach(lc, removed)
+			if (pl_hash_equal(*(PLHash *) lfirst(lc), found.digests[i]))
+				gone = true;
+		for (int j = 0; j < handles.count && !conflict && !gone; j++)
 			if (handles.items[j] != self)
 				conflict = handles.items[j];
+		for (int j = 0; j < n && !conflict; j++)
+			if (pending[j] != self)
+				conflict = pending[j];
 	}
 	dg_release(rows);
 	dg_release(entries);
@@ -498,26 +582,24 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 void
 dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull)
 {
-	DGState    *rows = dg_load(table, SnapshotSelf);
+	DGBatch    *batch = dg_batch_current(table);
+	DGState    *rows = batch ? NULL : dg_load(table, SnapshotSelf);
 	uint64		self = dg_id(tid);
-	uint8		id[8];
-	PLSlice		k = {id, 8};
-	PLValue		digest;
-	PLValue		row;
+	PLHash		digest;
+	PLSlice		row;
 	StringInfoData key;
 	size_t		prefix;
 	bool		nullkey;
 
-	pl_write64(id, self);
-	dg_check(pl_get(&rows->handles, k, &digest));
-	if (!digest.present)
+	/* The row may still be pending in the command's batch. */
+	if (batch ? !dg_batch_handle_digest(batch, self, &digest) : !handle_digest_of(rows, self, &digest))
 		elog(ERROR, "prolly row to check is missing");
-	dg_check(pl_get(&rows->content, digest.bytes, &row));
-	if (!row.present)
+	if (batch ? !dg_batch_row(batch, digest, &row) : !row_of(rows, digest, &row))
 		elog(ERROR, "missing canonical row contents");
 	initStringInfo(&key);
-	index_entry(index, (PLSlice) {row.bytes.data + 8, row.bytes.len - 8}, digest.bytes, &key, &prefix, &nullkey);
-	dg_release(rows);
+	index_entry(index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &key, &prefix, &nullkey);
+	if (rows)
+		dg_release(rows);
 	if (nullkey && !index->rd_index->indnullsnotdistinct)
 		return;
 	key.len = prefix;
@@ -824,8 +906,13 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	for (size_t i = 0; i < rows.count; i++)
 	{
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-		HandleList	handles = handles_of(table, dg_rowhash(row));
+		PLHash		digest;
+		HandleList	handles;
 		ItemPointerData first_tid;
+
+		if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
+			digest = dg_rowhash(row);
+		handles = handles_of(table, digest);
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)

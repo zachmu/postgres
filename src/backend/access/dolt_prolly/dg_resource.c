@@ -301,6 +301,9 @@ dg_storage_close(DGStorage *storage)
 {
 	ListCell   *lc;
 
+	/* Pending edits name this private descriptor: apply them while it lives. */
+	if (storage->writable)
+		dg_batch_finish(&storage->relation);
 	foreach(lc, storage->indexes)
 		dg_storage_close_relation((Relation) lfirst(lc));
 	RelationCloseSmgr(&storage->relation);
