@@ -2566,6 +2566,7 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		native->schemaname = get_namespace_name(get_rel_namespace(rte->relid));
 		item = addRangeTableEntry(pstate, native, rv->alias, false, true);
 		item->p_rte->dolt_database = rte->dolt_database;
+		item->p_rte->dolt_branch = rte->dolt_branch;
 		item->p_rte->dolt_ref = rte->dolt_ref;
 		item->p_rte->dolt_ref_target = rte->dolt_ref_target;
 		FreeTupleDesc(desc);

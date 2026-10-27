@@ -358,7 +358,8 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 	bool		pushed = false;
 	bool		working = false;
 	Oid			live = InvalidOid;
-	const char *context_branch = NULL;
+	/* Stored system-view rules inherit both schema and branch identity. */
+	const char *context_branch = rte->dolt_branch;
 	Snapshot	outer;
 	bool		session_name;
 

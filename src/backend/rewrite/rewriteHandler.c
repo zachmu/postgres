@@ -99,22 +99,25 @@ static List *matchLocks(CmdType event, Relation relation,
 /* Inherit immutable context into copied view actions, including nested queries.
  * Never modify the relcache's stored rule tree or a sibling view reference. */
 static bool
-inherit_catalog_context(Node *node, const char *database)
+inherit_catalog_context(Node *node, const RangeTblEntry *context)
 {
 	if (!node)
 		return false;
 	if (IsA(node, Query))
 		return query_tree_walker((Query *) node, inherit_catalog_context,
-								 (void *) database, QTW_EXAMINE_RTES_BEFORE);
+								 (void *) context, QTW_EXAMINE_RTES_BEFORE);
 	if (IsA(node, RangeTblEntry))
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) node;
 
 		if (rte->rtekind == RTE_RELATION && !rte->dolt_database)
-			rte->dolt_database = pstrdup(database);
+		{
+			rte->dolt_database = pstrdup(context->dolt_database);
+			rte->dolt_branch = context->dolt_branch ? pstrdup(context->dolt_branch) : NULL;
+		}
 		return false;
 	}
-	return expression_tree_walker(node, inherit_catalog_context, (void *) database);
+	return expression_tree_walker(node, inherit_catalog_context, (void *) context);
 }
 
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
@@ -1876,7 +1879,7 @@ ApplyRetrieveRule(Query *parsetree,
 	rule_action = copyObject(linitial(rule->actions));
 	rte = rt_fetch(rt_index, parsetree->rtable);
 	if (rte->dolt_database)
-		inherit_catalog_context((Node *) rule_action, rte->dolt_database);
+		inherit_catalog_context((Node *) rule_action, rte);
 
 	AcquireRewriteLocks(rule_action, true, (rc != NULL));
 
