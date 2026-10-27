@@ -146,6 +146,7 @@
 #autovacuum_work_mem = -1		# min 64kB, or -1 to use maintenance_work_mem
 #logical_decoding_work_mem = 64MB	# min 64kB
 #dolt_chunk_cache_size = 256MB		# per-session prolly chunk cache, 0 disables
+#dolt_catalog_cache_entries = 16	# decoded revision catalog views retained per session
 #max_stack_depth = 2MB			# min 100kB
 #shared_memory_type = mmap		# the default is the first option
 					# supported by the operating system:
@@ -854,6 +855,7 @@
 # - Other Platforms and Clients -
 
 #transform_null_equals = off
+#dolt_show_system_tables = off		# list generated Dolt system tables in catalog views
 #allow_alter_system = on
 
 
