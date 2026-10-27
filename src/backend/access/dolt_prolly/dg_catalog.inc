@@ -492,10 +492,16 @@ revision_selected:
 		cached = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), false);
 		if (cached && cached->desc && cached->invalidations == SharedInvalidMessageCounter)
 		{
-			bytea	   *now = catalog_working_schema(revision);
+			/*
+			 * A binding against the session's database is keyed by that
+			 * database's hash; one against the branch's working schema is
+			 * checked against the schema as it stands now.
+			 */
+			bytea	   *now = cached->schema ? catalog_working_schema(revision) : NULL;
 
-			if (now && VARSIZE_ANY_EXHDR(now) == VARSIZE_ANY_EXHDR(cached->schema) &&
-				memcmp(VARDATA_ANY(now), VARDATA_ANY(cached->schema), VARSIZE_ANY_EXHDR(now)) == 0)
+			if (!cached->schema ||
+				(now && VARSIZE_ANY_EXHDR(now) == VARSIZE_ANY_EXHDR(cached->schema) &&
+				 memcmp(VARDATA_ANY(now), VARDATA_ANY(cached->schema), VARSIZE_ANY_EXHDR(now)) == 0))
 			{
 				rte->dolt_database = pstrdup(cached->dolt_database);
 				rte->dolt_ref = pstrdup(cached->dolt_ref);
@@ -688,7 +694,7 @@ revision_selected:
 			{
 				rte->dolt_branch = pstrdup(revision);
 				rte->dolt_relid = live;
-				cacheable = plain && bound_schema != NULL;
+				cacheable = plain && rte->dolt_ref && rte->dolt_ref_target;
 			}
 		}
 binding_done:
@@ -700,13 +706,14 @@ binding_done:
 			if (entry->desc)
 			{
 				FreeTupleDesc(entry->desc);
-				pfree(entry->schema);
+				if (entry->schema)
+					pfree(entry->schema);
 				pfree(entry->dolt_database);
 				pfree(entry->dolt_ref);
 				pfree(entry->dolt_ref_target);
 				pfree(entry->dolt_branch);
 			}
-			entry->schema = (bytea *) datumCopy(PointerGetDatum(bound_schema), false, -1);
+			entry->schema = bound_schema ? (bytea *) datumCopy(PointerGetDatum(bound_schema), false, -1) : NULL;
 			entry->invalidations = SharedInvalidMessageCounter;
 			entry->dolt_database = pstrdup(rte->dolt_database);
 			entry->dolt_ref = pstrdup(rte->dolt_ref);

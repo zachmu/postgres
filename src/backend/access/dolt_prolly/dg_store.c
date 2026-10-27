@@ -159,15 +159,56 @@ roots_from_tuple(HeapTuple tuple, TupleDesc desc)
 	return roots;
 }
 
+/*
+ * The latest committed roots of each key this backend has read, with the
+ * generation they were read under and the transaction that wrote them. While
+ * the generation stands, no roots have been published, so the row is still
+ * the latest; a snapshot that sees its writer sees it.
+ */
+typedef struct RootsCacheEntry
+{
+	RootKey		key;
+	uint64		generation;
+	TransactionId xmin;
+	Roots		roots;
+} RootsCacheEntry;
+
+static HTAB *roots_cache;
+static uint64 roots_generation(void);
+
+static RootsCacheEntry *
+roots_cache_find(const RootKey *key, bool enter)
+{
+	if (!roots_cache)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(RootKey);
+		ctl.entrysize = sizeof(RootsCacheEntry);
+		ctl.hcxt = CacheMemoryContext;
+		roots_cache = hash_create("prolly roots", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return hash_search(roots_cache, key, enter ? HASH_ENTER : HASH_FIND, NULL);
+}
+
 /* The committed roots |snapshot| selects. */
 static Roots
 roots_read(const RootKey *key, Snapshot snapshot)
 {
-	Relation	catalog = table_open(DoltRootRelationId, AccessShareLock);
+	uint64		generation = roots_generation();
+	RootsCacheEntry *cached = roots_cache_find(key, false);
+	Relation	catalog;
 	ScanKeyData keys[3];
 	SysScanDesc scan;
 	HeapTuple	tuple;
 	Roots		roots = {0};
+	TransactionId xmin = InvalidTransactionId;
+	bool		latest = false;
+
+	if (cached && cached->generation == generation && cached->roots.present &&
+		(!IsMVCCSnapshot(snapshot) || !XidInMVCCSnapshot(cached->xmin, snapshot)))
+		return cached->roots;
+	catalog = table_open(DoltRootRelationId, AccessShareLock);
 
 	/* Callers such as foreign key checks may pass an unregistered snapshot. */
 	snapshot = RegisterSnapshot(snapshot);
@@ -175,10 +216,33 @@ roots_read(const RootKey *key, Snapshot snapshot)
 	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, snapshot, 3, keys);
 	tuple = systable_getnext(scan);
 	if (HeapTupleIsValid(tuple))
+	{
 		roots = roots_from_tuple(tuple, RelationGetDescr(catalog));
+		xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		/* A version another transaction has replaced is not the latest. */
+		latest = (tuple->t_data->t_infomask & HEAP_XMAX_INVALID) ||
+			HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask);
+	}
 	systable_endscan(scan);
 	UnregisterSnapshot(snapshot);
 	table_close(catalog, AccessShareLock);
+
+	/*
+	 * Remember a committed row that is the latest version. A row of this
+	 * transaction's own is visible by command, which the cache cannot tell;
+	 * an older snapshot may select a version a later commit replaced, which
+	 * its xmax shows.
+	 */
+	if (roots.present && latest && TransactionIdIsValid(xmin) && !TransactionIdIsCurrentTransactionId(xmin) &&
+		IsMVCCSnapshot(snapshot) && !XidInMVCCSnapshot(xmin, snapshot) && generation == roots_generation())
+	{
+		RootsCacheEntry *entry = roots_cache_find(key, true);
+
+		entry->generation = generation;
+		entry->xmin = xmin;
+		entry->roots = roots;
+	}
 	return roots;
 }
 
