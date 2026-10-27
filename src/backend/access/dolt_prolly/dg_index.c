@@ -62,6 +62,50 @@ escaped(StringInfo out, PLSlice bytes, bool descending)
 	appendStringInfoCharMacro(out, 0 ^ xor);
 }
 /*
+ * The row digest an index key of |index| ends with, read back from its
+ * escaped bytes: cheaper than hashing the row the value holds.
+ */
+static bool
+key_digest(Relation index, PLSlice key, PLHash *digest)
+{
+	size_t		i = 0;
+	int			j;
+
+	for (j = 0; j < index->rd_index->indnkeyatts; j++)
+	{
+		bool		desc = (index->rd_indoption[j] & INDOPTION_DESC) != 0;
+		uint8		xor = desc ? 255 : 0;
+
+		if (i >= key.len)
+			return false;
+		if (key.data[i++] != 1)
+			continue;			/* a null: its tag alone */
+		for (;;)
+		{
+			if (i + 1 >= key.len)
+				return false;
+			if ((key.data[i] ^ xor) == 0)
+			{
+				i++;
+				if ((key.data[i++] ^ xor) == 0)
+					break;		/* the terminator */
+				continue;		/* an escaped zero byte */
+			}
+			i++;
+		}
+	}
+	for (j = 0; j < PL_HASH_SIZE; j++)
+	{
+		if (i >= key.len)
+			return false;
+		digest->bytes[j] = key.data[i++];
+		if (!digest->bytes[j])
+			i++;				/* the escape of a zero byte */
+	}
+	return i + 2 == key.len;
+}
+
+/*
  * The index entry key for table row |row| with digest |digest|: each key
  * column as a null tag and escaped canonical bytes, then the escaped digest.
  * *prefix receives the length of the key-column part, and *nullkey whether
@@ -408,6 +452,7 @@ handles_of(DGState *table, PLHash digest)
 
 typedef struct KeyRows
 {
+	Relation	index;
 	PLHash	   *digests;
 	int			count;
 	int			capacity;
@@ -424,7 +469,9 @@ collect_key_rows(void *arg, PLSlice key, PLSlice value)
 		rows->digests = rows->digests ? repalloc_array(rows->digests, PLHash, rows->capacity) :
 			palloc_array(PLHash, rows->capacity);
 	}
-	rows->digests[rows->count++] = dg_rowhash((PLSlice) {value.data + 8, value.len - 8});
+	if (!key_digest(rows->index, key, &rows->digests[rows->count]))
+		rows->digests[rows->count] = dg_rowhash((PLSlice) {value.data + 8, value.len - 8});
+	rows->count++;
 	return PL_OK;
 }
 
@@ -469,7 +516,7 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 	StringInfoData upper;
 	PLSlice		lo = {(uint8 *) prefix->data, prefix->len},
 				hi;
-	KeyRows		found = {0};
+	KeyRows		found = {index};
 	List	   *added = NIL,
 			   *removed = NIL;
 	ListCell   *lc;
@@ -859,8 +906,13 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	for (size_t i = 0; i < rows.count; i++)
 	{
 		PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
-		HandleList	handles = handles_of(table, dg_rowhash(row));
+		PLHash		digest;
+		HandleList	handles;
 		ItemPointerData first_tid;
+
+		if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
+			digest = dg_rowhash(row);
+		handles = handles_of(table, digest);
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)
