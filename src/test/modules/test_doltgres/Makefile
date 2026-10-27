@@ -5,6 +5,8 @@ OBJS = $(WIN32RES) test_doltgres.o catalog_view.o
 PGFILEDESC = "test_doltgres - branch catalog projection experiment"
 REGRESS = branch_catalog
 TAP_TESTS = 1
+# 026_native_binding counts the internal statements binding runs.
+EXTRA_INSTALL = contrib/pg_stat_statements
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

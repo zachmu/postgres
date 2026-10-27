@@ -260,6 +260,17 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 	return state;
 }
 
+/*
+ * Release |state|, from dg_catalog_mutation_load, unless it is the rewrite's
+ * destination, which the rewrite owns: it shares the source's store.
+ */
+void
+dg_catalog_mutation_release(DGState *state)
+{
+	if (state != native_mutation_destination)
+		dg_release(state);
+}
+
 static char *
 mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 {

@@ -1,6 +1,7 @@
 #include "dg.h"
 #include <math.h>
 #include "nodes/tidbitmap.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "access/doltbranch.h"
 #include "miscadmin.h"
@@ -191,6 +192,15 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 		return true;
 	}
 }
+/* Release a state loaded for |rel|; a provisional rewrite keeps its own. */
+static void
+release_state(Relation rel, DGState *s)
+{
+	if (CatalogViewIsProvisional(rel->rd_catalogview))
+		dg_catalog_mutation_release(s);
+	else
+		dg_release(s);
+}
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 {
@@ -206,13 +216,13 @@ fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 	status = pl_get(&s->handles, k, &value);
 	if (status == PL_OK && !value.present)
 	{
-		dg_release(s);
+		release_state(rel, s);
 		ExecClearTuple(slot);
 		return false;
 	}
 	dg_check(status);
 	dg_decode(rel, row_for_handle(s, value.bytes), tid, slot);
-	dg_release(s);
+	release_state(rel, s);
 	return true;
 }
 static IndexFetchTableData *
@@ -738,6 +748,10 @@ toast(Relation rel)
 {
 	return false;
 }
+/* As heapam_handler.c sizes heap tuples and pages for the planner. */
+#define DG_HEAP_OVERHEAD_BYTES_PER_TUPLE (MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))
+#define DG_HEAP_USABLE_BYTES_PER_PAGE (BLCKSZ - SizeOfPageHeaderData)
+
 static void
 estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double *allvis)
 {
@@ -755,8 +769,19 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	bytes = *tuples * (Max(width, 1) + sizeof(ItemPointerData));
 	*pages = (BlockNumber) Min((double) MaxBlockNumber,
 		Max(1.0, ceil(bytes / BLCKSZ)));
+
+	/*
+	 * A prolly table is never vacuumed or analyzed. Size a small one as
+	 * PostgreSQL sizes a heap table never vacuumed, at ten pages of tuples of
+	 * its width, so that plans over small tables are the ones it would choose.
+	 */
+	if (*pages < 10)
+	{
+		*pages = 10;
+		*tuples = rint(clamp_row_est((double) (DG_HEAP_USABLE_BYTES_PER_PAGE / (width + DG_HEAP_OVERHEAD_BYTES_PER_TUPLE))) * 10);
+	}
 	*allvis = 0;
-	dg_release(state);
+	release_state(rel, state);
 }
 static bool
 sample_block(TableScanDesc s, struct SampleScanState *state)
