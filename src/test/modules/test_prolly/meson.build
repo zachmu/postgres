@@ -33,5 +33,6 @@ tests += {
     't/028_bitmap.pl',
     't/029_batched_writes.pl',
     't/030_decode_plan.pl',
+    't/031_scan_walk.pl',
   ]},
 }

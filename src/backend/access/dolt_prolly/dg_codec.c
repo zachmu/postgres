@@ -724,6 +724,12 @@ receive_planned(DecodeColumn *column, PLSlice bytes)
 	StringInfoData input;
 	Datum		result;
 
+	if (bytes.len < 4 || memcmp(bytes.data, "DGB1", 4))
+		elog(ERROR, "invalid prolly binary codec version");
+	bytes.data += 4;
+	bytes.len -= 4;
+
+	/* PostgreSQL 18's tsqueryrecv rejects the valid zero-item wire form. */
 	if (column->base == TSQUERYOID && bytes.len == 4 && pl_read32(bytes.data) == 0)
 	{
 		TSQuery		query = palloc0(HDRSIZETQ);
@@ -731,10 +737,8 @@ receive_planned(DecodeColumn *column, PLSlice bytes)
 		SET_VARSIZE(query, HDRSIZETQ);
 		return PointerGetDatum(query);
 	}
-	if (bytes.len < 4 || memcmp(bytes.data, "DGB1", 4))
-		elog(ERROR, "invalid prolly binary codec version");
 	initStringInfo(&input);
-	appendBinaryStringInfo(&input, (const char *) bytes.data + 4, bytes.len - 4);
+	appendBinaryStringInfo(&input, (const char *) bytes.data, bytes.len);
 	result = ReceiveFunctionCall(&column->receive, &input, column->ioparam, -1);
 	if (input.cursor != input.len)
 		elog(ERROR, "trailing bytes in prolly binary value");
