@@ -29,7 +29,8 @@ is(sql('SELECT * FROM composite'),'1|2','table-level composite primary key suppo
 sql(q{CREATE INDEX additional_index ON new_table(id)});
 is(sql(q{SELECT count(*) FROM pg_indexes WHERE indexname='additional_index'}),'1','standalone index DDL publishes canonical membership');
 sql(q{DROP INDEX additional_index});
-fails(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)},qr/deferred constraint/, 'deferred constraint remains rejected');
+sql(q{CREATE TABLE deferred(id int PRIMARY KEY DEFERRABLE)});
+is(sql(q{SELECT indimmediate FROM pg_index WHERE indrelid='deferred'::regclass}),'f','a deferrable constraint publishes a deferred index');
 fails(q{CREATE TABLE bad_index(id json PRIMARY KEY)},qr/default operator class/, 'native index creation failure aborts entire CREATE');
 is(sql(q{SELECT to_regclass('bad_index') IS NULL}),'t','failed index leaves no canonical table');
 sql(q{CREATE TABLE after_failure(id int PRIMARY KEY); INSERT INTO after_failure VALUES(4)});

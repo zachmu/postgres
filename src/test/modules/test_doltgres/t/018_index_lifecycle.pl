@@ -20,8 +20,8 @@ is(sql(q{SELECT dolt_hashof_db()}),$initial,'index create/drop preserves canonic
 sql(q{CREATE UNIQUE INDEX x_idx ON t(x)});
 is(sql(q{SELECT indexname FROM pg_indexes WHERE tablename='t' ORDER BY indexname}),"t_pkey\nx_idx",'independent index creation publishes canonical index');
 rejects(q{INSERT INTO t VALUES(3,10,'duplicate')},'new unique index validates writes');
-rejects(q{INSERT INTO t VALUES(3,10,'duplicate') ON CONFLICT DO NOTHING},'unsupported conflict snapshot releases private index scan pins safely');
-is(sql(q{SELECT count(*) FROM t}),'2','index scan failure leaves session usable');
+sql(q{INSERT INTO t VALUES(3,10,'duplicate') ON CONFLICT DO NOTHING});
+is(sql(q{SELECT count(*) FROM t}),'2','ON CONFLICT arbitrates on a new unique index');
 sql(q{SET enable_seqscan=off});
 is(sql(q{SELECT indkey::text FROM pg_index WHERE indexrelid='x_idx'::regclass}),'2','new index binds the correct table attribute');
 my $before=sql(q{SELECT dolt_hashof_db()});

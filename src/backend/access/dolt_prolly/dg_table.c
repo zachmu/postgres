@@ -90,8 +90,6 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 
 	if (parallel || nkeys)
 		dg_unsupported("parallel scans or table scan keys");
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	dg_validate_descriptor(RelationGetDescr(rel));
 	/* ANALYZE opens its sample scan without a snapshot; read the live state. */
 	if (!snap && (flags & SO_TYPE_ANALYZE))
@@ -457,6 +455,11 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 	*again = false;
 	if (dead)
 		*dead = false;
+	if (snap->snapshot_type == SNAPSHOT_DIRTY)
+	{
+		snap->xmin = snap->xmax = InvalidTransactionId;
+		snap->speculativeToken = 0;
+	}
 	if (CatalogViewIsProvisional(rel->rd_catalogview) || snap == SnapshotAny)
 		return fetch(rel, tid, snap, slot);
 	if (f->state && f->snapshot != snap)
@@ -472,19 +475,22 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 		f->snapshot = snap;
 		MemoryContextSwitchTo(old);
 	}
-	if (dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
+	if (!dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
 	{
-		dg_decode(rel, row, tid, slot);
-		return true;
+		pl_write64(key, dg_id(tid));
+		dg_check(pl_get(&f->state->handles, k, &value));
+		if (!value.present)
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		row = row_for_handle(f->state, value.bytes);
 	}
-	pl_write64(key, dg_id(tid));
-	dg_check(pl_get(&f->state->handles, k, &value));
-	if (!value.present)
-	{
-		ExecClearTuple(slot);
-		return false;
-	}
-	dg_decode(rel, row_for_handle(f->state, value.bytes), tid, slot);
+	dg_decode(rel, row, tid, slot);
+
+	/* A dirty snapshot reports the running transaction changing the row. */
+	if (snap->snapshot_type == SNAPSHOT_DIRTY)
+		snap->xmax = dg_record_xwait(rel, dg_relation_branch(rel), (int64) dg_id(tid), false);
 	return true;
 }
 static bool
@@ -497,10 +503,35 @@ latest(TableScanDesc s, ItemPointer tid)
 {
 	/* Successors are found by locking; an unlocked lookup keeps the TID. */
 }
+/* Whether |snap| sees row |tid|. */
+static bool
+visible(Relation rel, ItemPointer tid, Snapshot snap)
+{
+	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
+		dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
+	uint8		key[8];
+	PLSlice		k = {key, 8};
+	PLValue		value;
+
+	pl_write64(key, dg_id(tid));
+	dg_check(pl_get(&s->handles, k, &value));
+	release_state(rel, s);
+	return value.present;
+}
 static bool
 satisfies(Relation rel, TupleTableSlot *slot, Snapshot snap)
 {
-	return fetch(rel, &slot->tts_tid, snap, slot);
+	return visible(rel, &slot->tts_tid, snap);
+}
+
+/*
+ * Whether this transaction inserted row |tid| of |rel|, as heap tests a
+ * tuple's xmin: the row is in its changes and not in the committed state.
+ */
+bool
+dg_tuple_inserted_by_self(Relation rel, ItemPointer tid)
+{
+	return !dg_row_committed(rel, dg_id(tid)) && visible(rel, tid, SnapshotSelf);
 }
 static TransactionId
 index_delete(Relation rel, TM_IndexDeleteOp *op)
@@ -525,9 +556,8 @@ read_only_revision(Relation rel)
 static void
 writer(Relation rel)
 {
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
+	dg_serializable_write(rel);
 	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 }
@@ -637,15 +667,24 @@ multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int op
 	for (i = 0; i < n; i++)
 		insert_row(rel, slots_[i], cid, opts, state);
 }
+/*
+ * A speculative insertion is an ordinary one: the row stays private until
+ * commit, and competing inserters of its key wait on the unique-key
+ * reservation the arbiter index check takes, not on a speculative token.
+ */
 static void
-speculative(Relation r, TupleTableSlot *s, CommandId c, int o, BulkInsertState b, uint32 token)
+speculative(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate, uint32 token)
 {
-	dg_unsupported("ON CONFLICT/speculative insertion");
+	insert_row(rel, slot, cid, options, bistate);
 }
+static void remove_row(Relation rel, uint64 handle, CommandId cid);
+
+/* An insertion that met a conflicting row is undone without a trace. */
 static void
-complete(Relation r, TupleTableSlot *s, uint32 token, bool succeeded)
+complete(Relation rel, TupleTableSlot *slot, uint32 token, bool succeeded)
 {
-	dg_unsupported("speculative insertion");
+	if (!succeeded)
+		remove_row(rel, dg_id(&slot->tts_tid), GetCurrentCommandId(true));
 }
 static PLSlice
 copy_slice(PLSlice bytes)
@@ -743,23 +782,32 @@ crosscheck_visible(Relation rel, Snapshot crosscheck, uint64 handle)
 static TM_Result
 delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, bool changing)
 {
-	DGBatch    *b;
 	uint64		handle = dg_id(tid);
-	PLHash		digest;
-	PLSlice		row;
 	TM_Result	result;
 	int64		next;
 
 	writer(rel);
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
-	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, changing, failure, &next);
+	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, cid, wait, changing, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
 		result = TM_Updated;
 	result = still_current(rel, handle, result, failure);
 	if (result != TM_Ok)
 		return result;
-	b = dg_batch_latest(rel, cid);
+	remove_row(rel, handle, cid);
+	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
+	return TM_Ok;
+}
+
+/* Remove row version |handle| and its index entries in command |cid|. */
+static void
+remove_row(Relation rel, uint64 handle, CommandId cid)
+{
+	DGBatch    *b = dg_batch_latest(rel, cid);
+	PLHash		digest;
+	PLSlice		row;
+
 	if (!dg_batch_handle_digest(b, handle, &digest))
 		elog(ERROR, "locked prolly row is missing");
 	if (!dg_batch_row(b, digest, &row))
@@ -767,9 +815,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	row = copy_slice(row);
 	dg_batch_remove(b, row, handle);
 	dg_index_apply(rel, row, -1, handle);
-	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
 	dg_collect();
-	return TM_Ok;
 }
 
 /* Whether the old and new rows differ in any column of |attributes|. */
@@ -869,7 +915,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
 	successor = dg_allocate_handle(rel);
-	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, key_change,
+	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, cid, key_change,
 							  wait, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
 		result = TM_Updated;
@@ -905,15 +951,56 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 	TM_Result	result;
 	bool		traversed = false;
 	int64		next;
+	CommandId	made = InvalidCommandId;	/* the command that made *tid, if this transaction did */
 
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
+
+	/*
+	 * A row this transaction inserted in the current command, as a later row
+	 * of one INSERT ... ON CONFLICT finds, is invisible to heap_lock_tuple,
+	 * which still returns it.
+	 */
+	if (snapshot && IsMVCCSnapshot(snapshot) && dg_tuple_inserted_by_self(rel, tid) &&
+		!visible(rel, tid, snapshot))
+	{
+		fetch(rel, tid, SnapshotAny, slot);
+		return TM_Invisible;
+	}
 	for (;;)
 	{
-		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))
+		CommandId	modified;
+
+		/*
+		 * Following a concurrent update, heapam_tuple_lock reads the chain
+		 * with a dirty snapshot, to which versions this transaction replaced
+		 * or deleted are dead: it passes them by. The live version, if this
+		 * transaction made it in this command or a later one, is
+		 * TM_SelfModified, reporting the command that made it.
+		 */
+		if (traversed && dg_row_modified(rel, dg_relation_branch(rel), dg_id(tid), &modified))
+		{
+			int64		replacement = dg_record_successor(rel, dg_relation_branch(rel), (int64) dg_id(tid));
+
+			if (!replacement)
+			{
+				dg_tid(dg_id(tid), &tmfd->ctid);
+				result = TM_Deleted;
+				break;
+			}
+			made = modified;
+			dg_tid((uint64) replacement, tid);
+			continue;
+		}
+		if (traversed && made != InvalidCommandId && made >= cid)
+		{
+			dg_tid(dg_id(tid), &tmfd->ctid);
+			tmfd->xmax = GetTopTransactionIdIfAny();
+			tmfd->cmax = made;
+			result = TM_SelfModified;
 			break;
-		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), mode, policy,
+		}
+		made = InvalidCommandId;
+		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), cid, mode, policy,
 								(flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0, tmfd, &next);
 		if (result == TM_Updated && (flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
 			ItemPointerIndicatesMovedPartitions(&tmfd->ctid))

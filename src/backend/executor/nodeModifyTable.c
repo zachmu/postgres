@@ -52,9 +52,11 @@
 
 #include "postgres.h"
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
@@ -352,6 +354,23 @@ ExecProcessReturning(ModifyTableContext *context,
 }
 
 /*
+ * Whether the current transaction inserted the tuple in |slot|. Prolly rows
+ * carry no xmin; their table AM answers instead.
+ */
+static bool
+ExecTupleInsertedBySelf(Relation rel, TupleTableSlot *slot)
+{
+	Datum		xminDatum;
+	bool		isnull;
+
+	if (rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+		return dg_tuple_inserted_by_self(rel, &slot->tts_tid);
+	xminDatum = slot_getsysattr(slot, MinTransactionIdAttributeNumber, &isnull);
+	Assert(!isnull);
+	return TransactionIdIsCurrentTransactionId(DatumGetTransactionId(xminDatum));
+}
+
+/*
  * ExecCheckTupleVisible -- verify tuple is visible
  *
  * It would not be consistent with guarantees of the higher isolation levels to
@@ -369,21 +388,13 @@ ExecCheckTupleVisible(EState *estate,
 
 	if (!table_tuple_satisfies_snapshot(rel, slot, estate->es_snapshot))
 	{
-		Datum		xminDatum;
-		TransactionId xmin;
-		bool		isnull;
-
-		xminDatum = slot_getsysattr(slot, MinTransactionIdAttributeNumber, &isnull);
-		Assert(!isnull);
-		xmin = DatumGetTransactionId(xminDatum);
-
 		/*
 		 * We should not raise a serialization failure if the conflict is
 		 * against a tuple inserted by our own transaction, even if it's not
 		 * visible to our snapshot.  (This would happen, for example, if
 		 * conflicting keys are proposed for insertion in a single command.)
 		 */
-		if (!TransactionIdIsCurrentTransactionId(xmin))
+		if (!ExecTupleInsertedBySelf(rel, slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("could not serialize access due to concurrent update")));
@@ -2744,9 +2755,6 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 	TM_FailureData tmfd;
 	LockTupleMode lockmode;
 	TM_Result	test;
-	Datum		xminDatum;
-	TransactionId xmin;
-	bool		isnull;
 
 	/*
 	 * Parse analysis should have blocked ON CONFLICT for all system
@@ -2794,13 +2802,7 @@ ExecOnConflictUpdate(ModifyTableContext *context,
 			 * specifies that for SQL MERGE, an exception must be raised in
 			 * the event of an attempt to update the same row twice.
 			 */
-			xminDatum = slot_getsysattr(existing,
-										MinTransactionIdAttributeNumber,
-										&isnull);
-			Assert(!isnull);
-			xmin = DatumGetTransactionId(xminDatum);
-
-			if (TransactionIdIsCurrentTransactionId(xmin))
+			if (ExecTupleInsertedBySelf(relation, existing))
 				ereport(ERROR,
 						(errcode(ERRCODE_CARDINALITY_VIOLATION),
 				/* translator: %s is a SQL command name */

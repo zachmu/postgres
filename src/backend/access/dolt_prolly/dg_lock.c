@@ -30,6 +30,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/twophase.h"
@@ -79,6 +80,17 @@ records_close(Records *r)
 	table_close(r->heap, RowExclusiveLock);
 }
 
+/* Whether the transaction that made the record version in |slot| failed. */
+static bool
+inserter_failed(TupleTableSlot *slot)
+{
+	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+	TransactionId xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+	return !TransactionIdIsCurrentTransactionId(xmin) && !TransactionIdIsInProgress(xmin) &&
+		!TransactionIdDidCommit(xmin);
+}
+
 /* The record whose current handle is |id|; false if there is none. */
 static bool
 find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid)
@@ -99,8 +111,13 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 	{
 		bool		isnull;
 
-		/* Index entries outlive the handle a record had when they were made. */
-		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id)
+		/*
+		 * Index entries outlive the handle a record had when they were made.
+		 * A version an aborted update made is dead, and its handle may since
+		 * have been allocated again: handles restart above the committed ones.
+		 */
+		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id &&
+			!inserter_failed(slot))
 		{
 			*tid = slot->tts_tid;
 			found = true;
@@ -200,6 +217,93 @@ lock_unavailable(Relation rel)
 			 errmsg("could not obtain lock on row in relation \"%s\"", RelationGetRelationName(rel))));
 }
 
+/*
+ * The handle of the version that replaced row version |id| of |rel| on
+ * |branch|, or 0 if it was deleted or never replaced.
+ */
+int64
+dg_record_successor(Relation rel, const char *branch, int64 id)
+{
+	Records		r = records_open();
+	ItemPointerData tid;
+	HeapTupleData tuple;
+	Buffer		buffer;
+	int64		next = 0;
+
+	if (find_record(&r, &rel->rd_locator, branch, id, &tid))
+	{
+		tuple.t_self = tid;
+		if (!heap_fetch(r.heap, SnapshotAny, &tuple, &buffer, false))
+			elog(ERROR, "prolly row lock record is missing");
+		if (!ItemPointerEquals(&tuple.t_self, &tuple.t_data->t_ctid))
+		{
+			ItemPointerData ctid = tuple.t_data->t_ctid;
+
+			ReleaseBuffer(buffer);
+			next = record_handle(&r, &ctid);
+		}
+		else
+			ReleaseBuffer(buffer);
+	}
+	records_close(&r);
+	return next;
+}
+
+/* Whether |xid| belongs to another transaction that is still running. */
+static bool
+running_elsewhere(TransactionId xid)
+{
+	return !TransactionIdIsCurrentTransactionId(xid) && TransactionIdIsInProgress(xid);
+}
+
+/*
+ * A running transaction that a dirty-snapshot reader of record |id| must wait
+ * for, as heap's dirty snapshot reports one in xmax: the transaction updating
+ * or deleting the row, or, if |lockers|, any other holding a lock on the
+ * record, as an inserter holds its unique-key reservation.
+ */
+TransactionId
+dg_record_xwait(Relation rel, const char *branch, int64 id, bool lockers)
+{
+	Records		r = records_open();
+	HeapTupleData tuple;
+	Buffer		buffer;
+	TransactionId xmax;
+	uint16		infomask;
+	TransactionId xwait = InvalidTransactionId;
+
+	if (!find_record(&r, &rel->rd_locator, branch, id, &tuple.t_self))
+	{
+		records_close(&r);
+		return InvalidTransactionId;
+	}
+	if (!heap_fetch(r.heap, SnapshotAny, &tuple, &buffer, false))
+		elog(ERROR, "prolly row lock record is missing");
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+	infomask = tuple.t_data->t_infomask;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+	if (infomask & HEAP_XMAX_INVALID)
+		xmax = InvalidTransactionId;
+	if (TransactionIdIsValid(xmax) && (infomask & HEAP_XMAX_IS_MULTI))
+	{
+		MultiXactMember *members;
+		int			n = GetMultiXactIdMembers(xmax, &members, false, HEAP_XMAX_IS_LOCKED_ONLY(infomask));
+
+		for (int i = 0; i < n && !TransactionIdIsValid(xwait); i++)
+			if ((lockers || ISUPDATE_from_mxstatus(members[i].status)) && running_elsewhere(members[i].xid))
+				xwait = members[i].xid;
+		if (n > 0)
+			pfree(members);
+	}
+	else if (TransactionIdIsValid(xmax) && (lockers || !HEAP_XMAX_IS_LOCKED_ONLY(infomask)) &&
+			 running_elsewhere(xmax))
+		xwait = xmax;
+	records_close(&r);
+	return xwait;
+}
+
 /* Report a replaced record's successor as a TID in the row's relation. */
 static void
 successor(Records *r, TM_Result result, TM_FailureData *tmfd, int64 id, int64 *next)
@@ -216,12 +320,16 @@ successor(Records *r, TM_Result result, TM_FailureData *tmfd, int64 id, int64 *n
 
 /*
  * Lock row version |id| of |rel| on |branch| in |mode|, as heap_lock_tuple
- * locks a tuple; |follow| also locks later versions, as SELECT FOR UPDATE
- * does. Under NOWAIT a conflict raises the usual error. On TM_Updated, *next
- * is the successor's handle and tmfd->ctid its TID.
+ * locks a tuple for command |cid|; |follow| also locks later versions, as
+ * SELECT FOR UPDATE does. Under NOWAIT a conflict raises the usual error. On
+ * TM_Updated, *next is the successor's handle and tmfd->ctid its TID.
+ *
+ * A record's versions mirror its row's, made by the same commands, so heap
+ * decides, as for the row itself, how this transaction's own earlier changes
+ * affect the command.
  */
 TM_Result
-dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode, LockWaitPolicy wait,
+dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTupleMode mode, LockWaitPolicy wait,
 			   bool follow, TM_FailureData *tmfd, int64 *next)
 {
 	Records		r = records_open();
@@ -230,7 +338,7 @@ dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode, L
 	TM_Result	result;
 
 	record_for(&r, &rel->rd_locator, branch, id, &tuple.t_self);
-	result = heap_lock_tuple(r.heap, &tuple, GetCurrentCommandId(true), mode,
+	result = heap_lock_tuple(r.heap, &tuple, cid, mode,
 							 wait == LockWaitError ? LockWaitSkip : wait, follow, &buffer, tmfd);
 	if (BufferIsValid(buffer))
 		ReleaseBuffer(buffer);
@@ -242,12 +350,12 @@ dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode, L
 }
 
 /*
- * Update row version |id| to |next_id|, as heap_update updates a tuple. A key
- * change first takes the stronger lock heap would. On TM_Updated, *next is the
- * concurrent successor's handle.
+ * Update row version |id| to |next_id| in command |cid|, as heap_update
+ * updates a tuple. A key change first takes the stronger lock heap would. On
+ * TM_Updated, *next is the concurrent successor's handle.
  */
 TM_Result
-dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, bool key_change, bool wait,
+dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, CommandId cid, bool key_change, bool wait,
 				 TM_FailureData *tmfd, int64 *next)
 {
 	Records		r = records_open();
@@ -260,7 +368,7 @@ dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, bool
 	if (key_change)
 	{
 		probe.t_self = tid;
-		result = heap_lock_tuple(r.heap, &probe, GetCurrentCommandId(true), LockTupleExclusive,
+		result = heap_lock_tuple(r.heap, &probe, cid, LockTupleExclusive,
 								 wait ? LockWaitBlock : LockWaitError, false, &buffer, tmfd);
 		if (BufferIsValid(buffer))
 			ReleaseBuffer(buffer);
@@ -283,7 +391,7 @@ dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, bool
 		values[Anum_pg_dolt_lock_lockhandle - 1] = Int64GetDatum(next_id);
 		replace[Anum_pg_dolt_lock_lockhandle - 1] = true;
 		tuple = heap_modify_tuple(old, RelationGetDescr(r.heap), values, nulls, replace);
-		result = heap_update(r.heap, &tid, tuple, GetCurrentCommandId(true), InvalidSnapshot, wait,
+		result = heap_update(r.heap, &tid, tuple, cid, InvalidSnapshot, wait,
 							 tmfd, &mode, &indexes);
 		if (result == TM_Ok)
 			index_record(&r, tuple, false);
@@ -296,11 +404,12 @@ dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, bool
 }
 
 /*
- * Delete row version |id|, as heap_delete deletes a tuple. |changing_part|
- * marks a row moving to another partition, so waiters learn of the move.
+ * Delete row version |id| in command |cid|, as heap_delete deletes a tuple.
+ * |changing_part| marks a row moving to another partition, so waiters learn
+ * of the move.
  */
 TM_Result
-dg_record_delete(Relation rel, const char *branch, int64 id, bool wait, bool changing_part,
+dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool wait, bool changing_part,
 				 TM_FailureData *tmfd, int64 *next)
 {
 	Records		r = records_open();
@@ -308,7 +417,7 @@ dg_record_delete(Relation rel, const char *branch, int64 id, bool wait, bool cha
 	TM_Result	result;
 
 	record_for(&r, &rel->rd_locator, branch, id, &tid);
-	result = heap_delete(r.heap, &tid, GetCurrentCommandId(true), InvalidSnapshot, wait, tmfd, changing_part);
+	result = heap_delete(r.heap, &tid, cid, InvalidSnapshot, wait, tmfd, changing_part);
 	successor(&r, result, tmfd, id, next);
 	records_close(&r);
 	return result;
@@ -434,13 +543,24 @@ remember_reservation(const ReservationKey *key)
 	MemoryContextSwitchTo(old);
 }
 
+static ReservationKey
+reservation_key(Relation index, const char *branch, uint64 hash)
+{
+	ReservationKey key;
+
+	key.index = index->rd_locator.relNumber;
+	key.branch = hash_bytes_extended((const unsigned char *) branch, strlen(branch), 0);
+	key.key = hash;
+	return key;
+}
+
 /*
  * Reserve key |hash| of |index| on |branch| for this transaction, waiting for
  * any other transaction holding it to end, as heap waits for a concurrent
- * inserter of a unique key.
+ * inserter of a unique key. Without |wait|, return false instead of waiting.
  */
-void
-dg_key_reserve(Relation index, const char *branch, uint64 hash)
+bool
+dg_key_reserve(Relation index, const char *branch, uint64 hash, bool wait)
 {
 	ReservationKey key;
 	FullTransactionId me;
@@ -450,14 +570,12 @@ dg_key_reserve(Relation index, const char *branch, uint64 hash)
 		TM_FailureData tmfd;
 		int64		next;
 
-		dg_record_lock(index, branch, (int64) hash, LockTupleExclusive, LockWaitBlock, false, &tmfd, &next);
-		return;
+		return dg_record_lock(index, branch, (int64) hash, GetCurrentCommandId(true), LockTupleExclusive,
+							  wait ? LockWaitBlock : LockWaitSkip, false, &tmfd, &next) != TM_WouldBlock;
 	}
 	me = GetTopFullTransactionId();
 	reservations_attach();
-	key.index = index->rd_locator.relNumber;
-	key.branch = hash_bytes_extended((const unsigned char *) branch, strlen(branch), 0);
-	key.key = hash;
+	key = reservation_key(index, branch, hash);
 	for (;;)
 	{
 		bool		found;
@@ -473,11 +591,41 @@ dg_key_reserve(Relation index, const char *branch, uint64 hash)
 			dshash_release_lock(reservations, r);
 			if (!held)
 				remember_reservation(&key);
-			return;
+			return true;
 		}
 		dshash_release_lock(reservations, r);
+		if (!wait)
+			return false;
 		XactLockTableWait(other, NULL, NULL, XLTW_None);
 	}
+}
+
+/*
+ * The running transaction, other than this one, holding key |hash| of |index|
+ * on |branch|, or InvalidTransactionId: whom a dirty-snapshot reader of the key
+ * waits for, as for an inserter heap's dirty snapshot reports.
+ */
+TransactionId
+dg_key_reserver(Relation index, const char *branch, uint64 hash)
+{
+	ReservationKey key;
+	Reservation *r;
+	TransactionId owner = InvalidTransactionId;
+
+	if (max_prepared_xacts > 0)
+		return dg_record_xwait(index, branch, (int64) hash, true);
+	reservations_attach();
+	key = reservation_key(index, branch, hash);
+	r = dshash_find(reservations, &key, false);
+	if (r)
+	{
+		owner = XidFromFullTransactionId(r->owner);
+		dshash_release_lock(reservations, r);
+	}
+	if (TransactionIdIsValid(owner) &&
+		(TransactionIdIsCurrentTransactionId(owner) || !TransactionIdIsInProgress(owner)))
+		owner = InvalidTransactionId;
+	return owner;
 }
 
 /* Drop this transaction's reservations recorded under |subxid|, or all of them. */

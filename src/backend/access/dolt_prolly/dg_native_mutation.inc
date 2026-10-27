@@ -401,8 +401,8 @@ mutation_indexes(CatalogView *view, Oid table)
 
 			if (index->indrelid != table)
 				continue;
-			if (index->indisexclusion || !index->indisvalid || !index->indisready || !index->indimmediate)
-				unsupported("native index validity or deferred constraint codec");
+			if (index->indisexclusion || !index->indisvalid || !index->indisready)
+				unsupported("native index validity or exclusion constraint codec");
 			for (int i = 0; i < index->indnatts; i++)
 				if (index->indkey.values[i] <= 0)
 					unsupported("canonical expression index codec");

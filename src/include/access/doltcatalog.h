@@ -40,6 +40,7 @@ extern bool dg_catalog_lookup_relation(const RangeVar *rv, bool missing_ok, Oid 
 extern Relation dg_catalog_target(struct ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte);
 extern void dg_storage_close_relation(Relation rel);
 extern void dg_truncate(Relation rel);
+extern bool dg_tuple_inserted_by_self(Relation rel, ItemPointer tid);
 extern Relation dg_storage_index(Relation rel, Oid id);
 extern struct CatalogView *dg_catalog_view(const char *database, const char *branch);
 extern bool dg_catalog_create(Node *statement, const char *query);
