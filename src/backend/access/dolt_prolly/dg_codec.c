@@ -25,6 +25,10 @@
 #include "utils/inet.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
+#include "utils/memutils.h"
+#include "common/hashfn.h"
 
 static PLSlice encode_value(Oid type, Datum value);
 static Datum decode_value(Oid type, PLSlice bytes);
@@ -556,17 +560,274 @@ dg_decode_mutation(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot 
 	slot->tts_tableOid = RelationGetRelid(rel);
 }
 
+/* ---------------------------------------------------------------------------
+ * Decode plans
+ * ---------------------------------------------------------------------------
+ *
+ * Decoding a row used to validate the relation's descriptor and look every
+ * column's type up again, per row. A decode plan does that once per relation:
+ * it validates the descriptor, classifies each column, and resolves the
+ * receive function of those that need one. Plans are keyed by relation OID
+ * and dropped by relcache invalidation; a descriptor fingerprint guards the
+ * private descriptors that share an OID across branches.
+ */
+typedef enum DecodeKind
+{
+	DECODE_INTEGER,				/* bool and the integer types */
+	DECODE_BYTES,				/* text and bytea */
+	DECODE_GENERAL,				/* arrays and composites: the recursive codec */
+	DECODE_RECEIVE				/* a binary receive function */
+} DecodeKind;
+
+typedef struct DecodeColumn
+{
+	Oid			type;			/* the column's declared type */
+	Oid			base;			/* its base type, which the codec uses */
+	DecodeKind	kind;
+	FmgrInfo	receive;
+	Oid			ioparam;
+	bool		dropped;
+} DecodeColumn;
+
+typedef struct DecodePlan
+{
+	Oid			relid;			/* hash key */
+	TupleDesc	desc;
+	uint32		fingerprint;
+	int			natts;
+	DecodeColumn *columns;
+	bool		xml;			/* any column receives XML */
+} DecodePlan;
+
+static HTAB *decode_plans;
+static bool decode_callback;
+
+static void
+decode_plans_changed(Datum arg, Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	DecodePlan *plan;
+
+	if (!decode_plans)
+		return;
+	hash_seq_init(&status, decode_plans);
+	while ((plan = hash_seq_search(&status)) != NULL)
+		if (!OidIsValid(relid) || plan->relid == relid)
+		{
+			pfree(plan->columns);
+			hash_search(decode_plans, &plan->relid, HASH_REMOVE, NULL);
+		}
+}
+
+/* The descriptor's shape, to notice a private descriptor replaced in place. */
+static uint32
+descriptor_fingerprint(TupleDesc desc)
+{
+	uint32		hash = (uint32) desc->natts;
+	int			i;
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		hash = hash_combine(hash, (uint32) attr->atttypid);
+		hash = hash_combine(hash, (uint32) attr->atttypmod);
+		hash = hash_combine(hash, (uint32) attr->attisdropped);
+	}
+	return hash;
+}
+
+static void
+decode_plan_build(DecodePlan *plan, TupleDesc desc)
+{
+	int			i;
+
+	dg_validate_descriptor(desc);
+	plan->desc = desc;
+	plan->fingerprint = descriptor_fingerprint(desc);
+	plan->natts = desc->natts;
+	plan->columns = MemoryContextAllocZero(CacheMemoryContext, sizeof(DecodeColumn) * Max(desc->natts, 1));
+	plan->xml = false;
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		DecodeColumn *column = &plan->columns[i];
+
+		column->type = attr->atttypid;
+		column->dropped = attr->attisdropped;
+		if (column->dropped)
+			continue;
+		column->base = getBaseType(attr->atttypid);
+		if (column->base == TEXTOID || column->base == BYTEAOID)
+			column->kind = DECODE_BYTES;
+		else if (column->base == BOOLOID || column->base == INT2OID || column->base == INT4OID || column->base == INT8OID)
+			column->kind = DECODE_INTEGER;
+		else if (OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
+			column->kind = DECODE_GENERAL;
+		else
+		{
+			Oid			function;
+
+			column->kind = DECODE_RECEIVE;
+			getTypeBinaryInputInfo(column->base, &function, &column->ioparam);
+			fmgr_info_cxt(function, &column->receive, CacheMemoryContext);
+			plan->xml |= column->base == XMLOID;
+		}
+	}
+}
+
+static DecodePlan *
+decode_plan(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	Oid			relid = RelationGetRelid(rel);
+	DecodePlan *plan;
+	bool		found;
+
+	if (!decode_plans)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DecodePlan);
+		ctl.hcxt = CacheMemoryContext;
+		decode_plans = hash_create("prolly decode plans", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	if (!decode_callback)
+	{
+		CacheRegisterRelcacheCallback(decode_plans_changed, (Datum) 0);
+		decode_callback = true;
+	}
+	plan = hash_search(decode_plans, &relid, HASH_ENTER, &found);
+	if (found && plan->desc == desc && plan->natts == desc->natts && plan->fingerprint == descriptor_fingerprint(desc))
+		return plan;
+	if (found)
+		pfree(plan->columns);
+	plan->columns = NULL;
+	PG_TRY();
+	{
+		decode_plan_build(plan, desc);
+	}
+	PG_CATCH();
+	{
+		hash_search(decode_plans, &relid, HASH_REMOVE, NULL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return plan;
+}
+
+/* Decode one column's stored bytes with its planned receive function. */
+static Datum
+receive_planned(DecodeColumn *column, PLSlice bytes)
+{
+	StringInfoData input;
+	Datum		result;
+
+	if (column->base == TSQUERYOID && bytes.len == 4 && pl_read32(bytes.data) == 0)
+	{
+		TSQuery		query = palloc0(HDRSIZETQ);
+
+		SET_VARSIZE(query, HDRSIZETQ);
+		return PointerGetDatum(query);
+	}
+	if (bytes.len < 4 || memcmp(bytes.data, "DGB1", 4))
+		elog(ERROR, "invalid prolly binary codec version");
+	initStringInfo(&input);
+	appendBinaryStringInfo(&input, (const char *) bytes.data + 4, bytes.len - 4);
+	result = ReceiveFunctionCall(&column->receive, &input, column->ioparam, -1);
+	if (input.cursor != input.len)
+		elog(ERROR, "trailing bytes in prolly binary value");
+	pfree(input.data);
+	return result;
+}
+
+/*
+ * Decode |bytes| into |slot| by |rel|'s plan: values land in the slot as a
+ * virtual tuple, in the caller's memory, with no heap tuple in between.
+ * Receive functions convert from the client encoding, so the row is decoded
+ * under the database encoding when the two differ.
+ */
 void
 dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 {
-	HeapTuple	tuple;
+	DecodePlan *plan = decode_plan(rel);
+	PLTupleView view;
+	int			encoding = pg_get_client_encoding();
+	bool		switched = plan->xml || encoding != GetDatabaseEncoding();
+	int			saved_xmloption = xmloption;
+	int			i;
 
-	dg_validate_descriptor(RelationGetDescr(rel));
-	tuple = decode_fields(RelationGetDescr(rel), bytes);
+	if (!TTS_IS_VIRTUAL(slot))
+	{
+		HeapTuple	tuple = decode_fields(RelationGetDescr(rel), bytes);
 
-	tuple->t_self = *tid;
-	tuple->t_tableOid = RelationGetRelid(rel);
-	ExecForceStoreHeapTuple(tuple, slot, true);
+		tuple->t_self = *tid;
+		tuple->t_tableOid = RelationGetRelid(rel);
+		ExecForceStoreHeapTuple(tuple, slot, true);
+		slot->tts_tid = *tid;
+		slot->tts_tableOid = RelationGetRelid(rel);
+		return;
+	}
+	dg_check(pl_tuple_open(bytes, &view));
+	if (view.count != (size_t) plan->natts)
+		dg_unsupported("schema changes to stored tuples");
+	ExecClearTuple(slot);
+	if (switched)
+	{
+		if (SetClientEncoding(GetDatabaseEncoding()) < 0)
+			elog(ERROR, "could not select storage encoding");
+		xmloption = XMLOPTION_CONTENT;
+	}
+	PG_TRY();
+	{
+		for (i = 0; i < plan->natts; i++)
+		{
+			DecodeColumn *column = &plan->columns[i];
+			PLValue		field;
+
+			dg_check(pl_tuple_field(&view, i, &field));
+			slot->tts_isnull[i] = !field.present || column->dropped;
+			slot->tts_values[i] = (Datum) 0;
+			if (slot->tts_isnull[i])
+				continue;
+			switch (column->kind)
+			{
+				case DECODE_BYTES:
+					slot->tts_values[i] = PointerGetDatum(cstring_to_text_with_len((const char *) field.bytes.data, field.bytes.len));
+					break;
+				case DECODE_INTEGER:
+					{
+						int64		n;
+
+						if (field.bytes.len != 8)
+							elog(ERROR, "invalid prolly integer encoding");
+						n = (int64) (pl_read64(field.bytes.data) ^ UINT64CONST(0x8000000000000000));
+						slot->tts_values[i] = column->base == BOOLOID ? BoolGetDatum(n != 0) :
+							column->base == INT2OID ? Int16GetDatum(n) :
+							column->base == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
+						break;
+					}
+				case DECODE_GENERAL:
+					slot->tts_values[i] = decode_value(column->type, field.bytes);
+					break;
+				case DECODE_RECEIVE:
+					slot->tts_values[i] = receive_planned(column, field.bytes);
+					break;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (switched)
+		{
+			xmloption = saved_xmloption;
+			if (SetClientEncoding(encoding) < 0)
+				elog(FATAL, "could not restore client encoding");
+		}
+	}
+	PG_END_TRY();
+	ExecStoreVirtualTuple(slot);
 	slot->tts_tid = *tid;
 	slot->tts_tableOid = RelationGetRelid(rel);
 }
