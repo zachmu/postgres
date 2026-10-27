@@ -339,37 +339,48 @@ next_handle(Relation rel, DGState *s)
 {
 	return s->nextid ? s->nextid++ : dg_allocate_handle(rel);
 }
+/*
+ * An ordinary insert records its edits in the command's batch, applied to
+ * the trees in one pass when something else reads them; a rewrite's state
+ * is private and takes each edit directly.
+ */
 static void
 insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate)
 {
-	DGState    *s;
 	PLSlice		row;
 	uint64		handle;
-	bool		rewriting = CatalogViewIsProvisional(rel->rd_catalogview);
 
-	if (rewriting)
-		s = dg_catalog_rewrite_state(rel);
+	if (CatalogViewIsProvisional(rel->rd_catalogview))
+	{
+		DGState    *s = dg_catalog_rewrite_state(rel);
+
+		row = dg_encode(rel, slot);
+		multiplicity(s, row, 1);
+		handle = next_handle(rel, s);
+		handle_edit(s, handle, dg_rowhash(row), true);
+	}
 	else
 	{
+		DGBatch    *batch;
+
 		writer(rel);
-		s = dg_load(rel, SnapshotSelf);
-	}
-	row = dg_encode(rel, slot);
-	multiplicity(s, row, 1);
-	handle = next_handle(rel, s);
-	handle_edit(s, handle, dg_rowhash(row), true);
-	dg_tid(handle, &slot->tts_tid);
-	if (!rewriting)
-	{
-		dg_save(rel, s, cid);
-		dg_release(s);
-	}
-	if (!rewriting)
+		batch = dg_batch(rel, cid);
+		row = dg_encode(rel, slot);
+		handle = next_handle(rel, dg_batch_state(batch));
+		dg_batch_insert(batch, row, handle);
 		dg_index_apply(rel, row, 1, handle);
+		dg_collect();
+	}
+	dg_tid(handle, &slot->tts_tid);
 	pfree((void *) row.data);
 	slot->tts_tableOid = RelationGetRelid(rel);
-	if (!rewriting)
-		dg_collect();
+}
+/* The end of a COPY or multi-row INSERT: apply what the command recorded. */
+static void
+finish_bulk_insert(Relation rel, int options)
+{
+	if (!CatalogViewIsProvisional(rel->rd_catalogview))
+		dg_batch_finish(rel);
 }
 static void
 multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int opts, BulkInsertState state)
@@ -846,6 +857,7 @@ dg_table_routine(void)
 		methods.index_delete_tuples = index_delete;
 		methods.tuple_insert = insert_row;
 		methods.multi_insert = multi_insert;
+		methods.finish_bulk_insert = finish_bulk_insert;
 		methods.tuple_insert_speculative = speculative;
 		methods.tuple_complete_speculative = complete;
 		methods.tuple_delete = delete_row;

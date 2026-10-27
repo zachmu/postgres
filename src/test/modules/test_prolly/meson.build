@@ -31,5 +31,6 @@ tests += {
     't/025_compat.pl',
     't/026_function_integration.pl',
     't/028_bitmap.pl',
+    't/029_batched_writes.pl',
   ]},
 }

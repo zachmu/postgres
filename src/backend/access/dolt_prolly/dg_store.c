@@ -496,6 +496,14 @@ typedef struct Overlay
 static HTAB *overlays;
 static bool callbacks_registered;
 
+/* Pending edits, in dg_batch.inc. */
+static bool loading_for_batch;
+static HTAB *batches;
+static void batch_flush_key(const RootKey *key);
+static void batch_flush_all(void);
+static void batch_discard(SubTransactionId subxid);
+static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid);
+
 /*
  * Rows this transaction updated or deleted, by handle, with the command and
  * subtransaction that did it. A row changed by the current command must be
@@ -575,13 +583,13 @@ overlay_entry(Overlay *overlay, Snapshot snapshot)
 }
 
 static void
-overlay_push(const RootKey *key, CommandId cid, const Roots *base, const Roots *roots)
+overlay_push(const RootKey *key, CommandId cid, SubTransactionId subxid, const Roots *base, const Roots *roots)
 {
 	Overlay    *overlay = overlay_find(key, true);
 	OverlayEntry *top;
 
 	if (overlay->count && overlay->entries[overlay->count - 1].cid == cid &&
-		overlay->entries[overlay->count - 1].subxid == GetCurrentSubTransactionId())
+		overlay->entries[overlay->count - 1].subxid == subxid)
 		top = &overlay->entries[overlay->count - 1];
 	else
 	{
@@ -595,7 +603,7 @@ overlay_push(const RootKey *key, CommandId cid, const Roots *base, const Roots *
 		top = &overlay->entries[overlay->count++];
 	}
 	top->cid = cid;
-	top->subxid = GetCurrentSubTransactionId();
+	top->subxid = subxid;
 	top->base = *base;
 	top->roots = *roots;
 }
@@ -758,6 +766,7 @@ store_xact(XactEvent event, void *arg)
 				CurrentResourceOwner = TopTransactionResourceOwner;
 				PG_TRY();
 				{
+					batch_flush_all();
 					publish_all();
 					working_close(true);
 				}
@@ -781,6 +790,7 @@ store_xact(XactEvent event, void *arg)
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
 			overlays = NULL;	/* in TopTransactionContext */
+			batches = NULL;
 			modified = NULL;
 			live_states = NULL;
 			live_count = live_capacity = 0;
@@ -802,6 +812,14 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	HASH_SEQ_STATUS status;
 	Overlay    *overlay;
 
+	/*
+	 * Pending edits belong to one subtransaction: applied before a nested one
+	 * starts or as their own commits, forgotten as it aborts.
+	 */
+	if (event == SUBXACT_EVENT_START_SUB || event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		batch_flush_all();
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+		batch_discard(mySubid);
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
 		return;
 
@@ -1219,8 +1237,12 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		dg_unsupported("SERIALIZABLE isolation");
 	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && !wanted)
 		dg_unsupported("non-MVCC snapshots");
-	s = new_state(rel);
 	key = root_key(rel, branch);
+
+	/* Any other reader of these roots sees the current command's edits applied. */
+	if (!loading_for_batch)
+		batch_flush_key(&key);
+	s = new_state(rel);
 	overlay = overlay_find(&key, false);
 	if (snap && IsMVCCSnapshot(snap))
 		committed = roots_read(&key, snap);
@@ -1397,16 +1419,15 @@ dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 }
 
 static void
-save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
+save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid)
 {
-	RootKey		key = root_key(rel, branch);
 	Roots		base = {0},
 				roots = {.present = true};
 
 	register_callbacks();
 	if (s->store != dg_working_store())
 		elog(ERROR, "prolly state does not belong to this transaction");
-	roots.table = rel->rd_rel->relkind != RELKIND_INDEX;
+	roots.table = table;
 	roots.content = s->content.root;
 	if (roots.table)
 	{
@@ -1421,7 +1442,14 @@ save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
 		base.handles = s->base[1];
 		base.keys = s->base[2];
 	}
-	overlay_push(&key, cid, &base, &roots);
+	overlay_push(key, cid, subxid, &base, &roots);
+}
+static void
+save_state(Relation rel, DGState *s, CommandId cid, const char *branch)
+{
+	RootKey		key = root_key(rel, branch);
+
+	save_roots(&key, rel->rd_rel->relkind != RELKIND_INDEX, s, cid, GetCurrentSubTransactionId());
 }
 void
 dg_save(Relation rel, DGState *s, CommandId cid)
@@ -1430,6 +1458,8 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 		dg_storage_require_write(rel);
 	save_state(rel, s, cid, dg_relation_branch(rel));
 }
+
+#include "dg_batch.inc"
 
 /* Only the transactional resource allocator calls this, before publishing any
  * branch binding: the new storage starts empty on its branch. */

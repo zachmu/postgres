@@ -240,7 +240,14 @@ dg_catalog_mutation_load(Relation definition, Snapshot snapshot)
 	if (view != native_mutation_view || !CatalogViewIsProvisional(view))
 		elog(ERROR, "native catalog validation has no storage authority");
 	if (native_mutation_rewritten && RelationGetRelid(definition) == native_mutation_relation)
-		return native_mutation_destination;
+	{
+		/* A reader's copy: releasing it must not free the shared store. */
+		state = palloc0(sizeof(DGState));
+		*state = *native_mutation_destination;
+		state->shared = true;
+		memset(&state->cleanup, 0, sizeof(state->cleanup));
+		return state;
+	}
 	name = CatalogViewObjectIdentity(RelationGetRelid(definition), RelationRelationId);
 	previous = CatalogViewSwitch(NULL);
 	GetUserIdAndSecContext(&user, &security);
