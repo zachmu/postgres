@@ -183,7 +183,6 @@ ERROR:  prolly storage rejects type gtsvector
 DETAIL:  Only codecs verified to exclude non-portable identifiers are supported.
 HINT:  OID and other local identifier translation is not implemented.
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
-ERROR:  prolly phase 2 does not support non-MVCC snapshots
 SELECT * FROM p FOR UPDATE;
  id |  value  | flag | payload 
 ----+---------+------+---------

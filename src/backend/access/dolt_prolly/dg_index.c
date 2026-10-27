@@ -342,7 +342,7 @@ dg_rebuild_indexes(Relation rel)
 	close_indexes(indexes, opened);
 }
 
-static void check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row);
+static bool check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, bool partial);
 static pg_noreturn void unique_violation(Relation table, Relation index, Datum *values, bool *isnull);
 
 /*
@@ -378,7 +378,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 			(!nullkey || index->rd_index->indnullsnotdistinct))
 		{
 			key.len = prefix;
-			check_key(table, index, handle, &key, row);
+			check_key(table, index, handle, &key, row, false);
 		}
 		pfree(key.data);
 	}
@@ -579,8 +579,8 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
  * it lets that transaction finish first, as heap unique checks wait for the
  * deleting transaction.
  */
-void
-dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull)
+bool
+dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull, bool partial)
 {
 	DGBatch    *batch = dg_batch_current(table);
 	DGState    *rows = batch ? NULL : dg_load(table, SnapshotSelf);
@@ -601,17 +601,19 @@ dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *va
 	if (rows)
 		dg_release(rows);
 	if (nullkey && !index->rd_index->indnullsnotdistinct)
-		return;
+		return true;
 	key.len = prefix;
-	check_key(table, index, self, &key, (PLSlice) {NULL, 0});
+	return check_key(table, index, self, &key, (PLSlice) {NULL, 0}, partial);
 }
 
 /*
  * Raise a unique violation if another live row shares |key| (an index key
  * prefix) with row |self|. |row|, if given, describes the key for the error.
+ * A |partial| check, for speculative insertion, instead returns false; the
+ * executor then rechecks, waiting for whoever changes the other row.
  */
-static void
-check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row)
+static bool
+check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, bool partial)
 {
 	const char *branch = dg_relation_branch(table);
 	uint64		conflict;
@@ -634,6 +636,8 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 		uint8		id[8];
 		PLSlice		k = {id, 8};
 
+		if (partial)
+			return false;
 		if (!dg_row_modified(table, branch, conflict, &cid))
 		{
 			dg_record_lock(table, branch, (int64) conflict, GetCurrentCommandId(true), LockTupleKeyShare, LockWaitBlock, false, &failure, &next);
@@ -656,6 +660,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 			values[j] = slot_getattr(slot, index->rd_index->indkey.values[j], &isnull[j]);
 		unique_violation(table, index, values, isnull);
 	}
+	return true;
 }
 
 static void
@@ -691,12 +696,13 @@ build_empty(Relation rel)
 static bool
 insert(Relation index, Datum *values, bool *nulls, ItemPointer tid, Relation table, IndexUniqueCheck unique, bool unchanged, IndexInfo *info)
 {
-	if (unique == UNIQUE_CHECK_PARTIAL || unique == UNIQUE_CHECK_EXISTING)
+	/* Speculative insertion checks an immediate arbiter index partially. */
+	if (unique == UNIQUE_CHECK_EXISTING || (unique == UNIQUE_CHECK_PARTIAL && !index->rd_index->indimmediate))
 		dg_unsupported("deferred unique constraints");
 
 	/* The table AM added the entry, and checks bound storage itself. */
-	if (unique == UNIQUE_CHECK_YES && !dg_storage_bound(table))
-		dg_index_check_unique(table, index, tid, values, nulls);
+	if (unique != UNIQUE_CHECK_NO && !dg_storage_bound(table))
+		return dg_index_check_unique(table, index, tid, values, nulls, unique == UNIQUE_CHECK_PARTIAL);
 	return true;
 }
 static IndexBulkDeleteResult *
@@ -855,6 +861,40 @@ scan_bounds(IndexScanDesc scan, StringInfo lower, StringInfo upper, bool *has_lo
 	*has_upper = prefix_successor(upper);
 }
 
+/*
+ * Under a dirty snapshot, wait out any other transaction holding the unique-key
+ * reservation the scan's equality keys name. A competing inserter's row is
+ * private until it commits, so where heap's dirty snapshot would report that
+ * inserter, this waits for it before reading the latest rows.
+ */
+static void
+wait_for_reservation(IndexScanDesc scan)
+{
+	Relation	index = scan->indexRelation;
+	StringInfoData key;
+	int64		id;
+	TransactionId xwait;
+
+	if (!index->rd_index->indisunique || dg_storage_bound(scan->heapRelation))
+		return;
+	initStringInfo(&key);
+	for (int j = 0; j < index->rd_index->indnkeyatts; j++)
+	{
+		ScanKey		equal = NULL;
+
+		for (int i = 0; i < scan->numberOfKeys && !equal; i++)
+			if (scan->keyData[i].sk_attno == j + 1 && scan->keyData[i].sk_flags == 0 &&
+				scan->keyData[i].sk_strategy == BTEqualStrategyNumber)
+				equal = &scan->keyData[i];
+		if (!equal)
+			return;
+		append_key_value(scan, j, equal, &key);
+	}
+	id = (int64) hash_bytes_extended((const unsigned char *) key.data, key.len, 0);
+	while (TransactionIdIsValid(xwait = dg_record_xwait(index, dg_relation_branch(index), id, true)))
+		XactLockTableWait(xwait, NULL, NULL, XLTW_None);
+}
+
 static void
 rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys)
 {
@@ -884,6 +924,8 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		memcpy(scan->keyData, keys, sizeof(ScanKeyData) * nkeys);
 	MemoryContextReset(s->context);
 	old = MemoryContextSwitchTo(s->context);
+	if (scan->xs_snapshot->snapshot_type == SNAPSHOT_DIRTY)
+		wait_for_reservation(scan);
 	index = dg_load(scan->indexRelation, scan->xs_snapshot);
 	table = dg_load(scan->heapRelation, scan->xs_snapshot);
 	initStringInfo(&lower);

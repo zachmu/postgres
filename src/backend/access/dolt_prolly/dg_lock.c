@@ -30,6 +30,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -42,6 +43,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -216,6 +218,61 @@ dg_record_successor(Relation rel, const char *branch, int64 id)
 	}
 	records_close(&r);
 	return next;
+}
+
+/* Whether |xid| belongs to another transaction that is still running. */
+static bool
+running_elsewhere(TransactionId xid)
+{
+	return !TransactionIdIsCurrentTransactionId(xid) && TransactionIdIsInProgress(xid);
+}
+
+/*
+ * A running transaction that a dirty-snapshot reader of record |id| must wait
+ * for, as heap's dirty snapshot reports one in xmax: the transaction updating
+ * or deleting the row, or, if |lockers|, any other holding a lock on the
+ * record, as an inserter holds its unique-key reservation.
+ */
+TransactionId
+dg_record_xwait(Relation rel, const char *branch, int64 id, bool lockers)
+{
+	Records		r = records_open();
+	HeapTupleData tuple;
+	Buffer		buffer;
+	TransactionId xmax;
+	uint16		infomask;
+	TransactionId xwait = InvalidTransactionId;
+
+	if (!find_record(&r, &rel->rd_locator, branch, id, &tuple.t_self))
+	{
+		records_close(&r);
+		return InvalidTransactionId;
+	}
+	if (!heap_fetch(r.heap, SnapshotAny, &tuple, &buffer, false))
+		elog(ERROR, "prolly row lock record is missing");
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	xmax = HeapTupleHeaderGetRawXmax(tuple.t_data);
+	infomask = tuple.t_data->t_infomask;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+	if (infomask & HEAP_XMAX_INVALID)
+		xmax = InvalidTransactionId;
+	if (TransactionIdIsValid(xmax) && (infomask & HEAP_XMAX_IS_MULTI))
+	{
+		MultiXactMember *members;
+		int			n = GetMultiXactIdMembers(xmax, &members, false, HEAP_XMAX_IS_LOCKED_ONLY(infomask));
+
+		for (int i = 0; i < n && !TransactionIdIsValid(xwait); i++)
+			if ((lockers || ISUPDATE_from_mxstatus(members[i].status)) && running_elsewhere(members[i].xid))
+				xwait = members[i].xid;
+		if (n > 0)
+			pfree(members);
+	}
+	else if (TransactionIdIsValid(xmax) && (lockers || !HEAP_XMAX_IS_LOCKED_ONLY(infomask)) &&
+			 running_elsewhere(xmax))
+		xwait = xmax;
+	records_close(&r);
+	return xwait;
 }
 
 /* Report a replaced record's successor as a TID in the row's relation. */

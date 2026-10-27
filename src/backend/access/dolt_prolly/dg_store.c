@@ -509,6 +509,7 @@ static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid
 static uint64 roots_generation(void);
 static void roots_generation_bump(void);
 static void handle_table_init(void *ptr);
+static bool tree_has(PLTree *tree, uint64 id);
 
 /*
  * Rows this transaction updated or deleted, by handle, with the command and
@@ -885,6 +886,27 @@ dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid)
 	row = hash_search(modified, &key, HASH_ENTER, NULL);
 	row->cid = cid;
 	row->subxid = GetCurrentSubTransactionId();
+}
+
+/*
+ * Whether row |handle| exists in the latest committed state of |rel|'s branch,
+ * rather than only among this transaction's changes.
+ */
+bool
+dg_row_committed(Relation rel, uint64 handle)
+{
+	RootKey		key = root_key(rel, dg_relation_branch(rel));
+	Roots		committed;
+	PLTree		handles;
+
+	/* Derived handles name rows of a branch's committed content. */
+	if (handle <= DG_DERIVED_HANDLES)
+		return true;
+	committed = roots_latest(&key);
+	if (!committed.present || !committed.table)
+		return false;
+	handles = tree_at(committed.handles);
+	return tree_has(&handles, handle);
 }
 
 /* If this transaction updated or deleted row |handle|, the command that did. */
@@ -1278,7 +1300,8 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		dg_catalog_check_relation(rel, branch, snap);
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
-	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && !wanted)
+	/* A dirty snapshot reads as SnapshotSelf; uniqueness checks wait on reservations. */
+	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && snap->snapshot_type != SNAPSHOT_DIRTY && !wanted)
 		dg_unsupported("non-MVCC snapshots");
 	key = root_key(rel, branch);
 

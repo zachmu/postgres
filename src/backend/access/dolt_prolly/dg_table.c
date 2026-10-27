@@ -355,6 +355,11 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 	*again = false;
 	if (dead)
 		*dead = false;
+	if (snap->snapshot_type == SNAPSHOT_DIRTY)
+	{
+		snap->xmin = snap->xmax = InvalidTransactionId;
+		snap->speculativeToken = 0;
+	}
 	if (CatalogViewIsProvisional(rel->rd_catalogview) || snap == SnapshotAny)
 		return fetch(rel, tid, snap, slot);
 	if (f->state && f->snapshot != snap)
@@ -378,6 +383,10 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 		return false;
 	}
 	dg_decode(rel, row_for_handle(f->state, value.bytes), tid, slot);
+
+	/* A dirty snapshot reports the running transaction changing the row. */
+	if (snap->snapshot_type == SNAPSHOT_DIRTY)
+		snap->xmax = dg_record_xwait(rel, dg_relation_branch(rel), (int64) dg_id(tid), false);
 	return true;
 }
 static bool
@@ -390,10 +399,35 @@ latest(TableScanDesc s, ItemPointer tid)
 {
 	/* Successors are found by locking; an unlocked lookup keeps the TID. */
 }
+/* Whether |snap| sees row |tid|. */
+static bool
+visible(Relation rel, ItemPointer tid, Snapshot snap)
+{
+	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
+		dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
+	uint8		key[8];
+	PLSlice		k = {key, 8};
+	PLValue		value;
+
+	pl_write64(key, dg_id(tid));
+	dg_check(pl_get(&s->handles, k, &value));
+	release_state(rel, s);
+	return value.present;
+}
 static bool
 satisfies(Relation rel, TupleTableSlot *slot, Snapshot snap)
 {
-	return fetch(rel, &slot->tts_tid, snap, slot);
+	return visible(rel, &slot->tts_tid, snap);
+}
+
+/*
+ * Whether this transaction inserted row |tid| of |rel|, as heap tests a
+ * tuple's xmin: the row is in its changes and not in the committed state.
+ */
+bool
+dg_tuple_inserted_by_self(Relation rel, ItemPointer tid)
+{
+	return !dg_row_committed(rel, dg_id(tid)) && visible(rel, tid, SnapshotSelf);
 }
 static TransactionId
 index_delete(Relation rel, TM_IndexDeleteOp *op)
@@ -530,15 +564,24 @@ multi_insert(Relation rel, TupleTableSlot **slots_, int n, CommandId cid, int op
 	for (i = 0; i < n; i++)
 		insert_row(rel, slots_[i], cid, opts, state);
 }
+/*
+ * A speculative insertion is an ordinary one: the row stays private until
+ * commit, and competing inserters of its key wait on the unique-key
+ * reservation the arbiter index check takes, not on a speculative token.
+ */
 static void
-speculative(Relation r, TupleTableSlot *s, CommandId c, int o, BulkInsertState b, uint32 token)
+speculative(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkInsertState bistate, uint32 token)
 {
-	dg_unsupported("ON CONFLICT/speculative insertion");
+	insert_row(rel, slot, cid, options, bistate);
 }
+static void remove_row(Relation rel, uint64 handle, CommandId cid);
+
+/* An insertion that met a conflicting row is undone without a trace. */
 static void
-complete(Relation r, TupleTableSlot *s, uint32 token, bool succeeded)
+complete(Relation rel, TupleTableSlot *slot, uint32 token, bool succeeded)
 {
-	dg_unsupported("speculative insertion");
+	if (!succeeded)
+		remove_row(rel, dg_id(&slot->tts_tid), GetCurrentCommandId(true));
 }
 static PLSlice
 copy_slice(PLSlice bytes)
@@ -630,10 +673,7 @@ crosscheck_visible(Relation rel, Snapshot crosscheck, uint64 handle)
 static TM_Result
 delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, bool changing)
 {
-	DGState    *s;
 	uint64		handle = dg_id(tid);
-	PLHash		digest;
-	PLSlice		row;
 	TM_Result	result;
 	int64		next;
 
@@ -646,7 +686,19 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	result = still_current(rel, handle, result, failure);
 	if (result != TM_Ok)
 		return result;
-	s = dg_load(rel, SnapshotSelf);
+	remove_row(rel, handle, cid);
+	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
+	return TM_Ok;
+}
+
+/* Remove row version |handle| and its index entries in command |cid|. */
+static void
+remove_row(Relation rel, uint64 handle, CommandId cid)
+{
+	DGState    *s = dg_load(rel, SnapshotSelf);
+	PLHash		digest;
+	PLSlice		row;
+
 	if (!handle_digest(s, handle, &digest))
 		elog(ERROR, "locked prolly row is missing");
 	row = copy_slice(row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}));
@@ -655,9 +707,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	dg_save(rel, s, cid);
 	dg_release(s);
 	dg_index_apply(rel, row, -1, handle);
-	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
 	dg_collect();
-	return TM_Ok;
 }
 
 /* Whether the old and new rows differ in any column of |attributes|. */
@@ -780,6 +830,18 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
+
+	/*
+	 * A row this transaction inserted in the current command, as a later row
+	 * of one INSERT ... ON CONFLICT finds, is invisible to heap_lock_tuple,
+	 * which still returns it.
+	 */
+	if (snapshot && IsMVCCSnapshot(snapshot) && dg_tuple_inserted_by_self(rel, tid) &&
+		!visible(rel, tid, snapshot))
+	{
+		fetch(rel, tid, SnapshotAny, slot);
+		return TM_Invisible;
+	}
 	for (;;)
 	{
 		CommandId	modified;

@@ -89,11 +89,13 @@ extern void dg_identity_delete_branch(const char *branch);
 extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
+extern bool dg_row_committed(Relation rel, uint64 handle);
 extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTupleMode mode,
 								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
 extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, CommandId cid,
 								  bool key_change, bool wait, TM_FailureData *tmfd, int64 *next);
 extern int64 dg_record_successor(Relation rel, const char *branch, int64 id);
+extern TransactionId dg_record_xwait(Relation rel, const char *branch, int64 id, bool lockers);
 extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool wait,
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
@@ -150,7 +152,8 @@ extern bool dg_key_ordered(Oid type);
 extern PLSlice dg_key_value(Oid type, Datum value);
 extern PLSlice dg_key_field(Oid type, PLSlice bytes);
 extern void dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle);
-extern void dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull);
+extern bool dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull,
+								  bool partial);
 extern void dg_index_validate(Relation table, Relation index);
 extern HeapTuple dg_decode_descriptor(TupleDesc desc, PLSlice bytes);
 extern void dg_decode(Relation rel, PLSlice tuple, ItemPointer tid, TupleTableSlot *slot);

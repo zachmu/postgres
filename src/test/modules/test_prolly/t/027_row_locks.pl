@@ -159,6 +159,60 @@ $a->query_safe('COMMIT');
 $b->query_safe('SELECT 1');
 is(sql('SELECT v FROM t WHERE id = 7'), '72', 'insert succeeds once the conflicting row is deleted');
 
+# ON CONFLICT waits for a concurrent inserter of its key, then takes its
+# alternative path if that inserter commits, or inserts if it aborts.
+$a->query_safe('BEGIN; INSERT INTO t VALUES (20, 80)');
+start($b, 'INSERT INTO t VALUES (20, 81) ON CONFLICT DO NOTHING;');
+blocked($bpid, 'ON CONFLICT DO NOTHING waits for an inserter of its key');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 20'), '80', 'DO NOTHING keeps the committed row');
+$a->query_safe('BEGIN; INSERT INTO t VALUES (21, 90)');
+start($b, 'INSERT INTO t VALUES (21, 91) ON CONFLICT (id) DO UPDATE SET v = t.v + excluded.v;');
+blocked($bpid, 'ON CONFLICT DO UPDATE waits for an inserter of its key');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 21'), '181', 'DO UPDATE updates the row the inserter committed');
+$a->query_safe('BEGIN; INSERT INTO t VALUES (22, 100)');
+start($b, 'INSERT INTO t VALUES (22, 101) ON CONFLICT (id) DO UPDATE SET v = 0;');
+blocked($bpid, 'ON CONFLICT waits again');
+$a->query_safe('ROLLBACK');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 22'), '101', 'ON CONFLICT inserts once the other inserter aborts');
+
+# It waits for a running updater of the conflicting row and updates the newer
+# version, or inserts if a running deleter commits.
+$a->query_safe('BEGIN; UPDATE t SET v = 102 WHERE id = 22');
+start($b, 'INSERT INTO t VALUES (22, 1) ON CONFLICT (id) DO UPDATE SET v = t.v + excluded.v;');
+blocked($bpid, 'DO UPDATE waits for an updater of the conflicting row');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 22'), '103', 'DO UPDATE updates the version the updater made');
+$a->query_safe('BEGIN; DELETE FROM t WHERE id = 22');
+start($b, 'INSERT INTO t VALUES (22, 104) ON CONFLICT (id) DO UPDATE SET v = 0;');
+blocked($bpid, 'ON CONFLICT waits for a deleter of the conflicting row');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 22'), '104', 'ON CONFLICT inserts once the conflicting row is deleted');
+
+# One command proposing a key twice: DO UPDATE fails, DO NOTHING inserts once.
+$b->query('INSERT INTO t VALUES (23, 110), (23, 111) ON CONFLICT (id) DO UPDATE SET v = excluded.v');
+like($b->{stderr}, qr/ON CONFLICT DO UPDATE command cannot affect row a second time/,
+	'DO UPDATE cannot change a row its own command inserted');
+$b->{stderr} = '';
+$b->query_safe('INSERT INTO t VALUES (23, 112), (23, 113) ON CONFLICT DO NOTHING');
+is(sql('SELECT v FROM t WHERE id = 23'), '112', 'DO NOTHING skips a key its own command inserted');
+
+# Under Repeatable Read a conflict with a row committed after the snapshot is
+# a serialization failure.
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+sql('INSERT INTO t VALUES (24, 120)');
+$b->query('INSERT INTO t VALUES (24, 121) ON CONFLICT DO NOTHING');
+like($b->{stderr}, qr/could not serialize access due to concurrent update/,
+	'repeatable read cannot skip a row it does not see');
+$b->{stderr} = '';
+$b->query_safe('ROLLBACK');
+
 # AFTER triggers and RETURNING see the old version: each version has its own TID.
 # TODO: triggers on versioned tables. CREATE TRIGGER is native DDL today, and
 # a native trigger cannot depend on a versioned table.
