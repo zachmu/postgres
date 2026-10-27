@@ -757,6 +757,20 @@ test_apply_batches(void)
 			CHECK(pl_store_drop_unbacked(backed) == 0);
 			CHECK(pl_store_stats(backed).chunks == after.fetched);
 		}
+
+		/* A pinned node outlives the drop until something writes it. */
+		{
+			PLTree		empty;
+			size_t		chunks = pl_store_stats(backed).chunks;
+
+			OK(pl_build(backed, NULL, 0, &empty));
+			CHECK(pl_store_stats(backed).chunks == chunks + 1);
+			pl_node_pin(backed, pl_find_local(backed, empty.root));
+			CHECK(pl_store_drop_unbacked(backed) == 0);
+			CHECK(pl_find_local(backed, empty.root) != NULL);
+			CHECK(!pl_find_local(backed, empty.root)->backed);
+			pl_node_set_backed(pl_find_local(backed, empty.root));
+		}
 		pl_store_free(backed);
 	}
 

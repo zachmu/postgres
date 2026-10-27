@@ -301,12 +301,25 @@ tree_at(PLHash root)
 	return tree;
 }
 
+/*
+ * The empty tree, built once per working store and pinned so that dropping a
+ * transaction's unwritten nodes keeps it; it is written like any other node
+ * the first time a persisted root reaches it.
+ */
 static PLTree
 empty_tree(void)
 {
+	static PLHash empty_root;
+	static bool empty_known;
+	PLStore    *store = dg_working_store();
 	PLTree		tree;
 
-	dg_check(pl_build(dg_working_store(), NULL, 0, &tree));
+	if (empty_known && pl_find_local(store, empty_root))
+		return (PLTree) {store, empty_root};
+	dg_check(pl_build(store, NULL, 0, &tree));
+	pl_node_pin(store, pl_find_local(store, tree.root));
+	empty_root = tree.root;
+	empty_known = true;
 	return tree;
 }
 
