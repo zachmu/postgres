@@ -50,6 +50,7 @@
 #include "miscadmin.h"
 #include "storage/dsm_registry.h"
 #include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/spin.h"
 #include "utils/builtins.h"
@@ -510,6 +511,7 @@ static uint64 roots_generation(void);
 static void roots_generation_bump(void);
 static void handle_table_init(void *ptr);
 static bool tree_has(PLTree *tree, uint64 id);
+static void writer_forget(TransactionId xid, int slot);
 
 /*
  * Rows this transaction updated or deleted, by handle, with the command and
@@ -530,6 +532,39 @@ typedef struct Modified
 } Modified;
 
 static HTAB *modified;
+
+/* The tables a serializable transaction wrote, rechecked before it publishes. */
+typedef struct SerializableWrite
+{
+	Oid			db;
+	Oid			relid;
+} SerializableWrite;
+
+static SerializableWrite *serializable_writes;
+static int	serializable_count;
+static int	serializable_capacity;
+
+/*
+ * Running serializable writers of each table, which readers conflict out to:
+ * their private changes are what heap's reader would find in progress. A full
+ * registry leaves later writers to the check they make before publishing.
+ */
+#define DG_WRITER_SLOTS 1024
+
+typedef struct WriterSlot
+{
+	Oid			db;
+	Oid			relid;
+	TransactionId xid;
+} WriterSlot;
+
+typedef struct WriterTable
+{
+	slock_t		mutex;
+	WriterSlot	slots[DG_WRITER_SLOTS];
+} WriterTable;
+
+static WriterTable *writer_table;
 
 /*
  * Every edit builds new nodes and orphans old ones, and the working store keeps
@@ -774,6 +809,8 @@ store_xact(XactEvent event, void *arg)
 				CurrentResourceOwner = TopTransactionResourceOwner;
 				PG_TRY();
 				{
+					for (int i = 0; i < serializable_count; i++)
+						CheckRelationForSerializableConflictIn(serializable_writes[i].db, serializable_writes[i].relid);
 					batch_flush_all();
 					publish_all();
 					working_close(true);
@@ -800,6 +837,11 @@ store_xact(XactEvent event, void *arg)
 			overlays = NULL;	/* in TopTransactionContext */
 			batches = NULL;
 			modified = NULL;
+			/* A prepared writer stays registered until readers find it finished. */
+			if (serializable_count && event != XACT_EVENT_PREPARE)
+				writer_forget(GetTopTransactionIdIfAny(), -1);
+			serializable_writes = NULL;
+			serializable_count = serializable_capacity = 0;
 			live_states = NULL;
 			live_count = live_capacity = 0;
 			collect_threshold = DG_COLLECT_MINIMUM;
@@ -886,6 +928,148 @@ dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid)
 	row = hash_search(modified, &key, HASH_ENTER, NULL);
 	row->cid = cid;
 	row->subxid = GetCurrentSubTransactionId();
+}
+
+/* ---------------------------------------------------------------------------
+ * Serializable isolation
+ *
+ * Predicate locks cover whole tables. A reader locks the table and conflicts
+ * out to every writer that published the table's roots after its snapshot,
+ * and to every running writer of it: their row versions are those heap's
+ * reader would find invisible. A writer checks for readers as it writes, and
+ * again before it publishes, in case the registry of running writers had no
+ * room for it.
+ * ---------------------------------------------------------------------------
+ */
+
+static void
+writer_table_init(void *ptr)
+{
+	WriterTable *table = ptr;
+
+	memset(table, 0, sizeof(*table));
+	SpinLockInit(&table->mutex);
+}
+
+static WriterTable *
+shared_writers(void)
+{
+	bool		found;
+
+	if (!writer_table)
+		writer_table = GetNamedDSMSegment("dolt prolly serializable writers", sizeof(WriterTable),
+										  writer_table_init, &found);
+	return writer_table;
+}
+
+static void
+writer_register(Oid db, Oid relid, TransactionId xid)
+{
+	WriterTable *table = shared_writers();
+
+	SpinLockAcquire(&table->mutex);
+	for (int i = 0; i < DG_WRITER_SLOTS; i++)
+		if (!TransactionIdIsValid(table->slots[i].xid))
+		{
+			table->slots[i].db = db;
+			table->slots[i].relid = relid;
+			table->slots[i].xid = xid;
+			break;
+		}
+	SpinLockRelease(&table->mutex);
+}
+
+/* Forget this transaction's registrations, or a finished writer's at |slot|. */
+static void
+writer_forget(TransactionId xid, int slot)
+{
+	WriterTable *table = shared_writers();
+
+	SpinLockAcquire(&table->mutex);
+	for (int i = slot < 0 ? 0 : slot; i < (slot < 0 ? DG_WRITER_SLOTS : slot + 1); i++)
+		if (TransactionIdEquals(table->slots[i].xid, xid))
+			table->slots[i].xid = InvalidTransactionId;
+	SpinLockRelease(&table->mutex);
+}
+
+/* Conflict out from a read of |rel| to each running writer of it. */
+static void
+writers_conflict_out(Relation rel, Snapshot snap)
+{
+	WriterTable *table = shared_writers();
+	TransactionId xids[DG_WRITER_SLOTS];
+	int			slots[DG_WRITER_SLOTS];
+	int			n = 0;
+
+	SpinLockAcquire(&table->mutex);
+	for (int i = 0; i < DG_WRITER_SLOTS; i++)
+		if (TransactionIdIsValid(table->slots[i].xid) && table->slots[i].db == rel->rd_locator.dbOid &&
+			table->slots[i].relid == RelationGetRelid(rel))
+		{
+			xids[n] = table->slots[i].xid;
+			slots[n++] = i;
+		}
+	SpinLockRelease(&table->mutex);
+	for (int i = 0; i < n; i++)
+	{
+		if (TransactionIdIsCurrentTransactionId(xids[i]))
+			continue;
+		if (TransactionIdIsInProgress(xids[i]))
+			CheckForSerializableConflictOut(rel, xids[i], snap);
+		else
+			writer_forget(xids[i], slots[i]);
+	}
+}
+
+/* Note a serializable transaction's write to |rel|. */
+void
+dg_serializable_write(Relation rel)
+{
+	if (!IsolationIsSerializable())
+		return;
+	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
+	for (int i = 0; i < serializable_count; i++)
+		if (serializable_writes[i].db == rel->rd_locator.dbOid && serializable_writes[i].relid == RelationGetRelid(rel))
+			return;
+	if (serializable_count == serializable_capacity)
+	{
+		serializable_capacity = serializable_capacity ? serializable_capacity * 2 : 8;
+		serializable_writes = serializable_writes ?
+			repalloc_array(serializable_writes, SerializableWrite, serializable_capacity) :
+			MemoryContextAlloc(TopTransactionContext, serializable_capacity * sizeof(SerializableWrite));
+	}
+	serializable_writes[serializable_count].db = rel->rd_locator.dbOid;
+	serializable_writes[serializable_count++].relid = RelationGetRelid(rel);
+	writer_register(rel->rd_locator.dbOid, RelationGetRelid(rel), GetTopTransactionId());
+}
+
+/* Lock table |rel| for a serializable read under |snap|, of roots |key|. */
+static void
+serializable_read(Relation rel, const RootKey *key, Snapshot snap)
+{
+	Relation	catalog;
+	ScanKeyData keys[3];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	PredicateLockRelation(rel, snap);
+	if (!CheckForSerializableConflictOutNeeded(rel, snap))
+		return;
+	writers_conflict_out(rel, snap);
+	catalog = table_open(DoltRootRelationId, AccessShareLock);
+	root_scan_keys(key, keys);
+	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, SnapshotAny, 3, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		TransactionId xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		if (TransactionIdIsNormal(xmin) && !TransactionIdIsCurrentTransactionId(xmin) &&
+			XidInMVCCSnapshot(xmin, snap) &&
+			(TransactionIdIsInProgress(xmin) || TransactionIdDidCommit(xmin)))
+			CheckForSerializableConflictOut(rel, xmin, snap);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
 }
 
 /*
@@ -1298,12 +1482,12 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 
 	if (!bound)
 		dg_catalog_check_relation(rel, branch, snap);
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	/* A dirty snapshot reads as SnapshotSelf; uniqueness checks wait on reservations. */
 	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && snap->snapshot_type != SNAPSHOT_DIRTY && !wanted)
 		dg_unsupported("non-MVCC snapshots");
 	key = root_key(rel, branch);
+	if (table && snap && IsMVCCSnapshot(snap) && IsolationIsSerializable())
+		serializable_read(rel, &key, snap);
 
 	/* Any other reader of these roots sees the current command's edits applied. */
 	if (!loading_for_batch)

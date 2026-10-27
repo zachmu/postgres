@@ -4389,6 +4389,36 @@ CheckForSerializableConflictIn(Relation relation, ItemPointer tid, BlockNumber b
 }
 
 /*
+ * CheckRelationForSerializableConflictIn
+ *		As CheckForSerializableConflictIn for a whole relation, named by its
+ *		database and OID.
+ *
+ * A table access method whose writes stay private until commit uses this to
+ * recheck, before commit, the relations it wrote: a concurrent reader could
+ * not see those writes, so the conflict it took a predicate lock into since
+ * is found here rather than when the reader read the writer's tuples.
+ */
+void
+CheckRelationForSerializableConflictIn(Oid dbId, Oid relId)
+{
+	PREDICATELOCKTARGETTAG targettag;
+
+	if (MySerializableXact == InvalidSerializableXact)
+		return;
+
+	if (SxactIsDoomed(MySerializableXact))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to read/write dependencies among transactions"),
+				 errdetail_internal("Reason code: Canceled on identification as a pivot, during conflict in checking."),
+				 errhint("The transaction might succeed if retried.")));
+
+	MyXactDidWrite = true;
+	SET_PREDICATELOCKTARGETTAG_RELATION(targettag, dbId, relId);
+	CheckTargetForConflictsIn(&targettag);
+}
+
+/*
  * CheckTableForSerializableConflictIn
  *		The entire table is going through a DDL-style logical mass delete
  *		like TRUNCATE or DROP TABLE.  If that causes a rw-conflict in from

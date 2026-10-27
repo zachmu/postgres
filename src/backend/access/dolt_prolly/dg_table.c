@@ -87,8 +87,6 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 
 	if (parallel || nkeys)
 		dg_unsupported("parallel scans or table scan keys");
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	dg_validate_descriptor(RelationGetDescr(rel));
 	/* ANALYZE opens its sample scan without a snapshot; read the live state. */
 	if (!snap && (flags & SO_TYPE_ANALYZE))
@@ -452,9 +450,8 @@ read_only_revision(Relation rel)
 static void
 writer(Relation rel)
 {
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
+	dg_serializable_write(rel);
 	if (dg_storage_bound(rel) || CatalogViewIsLeased(RelationGetRelid(rel)))
 		dg_storage_require_write(rel);
 }
@@ -827,8 +824,6 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 	int64		next;
 	CommandId	made = InvalidCommandId;	/* the command that made *tid, if this transaction did */
 
-	if (IsolationIsSerializable())
-		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
 
 	/*

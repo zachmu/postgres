@@ -654,6 +654,12 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 				continue;
 		}
 
+		/*
+		 * As _bt_check_unique, give serializable isolation the chance to
+		 * report a conflict the unique violation would otherwise mask.
+		 */
+		dg_serializable_write(table);
+
 		/* Describe the key from our row, which the error reports. */
 		rows = dg_load(table, SnapshotSelf);
 		pl_write64(id, self);

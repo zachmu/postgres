@@ -90,6 +90,7 @@ extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
 extern bool dg_row_committed(Relation rel, uint64 handle);
+extern void dg_serializable_write(Relation rel);
 extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTupleMode mode,
 								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
 extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, CommandId cid,
