@@ -233,6 +233,24 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 	return freed;
 }
 
+/*
+ * Keep |node| through pl_store_drop_unbacked until it is written: for a node
+ * every transaction would otherwise rebuild, such as the empty tree.
+ */
+void
+pl_node_pin(PLStore *store, PLNode *node)
+{
+	if (node->pinned || node->backed)
+		return;
+	node->pinned = true;
+	for (size_t i = 0; i < store->unbacked_count; i++)
+		if (store->unbacked[i] == node)
+		{
+			store->unbacked[i] = store->unbacked[--store->unbacked_count];
+			break;
+		}
+}
+
 /* Record that |node| is now in the backing store; it stays listed until dropped. */
 void
 pl_node_set_backed(PLNode *node)

@@ -22,6 +22,7 @@ typedef struct PLNode
 	uint32_t	value_bytes;
 	bool		backed;			/* known to be in the backing store */
 	bool		marked;			/* reachable, during pl_store_retain */
+	bool		pinned;			/* kept until written, across pl_store_drop_unbacked */
 	struct PLNode *next;
 } PLNode;
 
@@ -52,6 +53,7 @@ bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);
+void		pl_node_pin(PLStore *store, PLNode *node);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);
 PLSlice		pl_node_value(const PLNode *node, uint32_t index);
 uint64_t	pl_node_rows(const PLNode *node);
