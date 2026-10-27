@@ -506,6 +506,9 @@ static void batch_flush_key(const RootKey *key);
 static void batch_flush_all(void);
 static void batch_discard(SubTransactionId subxid);
 static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid);
+static uint64 roots_generation(void);
+static void roots_generation_bump(void);
+static void handle_table_init(void *ptr);
 
 /*
  * Rows this transaction updated or deleted, by handle, with the command and
@@ -696,6 +699,7 @@ roots_write(Relation catalog, const RootKey *key, ItemPointer tid, const Roots *
 	else
 		CatalogTupleInsert(catalog, tuple);
 	heap_freetuple(tuple);
+	roots_generation_bump();
 }
 
 /* Publish every written relation, in a fixed order to avoid deadlocks. */
@@ -928,10 +932,38 @@ typedef struct HandleSlot
 typedef struct HandleTable
 {
 	slock_t		mutex;
+	pg_atomic_uint64 roots_generation;	/* bumped by every roots write */
 	HandleSlot	slots[DG_HANDLE_SLOTS];
 } HandleTable;
 
 static HandleTable *handle_table;
+
+static HandleTable *
+shared_handles(void)
+{
+	bool		found;
+
+	if (!handle_table)
+		handle_table = GetNamedDSMSegment("dolt prolly handles", sizeof(HandleTable), handle_table_init, &found);
+	return handle_table;
+}
+
+/*
+ * A counter every roots write advances before its commit: while it stands
+ * still, no transaction has published roots, so trees loaded under it are
+ * still the latest.
+ */
+static uint64
+roots_generation(void)
+{
+	return pg_atomic_read_u64(&shared_handles()->roots_generation);
+}
+
+static void
+roots_generation_bump(void)
+{
+	pg_atomic_fetch_add_u64(&shared_handles()->roots_generation, 1);
+}
 
 static void
 handle_table_init(void *ptr)
@@ -944,6 +976,7 @@ handle_table_init(void *ptr)
 		pg_atomic_init_u32(&table->slots[i].used, 0);
 		pg_atomic_init_u64(&table->slots[i].next, 0);
 	}
+	pg_atomic_init_u64(&table->roots_generation, 1);
 }
 
 static uint32
@@ -1025,10 +1058,8 @@ dg_allocate_handle(Relation rel)
 				space = rel->rd_locator.spcOid;
 	RelFileNumber file = rel->rd_locator.relNumber;
 	HandleSlot *slot;
-	bool		found;
 
-	if (!handle_table)
-		handle_table = GetNamedDSMSegment("dolt prolly handles", sizeof(HandleTable), handle_table_init, &found);
+	shared_handles();
 	slot = handle_slot_find(db, space, file);
 	if (!slot)
 	{

@@ -56,6 +56,7 @@ struct DGBatch
 	Relation	bound;			/* ... unless a private storage descriptor */
 	CommandId	cid;
 	SubTransactionId subxid;
+	uint64		generation;		/* roots generation the state was loaded under */
 	bool		table;
 	MemoryContext memory;
 	DGState    *state;			/* the trees the edits apply to */
@@ -269,19 +270,24 @@ batch_flush(DGBatch *b)
 
 	if (b->count)
 	{
-		MemoryContext old = MemoryContextSwitchTo(memory);
-		Relation	rel = b->bound ? b->bound : relation_open(b->relid, NoLock);
+		/* Reload only if someone published roots since the state was loaded. */
+		if (roots_generation() != b->generation)
+		{
+			MemoryContext old = MemoryContextSwitchTo(memory);
+			Relation	rel = b->bound ? b->bound : relation_open(b->relid, NoLock);
 
-		/* The writer's lock on the relation outlives its statement. */
-		b->state = batch_load(rel);
-		MemoryContextSwitchTo(old);
+			/* The writer's lock on the relation outlives its statement. */
+			b->generation = roots_generation();
+			b->state = batch_load(rel);
+			MemoryContextSwitchTo(old);
+			if (!b->bound)
+				relation_close(rel, NoLock);
+		}
 		if (b->table)
 			batch_flush_table(b);
 		else
 			batch_flush_index(b);
 		save_roots(&key, b->table, b->state, b->cid, b->subxid);
-		if (!b->bound)
-			relation_close(rel, NoLock);
 	}
 	hash_search(batches, &key, HASH_REMOVE, NULL);
 
@@ -397,6 +403,7 @@ dg_batch(Relation rel, CommandId cid)
 	b->entries = NULL;
 	b->entry_count = b->entry_capacity = 0;
 	old = MemoryContextSwitchTo(b->memory);
+	b->generation = roots_generation();
 	b->state = batch_load(rel);
 	if (b->table)
 	{
@@ -575,11 +582,24 @@ dg_batch_handles(DGBatch *b, PLHash digest, uint64 **handles)
 	return pending ? pending->handle_count : 0;
 }
 
-/* The latest trees of |rel| without the current command's pending edits. */
+/*
+ * The latest trees of |rel| without the current command's pending edits,
+ * which the caller releases: a copy of its batch's state while nothing has
+ * published roots since that was loaded, else freshly loaded.
+ */
 DGState *
 dg_batch_load(Relation rel)
 {
-	return batch_load(rel);
+	DGBatch    *b = dg_batch_current(rel);
+	DGState    *copy;
+
+	if (!b || roots_generation() != b->generation)
+		return batch_load(rel);
+	copy = palloc0(sizeof(DGState));
+	*copy = *b->state;
+	copy->shared = true;
+	memset(&copy->cleanup, 0, sizeof(copy->cleanup));
+	return copy;
 }
 
 /* Apply |rel|'s pending edits now, as the end of a bulk insert does. */
