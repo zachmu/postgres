@@ -139,6 +139,8 @@ index_entry(Relation index, PLSlice row, PLSlice digest, StringInfo key, size_t 
 static const char *
 index_comparator(Oid type)
 {
+	if (OidIsValid(get_element_type(type)))
+		return "btarraycmp";
 	switch (type)
 	{
 		case BOOLOID:
@@ -215,7 +217,7 @@ dg_index_validate(Relation table, Relation index)
 		type = getBaseType(TupleDescAttr(RelationGetDescr(table), att - 1)->atttypid);
 		if (!dg_key_ordered(type))
 			dg_unsupported("ordered index keys of this type");
-		if ((type == TEXTOID || type == VARCHAROID || type == BPCHAROID || type == NAMEOID) &&
+		if (OidIsValid(index->rd_indcollation[j]) &&
 			!pg_newlocale_from_collation(index->rd_indcollation[j])->collate_is_c)
 			dg_unsupported("non-C index collations");
 		expected = index_comparator(type);
@@ -223,7 +225,9 @@ dg_index_validate(Relation table, Relation index)
 			dg_unsupported("custom index comparators");
 
 		/* Operator classes are declared on varchar's text and an enum's anyenum. */
-		if (type == VARCHAROID)
+		if (OidIsValid(get_element_type(type)))
+			type = ANYARRAYOID;
+		else if (type == VARCHAROID)
 			type = TEXTOID;
 		else if (get_typtype(type) == TYPTYPE_ENUM)
 			type = ANYENUMOID;
@@ -783,7 +787,7 @@ static void
 append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 {
 	Relation	index = scan->indexRelation;
-	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID ? key->sk_subtype :
+	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID && key->sk_subtype != ANYARRAYOID ? key->sk_subtype :
 		TupleDescAttr(RelationGetDescr(scan->heapRelation), index->rd_index->indkey.values[j] - 1)->atttypid;
 
 	appendStringInfoChar(out, 1);

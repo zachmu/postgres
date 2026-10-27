@@ -538,4 +538,7 @@
 { opcmethod => 'dolt_prolly_index', opcname => 'dolt_enum_ops',
   opcfamily => 'dolt_prolly_index/dolt_enum_ops', opcintype => 'anyenum' },
 
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_array_ops',
+  opcfamily => 'dolt_prolly_index/dolt_array_ops', opcintype => 'anyarray' },
+
 ]

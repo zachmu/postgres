@@ -3668,4 +3668,20 @@
   amoprighttype => 'anyenum', amopstrategy => '5', amopopr => '>(anyenum,anyenum)',
   amopmethod => 'dolt_prolly_index' },
 
+{ amopfamily => 'dolt_prolly_index/dolt_array_ops', amoplefttype => 'anyarray',
+  amoprighttype => 'anyarray', amopstrategy => '1',
+  amopopr => '<(anyarray,anyarray)', amopmethod => 'dolt_prolly_index' },
+{ amopfamily => 'dolt_prolly_index/dolt_array_ops', amoplefttype => 'anyarray',
+  amoprighttype => 'anyarray', amopstrategy => '2',
+  amopopr => '<=(anyarray,anyarray)', amopmethod => 'dolt_prolly_index' },
+{ amopfamily => 'dolt_prolly_index/dolt_array_ops', amoplefttype => 'anyarray',
+  amoprighttype => 'anyarray', amopstrategy => '3',
+  amopopr => '=(anyarray,anyarray)', amopmethod => 'dolt_prolly_index' },
+{ amopfamily => 'dolt_prolly_index/dolt_array_ops', amoplefttype => 'anyarray',
+  amoprighttype => 'anyarray', amopstrategy => '4',
+  amopopr => '>=(anyarray,anyarray)', amopmethod => 'dolt_prolly_index' },
+{ amopfamily => 'dolt_prolly_index/dolt_array_ops', amoplefttype => 'anyarray',
+  amoprighttype => 'anyarray', amopstrategy => '5',
+  amopopr => '>(anyarray,anyarray)', amopmethod => 'dolt_prolly_index' },
+
 ]
