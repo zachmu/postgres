@@ -738,6 +738,23 @@ test_apply_batches(void)
 		CHECK(pl_store_stats(backed).chunks == stats.fetched);
 		CHECK(pl_store_drop_unbacked(backed) == 0);
 		CHECK(pl_store_stats(backed).chunks == stats.fetched);
+
+		/* Unbacked nodes that retain frees are forgotten, not freed again. */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						again;
+			uint8_t		other[4] = {5, 6, 7, 8};
+			PLEdit		edit2 = {{keys[SLOTS / 3], 8}, {true, {other, 4}}};
+			size_t		before = pl_store_stats(backed).chunks,
+						built;
+
+			OK(pl_apply(&base_remote, &edit2, 1, &again));
+			built = pl_store_stats(backed).chunks - before;
+			CHECK(built > 0);
+			CHECK(pl_store_retain(backed, &tree.root, 1) == built);
+			CHECK(pl_store_drop_unbacked(backed) == 0);
+			CHECK(pl_store_stats(backed).chunks == before);
+		}
 		pl_store_free(backed);
 	}
 
