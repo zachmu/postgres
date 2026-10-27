@@ -1502,10 +1502,12 @@ CREATE VIEW dolt.diff WITH (security_invoker=true) AS
 CREATE VIEW dolt.column_diff WITH (security_invoker=true) AS
     SELECT * FROM pg_catalog.dolt_column_diff();
 CREATE VIEW dolt.conflicts WITH (security_invoker=true) AS
-    SELECT (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] AS "table",
-           count(*)::numeric AS num_conflicts
+    SELECT CASE WHEN strpos(v->>'table','(')>0 THEN v->>'table'
+                ELSE (parse_ident(v->>'table'))[array_length(parse_ident(v->>'table'),1)] END AS "table",
+           count(*) FILTER (WHERE v->>'description' IS NULL)::numeric AS num_conflicts
     FROM pg_catalog.pg_dolt_ref r JOIN pg_catalog.pg_dolt_object_visible o ON o.objhash=r.reftarget,
-         LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts') v
+         LATERAL jsonb_array_elements(convert_from(o.objpayload,'UTF8')::jsonb->'conflicts' ||
+                                      coalesce(convert_from(o.objpayload,'UTF8')::jsonb->'schema_conflicts','[]'::jsonb)) v
     WHERE r.refname='merge/' || pg_catalog.active_branch()
     GROUP BY 1 ORDER BY 1;
 CREATE VIEW dolt.constraint_violations WITH (security_invoker=true) AS

@@ -509,10 +509,18 @@ object-level schema merge (`6c06fa14602`), and user-defined types
   create of the new one, so it conflicts only with changes to the old object
   on the other branch. Heuristic rename detection may come later if renames
   across branches prove common.
-- **Column-level schema merge:** a table whose definition changed on one side
-  and rows on the other, or whose definition changed on both sides.
-- **Schema conflicts as data,** in `dolt_schema_conflicts`, resolvable,
-  instead of an error.
+- **Column-level schema merge and schema conflicts as data (2026-10-26):**
+  done (`zachmu/column-schema-merge`, `reports/schema-merge.html`). A table
+  changed on both sides merges its definition column by column, constraint
+  by constraint and index by index, matched by name, following Dolt's rules;
+  each side's rows are laid out in the merged definition (defaults filled,
+  one-sided type changes converted by assignment cast) before rows merge.
+  Unmergeable definitions, and other objects changed on both sides, are
+  recorded in `dolt_schema_conflicts`, block commit, and resolve with
+  `dolt_conflicts_resolve --ours/--theirs` (whole object), which Dolt cannot
+  do yet. Still open: previewing row conflicts of tables whose definitions
+  merge; recomputing stored generated columns of field-merged rows; recording
+  foreign key violations instead of failing the merge.
 - **Index key encodings:** done for numeric, floats, date and time types,
   interval, uuid, character types, money, MAC addresses and enums (by label
   position; ADD VALUE rebuilds affected indexes). Deferred, with no effect on

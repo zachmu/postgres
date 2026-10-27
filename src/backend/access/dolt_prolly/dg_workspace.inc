@@ -163,12 +163,14 @@ compose_database(bytea *base, bytea *source, List *tables)
 /* ---- Schema merge ----
  *
  * A three-way merge of database states, object by object: a namespace,
- * routine or trigger is keyed by kind and name, and a table together with
- * its indexes, which its definition lists. An object changed (added, altered
- * or dropped) on one side only takes that side. A table whose definition is
- * the same on all three sides but whose rows changed on both is returned in
- * |row_merges|, for its rows to be merged. Any other object changed on both
- * sides is a schema conflict. */
+ * routine, type, view or trigger is keyed by kind and name, and a table
+ * together with its indexes, which its definition lists. An object changed
+ * (added, altered or dropped) on one side only takes that side. A table
+ * changed on both sides merges its definition column by column (see
+ * dg_schema_merge.inc) and is returned in |row_merges|, for its rows to be
+ * merged. Anything else changed on both sides, and a table whose definitions
+ * do not merge, is a schema conflict: it keeps our side, and is recorded in
+ * |schema_conflicts|. */
 
 static Member *
 merge_member(Member * members, int count, const char *kind, const char *name)
@@ -185,8 +187,114 @@ merge_same(Member * a, Member * b)
 	return (!a && !b) || (a && b && same(a->hash, b->hash));
 }
 
+static char *
+member_definition(Member * member)
+{
+	if (!member)
+		return NULL;
+	if (!strcmp(member->kind, "namespace"))
+		return member->payload;
+	return metadata(child(member->hash, 1), "schema");
+}
+
+/*
+ * The indexes of table |name| merged by name from each side's index members,
+ * appended to |members| and |hashes|, and listed in |definition|, which they
+ * are returned in. NULL after describing a conflict.
+ */
+static char *
+merge_table_indexes(const char *name, char *definition, Member * sides[3], int counts[3], Member * table[3],
+					StringInfo members, Datum *hashes, int *used, StringInfo description)
+{
+	List	   *names[3] = {NIL, NIL, NIL},
+			   *order = NIL,
+			   *chosen = NIL;
+	List	   *columns = definition_items(definition, "columns");
+	StringInfoData sql;
+
+	for (int side = 0; side < 3; side++)
+		if (table[side])
+			names[side] = table_index_names(member_definition(table[side]), name);
+	foreach_ptr(char, index, names[1])
+		order = lappend(order, index);
+	foreach_ptr(char, index, names[2])
+		if (!name_selected(names[1], index))
+		order = lappend(order, index);
+	foreach_ptr(char, index, order)
+	{
+		Member	   *m[3];
+		Member	   *pick;
+
+		char	   *d[3];
+
+		/* Definitions, not members: an index member holds its entries too. */
+		for (int side = 0; side < 3; side++)
+		{
+			m[side] = name_selected(names[side], index) ? merge_member(sides[side], counts[side], "index", index) : NULL;
+			d[side] = member_definition(m[side]);
+		}
+		if (json_equal(d[1], d[2]) || json_equal(d[0], d[2]))
+			pick = m[1];
+		else if (json_equal(d[0], d[1]))
+			pick = m[2];
+		else
+		{
+			merge_describe(description, "different index definitions for our index %s and their index %s", index, index);
+			return NULL;
+		}
+		if (!pick)
+			continue;
+
+		/* As Dolt, an index over a dropped column is dropped; one over a retyped column conflicts. */
+		{
+			bool		dropped = false;
+
+			foreach_ptr(DefinitionItem, column, definition_items(member_definition(pick), "columns"))
+			{
+				char	   *merged = definition_item(columns, column->name);
+
+				if (!merged)
+					dropped = true;
+				else if (!json_equal(column_type_unit(merged), column_type_unit(column->json)))
+				{
+					merge_describe(description, "index %s covers column %s, whose type changed on the other side", index, column->name);
+					return NULL;
+				}
+			}
+			if (dropped)
+				continue;
+		}
+		chosen = lappend(chosen, pick);
+	}
+	initStringInfo(&sql);
+	appendStringInfoChar(&sql, '[');
+	foreach_ptr(Member, pick, chosen)
+	{
+		if (sql.len > 1)
+			appendStringInfoChar(&sql, ',');
+		escape_json(&sql, json_value(member_definition(pick), "index_definition"));
+		appendStringInfo(members, "%s%s", *used ? "," : "", pick->payload);
+		hashes[(*used)++] = PointerGetDatum(pick->hash);
+	}
+	appendStringInfoChar(&sql, ']');
+	run("SELECT jsonb_set($1::jsonb,'{indexes}',(SELECT coalesce(jsonb_agg(v ORDER BY v #>> '{}' COLLATE \"C\"),'[]'::jsonb) FROM jsonb_array_elements($2::jsonb) v))::text", 2,
+		VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(sql.data)), NULL, true);
+	return strcell(0, 1);
+}
+
+/* A schema object's definition as dolt_schema_conflicts shows it. */
+static char *
+conflict_schema(Member * member, const char *kind, const char *name)
+{
+	if (!member)
+		return pstrdup("<deleted>");
+	if (!strcmp(kind, "table"))
+		return definition_statement(name, member_definition(member));
+	return member_definition(member);
+}
+
 static bytea *
-merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
+merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, StringInfo schema_conflicts)
 {
 	int			counts[3];
 	Member	   *sides[3] = {
@@ -214,6 +322,8 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
 					   *chosen;
 			Member	   *from;
 			int			fromcount;
+			bool		table,
+						both;
 
 			/* Indexes follow their tables. */
 			if (!strcmp(key->kind, "index") || list_member(seen, makeString(identity)))
@@ -222,25 +332,64 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
 			b = merge_member(sides[0], counts[0], key->kind, key->name);
 			o = merge_member(sides[1], counts[1], key->kind, key->name);
 			t = merge_member(sides[2], counts[2], key->kind, key->name);
+			table = !strcmp(key->kind, "table");
 
 			/*
-			 * Rows changed on both sides are merged row by row even when the
+			 * A table changed on both sides merges row by row even when the
 			 * results agree, as a keyless table's matching changes conflict.
 			 */
-			if (!strcmp(key->kind, "table") && b && o && t && !merge_same(b, o) && !merge_same(b, t) &&
-				same(child(b->hash, 1), child(o->hash, 1)) && same(child(o->hash, 1), child(t->hash, 1)))
-			{
+			both = table && b && o && t && !merge_same(b, o) && !merge_same(b, t);
+			if (!both && (merge_same(o, t) || merge_same(b, t)))
 				chosen = o, from = sides[1], fromcount = counts[1];
-				*row_merges = lappend(*row_merges, key->name);
-			}
-			else if (merge_same(o, t) || merge_same(b, t))
-				chosen = o, from = sides[1], fromcount = counts[1];
-			else if (merge_same(b, o))
+			else if (!both && merge_same(b, o))
 				chosen = t, from = sides[2], fromcount = counts[2];
+			else if (table && o && t)
+			{
+				/* Changed on both sides: merge the definitions, then the rows. */
+				char	   *defs[3] = {member_definition(b), member_definition(o), member_definition(t)};
+				RowMerge   *merge = palloc0(sizeof(RowMerge));
+				StringInfoData description;
+				char	   *definition;
+
+				initStringInfo(&description);
+				merge->table = key->name;
+				if (b && json_equal(defs[0], defs[1]) && json_equal(defs[1], defs[2]))
+				{
+					*row_merges = lappend(*row_merges, merge);
+					chosen = o, from = sides[1], fromcount = counts[1];
+				}
+				else if ((definition = merge_table_definition(key->name, defs[0], defs[1], defs[2], &description)) &&
+						 (definition = merge_table_indexes(key->name, definition, sides, counts, (Member *[3]) {b, o, t},
+														   &json, hashes, &used, &description)))
+				{
+					bytea	   *member = merged_table_member(key->name, definition);
+					char	   *payload = metadata(member, "table");
+
+					merge->remap = true;
+					for (int k = 0; k < 3; k++)
+						merge->definitions[k] = defs[k];
+					*row_merges = lappend(*row_merges, merge);
+
+					appendStringInfo(&json, "%s%s", used ? "," : "", payload);
+					hashes[used++] = PointerGetDatum(member);
+					continue;
+				}
+				else
+				{
+					record_schema_conflict(schema_conflicts, key->kind, key->name, conflict_schema(b, "table", key->name),
+										   conflict_schema(o, "table", key->name), conflict_schema(t, "table", key->name), description.data);
+					chosen = o, from = sides[1], fromcount = counts[1];
+				}
+			}
 			else
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("merge conflict in the definition of %s %s", key->kind, key->name),
-								errdetail("Both branches changed it. Merging such schema changes is not supported yet.")));
+			{
+				const char *description = !table ? psprintf("both branches changed %s %s", key->kind, key->name) :
+					!b ? "both branches added the table" : "cannot merge a table deletion with data or schema modification";
+
+				record_schema_conflict(schema_conflicts, key->kind, key->name, conflict_schema(b, key->kind, key->name),
+									   conflict_schema(o, key->kind, key->name), conflict_schema(t, key->kind, key->name), description);
+				chosen = o, from = sides[1], fromcount = counts[1];
+			}
 			if (!chosen)
 				continue;
 			if (used)
@@ -271,10 +420,11 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges)
  * changed on both sides are merged.
  */
 static void
-merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations)
+merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
+				StringInfo schema_conflicts)
 {
 	List	   *row_merges;
-	bytea	   *merged = merge_schemas(base, ours, theirs, &row_merges);
+	bytea	   *merged = merge_schemas(base, ours, theirs, &row_merges, schema_conflicts);
 
 	replace_working(dg_current_branch(), merged, NIL);
 	if (row_merges)
@@ -1014,7 +1164,8 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		char	   *meta = metadata(target, "commit"),
 				   *message;
 		StringInfoData conflicts,
-					violations;
+					violations,
+					schema_conflicts;
 
 		if (parent_count(target) < 1)
 			unsupported("reverting or cherry-picking a root commit");
@@ -1024,11 +1175,12 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 		head = read_ref(branch_ref("heads"));
 		initStringInfo(&conflicts);
 		initStringInfo(&violations);
+		initStringInfo(&schema_conflicts);
 		if (revert)
-			merge_databases(targetdb, child(head.target, 1), parentdb, &conflicts, &violations);
+			merge_databases(targetdb, child(head.target, 1), parentdb, &conflicts, &violations, &schema_conflicts);
 		else
-			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations);
-		if (conflicts.len || violations.len)
+			merge_databases(parentdb, child(head.target, 1), targetdb, &conflicts, &violations, &schema_conflicts);
+		if (conflicts.len || violations.len || schema_conflicts.len)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s resulted in conflicts; resolve them with dolt_merge", revert ? "revert" : "cherry-pick")));
 		database = capture_visible().hash;
 		message = revert ? psprintf("Revert \"%s\"", json_value(meta, "message")) : json_value(meta, "message");
