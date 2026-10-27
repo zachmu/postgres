@@ -191,6 +191,15 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 		return true;
 	}
 }
+/* Release a state loaded for |rel|; a provisional rewrite keeps its own. */
+static void
+release_state(Relation rel, DGState *s)
+{
+	if (CatalogViewIsProvisional(rel->rd_catalogview))
+		dg_catalog_mutation_release(s);
+	else
+		dg_release(s);
+}
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 {
@@ -206,13 +215,13 @@ fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 	status = pl_get(&s->handles, k, &value);
 	if (status == PL_OK && !value.present)
 	{
-		dg_release(s);
+		release_state(rel, s);
 		ExecClearTuple(slot);
 		return false;
 	}
 	dg_check(status);
 	dg_decode(rel, row_for_handle(s, value.bytes), tid, slot);
-	dg_release(s);
+	release_state(rel, s);
 	return true;
 }
 static IndexFetchTableData *
@@ -755,8 +764,16 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	bytes = *tuples * (Max(width, 1) + sizeof(ItemPointerData));
 	*pages = (BlockNumber) Min((double) MaxBlockNumber,
 		Max(1.0, ceil(bytes / BLCKSZ)));
+
+	/*
+	 * A prolly table is never analyzed, so nothing corrects an estimate the
+	 * planner makes from a small table's exact size. Count a small table as
+	 * a thousand rows, as before exact counts, so that plans over small tables
+	 * keep using their indexes.
+	 */
+	*tuples = Max(*tuples, 1000);
 	*allvis = 0;
-	dg_release(state);
+	release_state(rel, state);
 }
 static bool
 sample_block(TableScanDesc s, struct SampleScanState *state)
