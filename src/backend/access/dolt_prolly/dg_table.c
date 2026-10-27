@@ -345,8 +345,9 @@ typedef struct DGFetch
  */
 typedef struct StashKey
 {
-	Oid			relid;
 	uint64		handle;
+	Oid			relid;
+	uint32		pad;			/* zeroed: the hash covers every byte */
 } StashKey;
 
 typedef struct StashEntry
@@ -382,7 +383,7 @@ stash_reset(void)
 void
 dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 {
-	StashKey	key = {relid, handle};
+	StashKey	key = {handle, relid, 0};
 	StashEntry *entry;
 	bool		found;
 
@@ -407,7 +408,7 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 bool
 dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row)
 {
-	StashKey	key = {relid, handle};
+	StashKey	key = {handle, relid, 0};
 	StashEntry *entry;
 
 	if (!stash)
