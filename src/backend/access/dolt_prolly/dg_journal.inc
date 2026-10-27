@@ -756,21 +756,32 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 			return;
 		}
 	}
-	if (!entries.count)
-	{
-		if (fold)
-		{
-			journal_fold_unpin(fold);
-			hash_search(journal_folds, &key, HASH_REMOVE, NULL);
-		}
-		s->journal_seqs = NULL;
-		s->journal_count = 0;
-		return;
-	}
 	if (!fold)
 	{
 		fold = journal_fold_find(&key, true);
 		memset(((char *) fold) + sizeof(RootKey), 0, sizeof(*fold) - sizeof(RootKey));
+	}
+
+	/*
+	 * An empty stream is the common case for a read-mostly table: record it
+	 * under the same identity as a fold, so the next load with nothing moved
+	 * skips the catalog scan too.
+	 */
+	if (!entries.count)
+	{
+		journal_fold_unpin(fold);
+		memcpy(fold->base, current, sizeof(current));
+		memcpy(fold->folded, current, sizeof(current));
+		fold->seq_count = 0;
+		fold->store_epoch = store_epoch;
+		fold->roots_generation = roots_gen;
+		fold->local_version = journal_local_version;
+		fold->seen = seen;
+		fold->table = is_table;
+		fold->table_key = table_key;
+		s->journal_seqs = NULL;
+		s->journal_count = 0;
+		return;
 	}
 
 	/* Continue from the last result when it is a prefix of what is visible now. */
@@ -789,7 +800,6 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 				continue;
 			rest.items[rest.count++] = entries.items[i];
 		}
-		journal_fold_unpin(fold);
 		current[0] = fold->folded[0];
 		current[1] = fold->folded[1];
 		current[2] = fold->folded[2];
