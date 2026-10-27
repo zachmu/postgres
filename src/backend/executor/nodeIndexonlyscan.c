@@ -159,7 +159,13 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * It's worth going through this complexity to avoid needing to lock
 		 * the VM buffer, which could cause significant contention.
 		 */
-		if (!VM_ALL_VISIBLE(scandesc->heapRelation,
+		/*
+		 * The visibility map belongs to heap storage. Other table AMs must
+		 * establish visibility through index_fetch_tuple; their TIDs need
+		 * not identify heap pages, and they may have no relation file at all.
+		 */
+		if (scandesc->heapRelation->rd_tableam != GetHeapamTableAmRoutine() ||
+			!VM_ALL_VISIBLE(scandesc->heapRelation,
 							ItemPointerGetBlockNumber(tid),
 							&node->ioss_VMBuffer))
 		{
