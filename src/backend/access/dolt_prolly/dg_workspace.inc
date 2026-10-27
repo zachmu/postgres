@@ -582,6 +582,15 @@ stage_tables(List *tables)
 	move_ref(branch_ref("working"), working, current.hash);
 }
 
+/* -a stages changes to tracked tables; untracked tables remain in working. */
+static void
+stage_modified_tables(void)
+{
+	stage_tables(state_tables(staged_state()));
+	CommandCounterIncrement();
+	UpdateActiveSnapshotCommandId();
+}
+
 /* ---- dolt_reset ---- */
 
 Datum
