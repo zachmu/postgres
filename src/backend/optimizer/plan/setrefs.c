@@ -21,6 +21,7 @@
 #include "catalog/pg_dolt_storage.h"
 #include "utils/lsyscache.h"
 
+#include "access/doltcatalog.h"
 #include "access/transam.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
