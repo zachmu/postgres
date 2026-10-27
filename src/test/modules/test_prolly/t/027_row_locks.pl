@@ -159,6 +159,35 @@ $a->query_safe('COMMIT');
 $b->query_safe('SELECT 1');
 is(sql('SELECT v FROM t WHERE id = 7'), '72', 'insert succeeds once the conflicting row is deleted');
 
+# A deferrable unique constraint is checked when the statement or transaction
+# ends. An inserter of a key another transaction holds does not wait; its
+# commit-time recheck does.
+sql(q{CREATE TABLE d(id int UNIQUE DEFERRABLE INITIALLY IMMEDIATE, v int);
+INSERT INTO d VALUES (1, 1), (2, 2)});
+sql('UPDATE d SET id = id + 1');
+is(sql(q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM d}), '2:1,3:2',
+	'a statement may pass through duplicate keys of a deferrable constraint');
+$b->query('INSERT INTO d VALUES (2, 9)');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "d_id_key"/,
+	'a duplicate fails at the end of its statement');
+$b->{stderr} = '';
+$b->query_safe('BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (2, 9); UPDATE d SET id = 4 WHERE v = 9; COMMIT');
+$b->query('BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (2, 10); COMMIT');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "d_id_key"/,
+	'a deferred duplicate fails at commit');
+$b->{stderr} = '';
+is(sql(q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM d}), '2:1,3:2,4:9',
+	'deferred checks keep resolved duplicates and reject the rest');
+$a->query_safe('BEGIN; INSERT INTO d VALUES (5, 50)');
+$b->query_safe('BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (5, 51)');
+start($b, 'COMMIT;');
+blocked($bpid, 'a deferred check waits at commit for an inserter of its key');
+$a->query_safe('COMMIT');
+$b->query('SELECT 1');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "d_id_key"/,
+	'and fails once that inserter commits');
+$b->{stderr} = '';
+
 # ON CONFLICT waits for a concurrent inserter of its key, then takes its
 # alternative path if that inserter commits, or inserts if it aborts.
 $a->query_safe('BEGIN; INSERT INTO t VALUES (20, 80)');
@@ -254,6 +283,10 @@ $b->query_safe('COMMIT');
 $a->query_safe('COMMIT');
 is(sql('SELECT v FROM t WHERE id = 1'), '100', 'main keeps its own update');
 is($b->query_safe('SELECT v FROM t WHERE id = 1'), '200', 'the other branch keeps its update');
+$b->query('BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO d VALUES (2, 11); COMMIT');
+like($b->{stderr}, qr/duplicate key value violates unique constraint "d_id_key"/,
+	'a branch rebuilt from canonical catalogs keeps the deferred recheck');
+$b->{stderr} = '';
 
 # Concurrent first publishers of a new table both commit.
 sql('CREATE TABLE fresh(id int)');

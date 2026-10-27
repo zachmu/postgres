@@ -593,6 +593,8 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_constraint_conbin, CStringGetTextDatum(nodeToString(expression)));
 		if (form.contype == CONSTRAINT_FOREIGN)
 			tuple = provider_foreign(rows, view, tuple, constraint, desc, metadata[i], count, definitions, kinds);
+		else if (form.conindid && form.condeferrable)
+			provider_unique_trigger(rows, view, (Form_pg_constraint) GETSTRUCT(tuple));
 		rows->rows[slot] = lappend(rows->rows[slot], tuple);
 		if (form.conindid)
 			provider_dependency(rows, RelationRelationId, form.conindid, 0, ConstraintRelationId, form.oid, 0, DEPENDENCY_INTERNAL);

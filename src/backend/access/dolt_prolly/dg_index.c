@@ -342,7 +342,7 @@ dg_rebuild_indexes(Relation rel)
 	close_indexes(indexes, opened);
 }
 
-static bool check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, bool partial);
+static bool check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, IndexUniqueCheck check);
 static pg_noreturn void unique_violation(Relation table, Relation index, Datum *values, bool *isnull);
 
 /*
@@ -378,7 +378,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 			(!nullkey || index->rd_index->indnullsnotdistinct))
 		{
 			key.len = prefix;
-			check_key(table, index, handle, &key, row, false);
+			check_key(table, index, handle, &key, row, UNIQUE_CHECK_YES);
 		}
 		pfree(key.data);
 	}
@@ -580,7 +580,8 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
  * deleting transaction.
  */
 bool
-dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull, bool partial)
+dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull,
+					  IndexUniqueCheck check)
 {
 	DGBatch    *batch = dg_batch_current(table);
 	DGState    *rows = batch ? NULL : dg_load(table, SnapshotSelf);
@@ -603,26 +604,34 @@ dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *va
 	if (nullkey && !index->rd_index->indnullsnotdistinct)
 		return true;
 	key.len = prefix;
-	return check_key(table, index, self, &key, (PLSlice) {NULL, 0}, partial);
+	return check_key(table, index, self, &key, (PLSlice) {NULL, 0}, check);
 }
 
 /*
  * Raise a unique violation if another live row shares |key| (an index key
  * prefix) with row |self|. |row|, if given, describes the key for the error.
- * A |partial| check, for speculative insertion, instead returns false; the
- * executor then rechecks, waiting for whoever changes the other row.
+ *
+ * A partial check instead returns false, and the executor checks again later:
+ * for speculative insertion at once, waiting for whoever changes the other
+ * row, and for a deferred constraint with an existing check, which waits as
+ * an immediate one does. A deferred partial check waits for nothing; a
+ * reservation another transaction holds is a potential conflict.
  */
 static bool
-check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, bool partial)
+check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice row, IndexUniqueCheck check)
 {
 	const char *branch = dg_relation_branch(table);
 	uint64		conflict;
 	TM_FailureData failure;
 	int64		next;
 
-	dg_record_lock(index, dg_relation_branch(index),
-				   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
-				   GetCurrentCommandId(true), LockTupleExclusive, LockWaitBlock, false, &failure, &next);
+	bool		deferred = check == UNIQUE_CHECK_PARTIAL && !index->rd_index->indimmediate;
+
+	if (dg_record_lock(index, dg_relation_branch(index),
+					   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
+					   GetCurrentCommandId(true), LockTupleExclusive, deferred ? LockWaitSkip : LockWaitBlock,
+					   false, &failure, &next) == TM_WouldBlock)
+		return false;
 	while ((conflict = unique_conflict(table, index, self, key)) != 0)
 	{
 		CommandId	cid;
@@ -636,7 +645,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 		uint8		id[8];
 		PLSlice		k = {id, 8};
 
-		if (partial)
+		if (check == UNIQUE_CHECK_PARTIAL)
 			return false;
 		if (!dg_row_modified(table, branch, conflict, &cid))
 		{
@@ -696,13 +705,13 @@ build_empty(Relation rel)
 static bool
 insert(Relation index, Datum *values, bool *nulls, ItemPointer tid, Relation table, IndexUniqueCheck unique, bool unchanged, IndexInfo *info)
 {
-	/* Speculative insertion checks an immediate arbiter index partially. */
-	if (unique == UNIQUE_CHECK_EXISTING || (unique == UNIQUE_CHECK_PARTIAL && !index->rd_index->indimmediate))
-		dg_unsupported("deferred unique constraints");
-
-	/* The table AM added the entry, and checks bound storage itself. */
-	if (unique != UNIQUE_CHECK_NO && !dg_storage_bound(table))
-		return dg_index_check_unique(table, index, tid, values, nulls, unique == UNIQUE_CHECK_PARTIAL);
+	/*
+	 * The table AM added the entry, and checks bound storage itself as it
+	 * writes. An existing check, a deferred constraint's recheck, finds the
+	 * entry there, and may run against bound storage.
+	 */
+	if (unique == UNIQUE_CHECK_EXISTING || (unique != UNIQUE_CHECK_NO && !dg_storage_bound(table)))
+		return dg_index_check_unique(table, index, tid, values, nulls, unique);
 	return true;
 }
 static IndexBulkDeleteResult *

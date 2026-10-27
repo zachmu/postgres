@@ -153,7 +153,7 @@ extern PLSlice dg_key_value(Oid type, Datum value);
 extern PLSlice dg_key_field(Oid type, PLSlice bytes);
 extern void dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle);
 extern bool dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull,
-								  bool partial);
+								  IndexUniqueCheck check);
 extern void dg_index_validate(Relation table, Relation index);
 extern HeapTuple dg_decode_descriptor(TupleDesc desc, PLSlice bytes);
 extern void dg_decode(Relation rel, PLSlice tuple, ItemPointer tid, TupleTableSlot *slot);

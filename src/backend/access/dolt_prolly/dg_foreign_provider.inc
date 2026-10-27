@@ -1,4 +1,7 @@
-/* Reconstruct native RI catalog tuples from portable constraint metadata. */
+/*
+ * Reconstruct the native constraint triggers, RI and deferred unique checks,
+ * from portable constraint metadata.
+ */
 static Oid
 foreign_action(char action, bool update)
 {
@@ -44,6 +47,46 @@ provider_foreign_trigger(DGProviderRows *rows, CatalogView *view,
 	trigger.tgisinternal = true;
 	trigger.tgdeferrable = (check || action == FKCONSTR_ACTION_NOACTION) && con->condeferrable;
 	trigger.tginitdeferred = trigger.tgdeferrable && con->condeferred;
+	tuple = provider_fixed(rows->relations[slot], &trigger, sizeof(trigger), Anum_pg_trigger_tgnargs);
+	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_trigger_tgattr, PointerGetDatum(buildint2vector(NULL, 0)));
+	SET_VARSIZE(args, VARHDRSZ);
+	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_trigger_tgargs, PointerGetDatum(args));
+	rows->rows[slot] = lappend(rows->rows[slot], tuple);
+	provider_dependency(rows, TriggerRelationId, trigger.oid, 0, ConstraintRelationId, con->oid, 0, DEPENDENCY_INTERNAL);
+	foreach_ptr(HeapTupleData, klass, rows->rows[provider_catalog_index(RelationRelationId)])
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(klass);
+
+		if (form->oid == trigger.tgrelid)
+			form->relhastriggers = true;
+	}
+}
+
+/*
+ * As index_constraint_create, the internal trigger that rechecks a deferrable
+ * primary key or unique constraint |con| after the rows it queued change.
+ */
+static void
+provider_unique_trigger(DGProviderRows *rows, CatalogView *view, Form_pg_constraint con)
+{
+	FormData_pg_trigger trigger = {0};
+	int			slot = provider_catalog_index(TriggerRelationId);
+	HeapTuple	tuple;
+	bytea	   *args = palloc0(VARHDRSZ);
+
+	trigger.oid = CatalogViewBindObject(view, TriggerRelationId,
+										psprintf("%s/recheck", CatalogViewObjectIdentity(con->oid, ConstraintRelationId)), InvalidOid);
+	trigger.tgrelid = con->conrelid;
+	trigger.tgconstraint = con->oid;
+	trigger.tgconstrindid = con->conindid;
+	snprintf(NameStr(trigger.tgname), NAMEDATALEN, "%s_%u",
+			 con->contype == CONSTRAINT_PRIMARY ? "PK_ConstraintTrigger" : "Unique_ConstraintTrigger", trigger.oid);
+	trigger.tgfoid = F_UNIQUE_KEY_RECHECK;
+	trigger.tgtype = TRIGGER_TYPE_ROW | TRIGGER_TYPE_AFTER | TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE;
+	trigger.tgenabled = TRIGGER_FIRES_ON_ORIGIN;
+	trigger.tgisinternal = true;
+	trigger.tgdeferrable = true;
+	trigger.tginitdeferred = con->condeferred;
 	tuple = provider_fixed(rows->relations[slot], &trigger, sizeof(trigger), Anum_pg_trigger_tgnargs);
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_trigger_tgattr, PointerGetDatum(buildint2vector(NULL, 0)));
 	SET_VARSIZE(args, VARHDRSZ);
