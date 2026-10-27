@@ -580,6 +580,11 @@ typedef enum DecodeKind
 {
 	DECODE_INTEGER,				/* bool and the integer types */
 	DECODE_BYTES,				/* text and bytea */
+	DECODE_ENVELOPE_BYTES,		/* varchar, bpchar, json: the text in an envelope */
+	DECODE_WIRE8,				/* an 8-byte by-value wire form: timestamps, float8, money */
+	DECODE_WIRE4,				/* a 4-byte by-value wire form: date, float4 */
+	DECODE_UUID,				/* 16 raw bytes */
+	DECODE_NUMERIC,				/* the numeric wire form, assembled directly */
 	DECODE_GENERAL,				/* arrays and composites: the recursive codec */
 	DECODE_RECEIVE				/* a binary receive function */
 } DecodeKind;
@@ -667,6 +672,17 @@ decode_plan_build(DecodePlan *plan, TupleDesc desc)
 			column->kind = DECODE_BYTES;
 		else if (column->base == BOOLOID || column->base == INT2OID || column->base == INT4OID || column->base == INT8OID)
 			column->kind = DECODE_INTEGER;
+		else if (column->base == VARCHAROID || column->base == BPCHAROID || column->base == JSONOID)
+			column->kind = DECODE_ENVELOPE_BYTES;
+		else if (column->base == TIMESTAMPOID || column->base == TIMESTAMPTZOID || column->base == TIMEOID ||
+				 column->base == FLOAT8OID || column->base == CASHOID)
+			column->kind = DECODE_WIRE8;
+		else if (column->base == DATEOID || column->base == FLOAT4OID)
+			column->kind = DECODE_WIRE4;
+		else if (column->base == UUIDOID)
+			column->kind = DECODE_UUID;
+		else if (column->base == NUMERICOID)
+			column->kind = DECODE_NUMERIC;
 		else if (OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
 			column->kind = DECODE_GENERAL;
 		else
@@ -723,6 +739,58 @@ decode_plan(Relation rel)
 }
 
 /* Decode one column's stored bytes with its planned receive function. */
+/* The wire bytes inside a DGB1 envelope. */
+static PLSlice
+envelope_contents(PLSlice bytes)
+{
+	if (bytes.len < 4 || memcmp(bytes.data, "DGB1", 4))
+		elog(ERROR, "invalid prolly binary codec version");
+	return (PLSlice) {bytes.data + 4, bytes.len - 4};
+}
+
+/*
+ * A numeric from its wire form, as numeric_recv assembles it: header words,
+ * then base-10000 digits. The long format holds any value; the digits were
+ * canonical when sent, so none need stripping.
+ */
+#define DG_NUMERIC_SPECIAL 0xC000
+#define DG_NUMERIC_DSCALE_MASK 0x3FFF
+
+static Datum
+decode_numeric(PLSlice wire)
+{
+	int			ndigits,
+				weight,
+				sign,
+				dscale;
+	uint8	   *result;
+	Size		size;
+
+	if (wire.len < 8)
+		elog(ERROR, "invalid prolly numeric encoding");
+	ndigits = (int16) ((wire.data[0] << 8) | wire.data[1]);
+	weight = (int16) ((wire.data[2] << 8) | wire.data[3]);
+	sign = (uint16) ((wire.data[4] << 8) | wire.data[5]);
+	dscale = (uint16) ((wire.data[6] << 8) | wire.data[7]);
+	if (ndigits < 0 || wire.len != 8 + (Size) ndigits * 2)
+		elog(ERROR, "invalid prolly numeric encoding");
+	if ((sign & DG_NUMERIC_SPECIAL) == DG_NUMERIC_SPECIAL)
+	{
+		result = palloc(VARHDRSZ + 2);
+		SET_VARSIZE(result, VARHDRSZ + 2);
+		*(uint16 *) (result + VARHDRSZ) = (uint16) sign;
+		return PointerGetDatum(result);
+	}
+	size = VARHDRSZ + 4 + (Size) ndigits * 2;
+	result = palloc(size);
+	SET_VARSIZE(result, size);
+	*(uint16 *) (result + VARHDRSZ) = (uint16) (sign | (dscale & DG_NUMERIC_DSCALE_MASK));
+	*(int16 *) (result + VARHDRSZ + 2) = (int16) weight;
+	for (int i = 0; i < ndigits; i++)
+		((int16 *) (result + VARHDRSZ + 4))[i] = (int16) ((wire.data[8 + 2 * i] << 8) | wire.data[9 + 2 * i]);
+	return PointerGetDatum(result);
+}
+
 static Datum
 receive_planned(DecodeColumn *column, PLSlice bytes)
 {
@@ -817,6 +885,72 @@ dg_decode(Relation rel, PLSlice bytes, ItemPointer tid, TupleTableSlot *slot)
 							column->base == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
 						break;
 					}
+				case DECODE_ENVELOPE_BYTES:
+					{
+						PLSlice		wire = envelope_contents(field.bytes);
+
+						slot->tts_values[i] = PointerGetDatum(cstring_to_text_with_len((const char *) wire.data, wire.len));
+						break;
+					}
+				case DECODE_WIRE8:
+					{
+						PLSlice		wire = envelope_contents(field.bytes);
+						int64		n;
+
+						if (wire.len != 8)
+							elog(ERROR, "invalid prolly 8-byte encoding");
+						n = (int64) pl_read64(wire.data);
+						if (column->base == FLOAT8OID)
+						{
+							union
+							{
+								int64		i;
+								float8		f;
+							}			swap = {n};
+
+							slot->tts_values[i] = Float8GetDatum(swap.f);
+						}
+						else
+							slot->tts_values[i] = Int64GetDatum(n);
+						break;
+					}
+				case DECODE_WIRE4:
+					{
+						PLSlice		wire = envelope_contents(field.bytes);
+						int32		n;
+
+						if (wire.len != 4)
+							elog(ERROR, "invalid prolly 4-byte encoding");
+						n = (int32) pl_read32(wire.data);
+						if (column->base == FLOAT4OID)
+						{
+							union
+							{
+								int32		i;
+								float4		f;
+							}			swap = {n};
+
+							slot->tts_values[i] = Float4GetDatum(swap.f);
+						}
+						else
+							slot->tts_values[i] = DateADTGetDatum((DateADT) n);
+						break;
+					}
+				case DECODE_UUID:
+					{
+						PLSlice		wire = envelope_contents(field.bytes);
+						pg_uuid_t  *uuid;
+
+						if (wire.len != UUID_LEN)
+							elog(ERROR, "invalid prolly uuid encoding");
+						uuid = palloc(UUID_LEN);
+						memcpy(uuid->data, wire.data, UUID_LEN);
+						slot->tts_values[i] = UUIDPGetDatum(uuid);
+						break;
+					}
+				case DECODE_NUMERIC:
+					slot->tts_values[i] = decode_numeric(envelope_contents(field.bytes));
+					break;
 				case DECODE_GENERAL:
 					slot->tts_values[i] = decode_value(column->type, field.bytes);
 					break;
