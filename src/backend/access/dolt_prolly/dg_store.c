@@ -804,6 +804,14 @@ store_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 
 			/*
+			 * Roots this transaction published become visible now: trees
+			 * loaded after they were written but before this point are
+			 * stale, so the generation moves again.
+			 */
+			if (event == XACT_EVENT_COMMIT && overlays)
+				roots_generation_bump();
+
+			/*
 			 * Later pre-commit work, and parallel workers, which publish
 			 * nothing, may still have read chunks; close cleanly unless
 			 * aborting, when resource owners clean up instead.
@@ -976,6 +984,13 @@ static void
 roots_generation_bump(void)
 {
 	pg_atomic_fetch_add_u64(&shared_handles()->roots_generation, 1);
+}
+
+/* A prepared transaction's roots became visible: COMMIT PREPARED calls this. */
+void
+dg_roots_published(void)
+{
+	roots_generation_bump();
 }
 
 static void
