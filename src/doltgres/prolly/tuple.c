@@ -61,8 +61,7 @@ pl_tuple_open(PLSlice tuple, PLTupleView *view)
 {
 	size_t		count,
 				bitmap,
-				header,
-				i;
+				header;
 	const uint8_t *offsets;
 
 	if (!view || !tuple.data || tuple.len < 12 || tuple.len > PL_MAX_ITEM ||
@@ -80,34 +79,34 @@ pl_tuple_open(PLSlice tuple, PLTupleView *view)
 		return PL_CORRUPT;
 	if (count % 8 && (tuple.data[12 + bitmap - 1] >> (count % 8)))
 		return PL_CORRUPT;
-	for (i = 0; i < count; i++)
-	{
-		uint32_t	start = pl_read32(offsets + 4 * i),
-					end = pl_read32(offsets + 4 * (i + 1));
-		bool		present = (tuple.data[12 + i / 8] & (1 << (i % 8))) != 0;
-
-		if (end < start || end > tuple.len - header || (!present && end != start))
-			return PL_CORRUPT;
-	}
 	*view = (PLTupleView) {tuple, count, header};
 	return PL_OK;
 }
 
-/* The caller must first validate the immutable backing bytes with open(). */
+/*
+ * A field of a tuple opened with pl_tuple_open, which checks the header; a
+ * field's own offsets are checked here, as it is read.
+ */
 PLStatus
 pl_tuple_field(const PLTupleView *view, size_t attribute, PLValue *out)
 {
 	const uint8_t *offsets;
 	PLValue result;
+	uint32_t	start,
+				end;
 
 	if (!view || !out)
 		return PL_INVALID;
 	if (attribute >= view->count)
 		return PL_NOT_FOUND;
 	offsets = view->bytes.data + 12 + (view->count + 7) / 8;
+	start = pl_read32(offsets + 4 * attribute);
+	end = pl_read32(offsets + 4 * (attribute + 1));
 	result.present = (view->bytes.data[12 + attribute / 8] & (1 << (attribute % 8))) != 0;
-	result.bytes.data = view->bytes.data + view->header + pl_read32(offsets + 4 * attribute);
-	result.bytes.len = pl_read32(offsets + 4 * (attribute + 1)) - pl_read32(offsets + 4 * attribute);
+	if (end < start || end > view->bytes.len - view->header || (!result.present && end != start))
+		return PL_CORRUPT;
+	result.bytes.data = view->bytes.data + view->header + start;
+	result.bytes.len = end - start;
 	*out = result;
 	return PL_OK;
 }

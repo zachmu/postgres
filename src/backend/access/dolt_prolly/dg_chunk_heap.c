@@ -62,6 +62,7 @@ typedef struct HeapChunkState
 	Relation	index;
 	LOCKMODE	lockmode;
 	IndexInfo  *index_info;		/* built on first write */
+	TupleDesc	part_desc;		/* unpinned copy, for the slots of a put */
 	TupleTableSlot *slot;
 	IndexScanDesc scan;			/* SnapshotAny probes by hash */
 	bytea	   *key;			/* scan key datum: the probed hash */
@@ -305,16 +306,24 @@ form_part(HeapChunkState *state, bytea *hashvalue, const uint8 *data, Size lengt
 	return tuple;
 }
 
+/* The part tuples of the chunks a put inserts, written to the heap together. */
+typedef struct PutBatch
+{
+	TupleTableSlot **slots;
+	Datum	   *index_values;	/* three per slot */
+	int			count,
+				capacity;
+} PutBatch;
+
 /*
- * Insert one chunk unless a usable copy exists; true if inserted. A copy is
- * keyed by this transaction's ID, so it never conflicts with another's.
+ * Form the parts of one chunk unless a usable copy exists; true if it is new.
+ * A copy is keyed by this transaction's ID, so it never conflicts with
+ * another's.
  */
 static bool
-put_one(HeapChunkState *state, const uint8 *hash, const uint8 *data, Size length)
+put_one(HeapChunkState *state, PutBatch *batch, const uint8 *hash, const uint8 *data, Size length)
 {
 	bytea	   *hashvalue;
-	Datum		index_values[3];
-	bool		index_nulls[3] = {false};
 	int32		parts = length ? (int32) ((length + DG_CHUNK_PART - 1) / DG_CHUNK_PART) : 1;
 
 	if (find_live(state, hash, 0))
@@ -324,15 +333,40 @@ put_one(HeapChunkState *state, const uint8 *hash, const uint8 *data, Size length
 	memcpy(VARDATA(hashvalue), hash, DOLT_CHUNK_HASH_SIZE);
 	for (int32 part = 0; part < parts; part++)
 	{
-		HeapTuple	tuple = form_part(state, hashvalue, data, length, part, index_values);
+		HeapTuple	tuple;
 
-		heap_insert(state->heap, tuple, GetCurrentCommandId(true), 0, NULL);
-		index_insert(state->index, index_values, index_nulls, &tuple->t_self, state->heap,
-					 UNIQUE_CHECK_NO, false, state->index_info);
-		heap_freetuple(tuple);
+		if (batch->count == batch->capacity)
+		{
+			batch->capacity = batch->capacity ? batch->capacity * 2 : 16;
+			batch->slots = batch->slots ? repalloc(batch->slots, batch->capacity * sizeof(TupleTableSlot *)) :
+				palloc(batch->capacity * sizeof(TupleTableSlot *));
+			batch->index_values = batch->index_values ? repalloc(batch->index_values, batch->capacity * 3 * sizeof(Datum)) :
+				palloc(batch->capacity * 3 * sizeof(Datum));
+		}
+		tuple = form_part(state, hashvalue, data, length, part, batch->index_values + 3 * batch->count);
+		batch->slots[batch->count] = MakeSingleTupleTableSlot(state->part_desc, &TTSOpsHeapTuple);
+		ExecStoreHeapTuple(tuple, batch->slots[batch->count], true);
+		batch->count++;
 	}
-	pfree(hashvalue);
 	return true;
+}
+
+/* Insert the batch's parts in one heap operation, then index each. */
+static void
+put_flush(HeapChunkState *state, PutBatch *batch)
+{
+	bool		index_nulls[3] = {false};
+
+	if (!batch->count)
+		return;
+	heap_multi_insert(state->heap, batch->slots, batch->count, GetCurrentCommandId(true), 0, NULL);
+	for (int i = 0; i < batch->count; i++)
+	{
+		index_insert(state->index, batch->index_values + 3 * i, index_nulls, &batch->slots[i]->tts_tid,
+					 state->heap, UNIQUE_CHECK_NO, false, state->index_info);
+		ExecDropSingleTupleTableSlot(batch->slots[i]);
+	}
+	batch->count = 0;
 }
 
 static const uint8 *sort_hashes;
@@ -351,9 +385,23 @@ heap_put(void *arg, int n, const uint8 *hashes, const uint8 *const *data, const 
 	HeapChunkState *state = arg;
 	int		   *order = palloc(Max(n, 1) * sizeof(int));
 	int			stored = 0;
+	PutBatch	batch = {0};
 
 	if (!state->index_info)
 		state->index_info = BuildIndexInfo(state->index);
+
+	/*
+	 * A slot pins a reference-counted descriptor in the resource owner, which
+	 * costs more than the insert itself over thousands of parts; a private
+	 * copy of the descriptor is not counted.
+	 */
+	if (!state->part_desc)
+	{
+		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(state));
+
+		state->part_desc = CreateTupleDescCopy(RelationGetDescr(state->heap));
+		MemoryContextSwitchTo(old);
+	}
 
 	/* Insert in hash order, so consecutive index insertions share leaf pages. */
 	for (int i = 0; i < n; i++)
@@ -364,9 +412,10 @@ heap_put(void *arg, int n, const uint8 *hashes, const uint8 *const *data, const 
 	{
 		int			j = order[i];
 
-		if (put_one(state, hashes + (Size) j * DOLT_CHUNK_HASH_SIZE, data[j], lengths[j]))
+		if (put_one(state, &batch, hashes + (Size) j * DOLT_CHUNK_HASH_SIZE, data[j], lengths[j]))
 			stored++;
 	}
+	put_flush(state, &batch);
 	pfree(order);
 	return stored;
 }

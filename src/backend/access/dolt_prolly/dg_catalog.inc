@@ -342,9 +342,78 @@ system_alias(const RangeVar *rv)
 	return alias;
 }
 
+/*
+ * Bindings of session names on the current branch, by name, search path,
+ * user and target use. A binding depends on the branch's working schema,
+ * read again on each use and compared, and on physical catalogs, which the
+ * invalidation counter tracks. Both unchanged, the binding is the same.
+ */
+typedef struct BindCacheEntry
+{
+	uint64		hash;			/* of key_text */
+	char	   *key_text;
+	bytea	   *schema;			/* the working schema bound against */
+	uint64		invalidations;
+	char	   *dolt_database,
+			   *dolt_ref,
+			   *dolt_ref_target,
+			   *dolt_branch;
+	Oid			dolt_relid,
+				dolt_rowtype;
+	TupleDesc	desc;
+} BindCacheEntry;
+
+static HTAB *bind_cache;
+
+static BindCacheEntry *
+bind_cache_find(const char *key_text, bool enter)
+{
+	uint64		hash = hash_bytes_extended((const unsigned char *) key_text, strlen(key_text), 0);
+	BindCacheEntry *entry;
+	bool		found;
+
+	if (!bind_cache)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(uint64);
+		ctl.entrysize = sizeof(BindCacheEntry);
+		ctl.hcxt = CacheMemoryContext;
+		bind_cache = hash_create("prolly bindings", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(bind_cache, &hash, enter ? HASH_ENTER : HASH_FIND, &found);
+	if (entry && found && strcmp(entry->key_text, key_text) != 0)
+	{
+		/* A different key with the same hash takes the slot. */
+		if (!enter)
+			return NULL;
+		found = false;
+	}
+	if (entry && !found)
+	{
+		MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
+
+		memset(((char *) entry) + sizeof(uint64), 0, sizeof(*entry) - sizeof(uint64));
+		entry->key_text = pstrdup(key_text);
+		MemoryContextSwitchTo(old);
+	}
+	return entry;
+}
+
+static char *
+bind_cache_key(const RangeVar *rv, const RangeTblEntry *rte, const char *revision, const char *search_path, Oid user, bool target)
+{
+	return psprintf("%s\n%s\n%s\n%s\n%s\n%u\n%d", rv->schemaname ? rv->schemaname : "", rv->relname, revision,
+					rte->dolt_database ? rte->dolt_database : "", search_path, user, target);
+}
+
 static TupleDesc
 catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool target)
 {
+	BindCacheEntry *cached = NULL;
+	bytea	   *bound_schema = NULL;	/* the working schema the binding used */
+	bool		plain = false;
+	bool		cacheable = false;
 	const char *sep = NULL;
 	char	   *resolution_path = pstrdup(GetConfigOption("search_path", false, false));
 	char	   *revision,
@@ -392,6 +461,7 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 			if (rv->catalogname && strcmp(rv->catalogname, get_database_name(MyDatabaseId)))
 				return NULL;
 			revision = pstrdup(context_branch ? context_branch : dg_current_branch());
+			plain = true;
 			goto revision_selected;
 		}
 		dbname = pnstrdup(rv->catalogname, sep - rv->catalogname);
@@ -417,6 +487,32 @@ catalog_bind(ParseState *pstate, const RangeVar *rv, RangeTblEntry *rte, bool ta
 revision_selected:
 	if (target && (rv->dolt_revision || (rv->catalogname && strpbrk(rv->catalogname, "@/"))))
 		unsupported("revision-qualified write targets");
+	if (plain)
+	{
+		cached = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), false);
+		if (cached && cached->desc && cached->invalidations == SharedInvalidMessageCounter)
+		{
+			/*
+			 * A binding against the session's database is keyed by that
+			 * database's hash; one against the branch's working schema is
+			 * checked against the schema as it stands now.
+			 */
+			bytea	   *now = cached->schema ? catalog_working_schema(revision) : NULL;
+
+			if (!cached->schema ||
+				(now && VARSIZE_ANY_EXHDR(now) == VARSIZE_ANY_EXHDR(cached->schema) &&
+				 memcmp(VARDATA_ANY(now), VARDATA_ANY(cached->schema), VARSIZE_ANY_EXHDR(now)) == 0))
+			{
+				rte->dolt_database = pstrdup(cached->dolt_database);
+				rte->dolt_ref = pstrdup(cached->dolt_ref);
+				rte->dolt_ref_target = pstrdup(cached->dolt_ref_target);
+				rte->dolt_branch = pstrdup(cached->dolt_branch);
+				rte->dolt_relid = cached->dolt_relid;
+				rte->dolt_rowtype = cached->dolt_rowtype;
+				return CreateTupleDescCopy(cached->desc);
+			}
+		}
+	}
 	/*
 	 * Names on a branch head resolve against its latest schema, as against
 	 * catalogs. A SQL query of a catalog itself reads it under the query's
@@ -437,7 +533,7 @@ revision_selected:
 		working = (!rte->dolt_database || context_branch) && !rv->dolt_revision &&
 			read_ref(psprintf("heads/%s", revision)).target != NULL;
 		db = rte->dolt_database ? unhex(rte->dolt_database) :
-			(working ? catalog_working_schema(revision) : NULL);
+			(working ? (bound_schema = catalog_working_schema(revision)) : NULL);
 		if (!db)
 		{
 			db = child(resolve(revision), 1);
@@ -598,10 +694,36 @@ revision_selected:
 			{
 				rte->dolt_branch = pstrdup(revision);
 				rte->dolt_relid = live;
+				cacheable = plain && rte->dolt_ref && rte->dolt_ref_target;
 			}
 		}
 binding_done:
-		;
+		if (cacheable)
+		{
+			MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
+			BindCacheEntry *entry = bind_cache_find(bind_cache_key(rv, rte, revision, resolution_path, user, target), true);
+
+			if (entry->desc)
+			{
+				FreeTupleDesc(entry->desc);
+				if (entry->schema)
+					pfree(entry->schema);
+				pfree(entry->dolt_database);
+				pfree(entry->dolt_ref);
+				pfree(entry->dolt_ref_target);
+				pfree(entry->dolt_branch);
+			}
+			entry->schema = bound_schema ? (bytea *) datumCopy(PointerGetDatum(bound_schema), false, -1) : NULL;
+			entry->invalidations = SharedInvalidMessageCounter;
+			entry->dolt_database = pstrdup(rte->dolt_database);
+			entry->dolt_ref = pstrdup(rte->dolt_ref);
+			entry->dolt_ref_target = pstrdup(rte->dolt_ref_target);
+			entry->dolt_branch = pstrdup(rte->dolt_branch);
+			entry->dolt_relid = rte->dolt_relid;
+			entry->dolt_rowtype = rte->dolt_rowtype;
+			entry->desc = CreateTupleDescCopy(result);
+			MemoryContextSwitchTo(old);
+		}
 	}
 	if (pushed)
 		PopActiveSnapshot();

@@ -202,7 +202,7 @@ add(PLBuilder *builder, PLEntry entry, uint32_t level)
 {
 	builder->pending[builder->count++] = entry;
 	builder->bytes += 8 + entry.key.len + entry.value.len;
-	if (pl_boundary(level, builder->count, builder->bytes, entry.key))
+	if (pl_boundary(level, builder->count, builder->bytes, 8 + entry.key.len + entry.value.len, entry.key))
 		return flush(builder, level);
 	return PL_OK;
 }
@@ -336,7 +336,7 @@ stream_child(PLStream *stream, uint32_t level, PLSlice key, PLHash hash, uint64_
 	l->entries++;
 	l->last = hash;
 	l->reused |= reused;
-	if (pl_boundary(level, l->count, l->bytes, key))
+	if (pl_boundary(level, l->count, l->bytes, 8 + key.len + PL_CHILD_SIZE, key))
 		return stream_flush(stream, level);
 	return PL_OK;
 }
@@ -349,7 +349,7 @@ stream_entry(PLStream *stream, PLEntry entry)
 	l->pending[l->count++] = entry;
 	l->bytes += 8 + entry.key.len + entry.value.len;
 	l->entries++;
-	if (pl_boundary(0, l->count, l->bytes, entry.key))
+	if (pl_boundary(0, l->count, l->bytes, 8 + entry.key.len + entry.value.len, entry.key))
 		return stream_flush(stream, 0);
 	return PL_OK;
 }

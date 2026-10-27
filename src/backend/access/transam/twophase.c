@@ -77,6 +77,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -1574,6 +1575,10 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 									   gid);
 
 	ProcArrayRemove(proc, latestXid);
+
+	/* Prolly roots the transaction published are visible from here on. */
+	if (isCommit)
+		dg_roots_published();
 
 	/*
 	 * In case we fail while running the callbacks, mark the gxact invalid so

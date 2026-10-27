@@ -35,5 +35,6 @@ tests += {
     't/030_decode_plan.pl',
     't/031_scan_walk.pl',
     't/032_batched_changes.pl',
+    't/033_index_fetches.pl',
   ]},
 }

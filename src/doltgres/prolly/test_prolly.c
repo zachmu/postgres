@@ -107,10 +107,12 @@ test_tuple_view(void)
 	CHECK(pl_tuple_field(&view, 64, &value) == PL_NOT_FOUND);
 	for (size_t i = 0; i < size; i++)
 		CHECK(pl_tuple_open(bytes(data, i), &view) == PL_CORRUPT);
-	/* A corrupt offset late in the row must fail even a field-zero lookup. */
+	/* A corrupt offset late in the row fails the fields it bounds, when read. */
 	data[12 + 8 + 4 * 63] = 255;
-	CHECK(pl_tuple_open(bytes(data, size), &view) == PL_CORRUPT);
-	CHECK(pl_tuple_get(bytes(data, size), 0, &value) == PL_CORRUPT);
+	OK(pl_tuple_open(bytes(data, size), &view));
+	OK(pl_tuple_get(bytes(data, size), 0, &value));
+	CHECK(pl_tuple_get(bytes(data, size), 62, &value) == PL_CORRUPT);
+	CHECK(pl_tuple_get(bytes(data, size), 63, &value) == PL_CORRUPT);
 	free(data);
 	OK(pl_tuple_pack(NULL, 0, &data, &size));
 	OK(pl_tuple_open(bytes(data, size), &view));
