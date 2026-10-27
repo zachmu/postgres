@@ -30,5 +30,15 @@ is(sql(q{BEGIN; INSERT INTO p VALUES (9001, 1, 'new'); SELECT count(*) FROM p WH
 sql(q{DELETE FROM p WHERE id % 2 = 0; DELETE FROM h WHERE id % 2 = 0});
 same(q{SELECT count(*), sum(id) FROM p}, 'scan after deletes');
 same(q{SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT count(*), sum(id) FROM p WHERE k = 1}, 'index fetches after deletes');
+# Parsed nodes survive a transaction; an aborted transaction's own do not.
+my $s = $node->background_psql('postgres');
+is($s->query_safe(q{SELECT count(*), sum(id) FROM p}), sql(q{SELECT count(*), sum(id) FROM h}), 'warm session, first scan');
+$s->query_safe(q{BEGIN; INSERT INTO p SELECT g, 1, 'x' FROM generate_series(20001, 20500) g; ROLLBACK});
+is($s->query_safe(q{SELECT count(*), sum(id) FROM p}), sql(q{SELECT count(*), sum(id) FROM h}), 'scan after an aborted insert');
+$s->query_safe(q{INSERT INTO p SELECT g, 1, 'x' FROM generate_series(20001, 20500) g});
+sql(q{INSERT INTO h SELECT g, 1, 'x' FROM generate_series(20001, 20500) g});
+is($s->query_safe(q{SELECT count(*), sum(id) FROM p}), sql(q{SELECT count(*), sum(id) FROM h}), 'scan after a committed insert in the same session');
+is(sql(q{SELECT count(*), sum(id) FROM p}), sql(q{SELECT count(*), sum(id) FROM h}), 'and from another session');
+$s->quit;
 $node->stop;
 done_testing();

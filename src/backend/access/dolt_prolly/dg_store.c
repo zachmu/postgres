@@ -199,6 +199,9 @@ roots_latest(const RootKey *key)
  */
 
 static PLStore *working_store;
+
+/* Parsed nodes kept across transactions, at most. */
+#define DG_NODE_CACHE_BYTES ((size_t) 64 * 1024 * 1024)
 static DoltChunkStore *working_chunks;
 static DoltChunk working_fetched;
 
@@ -795,10 +798,19 @@ store_xact(XactEvent event, void *arg)
 			live_states = NULL;
 			live_count = live_capacity = 0;
 			collect_threshold = DG_COLLECT_MINIMUM;
+			/*
+			 * Parsed nodes are content-addressed, so those the chunk store
+			 * holds stay valid for the next transaction: keep them, up to a
+			 * bound, and drop only this transaction's own unwritten nodes.
+			 */
 			if (working_store)
 			{
-				pl_store_free(working_store);
-				working_store = NULL;
+				pl_store_drop_unbacked(working_store);
+				if (pl_store_stats(working_store).bytes > DG_NODE_CACHE_BYTES)
+				{
+					pl_store_free(working_store);
+					working_store = NULL;
+				}
 			}
 			break;
 		default:

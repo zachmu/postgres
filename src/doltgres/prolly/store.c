@@ -130,6 +130,38 @@ pl_store_free(PLStore *store)
 	free(store);
 }
 
+/* Free the nodes not known to be in the backing store: a transaction's own. */
+size_t
+pl_store_drop_unbacked(PLStore *store)
+{
+	size_t		freed = 0;
+
+	if (!store)
+		return 0;
+	for (size_t i = 0; i < store->capacity; i++)
+	{
+		PLNode	  **link = &store->buckets[i];
+
+		while (*link)
+		{
+			PLNode	   *node = *link;
+
+			if (node->backed)
+			{
+				link = &node->next;
+				continue;
+			}
+			*link = node->next;
+			store->stats.chunks--;
+			store->stats.bytes -= node->size;
+			free(node->data);
+			free(node);
+			freed++;
+		}
+	}
+	return freed;
+}
+
 PLStats
 pl_store_stats(const PLStore *store)
 {
