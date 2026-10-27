@@ -102,7 +102,7 @@ is(sql(q{SELECT fast_forward FROM dolt_merge('other')}),'1','a type change merge
 is(sql(q{SELECT enum_range(NULL::mood)::text||','||(SELECT c::text||r::text FROM paint)}),'{sad,meh,fine,ok,happy,glad,calm},blue[1,2]','merged types and their rows');
 $node->safe_psql('postgres',q{SELECT dolt_branch('b1'); SELECT dolt_branch('b2'); SELECT dolt_checkout('b1'); ALTER TYPE mood ADD VALUE 'x1'; SELECT dolt_commit('-Am','b1'); SELECT dolt_checkout('b2'); ALTER TYPE mood ADD VALUE 'x2'; SELECT dolt_commit('-Am','b2')});
 sql(q{SELECT dolt_merge('b1')});
-fails(q{SELECT dolt_merge('b2')},qr/merge conflict in the definition of type public\.mood/,'a type changed on both branches conflicts');
+is(sql(q{SELECT conflicts FROM dolt_merge('b2')}).':'.sql(q{SELECT table_name||': '||description FROM dolt_schema_conflicts}),'1:public.mood: both branches changed type public.mood','a type changed on both branches conflicts');
 
 # ---- drops ----
 sql(q{DROP TABLE c, d; DROP TYPE pair; DROP DOMAIN upbeat; DROP TYPE loose});

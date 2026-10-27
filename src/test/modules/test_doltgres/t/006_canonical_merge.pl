@@ -50,12 +50,14 @@ is(sql(q{SELECT picked()}),'6','cherry-pick applies a schema change');
 
 sql(q{SELECT dolt_branch('both'); CREATE OR REPLACE FUNCTION kept() RETURNS int LANGUAGE sql AS $$SELECT 10$$; SELECT dolt_commit('-Am','our kept')});
 sql(q{SELECT dolt_checkout('both'); CREATE OR REPLACE FUNCTION kept() RETURNS int LANGUAGE sql AS $$SELECT 20$$; SELECT dolt_commit('-Am','their kept'); SELECT dolt_checkout('main')});
-my ($code,$out,$err)=$node->psql('postgres',q{SELECT dolt_merge('both')});
-like($err,qr/merge conflict in the definition of routine public\.kept\(\)/,'a routine changed differently on both branches is a schema conflict');
-is(sql(q{SELECT kept()}),'10','a schema conflict leaves the working set unchanged');
+is(sql(q{SELECT conflicts FROM dolt_merge('both')}),'1','a routine changed differently on both branches is a schema conflict');
+is(sql(q{SELECT table_name||': '||description FROM dolt_schema_conflicts}),'public.kept(): both branches changed routine public.kept()','the schema conflict is recorded');
+is(sql(q{SELECT kept()}),'10','a schema conflict keeps our side');
+sql(q{SELECT dolt_conflicts_resolve('--theirs','public.kept()'); SELECT dolt_commit('-Am','took their kept')});
+is(sql(q{SELECT kept()}),'20','a schema conflict resolves to their side');
 
 sql(q{SELECT dolt_branch('layout'); ALTER TABLE added ADD COLUMN z int; SELECT dolt_commit('-Am','our layout')});
 sql(q{SELECT dolt_checkout('layout'); INSERT INTO added VALUES (2,'rows'); SELECT dolt_commit('-Am','their rows'); SELECT dolt_checkout('main')});
-($code,$out,$err)=$node->psql('postgres',q{SELECT dolt_merge('layout')});
-like($err,qr/merge conflict in the definition of table public\.added/,'rows changed across a table definition change are not merged yet');
+is(sql(q{SELECT conflicts FROM dolt_merge('layout')}),'0','rows merge across a table definition change');
+is(sql(q{SELECT string_agg(id||':'||w||':'||coalesce(z::text,'-'), ',' ORDER BY id) FROM added}),'1:their row:-,2:rows:-','their rows take our added column');
 $node->stop;done_testing();

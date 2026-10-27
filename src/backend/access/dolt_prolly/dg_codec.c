@@ -23,6 +23,11 @@
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
 #include "utils/inet.h"
+#include "executor/executor.h"
+#include "nodes/makefuncs.h"
+#include "nodes/params.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
 #include "utils/hsearch.h"
@@ -848,6 +853,63 @@ PLSlice
 dg_encode_value(Oid type, Datum value)
 {
 	return encode_value(type, value);
+}
+
+Datum
+dg_decode_value(Oid type, PLSlice bytes)
+{
+	return decode_value(type, bytes);
+}
+
+/*
+ * A conversion of stored values of type |from| to type |to| and typmod
+ * |typmod|, by the assignment cast ALTER TABLE ... ALTER COLUMN TYPE would
+ * apply, for a merge whose other side changed a column's type.
+ */
+DGConversion *
+dg_conversion_begin(Oid from, Oid to, int32 typmod)
+{
+	DGConversion *conversion = palloc0(sizeof(DGConversion));
+	Param	   *param = makeNode(Param);
+	Node	   *expr;
+
+	param->paramkind = PARAM_EXTERN;
+	param->paramid = 1;
+	param->paramtype = from;
+	param->paramtypmod = -1;
+	param->paramcollid = get_typcollation(from);
+	param->location = -1;
+	expr = coerce_to_target_type(NULL, (Node *) param, from, to, typmod,
+								 COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+	if (!expr)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("cannot merge values of type %s into a column of type %s",
+						format_type_be(from), format_type_with_typemod(to, typmod))));
+	conversion->from = from;
+	conversion->to = to;
+	conversion->params = makeParamList(1);
+	conversion->params->params[0].ptype = from;
+	conversion->params->params[0].pflags = PARAM_FLAG_CONST;
+	conversion->params->numParams = 1;
+	conversion->state = ExecInitExprWithParams((Expr *) expression_planner((Expr *) expr), conversion->params);
+	conversion->context = CreateStandaloneExprContext();
+	conversion->context->ecxt_param_list_info = conversion->params;
+	return conversion;
+}
+
+PLSlice
+dg_conversion_apply(DGConversion *conversion, PLSlice bytes)
+{
+	bool		isnull;
+	Datum		value;
+
+	conversion->params->params[0].value = decode_value(conversion->from, bytes);
+	conversion->params->params[0].isnull = false;
+	value = ExecEvalExprSwitchContext(conversion->state, conversion->context, &isnull);
+	if (isnull)
+		elog(ERROR, "a merged value converted to NULL");
+	return encode_value(conversion->to, value);
 }
 
 /*

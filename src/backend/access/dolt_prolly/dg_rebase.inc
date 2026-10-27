@@ -260,7 +260,8 @@ apply_rebase_step(RebaseStep * step)
 			   *targetdb = child(target, 1),
 			   *parentdb;
 	StringInfoData conflicts,
-				violations;
+				violations,
+				schema_conflicts;
 	bytea	   *database;
 
 	if (parent_count(target) < 1)
@@ -268,12 +269,13 @@ apply_rebase_step(RebaseStep * step)
 	parentdb = child(child(target, 2), 1);
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	merge_databases(parentdb, headdb, targetdb, &conflicts, &violations);
-	if (conflicts.len || violations.len)
+	initStringInfo(&schema_conflicts);
+	merge_databases(parentdb, headdb, targetdb, &conflicts, &violations, &schema_conflicts);
+	if (conflicts.len || violations.len || schema_conflicts.len)
 	{
 		char	   *meta = metadata(target, "commit");
 
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("data conflict detected while rebasing commit %s (%s)", step->hash, json_value(meta, "message")), errhint("abort the rebase with dolt_rebase('--abort') and resolve the conflicting changes before rebasing again")));
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s conflict detected while rebasing commit %s (%s)", schema_conflicts.len ? "schema" : "data", step->hash, json_value(meta, "message")), errhint("abort the rebase with dolt_rebase('--abort') and resolve the conflicting changes before rebasing again")));
 	}
 	database = capture_visible().hash;
 	return same(database, headdb) ? NULL : database;
@@ -457,7 +459,7 @@ stash_apply(const char *name, int idx)
 	same_schema(metadata(ours, "database"), metadata(stashdb, "database"));
 	initStringInfo(&conflicts);
 	initStringInfo(&violations);
-	install_database(stashheaddb, ours, stashdb, state_tables(metadata(stashdb, "database")), &conflicts, &violations);
+	install_database(stashheaddb, ours, stashdb, row_merges(state_tables(metadata(stashdb, "database"))), &conflicts, &violations);
 	if (conflicts.len || violations.len)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: Your local changes to the following tables would be overwritten by applying stash@{%d}:\n%s", idx, conflicts.len ? conflicts.data : violations.data)));
 	move_ref(branch_ref("working"), read_ref(branch_ref("working")), capture_visible().hash);
