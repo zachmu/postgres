@@ -632,15 +632,21 @@ self_modified(Relation rel, uint64 handle, Snapshot snapshot, TM_FailureData *tm
 static TM_Result
 still_current(Relation rel, uint64 handle, TM_Result result, TM_FailureData *tmfd)
 {
+	DGBatch    *b;
 	DGState    *s;
 	PLHash		digest;
 	bool		present;
 
 	if (result != TM_Ok)
 		return result;
-	s = dg_load(rel, SnapshotSelf);
-	present = handle_digest(s, handle, &digest);
-	dg_release(s);
+	if ((b = dg_batch_fresh(rel)) != NULL)
+		present = dg_batch_handle_digest(b, handle, &digest);
+	else
+	{
+		s = dg_load(rel, SnapshotSelf);
+		present = handle_digest(s, handle, &digest);
+		dg_release(s);
+	}
 	if (present)
 		return TM_Ok;
 	dg_tid(handle, &tmfd->ctid);
@@ -692,17 +698,16 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 static void
 remove_row(Relation rel, uint64 handle, CommandId cid)
 {
-	DGState    *s = dg_load(rel, SnapshotSelf);
+	DGBatch    *b = dg_batch_latest(rel, cid);
 	PLHash		digest;
 	PLSlice		row;
 
-	if (!handle_digest(s, handle, &digest))
+	if (!dg_batch_handle_digest(b, handle, &digest))
 		elog(ERROR, "locked prolly row is missing");
-	row = copy_slice(row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}));
-	multiplicity(s, row, -1);
-	handle_edit(s, handle, digest, false);
-	dg_save(rel, s, cid);
-	dg_release(s);
+	if (!dg_batch_row(b, digest, &row))
+		elog(ERROR, "missing canonical row");
+	row = copy_slice(row);
+	dg_batch_remove(b, row, handle);
 	dg_index_apply(rel, row, -1, handle);
 	dg_collect();
 }
@@ -736,10 +741,43 @@ columns_differ(PLSlice old, PLSlice new, Bitmapset *attributes)
  * can still fetch the old version by its TID. The old version's lock record
  * names the new one for transactions that waited on it.
  */
+/*
+ * The row version |handle| as this transaction sees it, with its digest; a
+ * version a concurrent update already replaced in the latest state may still
+ * be in the caller's |snapshot|. Read through the command's batch while its
+ * trees are the latest, so a statement's earlier rows stay pending.
+ */
+static bool
+current_row(Relation rel, uint64 handle, Snapshot snapshot, PLHash *digest, PLSlice *row)
+{
+	DGBatch    *b = dg_batch_fresh(rel);
+	DGState    *s;
+	bool		present;
+
+	if (b && dg_batch_handle_digest(b, handle, digest))
+	{
+		if (!dg_batch_row(b, *digest, row))
+			elog(ERROR, "missing canonical row");
+		*row = copy_slice(*row);
+		return true;
+	}
+	s = dg_load(rel, SnapshotSelf);
+	if (!handle_digest(s, handle, digest) && snapshot && IsMVCCSnapshot(snapshot))
+	{
+		dg_release(s);
+		s = dg_load(rel, snapshot);
+	}
+	present = handle_digest(s, handle, digest);
+	if (present)
+		*row = copy_slice(row_for_handle(s, (PLSlice) {digest->bytes, PL_HASH_SIZE}));
+	dg_release(s);
+	return present;
+}
+
 static TM_Result
 update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, LockTupleMode *mode, TU_UpdateIndexes *indexes)
 {
-	DGState    *s;
+	DGBatch    *b;
 	uint64		handle = dg_id(tid),
 				successor;
 	PLHash		old_digest,
@@ -759,23 +797,14 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	 * update may already have replaced it in the latest state; the caller's
 	 * snapshot still has it.
 	 */
-	s = dg_load(rel, SnapshotSelf);
-	if (!handle_digest(s, handle, &old_digest) && snapshot && IsMVCCSnapshot(snapshot))
+	if (current_row(rel, handle, snapshot, &old_digest, &old_row))
 	{
-		dg_release(s);
-		s = dg_load(rel, snapshot);
-	}
-	if (handle_digest(s, handle, &old_digest))
-	{
-		PLSlice		row = row_for_handle(s, (PLSlice) {old_digest.bytes, PL_HASH_SIZE});
 		Bitmapset  *keys = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_KEY);
 		Bitmapset  *indexed = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_HOT_BLOCKING);
 
-		old_row = copy_slice(row);
 		key_change = columns_differ(old_row, new_row, keys);
 		indexed_change = columns_differ(old_row, new_row, indexed);
 	}
-	dg_release(s);
 	*mode = key_change ? LockTupleExclusive : LockTupleNoKeyExclusive;
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
@@ -789,20 +818,14 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 		return result;
 
 	/* The row may have changed between the first read and the lock. */
-	s = dg_load(rel, SnapshotSelf);
-	if (!handle_digest(s, handle, &old_digest))
+	b = dg_batch_latest(rel, cid);
+	if (!dg_batch_handle_digest(b, handle, &old_digest))
 		elog(ERROR, "locked prolly row is missing");
-	{
-		PLSlice		row = row_for_handle(s, (PLSlice) {old_digest.bytes, PL_HASH_SIZE});
-
-		old_row = copy_slice(row);
-	}
-	multiplicity(s, old_row, -1);
-	multiplicity(s, new_row, 1);
-	handle_edit(s, handle, old_digest, false);
-	handle_edit(s, successor, new_digest, true);
-	dg_save(rel, s, cid);
-	dg_release(s);
+	if (!dg_batch_row(b, old_digest, &old_row))
+		elog(ERROR, "missing canonical row");
+	old_row = copy_slice(old_row);
+	dg_batch_remove(b, old_row, handle);
+	dg_batch_insert(b, new_row, successor);
 	if (!pl_hash_equal(old_digest, new_digest))
 	{
 		dg_index_apply(rel, old_row, -1, handle);

@@ -431,6 +431,33 @@ dg_batch_current(Relation rel)
 	return b && b->cid == GetCurrentCommandId(false) && b->subxid == GetCurrentSubTransactionId() ? b : NULL;
 }
 
+/* The current command's batch for |rel| while its trees are still the latest. */
+DGBatch *
+dg_batch_fresh(Relation rel)
+{
+	DGBatch    *b = dg_batch_current(rel);
+
+	return b && b->generation == roots_generation() ? b : NULL;
+}
+
+/*
+ * The batch for |rel| with trees that are the latest: a batch loaded before
+ * another transaction published roots is applied first, so that what the
+ * caller reads through the new one includes that transaction's rows.
+ */
+DGBatch *
+dg_batch_latest(Relation rel, CommandId cid)
+{
+	DGBatch    *b = dg_batch(rel, cid);
+
+	if (b->generation != roots_generation())
+	{
+		batch_flush(b);
+		b = dg_batch(rel, cid);
+	}
+	return b;
+}
+
 DGState *
 dg_batch_state(DGBatch *b)
 {
@@ -468,6 +495,43 @@ dg_batch_insert(DGBatch *b, PLSlice row, uint64 handle)
 		dg_handle_key(digest, handle, bytes);
 		key = hash_search(b->keys, bytes, HASH_ENTER, NULL);
 		key->present = true;
+	}
+	b->count++;
+	MemoryContextSwitchTo(old);
+}
+
+/* Record one occurrence of |row| under |handle| removed: content, handle and key. */
+void
+dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
+{
+	PLHash		digest = dg_rowhash(row);
+	MemoryContext old = MemoryContextSwitchTo(b->memory);
+	PendingRow *pending;
+	PendingHandle *mapping;
+	PendingKey *key;
+	bool		found;
+
+	pending = hash_search(b->rows, &digest, HASH_ENTER, &found);
+	if (!found)
+	{
+		pending->delta = 0;
+		pending->row = slice_copy(row);
+		pending->handles = NULL;
+		pending->handle_count = 0;
+	}
+	pending->delta--;
+	for (int i = 0; i < pending->handle_count; i++)
+		if (pending->handles[i] == handle)
+			pending->handles[i] = pending->handles[--pending->handle_count];
+	mapping = hash_search(b->handles, &handle, HASH_ENTER, NULL);
+	mapping->digest = digest;
+	mapping->present = false;
+	{
+		uint8		bytes[DG_KEY_SIZE];
+
+		dg_handle_key(digest, handle, bytes);
+		key = hash_search(b->keys, bytes, HASH_ENTER, NULL);
+		key->present = false;
 	}
 	b->count++;
 	MemoryContextSwitchTo(old);

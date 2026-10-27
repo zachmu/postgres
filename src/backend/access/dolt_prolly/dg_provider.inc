@@ -803,6 +803,85 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
 }
 
+/*
+ * Row-type layout is independent of the table's columns. Build it before any
+ * composite attributes or table columns: either may name another table's row
+ * type, including through an array. Resolving that layout through syscache
+ * would recursively load the catalog view still being assembled.
+ */
+static void
+provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
+					const char *branch, const char *definition)
+{
+	char	   *name = json_value(definition, "name");
+	List	   *parts = stringToQualifiedNameList(name, NULL);
+	FormData_pg_class form = {0};
+	FormData_pg_type type = {0};
+	char	   *arrayname;
+	int			arraypass = 0;
+	char	   *arrayidentity;
+	FormData_pg_type array = {0};
+
+	form.oid = CatalogViewFindObject(view, RelationRelationId, name);
+	form.reltype = CatalogViewFindObject(view, TypeRelationId, name);
+	form.relnamespace = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
+	form.relowner = get_role_oid(json_value(definition, "owner"), false);
+	namestrcpy(&form.relname, strVal(lsecond(parts)));
+	arrayname = makeObjectName("", NameStr(form.relname), NULL);
+
+	for (;;)
+	{
+		arrayidentity = dg_qualified_name(strVal(linitial(parts)), arrayname);
+		if (!catalog_contains(database, arrayidentity) &&
+			!provider_has_type(rows, form.relnamespace, arrayname))
+			break;
+		pfree(arrayname);
+		arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
+	}
+	array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity);
+	type.typarray = array.oid;
+
+	type.oid = form.reltype;
+	type.typname = form.relname;
+	type.typnamespace = form.relnamespace;
+	type.typowner = form.relowner;
+	type.typlen = -1;
+	type.typtype = TYPTYPE_COMPOSITE;
+	type.typcategory = TYPCATEGORY_COMPOSITE;
+	type.typisdefined = true;
+	type.typdelim = ',';
+	type.typrelid = form.oid;
+	type.typinput = F_RECORD_IN;
+	type.typoutput = F_RECORD_OUT;
+	type.typreceive = F_RECORD_RECV;
+	type.typsend = F_RECORD_SEND;
+	type.typalign = TYPALIGN_DOUBLE;
+	type.typstorage = TYPSTORAGE_EXTENDED;
+	type.typtypmod = -1;
+	provider_add(rows, TypeRelationId, &type, sizeof(type), Anum_pg_type_typcollation);
+	provider_dependency(rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
+	namestrcpy(&array.typname, arrayname);
+	array.typnamespace = type.typnamespace;
+	array.typowner = type.typowner;
+	array.typlen = -1;
+	array.typtype = TYPTYPE_BASE;
+	array.typcategory = TYPCATEGORY_ARRAY;
+	array.typisdefined = true;
+	array.typdelim = ',';
+	array.typelem = type.oid;
+	array.typinput = F_ARRAY_IN;
+	array.typoutput = F_ARRAY_OUT;
+	array.typreceive = F_ARRAY_RECV;
+	array.typsend = F_ARRAY_SEND;
+	array.typanalyze = F_ARRAY_TYPANALYZE;
+	array.typsubscript = F_ARRAY_SUBSCRIPT_HANDLER;
+	array.typalign = TYPALIGN_DOUBLE;
+	array.typstorage = TYPSTORAGE_EXTENDED;
+	array.typtypmod = -1;
+	provider_add(rows, TypeRelationId, &array, sizeof(array), Anum_pg_type_typcollation);
+	provider_dependency(rows, TypeRelationId, array.oid, 0, TypeRelationId, type.oid, 0, DEPENDENCY_INTERNAL);
+}
+
 static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
@@ -904,6 +983,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		if (!strcmp(kinds[i], "type"))
 			provider_type(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "table"))
+			provider_table_type(&rows, view, database, branch, definitions[i]);
+	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type"))
 			provider_type_relation(&rows, view, definitions[i]);
 	for (i = 0; i < n; i++)
@@ -989,64 +1071,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			}
 			if (!index)
 			{
-				FormData_pg_type type = {0};
 				int			attno;
-				char	   *arrayname = makeObjectName("", NameStr(form.relname), NULL);
-				int			arraypass = 0;
-				char	   *arrayidentity;
-				FormData_pg_type array = {0};
-
-				for (;;)
-				{
-					arrayidentity = dg_qualified_name(strVal(linitial(parts)), arrayname);
-					if (!catalog_contains(database, arrayidentity) &&
-						!provider_has_type(&rows, form.relnamespace, arrayname))
-						break;
-					pfree(arrayname);
-					arrayname = makeObjectName("", NameStr(form.relname), psprintf("%d", ++arraypass));
-				}
-				array.oid = provider_bind(view, branch, TypeRelationId, DOLT_IDENTITY_ARRAYTYPE, name, arrayidentity);
-				type.typarray = array.oid;
-
-				type.oid = form.reltype;
-				type.typname = form.relname;
-				type.typnamespace = form.relnamespace;
-				type.typowner = form.relowner;
-				type.typlen = -1;
-				type.typtype = TYPTYPE_COMPOSITE;
-				type.typcategory = TYPCATEGORY_COMPOSITE;
-				type.typisdefined = true;
-				type.typdelim = ',';
-				type.typrelid = form.oid;
-				type.typinput = F_RECORD_IN;
-				type.typoutput = F_RECORD_OUT;
-				type.typreceive = F_RECORD_RECV;
-				type.typsend = F_RECORD_SEND;
-				type.typalign = TYPALIGN_DOUBLE;
-				type.typstorage = TYPSTORAGE_EXTENDED;
-				type.typtypmod = -1;
-				provider_add(&rows, TypeRelationId, &type, sizeof(type), Anum_pg_type_typcollation);
-				provider_dependency(&rows, TypeRelationId, type.oid, 0, RelationRelationId, form.oid, 0, DEPENDENCY_INTERNAL);
-				namestrcpy(&array.typname, arrayname);
-				array.typnamespace = type.typnamespace;
-				array.typowner = type.typowner;
-				array.typlen = -1;
-				array.typtype = TYPTYPE_BASE;
-				array.typcategory = TYPCATEGORY_ARRAY;
-				array.typisdefined = true;
-				array.typdelim = ',';
-				array.typelem = type.oid;
-				array.typinput = F_ARRAY_IN;
-				array.typoutput = F_ARRAY_OUT;
-				array.typreceive = F_ARRAY_RECV;
-				array.typsend = F_ARRAY_SEND;
-				array.typanalyze = F_ARRAY_TYPANALYZE;
-				array.typsubscript = F_ARRAY_SUBSCRIPT_HANDLER;
-				array.typalign = TYPALIGN_DOUBLE;
-				array.typstorage = TYPSTORAGE_EXTENDED;
-				array.typtypmod = -1;
-				provider_add(&rows, TypeRelationId, &array, sizeof(array), Anum_pg_type_typcollation);
-				provider_dependency(&rows, TypeRelationId, array.oid, 0, TypeRelationId, type.oid, 0, DEPENDENCY_INTERNAL);
 
 				for (attno = -1; attno > FirstLowInvalidHeapAttributeNumber; attno--)
 				{
@@ -1077,6 +1102,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	CatalogViewAddRows(view, ProcedureRelationId, rows.rows[provider_catalog_index(ProcedureRelationId)]);
 	CatalogViewAddRows(view, EnumRelationId, rows.rows[provider_catalog_index(EnumRelationId)]);
 	CatalogViewAddRows(view, TypeRelationId, rows.rows[provider_catalog_index(TypeRelationId)]);
+	/* Whole-row expressions also need the relation's row type and attributes. */
+	CatalogViewAddRows(view, RelationRelationId, rows.rows[provider_catalog_index(RelationRelationId)]);
+	CatalogViewAddRows(view, AttributeRelationId, rows.rows[provider_catalog_index(AttributeRelationId)]);
 	CatalogViewSetPartial(view, true);
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "type") && !strcmp(json_value(definitions[i], "kind"), "d"))
