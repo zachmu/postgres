@@ -475,19 +475,18 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 		f->snapshot = snap;
 		MemoryContextSwitchTo(old);
 	}
-	if (dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
+	if (!dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
 	{
-		dg_decode(rel, row, tid, slot);
-		return true;
+		pl_write64(key, dg_id(tid));
+		dg_check(pl_get(&f->state->handles, k, &value));
+		if (!value.present)
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		row = row_for_handle(f->state, value.bytes);
 	}
-	pl_write64(key, dg_id(tid));
-	dg_check(pl_get(&f->state->handles, k, &value));
-	if (!value.present)
-	{
-		ExecClearTuple(slot);
-		return false;
-	}
-	dg_decode(rel, row_for_handle(f->state, value.bytes), tid, slot);
+	dg_decode(rel, row, tid, slot);
 
 	/* A dirty snapshot reports the running transaction changing the row. */
 	if (snap->snapshot_type == SNAPSHOT_DIRTY)

@@ -56,6 +56,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
@@ -353,8 +354,8 @@ ExecProcessReturning(ModifyTableContext *context,
 }
 
 /*
- * Whether the current transaction inserted the tuple in |slot|. Prolly rows,
- * in virtual slots, carry no xmin; their table AM answers instead.
+ * Whether the current transaction inserted the tuple in |slot|. Prolly rows
+ * carry no xmin; their table AM answers instead.
  */
 static bool
 ExecTupleInsertedBySelf(Relation rel, TupleTableSlot *slot)
@@ -362,7 +363,7 @@ ExecTupleInsertedBySelf(Relation rel, TupleTableSlot *slot)
 	Datum		xminDatum;
 	bool		isnull;
 
-	if (TTS_IS_VIRTUAL(slot))
+	if (rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
 		return dg_tuple_inserted_by_self(rel, &slot->tts_tid);
 	xminDatum = slot_getsysattr(slot, MinTransactionIdAttributeNumber, &isnull);
 	Assert(!isnull);
