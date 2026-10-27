@@ -294,8 +294,8 @@ schema_expression_bind_trigger(CatalogView *view, Oid relation, const char *name
 	PG_TRY();
 	{
 		schema_expression_gucs();
-		if (schema_expression_calls_routine(raw, NULL))
-			CatalogViewSwitch(view);
+		/* OLD.* and NEW.* need the canonical relation row even without calls. */
+		CatalogViewSwitch(view);
 		result = transformWhereClause(pstate, raw, EXPR_KIND_TRIGGER_WHEN, "WHEN");
 		assign_expr_collations(pstate, result);
 	}
