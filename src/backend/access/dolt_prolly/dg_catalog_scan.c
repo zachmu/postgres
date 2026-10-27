@@ -42,6 +42,11 @@ void
 dg_catalog_path(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	CustomPath *path = makeNode(CustomPath);
+	Relation	catalog;
+
+	/* Whole-row width estimation opens the bootstrap relation with NoLock. */
+	catalog = table_open(rte->dolt_catalog, AccessShareLock);
+	table_close(catalog, NoLock);
 
 	/* Catalog views have no statistics; use a conservative estimate. */
 	rel->tuples = 1000;
