@@ -97,6 +97,13 @@ extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bo
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
 
+/* Unique-key reservations; see dg_lock.c. */
+extern void dg_key_reserve(Relation index, const char *branch, uint64 hash);
+
+/* Rows an index scan found, for the table fetches that follow; see dg_table.c. */
+extern void dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row);
+extern bool dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row);
+
 /* A command's pending edits to one relation's trees; see dg_batch.inc. */
 typedef struct DGBatch DGBatch;
 extern DGBatch *dg_batch(Relation rel, CommandId cid);

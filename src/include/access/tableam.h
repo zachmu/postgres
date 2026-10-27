@@ -576,6 +576,14 @@ typedef struct TableAmRoutine
 	 */
 	void		(*finish_bulk_insert) (Relation rel, int options);
 
+	/*
+	 * Whether an index-only scan can trust the index's entries without
+	 * consulting the visibility map or fetching the row: true for an AM
+	 * whose indexes are versioned with the table, so that every entry the
+	 * index scan returns names a row visible to the scan's snapshot.
+	 */
+	bool		index_only_visible;
+
 
 	/* ------------------------------------------------------------------------
 	 * DDL related functionality.

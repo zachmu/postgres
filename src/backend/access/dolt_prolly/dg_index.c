@@ -618,9 +618,8 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 	TM_FailureData failure;
 	int64		next;
 
-	dg_record_lock(index, dg_relation_branch(index),
-				   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
-				   LockTupleExclusive, LockWaitBlock, false, &failure, &next);
+	dg_key_reserve(index, dg_relation_branch(index),
+				   hash_bytes_extended((const unsigned char *) key->data, key->len, 0));
 	while ((conflict = unique_conflict(table, index, self, key)) != 0)
 	{
 		CommandId	cid;
@@ -910,9 +909,22 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		HandleList	handles;
 		ItemPointerData first_tid;
 
-		if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
-			digest = dg_rowhash(row);
-		handles = handles_of(table, digest);
+		/*
+		 * An index-only scan returns entries, not rows: it needs no handles,
+		 * only each entry's number of occurrences, and its TIDs are never
+		 * fetched. Other scans find the rows' handles, which name the TIDs.
+		 */
+		if (scan->xs_want_itup)
+		{
+			handles.count = (int) Min(pl_read64(rows.items[i].value.data), (uint64) INT_MAX);
+			handles.items = NULL;
+		}
+		else
+		{
+			if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
+				digest = dg_rowhash(row);
+			handles = handles_of(table, digest);
+		}
 
 		/* Duplicate occurrences share bytes and qualifications, not TIDs. */
 		if (handles.count == 0)
@@ -923,7 +935,10 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 		 */
 		if (!s->bitmap_table)
 		{
-			dg_tid(handles.items[0], &first_tid);
+			if (handles.items)
+				dg_tid(handles.items[0], &first_tid);
+			else
+				ItemPointerSet(&first_tid, 0, FirstOffsetNumber);
 			dg_decode(scan->heapRelation, row, &first_tid, slot);
 			if (!matches(scan, slot))
 				continue;
@@ -934,7 +949,13 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 			ItemPointerData tid;
 
 			CHECK_FOR_INTERRUPTS();
-			dg_tid(handles.items[j], &tid);
+			if (handles.items)
+			{
+				dg_tid(handles.items[j], &tid);
+				dg_stash_put(RelationGetRelid(scan->heapRelation), table, handles.items[j], row);
+			}
+			else
+				tid = first_tid;
 			if (s->count == capacity)
 			{
 				capacity *= 2;
