@@ -339,7 +339,7 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	}
 	if (node->backed)
 		return;					/* reached twice through shared subtrees */
-	node->backed = true;
+	pl_node_set_backed(store, node);
 	if (pending->count == pending->capacity)
 	{
 		pending->capacity = pending->capacity ? pending->capacity * 2 : 64;

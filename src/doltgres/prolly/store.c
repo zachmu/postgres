@@ -136,9 +136,9 @@ pl_store_drop_unbacked(PLStore *store)
 {
 	size_t		freed = 0;
 
-	if (!store)
+	if (!store || store->unbacked == 0)
 		return 0;
-	for (size_t i = 0; i < store->capacity; i++)
+	for (size_t i = 0; i < store->capacity && freed < store->unbacked; i++)
 	{
 		PLNode	  **link = &store->buckets[i];
 
@@ -159,6 +159,7 @@ pl_store_drop_unbacked(PLStore *store)
 			freed++;
 		}
 	}
+	store->unbacked = 0;
 	return freed;
 }
 
@@ -211,12 +212,24 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 			*link = node->next;
 			store->stats.chunks--;
 			store->stats.bytes -= node->size;
+			if (!node->backed)
+				store->unbacked--;
 			free(node->data);
 			free(node);
 			freed++;
 		}
 	}
 	return freed;
+}
+
+/* Record that |node| is now in the backing store. */
+void
+pl_node_set_backed(PLStore *store, PLNode *node)
+{
+	if (node->backed)
+		return;
+	node->backed = true;
+	store->unbacked--;
 }
 
 /* Find a node already in this store, without consulting a backing store. */
@@ -247,7 +260,7 @@ pl_find(PLStore *store, PLHash hash)
 	if (store->fetch(store->fetch_arg, hash, &bytes) != PL_OK ||
 		store_buffer(store, hash, bytes.data, bytes.len, &node) != PL_OK)
 		return NULL;
-	node->backed = true;
+	pl_node_set_backed(store, node);
 	store->stats.fetched++;
 	return node;
 }
@@ -431,6 +444,7 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, P
 	store->buckets[bucket] = node;
 	store->stats.chunks++;
 	store->stats.bytes += length;
+	store->unbacked++;
 	*out = node;
 	return PL_OK;
 }

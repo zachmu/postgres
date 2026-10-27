@@ -730,6 +730,14 @@ test_apply_batches(void)
 		CHECK(fetch.fetches > 0 && fetch.fetches < 12);
 		CHECK(fetch.fetches * 20 < stats.chunks);
 		printf("fetch-backed edit: %u fetches of %zu chunks\n", fetch.fetches, stats.chunks);
+
+		/* Dropping unbacked nodes removes exactly the edit's new nodes and keeps the fetched ones. */
+		stats = pl_store_stats(backed);
+		CHECK(stats.chunks > stats.fetched);
+		CHECK(pl_store_drop_unbacked(backed) == stats.chunks - stats.fetched);
+		CHECK(pl_store_stats(backed).chunks == stats.fetched);
+		CHECK(pl_store_drop_unbacked(backed) == 0);
+		CHECK(pl_store_stats(backed).chunks == stats.fetched);
 		pl_store_free(backed);
 	}
 

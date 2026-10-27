@@ -29,6 +29,7 @@ struct PLStore
 {
 	PLNode	  **buckets;
 	size_t		capacity;
+	size_t		unbacked;		/* nodes with backed == false */
 	PLStats		stats;
 	int			fd;
 	bool		loading;
@@ -48,6 +49,7 @@ void		pl_write64(uint8_t *p, uint64_t v);
 bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
+void		pl_node_set_backed(PLStore *store, PLNode *node);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);
 PLSlice		pl_node_value(const PLNode *node, uint32_t index);
 uint64_t	pl_node_rows(const PLNode *node);
