@@ -255,14 +255,22 @@ isnt(sql('SELECT ctid FROM t WHERE id = 2'), $before, 'an update gives the row a
 is(sql(q{UPDATE t SET v = 23 WHERE id = 2 RETURNING old.v || '->' || new.v}), '22->23',
 	'RETURNING old and new');
 
-# Handles are never reused across a restart.
+# Handles of committed rows are never reused across a restart. One an aborted
+# update allocated may be, and its dead lock record must not shadow the row
+# that has it now.
 $a->quit;
 $b->quit;
 my $max = sql('SELECT max((ctid::text::point)[0] * 65535 + (ctid::text::point)[1]) FROM t');
 $node->restart;
 sql('INSERT INTO t VALUES (8, 80)');
 cmp_ok(sql('SELECT (ctid::text::point)[0] * 65535 + (ctid::text::point)[1] FROM t WHERE id = 8'),
-	'>', $max, 'handles allocated after a restart exceed every earlier one');
+	'>', $max, 'handles allocated after a restart exceed every committed one');
+my $aborted = sql('BEGIN; UPDATE t SET v = 0 WHERE id = 1 RETURNING ctid; ROLLBACK');
+$node->restart;
+is(sql('INSERT INTO t VALUES (9, 90) RETURNING ctid'), $aborted,
+	'a handle an aborted update allocated is allocated again');
+sql('UPDATE t SET v = 91 WHERE id = 9; UPDATE t SET v = v + 1 WHERE id = 9');
+is(sql('SELECT v FROM t WHERE id = 9'), '92', 'the row with a reused handle locks and updates');
 ($a, $apid) = session();
 ($b, $bpid) = session();
 

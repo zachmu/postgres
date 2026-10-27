@@ -74,6 +74,17 @@ records_close(Records *r)
 	table_close(r->heap, RowExclusiveLock);
 }
 
+/* Whether the transaction that made the record version in |slot| failed. */
+static bool
+inserter_failed(TupleTableSlot *slot)
+{
+	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+	TransactionId xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+	return !TransactionIdIsCurrentTransactionId(xmin) && !TransactionIdIsInProgress(xmin) &&
+		!TransactionIdDidCommit(xmin);
+}
+
 /* The record whose current handle is |id|; false if there is none. */
 static bool
 find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid)
@@ -94,8 +105,13 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 	{
 		bool		isnull;
 
-		/* Index entries outlive the handle a record had when they were made. */
-		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id)
+		/*
+		 * Index entries outlive the handle a record had when they were made.
+		 * A version an aborted update made is dead, and its handle may since
+		 * have been allocated again: handles restart above the committed ones.
+		 */
+		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id &&
+			!inserter_failed(slot))
 		{
 			*tid = slot->tts_tid;
 			found = true;
