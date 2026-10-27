@@ -620,7 +620,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 	dg_record_lock(index, dg_relation_branch(index),
 				   (int64) hash_bytes_extended((const unsigned char *) key->data, key->len, 0),
-				   LockTupleExclusive, LockWaitBlock, false, &failure, &next);
+				   GetCurrentCommandId(true), LockTupleExclusive, LockWaitBlock, false, &failure, &next);
 	while ((conflict = unique_conflict(table, index, self, key)) != 0)
 	{
 		CommandId	cid;
@@ -636,7 +636,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 		if (!dg_row_modified(table, branch, conflict, &cid))
 		{
-			dg_record_lock(table, branch, (int64) conflict, LockTupleKeyShare, LockWaitBlock, false, &failure, &next);
+			dg_record_lock(table, branch, (int64) conflict, GetCurrentCommandId(true), LockTupleKeyShare, LockWaitBlock, false, &failure, &next);
 			if (unique_conflict(table, index, self, key) != conflict)
 				continue;
 		}

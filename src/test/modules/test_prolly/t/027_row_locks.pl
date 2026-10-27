@@ -72,6 +72,27 @@ like($b->{stderr}, qr/could not serialize access due to concurrent update/,
 $b->{stderr} = '';
 $b->query('ROLLBACK');
 
+# A writer that waited follows the row to its latest version, passing the
+# versions its own statement replaced, as heap does. If a later command of
+# the statement, here in a function, made that version, the statement fails;
+# if the statement itself made it, the second update is ignored.
+sql(q{CREATE FUNCTION bump(int) RETURNS bool LANGUAGE sql AS $$UPDATE t SET v = v + 1 WHERE id = $1; SELECT true$$});
+$a->query_safe('BEGIN; UPDATE t SET v = v + 1 WHERE id = 3');
+start($b, 'WITH up AS (UPDATE t SET v = v + 100 WHERE id = 3 RETURNING bump(3)) UPDATE t SET v = 0 FROM up WHERE t.id = 3;');
+blocked($bpid, 'writer waits behind a concurrent update');
+$a->query_safe('COMMIT');
+$b->query('SELECT 1');
+like($b->{stderr}, qr/tuple to be updated was already modified by an operation triggered by the current command/,
+	'a version a later command made is an error after waiting');
+$b->{stderr} = '';
+is(sql('SELECT v FROM t WHERE id = 3'), '63', 'the failed statement changed nothing');
+$a->query_safe('BEGIN; UPDATE t SET v = v + 1 WHERE id = 3');
+start($b, 'WITH up AS (UPDATE t SET v = v + 100 WHERE id = 3 RETURNING id) UPDATE t SET v = 0 FROM up WHERE t.id = 3;');
+blocked($bpid, 'writer waits behind a concurrent update again');
+$a->query_safe('COMMIT');
+$b->query_safe('SELECT 1');
+is(sql('SELECT v FROM t WHERE id = 3'), '164', 'a version the same command made is updated only once');
+
 # A deleted row is skipped by a waiting Read Committed writer.
 $a->query_safe('BEGIN; DELETE FROM t WHERE id = 5');
 start($b, 'UPDATE t SET v = 99 WHERE id = 5;');

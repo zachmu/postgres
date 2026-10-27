@@ -640,7 +640,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 	writer(rel);
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
-	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, wait, changing, failure, &next);
+	result = dg_record_delete(rel, dg_relation_branch(rel), (int64) handle, cid, wait, changing, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
 		result = TM_Updated;
 	result = still_current(rel, handle, result, failure);
@@ -733,7 +733,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
 	successor = dg_allocate_handle(rel);
-	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, key_change,
+	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, cid, key_change,
 							  wait, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
 		result = TM_Updated;
@@ -775,15 +775,46 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 	TM_Result	result;
 	bool		traversed = false;
 	int64		next;
+	CommandId	made = InvalidCommandId;	/* the command that made *tid, if this transaction did */
 
 	if (IsolationIsSerializable())
 		dg_unsupported("SERIALIZABLE isolation");
 	read_only_revision(rel);
 	for (;;)
 	{
-		if (self_modified(rel, dg_id(tid), snapshot, tmfd, &result))
+		CommandId	modified;
+
+		/*
+		 * Following a concurrent update, heapam_tuple_lock reads the chain
+		 * with a dirty snapshot, to which versions this transaction replaced
+		 * or deleted are dead: it passes them by. The live version, if this
+		 * transaction made it in this command or a later one, is
+		 * TM_SelfModified, reporting the command that made it.
+		 */
+		if (traversed && dg_row_modified(rel, dg_relation_branch(rel), dg_id(tid), &modified))
+		{
+			int64		replacement = dg_record_successor(rel, dg_relation_branch(rel), (int64) dg_id(tid));
+
+			if (!replacement)
+			{
+				dg_tid(dg_id(tid), &tmfd->ctid);
+				result = TM_Deleted;
+				break;
+			}
+			made = modified;
+			dg_tid((uint64) replacement, tid);
+			continue;
+		}
+		if (traversed && made != InvalidCommandId && made >= cid)
+		{
+			dg_tid(dg_id(tid), &tmfd->ctid);
+			tmfd->xmax = GetTopTransactionIdIfAny();
+			tmfd->cmax = made;
+			result = TM_SelfModified;
 			break;
-		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), mode, policy,
+		}
+		made = InvalidCommandId;
+		result = dg_record_lock(rel, dg_relation_branch(rel), (int64) dg_id(tid), cid, mode, policy,
 								(flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0, tmfd, &next);
 		if (result == TM_Updated && (flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
 			ItemPointerIndicatesMovedPartitions(&tmfd->ctid))

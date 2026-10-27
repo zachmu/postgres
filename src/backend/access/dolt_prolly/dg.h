@@ -89,11 +89,12 @@ extern void dg_identity_delete_branch(const char *branch);
 extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
-extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, LockTupleMode mode,
+extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTupleMode mode,
 								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
-extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id,
+extern TM_Result dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, CommandId cid,
 								  bool key_change, bool wait, TM_FailureData *tmfd, int64 *next);
-extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, bool wait,
+extern int64 dg_record_successor(Relation rel, const char *branch, int64 id);
+extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool wait,
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
 
