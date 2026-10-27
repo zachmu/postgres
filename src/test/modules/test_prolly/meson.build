@@ -36,5 +36,8 @@ tests += {
     't/031_scan_walk.pl',
     't/032_batched_changes.pl',
     't/033_index_fetches.pl',
+    't/033_array_indexes.pl',
+    't/034_index_only_visibility.pl',
+    't/035_commit_tracked.pl',
   ]},
 }

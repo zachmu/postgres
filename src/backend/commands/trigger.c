@@ -1856,6 +1856,14 @@ EnableDisableTrigger(Relation rel, const char *tgname, Oid tgparent,
 }
 
 
+/* Canonical catalog scans do not inherit the physical catalog index order. */
+static int
+trigger_name_cmp(const void *a, const void *b)
+{
+	return strcmp(((const Trigger *) a)->tgname,
+				  ((const Trigger *) b)->tgname);
+}
+
 /*
  * Build trigger data to attach to the given relcache entry.
  *
@@ -1998,6 +2006,10 @@ RelationBuildTriggers(Relation relation)
 		pfree(triggers);
 		return;
 	}
+
+	/* Match TriggerRelidNameIndexId ordering for a revision-bound relation. */
+	if (CatalogViewObjectContext(RelationGetRelid(relation)) && numtrigs > 1)
+		qsort(triggers, numtrigs, sizeof(Trigger), trigger_name_cmp);
 
 	/* Build trigdesc */
 	trigdesc = (TriggerDesc *) palloc0(sizeof(TriggerDesc));

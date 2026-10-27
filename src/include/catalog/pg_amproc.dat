@@ -2088,4 +2088,7 @@
 { amprocfamily => 'dolt_prolly_index/dolt_enum_ops', amproclefttype => 'anyenum',
   amprocrighttype => 'anyenum', amprocnum => '1', amproc => 'enum_cmp' },
 
+{ amprocfamily => 'dolt_prolly_index/dolt_array_ops', amproclefttype => 'anyarray',
+  amprocrighttype => 'anyarray', amprocnum => '1', amproc => 'btarraycmp' },
+
 ]

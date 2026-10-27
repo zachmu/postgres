@@ -140,6 +140,7 @@ static bytea *merge_parent(void);
 static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
+static void stage_modified_tables(void);
 static void replace_working(const char *branch, bytea *database, List *tables);
 static void merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, StringInfo violations,
 							StringInfo schema_conflicts);
@@ -1107,6 +1108,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 			   *committer = NULL,
 			   *committer_email = NULL;
 	bool		all = false,
+				modified = false,
 				allow_empty = false,
 				skip_empty = false;
 	TimestampTz author_date = GetCurrentTimestamp();
@@ -1124,16 +1126,20 @@ dolt_commit(PG_FUNCTION_ARGS)
 	nest = begin_api();
 	for (i = 0; i < n; i++)
 	{
-		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--all"))
+		if (!strcmp(args[i], "-A") || !strcmp(args[i], "--ALL"))
 			all = true;
+		else if (!strcmp(args[i], "-a") || !strcmp(args[i], "--all"))
+			modified = true;
 		else if (!strcmp(args[i], "--allow-empty"))
 			allow_empty = true;
 		else if (!strcmp(args[i], "--skip-empty"))
 			skip_empty = true;
 		else if (!strcmp(args[i], "-m") || !strcmp(args[i], "--message") || (!strcmp(args[i], "-Am") || !strcmp(args[i], "-am")))
 		{
-			if ((!strcmp(args[i], "-Am") || !strcmp(args[i], "-am")))
+			if (!strcmp(args[i], "-Am"))
 				all = true;
+			else if (!strcmp(args[i], "-am"))
+				modified = true;
 			if (++i == n)
 				unsupported("missing commit message");
 			message = args[i];
@@ -1164,6 +1170,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 	if (allow_empty && skip_empty)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("--allow-empty and --skip-empty are incompatible")));
 	ensure_repository();
+	if (modified && !all)
+		stage_modified_tables();
 	head = read_ref(branch_ref("heads"));
 	staged = read_ref(branch_ref("staged"));
 	working = read_ref(branch_ref("working"));

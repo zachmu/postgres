@@ -1599,7 +1599,12 @@ key_interval(Interval *interval)
 bool
 dg_key_ordered(Oid type)
 {
+	Oid			element;
+
 	type = getBaseType(type);
+	element = get_element_type(type);
+	if (OidIsValid(element))
+		return dg_key_ordered(element);
 	switch (type)
 	{
 		case BOOLOID:
@@ -1631,11 +1636,76 @@ dg_key_ordered(Oid type)
 	}
 }
 
+/*
+ * Match array_cmp: compare flattened elements, then dimensionality, dimensions,
+ * and lower bounds. End-of-array sorts before any next element; an element NULL
+ * sorts after every non-NULL. Escaping makes variable-width elements unambiguous.
+ */
+static PLSlice
+key_array(Datum value)
+{
+	ArrayType  *array = DatumGetArrayTypeP(value);
+	Oid			element = ARR_ELEMTYPE(array);
+	Datum	   *values;
+	bool	   *nulls;
+	int			count;
+	int16		length;
+	bool		byval;
+	char		align;
+	StringInfoData out;
+
+	get_typlenbyvalalign(element, &length, &byval, &align);
+	deconstruct_array(array, element, length, byval, align, &values, &nulls, &count);
+	initStringInfo(&out);
+	for (int i = 0; i < count; i++)
+	{
+		appendStringInfoChar(&out, nulls[i] ? 2 : 1);
+		if (!nulls[i])
+		{
+			PLSlice		key = dg_key_value(element, values[i]);
+
+			for (size_t j = 0; j < key.len; j++)
+			{
+				appendStringInfoChar(&out, key.data[j]);
+				if (!key.data[j])
+					appendStringInfoChar(&out, 255);
+			}
+			appendStringInfoChar(&out, 0);
+			appendStringInfoChar(&out, 0);
+			/* Text/bytea keys borrow their input's payload. */
+			if (getBaseType(element) != TEXTOID && getBaseType(element) != BYTEAOID)
+				pfree((void *) key.data);
+		}
+	}
+	appendStringInfoChar(&out, 0);
+	{
+		PLSlice		key = key_int64(ARR_NDIM(array));
+
+		appendBinaryStringInfo(&out, (char *) key.data, key.len);
+		pfree((void *) key.data);
+	}
+	for (int pass = 0; pass < 2; pass++)
+		for (int i = 0; i < ARR_NDIM(array); i++)
+		{
+			PLSlice		key = key_int64(pass ? ARR_LBOUND(array)[i] : ARR_DIMS(array)[i]);
+
+			appendBinaryStringInfo(&out, (char *) key.data, key.len);
+			pfree((void *) key.data);
+		}
+	pfree(values);
+	pfree(nulls);
+	if ((Pointer) array != DatumGetPointer(value))
+		pfree(array);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
 /* The key bytes of |value| of |type|. */
 PLSlice
 dg_key_value(Oid type, Datum value)
 {
 	type = getBaseType(type);
+	if (OidIsValid(get_element_type(type)))
+		return key_array(value);
 	if (key_is_row(type))
 		return encode_value(type, value);
 	switch (type)

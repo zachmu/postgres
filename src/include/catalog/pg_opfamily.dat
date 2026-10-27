@@ -330,4 +330,6 @@
 { oid => '9026', opfmethod => 'dolt_prolly_index', opfname => 'dolt_macaddr8_ops' },
 { oid => '9027', opfmethod => 'dolt_prolly_index', opfname => 'dolt_enum_ops' },
 
+{ oid => '9028', opfmethod => 'dolt_prolly_index', opfname => 'dolt_array_ops' },
+
 ]

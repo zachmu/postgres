@@ -342,11 +342,10 @@ canonical_drop(Node *statement)
 	}
 	if (stmt->concurrent || CatalogViewCurrent())
 		unsupported("concurrent or immutable-context DROP");
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed = true;
-	}
+	/* SQL functions may own a registered active snapshot. Publication advances
+	 * command IDs, so give this utility its own mutable copy. */
+	PushCopiedSnapshot(ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot());
+	pushed = true;
 	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
 	view = dg_catalog_session_view();
 	previous = CatalogViewSwitch(view);

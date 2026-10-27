@@ -159,10 +159,15 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * It's worth going through this complexity to avoid needing to lock
 		 * the VM buffer, which could cause significant contention.
 		 */
+		/*
+		 * An AM may establish visibility itself. Otherwise, only heap can
+		 * use the visibility map; other AMs must fetch to check visibility.
+		 */
 		if (!scandesc->heapRelation->rd_tableam->index_only_visible &&
-			!VM_ALL_VISIBLE(scandesc->heapRelation,
-							ItemPointerGetBlockNumber(tid),
-							&node->ioss_VMBuffer))
+			(scandesc->heapRelation->rd_tableam != GetHeapamTableAmRoutine() ||
+			 !VM_ALL_VISIBLE(scandesc->heapRelation,
+							 ItemPointerGetBlockNumber(tid),
+							 &node->ioss_VMBuffer)))
 		{
 			/*
 			 * Rats, we have to visit the heap to check visibility.
