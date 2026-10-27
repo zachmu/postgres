@@ -576,11 +576,12 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 }
 
 bool
-pl_boundary(uint32_t level, uint32_t count, size_t bytes, PLSlice key)
+pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PLSlice key)
 {
 	/*
 	 * Key-local, level-salted fingerprint; no dependence on insertion
-	 * history.
+	 * history. An entry ends its node with probability proportional to its
+	 * size, so nodes average PL_TARGET_BYTES whatever their entries' sizes.
 	 */
 	uint64_t	fingerprint = UINT64_C(14695981039346656037) ^ level;
 	size_t		i;
@@ -597,5 +598,5 @@ pl_boundary(uint32_t level, uint32_t count, size_t bytes, PLSlice key)
 	fingerprint ^= fingerprint >> 33;
 	fingerprint *= UINT64_C(0xff51afd7ed558ccd);
 	fingerprint ^= fingerprint >> 33;
-	return (fingerprint & 31) == 0;
+	return (fingerprint & 0xFFFFF) < (uint64_t) entry_bytes * 0x100000 / PL_TARGET_BYTES;
 }

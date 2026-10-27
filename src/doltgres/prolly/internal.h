@@ -6,8 +6,9 @@
 
 #define PL_MAX_DEPTH 32
 #define PL_MAX_ENTRIES 128
-#define PL_MIN_BYTES 512
-#define PL_MAX_BYTES 8192
+#define PL_MIN_BYTES 256
+#define PL_TARGET_BYTES 2048
+#define PL_MAX_BYTES (4 * PL_TARGET_BYTES)
 #define PL_HEADER 24
 #define PL_CHILD_SIZE 40
 
@@ -59,7 +60,7 @@ PLSlice		pl_node_value(const PLNode *node, uint32_t index);
 uint64_t	pl_node_rows(const PLNode *node);
 PLStatus	pl_save(PLStore *store, uint32_t level, const PLEntry *entries,
 					uint32_t count, PLNode **out);
-bool		pl_boundary(uint32_t level, uint32_t count, size_t bytes, PLSlice key);
+bool		pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PLSlice key);
 typedef struct PLCursor
 {
 	PLStore    *store;
