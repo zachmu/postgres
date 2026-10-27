@@ -745,15 +745,17 @@ test_apply_batches(void)
 						again;
 			uint8_t		other[4] = {5, 6, 7, 8};
 			PLEdit		edit2 = {{keys[SLOTS / 3], 8}, {true, {other, 4}}};
-			size_t		before = pl_store_stats(backed).chunks,
-						built;
+			PLStats		before = pl_store_stats(backed),
+						after;
+			size_t		built;
 
 			OK(pl_apply(&base_remote, &edit2, 1, &again));
-			built = pl_store_stats(backed).chunks - before;
+			after = pl_store_stats(backed);
+			built = (after.chunks - before.chunks) - (after.fetched - before.fetched);
 			CHECK(built > 0);
 			CHECK(pl_store_retain(backed, &tree.root, 1) == built);
 			CHECK(pl_store_drop_unbacked(backed) == 0);
-			CHECK(pl_store_stats(backed).chunks == before);
+			CHECK(pl_store_stats(backed).chunks == after.fetched);
 		}
 		pl_store_free(backed);
 	}
