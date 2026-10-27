@@ -8,7 +8,7 @@
 #define PL_MAX_ENTRIES 128
 #define PL_MIN_BYTES 256
 #ifndef PL_TARGET_BYTES
-#define PL_TARGET_BYTES 2048
+#define PL_TARGET_BYTES 1024
 #endif
 #define PL_MAX_BYTES (4 * PL_TARGET_BYTES)
 #define PL_HEADER 24
