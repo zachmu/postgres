@@ -1,7 +1,6 @@
 #include "dg.h"
 #include <math.h>
 #include "nodes/tidbitmap.h"
-#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "access/doltbranch.h"
 #include "miscadmin.h"
@@ -748,10 +747,6 @@ toast(Relation rel)
 {
 	return false;
 }
-/* As heapam_handler.c sizes heap tuples and pages for the planner. */
-#define DG_HEAP_OVERHEAD_BYTES_PER_TUPLE (MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))
-#define DG_HEAP_USABLE_BYTES_PER_PAGE (BLCKSZ - SizeOfPageHeaderData)
-
 static void
 estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double *allvis)
 {
@@ -771,15 +766,12 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 		Max(1.0, ceil(bytes / BLCKSZ)));
 
 	/*
-	 * A prolly table is never vacuumed or analyzed. Size a small one as
-	 * PostgreSQL sizes a heap table never vacuumed, at ten pages of tuples of
-	 * its width, so that plans over small tables are the ones it would choose.
+	 * A prolly table is never analyzed, so nothing corrects an estimate the
+	 * planner makes from a small table's exact size. Count a small table as
+	 * a thousand rows, as before exact counts, so that plans over small tables
+	 * keep using their indexes.
 	 */
-	if (*pages < 10)
-	{
-		*pages = 10;
-		*tuples = rint(clamp_row_est((double) (DG_HEAP_USABLE_BYTES_PER_PAGE / (width + DG_HEAP_OVERHEAD_BYTES_PER_TUPLE))) * 10);
-	}
+	*tuples = Max(*tuples, 1000);
 	*allvis = 0;
 	release_state(rel, state);
 }
