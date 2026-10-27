@@ -30,6 +30,8 @@ typedef struct DGState
 	bool		based;			/* derived from committed roots */
 	PLHash		base[3];		/* those committed content, handle, key roots */
 	MemoryContextCallback cleanup;
+	int64	   *journal_seqs;	/* journal entries folded into the trees, ascending */
+	int			journal_count;
 } DGState;
 
 /* Size of a key-to-handle tree key: row digest followed by the handle. */
@@ -64,6 +66,7 @@ extern Relation dg_storage_index(Relation rel, Oid id);
 extern const char *dg_storage_branch(Relation rel);
 extern void dg_storage_require_write(Relation rel);
 extern bool dg_storage_bound(Relation rel);
+extern void dg_storage_table_locator(Relation index, RelFileLocator *locator);
 extern DGState *dg_storage_am_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_storage_am_load_tid(Relation rel, uint64 id);
 extern DGState *dg_load_bound_tid(Relation rel, uint64 id, const char *branch);
@@ -100,6 +103,9 @@ extern TransactionId dg_record_xwait(Relation rel, const char *branch, int64 id,
 extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool wait,
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
 extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
+
+/* An index entry's key for |row|, as the index AM encodes it. */
+extern void dg_index_entry_key(Relation index, PLSlice row, PLHash digest, StringInfo key);
 
 /* Unique-key reservations; see dg_lock.c. */
 extern bool dg_key_reserve(Relation index, const char *branch, uint64 hash, bool wait);

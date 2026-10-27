@@ -57,6 +57,7 @@ PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);
 void		pl_node_pin(PLStore *store, PLNode *node);
+void		pl_node_unpin(PLStore *store, PLNode *node);
 PLSlice		pl_node_key(const PLNode *node, uint32_t index);
 PLSlice		pl_node_value(const PLNode *node, uint32_t index);
 uint64_t	pl_node_rows(const PLNode *node);

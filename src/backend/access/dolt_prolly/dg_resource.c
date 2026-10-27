@@ -548,6 +548,36 @@ dg_storage_enable_read(DGStorage *storage, bytea *base)
 }
 
 /*
+ * The locator of the table a bound |index| orders: the table's binding on
+ * the index's branch, read under the index's snapshot. The index definition
+ * names the table's canonical handle, which has no file of its own.
+ */
+void
+dg_storage_table_locator(Relation index, RelFileLocator *locator)
+{
+	DGStorage  *storage = bound_storage(index);
+	Relation	table = relation_open(storage->definition->rd_index->indrelid, NoLock);
+	char	   *name = dg_qualified_name(get_namespace_name(table->rd_rel->relnamespace), RelationGetRelationName(table));
+	Relation	catalog = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			resource;
+
+	relation_close(table, NoLock);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltBindingKeyIndexId, true, storage->snapshot, 2, keys);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime storage binding unavailable for %s on branch %s", name, storage->branch)));
+	resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	dg_storage_locator(resource, locator);
+}
+
+/*
  * The file locator of storage resource |resource|, for the relcache entry of
  * a branch head's relation. Read under the catalog snapshot, as relcache
  * builds read pg_class.

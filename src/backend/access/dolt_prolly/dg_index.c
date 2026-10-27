@@ -389,6 +389,15 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 	close_indexes(indexes, opened);
 }
 
+void
+dg_index_entry_key(Relation index, PLSlice row, PLHash digest, StringInfo key)
+{
+	size_t		prefix;
+	bool		nullkey;
+
+	index_entry(index, row, (PLSlice) {digest.bytes, PL_HASH_SIZE}, key, &prefix, &nullkey);
+}
+
 static PLStatus
 collect(void *arg, PLSlice key, PLSlice value)
 {

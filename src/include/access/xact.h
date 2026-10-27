@@ -140,6 +140,7 @@ typedef void (*XactCallback) (XactEvent event, void *arg);
 typedef enum
 {
 	SUBXACT_EVENT_START_SUB,
+	SUBXACT_EVENT_PRE_START_SUB,	/* before a child exists: the parent is still current */
 	SUBXACT_EVENT_COMMIT_SUB,
 	SUBXACT_EVENT_ABORT_SUB,
 	SUBXACT_EVENT_PRE_COMMIT_SUB,

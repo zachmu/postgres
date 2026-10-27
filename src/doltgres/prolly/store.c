@@ -251,6 +251,28 @@ pl_node_pin(PLStore *store, PLNode *node)
 		}
 }
 
+/* Let a pinned node drop with the next pl_store_drop_unbacked, unless written by then. */
+void
+pl_node_unpin(PLStore *store, PLNode *node)
+{
+	if (!node->pinned)
+		return;
+	node->pinned = false;
+	if (node->backed)
+		return;
+	if (store->unbacked_count == store->unbacked_capacity)
+	{
+		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;
+		PLNode	  **grown = realloc(store->unbacked, capacity * sizeof(*grown));
+
+		if (!grown)
+			return;				/* kept until the store is freed */
+		store->unbacked = grown;
+		store->unbacked_capacity = capacity;
+	}
+	store->unbacked[store->unbacked_count++] = node;
+}
+
 /* Record that |node| is now in the backing store; it stays listed until dropped. */
 void
 pl_node_set_backed(PLNode *node)
