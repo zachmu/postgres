@@ -56,9 +56,14 @@ like($s->{stderr},qr/cannot be made a member of itself/,'a type lookup among man
 $s->{stderr}='';
 is($s->query_safe(q{SELECT 1}),'1','the session survives the lookup');
 
-# A session keeps a bounded number of catalog views however much DDL it runs:
-# each DDL's private view is freed, and a branch's superseded views are too.
-cmp_ok($s->query_safe(q{SELECT count(*) FROM pg_backend_memory_contexts WHERE name='catalog view'}),'<=',16,'catalog views stay bounded across DDL');
+# A session keeps a bounded number of catalog views loaded however much DDL it
+# runs: each DDL's private view is freed, and superseded views are unloaded.
+cmp_ok($s->query_safe(q{SELECT count(*) FROM pg_backend_memory_contexts WHERE name='catalog view rows' AND total_bytes > 65536}),'<=',32,'loaded catalog views stay bounded across DDL');
+
+# An object's OID stays valid across later DDL, as psql's \d relies on.
+my $type=$s->query_safe(q{CREATE TYPE kept AS (a int); SELECT 'kept'::regtype::oid});
+add_tables(41,60);
+is($s->query_safe("SELECT format_type($type, NULL)"),'kept','an OID from before later DDL still names its object');
 
 $s->quit;
 done_testing();
