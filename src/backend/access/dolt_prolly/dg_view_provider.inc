@@ -80,20 +80,18 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 				/* A versioned table's columns are numbered as its definition lists them. */
 				bool		versioned = false;
 
-				for (int j = 0; j < provider_definition_count; j++)
+				int			j = provider_member(targets[i], NULL);
+
+				if (j >= 0 && !strcmp(provider_definition_kinds[j], "table"))
 				{
-					if (strcmp(json_value(provider_definition_list[j], "name"), targets[i]))
-						continue;
-					if (!strcmp(provider_definition_kinds[j], "table"))
-						column = provider_attribute(provider_columns(provider_definition_list[j]), columns[i]);
-					else if (!strcmp(provider_definition_kinds[j], "view"))
-					{
-						run("SELECT ord::int FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(provider_definition_list[j]), CStringGetTextDatum(columns[i])), NULL, true);
-						if (SPI_processed)
-							column = DatumGetInt32(cell(0, 1));
-					}
-					else
-						continue;
+					column = provider_attribute(provider_columns(provider_definition_list[j]), columns[i]);
+					versioned = true;
+				}
+				else if (j >= 0 && !strcmp(provider_definition_kinds[j], "view"))
+				{
+					run("SELECT ord::int FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(provider_definition_list[j]), CStringGetTextDatum(columns[i])), NULL, true);
+					if (SPI_processed)
+						column = DatumGetInt32(cell(0, 1));
 					versioned = true;
 				}
 				if (!versioned)

@@ -66,7 +66,60 @@ static DGProviderRows *provider_current_rows;
 static int	provider_definition_count;
 static char **provider_definition_kinds;
 static char **provider_definition_list;
+
+/* Its tables, indexes and views by name; relations share one namespace. */
+typedef struct ProviderMember
+{
+	char		name[2 * (2 * NAMEDATALEN + 2) + 2];
+	int			index;
+} ProviderMember;
+static HTAB *provider_members;
 static Oid routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name);
+
+static void
+provider_index_members(void)
+{
+	HASHCTL		ctl = {0};
+
+	ctl.keysize = sizeof(((ProviderMember *) NULL)->name);
+	ctl.entrysize = sizeof(ProviderMember);
+	ctl.hcxt = CurrentMemoryContext;
+	provider_members = hash_create("canonical members", Max(provider_definition_count, 16), &ctl,
+								   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	for (int i = 0; i < provider_definition_count; i++)
+	{
+		const char *kind = provider_definition_kinds[i];
+		char	   *name;
+		ProviderMember *member;
+		bool		found;
+
+		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view"))
+			continue;
+		name = json_value(provider_definition_list[i], "name");
+		if (strlen(name) >= sizeof(member->name))
+			elog(ERROR, "canonical member name is too long");
+		member = hash_search(provider_members, name, HASH_ENTER, &found);
+		if (!found)
+			member->index = i;
+	}
+}
+
+/*
+ * The member of the schema being rebuilt named |name|, or -1: a table, index
+ * or view, or only one of |kind| when given.
+ */
+static int
+provider_member(const char *name, const char *kind)
+{
+	ProviderMember *member;
+
+	if (strlen(name) >= sizeof(member->name))
+		return -1;
+	member = hash_search(provider_members, name, HASH_FIND, NULL);
+	if (!member || (kind && strcmp(provider_definition_kinds[member->index], kind)))
+		return -1;
+	return member->index;
+}
 
 static int
 provider_catalog_index(Oid id)
@@ -630,14 +683,10 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	if (!stmt->relation->schemaname)
 		elog(ERROR, "unqualified canonical index table");
 	table = dg_qualified_name(stmt->relation->schemaname, stmt->relation->relname);
-	for (i = 0; i < count; i++)
-		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), table))
-		{
-			desc = provider_columns(definitions[i]);
-			break;
-		}
-	if (!desc)
+	i = provider_member(table, "table");
+	if (i < 0)
 		elog(ERROR, "canonical index table is missing");
+	desc = provider_columns(definitions[i]);
 	form.indexrelid = CatalogViewLookupObject(view, RelationRelationId, json_value(definition, "name"));
 	form.indrelid = CatalogViewLookupObject(view, RelationRelationId, table);
 	form.indnkeyatts = list_length(stmt->indexParams);
@@ -832,7 +881,7 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 	for (;;)
 	{
 		arrayidentity = dg_qualified_name(strVal(linitial(parts)), arrayname);
-		if (!catalog_contains(database, arrayidentity) &&
+		if (provider_member(arrayidentity, NULL) < 0 &&
 			!provider_has_type(rows, form.relnamespace, arrayname))
 			break;
 		pfree(arrayname);
@@ -938,6 +987,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	provider_definition_count = n;
 	provider_definition_kinds = kinds;
 	provider_definition_list = definitions;
+	provider_index_members();
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "namespace"))
 		{
@@ -1146,6 +1196,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	provider_current_view = NULL;
 	provider_current_rows = NULL;
 	provider_definition_count = 0;
+	provider_members = NULL;
 	CatalogViewSeal(view);
 }
 

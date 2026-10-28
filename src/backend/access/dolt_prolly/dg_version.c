@@ -1,5 +1,7 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
+#include "utils/jsonb.h"
+#include "utils/numeric.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_relation.h"
@@ -797,11 +799,94 @@ capture(bool persist)
 	return capture_mode(persist, false);
 }
 
+/*
+ * Recently parsed definitions, by text. Decoding a schema reads many fields of
+ * each definition, so each is parsed once rather than once per field.
+ */
+#define PARSED_JSON_ENTRIES 32
+typedef struct ParsedJson
+{
+	char	   *text;
+	Size		len;
+	uint32		hash;
+	Jsonb	   *value;
+} ParsedJson;
+static ParsedJson parsed_json[PARSED_JSON_ENTRIES];
+static int	parsed_json_next;
+
+static Jsonb *
+json_parse(const char *json)
+{
+	Size		len = strlen(json);
+	uint32		hash = hash_bytes((const unsigned char *) json, len);
+	ParsedJson *entry;
+	Jsonb	   *value;
+	MemoryContext previous;
+
+	for (int i = 0; i < PARSED_JSON_ENTRIES; i++)
+	{
+		entry = &parsed_json[i];
+		if (entry->value && entry->hash == hash && entry->len == len && !memcmp(entry->text, json, len))
+			return entry->value;
+	}
+	value = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
+	entry = &parsed_json[parsed_json_next];
+	parsed_json_next = (parsed_json_next + 1) % PARSED_JSON_ENTRIES;
+	if (entry->value)
+	{
+		pfree(entry->text);
+		pfree(entry->value);
+	}
+	previous = MemoryContextSwitchTo(TopMemoryContext);
+	entry->text = pnstrdup(json, len);
+	entry->value = palloc(VARSIZE(value));
+	memcpy(entry->value, value, VARSIZE(value));
+	MemoryContextSwitchTo(previous);
+	entry->len = len;
+	entry->hash = hash;
+	return entry->value;
+}
+
+/* A JSON value as text, as the ->> operator gives it. */
+static char *
+json_text(JsonbValue *value)
+{
+	switch (value->type)
+	{
+		case jbvNull:
+			return NULL;
+		case jbvBool:
+			return pstrdup(value->val.boolean ? "true" : "false");
+		case jbvString:
+			return pnstrdup(value->val.string.val, value->val.string.len);
+		case jbvNumeric:
+			return DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(value->val.numeric)));
+		case jbvBinary:
+			{
+				StringInfoData text;
+
+				initStringInfo(&text);
+				(void) JsonbToCString(&text, value->val.binary.data, value->val.binary.len);
+				return text.data;
+			}
+		default:
+			elog(ERROR, "unrecognized jsonb type: %d", (int) value->type);
+			return NULL;
+	}
+}
+
+/* Field |key| of JSON object |json| as text, as $1::jsonb->>$2 gives it. */
 static char *
 json_value(const char *json, const char *key)
 {
-	run("SELECT $1::jsonb->>$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(key)), NULL, true);
-	return strcell(0, 1);
+	Jsonb	   *parsed = json_parse(json);
+	JsonbValue	buffer;
+	JsonbValue *value;
+
+	if (!JB_ROOT_IS_OBJECT(parsed))
+		return NULL;
+	value = getKeyJsonValueFromContainer(&parsed->root, key, strlen(key), &buffer);
+	return value ? json_text(value) : NULL;
 }
 
 /* Doltgres derives the default committer email from the role and the client

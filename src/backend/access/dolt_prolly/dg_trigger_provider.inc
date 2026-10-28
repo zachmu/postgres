@@ -25,11 +25,13 @@ provider_trigger(DGProviderRows *rows, CatalogView *view, const char *definition
 	if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, CreateTrigStmt))
 		elog(ERROR, "invalid canonical trigger definition");
 	stmt = castNode(CreateTrigStmt, linitial_node(RawStmt, parsed)->stmt);
-	for (int i = 0; i < count; i++)
-		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), table))
-			desc = provider_columns(definitions[i]);
-	if (!desc)
-		elog(ERROR, "canonical trigger's table is missing: %s", table);
+	{
+		int			member = provider_member(table, "table");
+
+		if (member < 0)
+			elog(ERROR, "canonical trigger's table is missing: %s", table);
+		desc = provider_columns(definitions[member]);
+	}
 	trigger.oid = CatalogViewBindObject(view, TriggerRelationId, name, InvalidOid);
 	trigger.tgrelid = CatalogViewLookupObject(view, RelationRelationId, table);
 	namestrcpy(&trigger.tgname, stmt->trigname);

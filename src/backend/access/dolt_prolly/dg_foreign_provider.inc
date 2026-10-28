@@ -119,11 +119,13 @@ provider_foreign(DGProviderRows *rows, CatalogView *view, HeapTuple tuple,
 	if (!metadata || !constraint->pktable->schemaname)
 		elog(ERROR, "foreign key metadata requires qualified identities");
 	name = dg_qualified_name(constraint->pktable->schemaname, constraint->pktable->relname);
-	for (int i = 0; i < count; i++)
-		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), name))
-			referenced = provider_columns(definitions[i]);
-	if (!referenced)
-		elog(ERROR, "canonical referenced table is missing");
+	{
+		int			member = provider_member(name, "table");
+
+		if (member < 0)
+			elog(ERROR, "canonical referenced table is missing");
+		referenced = provider_columns(definitions[member]);
+	}
 	con->confrelid = CatalogViewLookupObject(view, RelationRelationId, name);
 	con->conindid = CatalogViewLookupObject(view, RelationRelationId, json_value(metadata, "index"));
 	con->confupdtype = constraint->fk_upd_action;
