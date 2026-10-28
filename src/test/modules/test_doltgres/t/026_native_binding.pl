@@ -82,11 +82,11 @@ $s->query_safe(q{COMMIT});
 is($s->query_safe(q{EXECUTE head}),'main2','the next transaction rebinds to the moved ref');
 $s->quit;
 
-# The SQL that decodes a schema into a session's catalog view is prepared once.
+# Decoding a schema into a session's catalog view reads its definitions
+# natively, without internal SQL.
 sql(q{SELECT pg_stat_statements_reset()});
 sql(q{SELECT count(*) FROM t; SELECT count(*) FROM app.t});
-is(sql(q{SELECT bool_and(plans <= 6) FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','repeated internal statements reuse their plans');
-is(sql(q{SELECT count(*) > 0 FROM pg_stat_statements WHERE calls > 10 AND query LIKE '%jsonb%'}),'t','and there were such statements to reuse');
-is(sql(q{SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%::jsonb->$_->$_->>%'}),'0','columns are decoded by table, not by column');
+is(sql(q{SELECT coalesce(sum(calls),0) FROM pg_stat_statements WHERE query LIKE '%jsonb%'}),'0','definitions are decoded without internal SQL')
+  or diag(sql(q{SELECT calls||' '||left(query,160) FROM pg_stat_statements WHERE query LIKE '%jsonb%' ORDER BY calls DESC}));
 $node->stop;
 done_testing();

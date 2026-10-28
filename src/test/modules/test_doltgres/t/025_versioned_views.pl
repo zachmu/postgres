@@ -82,6 +82,16 @@ sql(q{DROP MATERIALIZED VIEW lazy; DROP TABLE src2 CASCADE});
 is(sql(q{SELECT count(*) FROM pg_matviews}),'0','DROP MATERIALIZED VIEW and DROP TABLE CASCADE');
 is(sql(q{SELECT count(*) FROM mv2 AS OF 'HEAD'}),'3','history keeps materialized views');
 
+# ---- native dependencies ----
+# A native object a view uses can go without it; the rest of the schema still
+# loads, and the view fails when used.
+sql(q{CREATE SEQUENCE view_seq; CREATE VIEW seq_view AS SELECT * FROM view_seq});
+$node->psql('postgres',q{DELETE FROM seq_view});
+sql(q{DROP SEQUENCE view_seq CASCADE});
+is(sql(q{SELECT count(*) > 0 FROM pg_class}),'t','the schema loads after a view\'s native dependency is dropped');
+fails(q{SELECT * FROM seq_view},qr/does not exist/,'the view fails when used');
+sql(q{DROP VIEW IF EXISTS seq_view});
+
 # ---- not versioned ----
 is(sql(q{CREATE TEMP VIEW tv AS SELECT 1 AS one; SELECT one FROM tv}),'1','temporary views stay native');
 $node->stop;

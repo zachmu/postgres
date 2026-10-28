@@ -1,5 +1,7 @@
 /* Native version-control command slice; see doc/doltgres/version-commands.md. */
 #include "dg.h"
+#include "utils/jsonb.h"
+#include "utils/numeric.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_relation.h"
@@ -557,17 +559,17 @@ links(Datum *hashes, int count)
 static bytea *
 put(const char *kind, const char *json, Datum *hashes, int count)
 {
-	Oid			types[] = {TEXTOID, TEXTOID, BYTEAARRAYOID};
-	Datum		args[] = {CStringGetTextDatum(kind), CStringGetTextDatum(json), PointerGetDatum(links(hashes, count))};
-
 	bytea	   *result;
 
 	if ((!strcmp(kind, "schema") || !strcmp(kind, "namespace")) && count == 0)
 		result = dg_schema_store(kind, json);
 	else
 	{
-		run("SELECT pg_catalog.dolt_manifest_put($1,convert_to(($2::jsonb)::text,'UTF8'),$3)", 3, types, args, NULL, false);
-		result = (bytea *) DatumGetPointer(cell(0, 1));
+		/* The payload is the JSON normalized, in UTF-8. */
+		char	   *normalized = DatumGetCString(DirectFunctionCall1(jsonb_out, DirectFunctionCall1(jsonb_in, CStringGetDatum(json))));
+		char	   *encoded = pg_server_to_any(normalized, strlen(normalized), PG_UTF8);
+
+		result = dg_manifest_put(kind, (bytea *) cstring_to_text_with_len(encoded, strlen(encoded)), links(hashes, count));
 	}
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
@@ -632,12 +634,41 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index','view') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	return SPI_processed != 0;
+	return dg_database_member(db, "table", name) || dg_database_member(db, "index", name) ||
+		dg_database_member(db, "view", name);
 }
 
 static CatalogView *provider_view(bytea *database);
+
+static int
+compare_members(const void *a, const void *b)
+{
+	const DGMember *left = a;
+	const DGMember *right = b;
+	int			kind = strcmp(left->kind, right->kind);
+	int			length = Min(VARSIZE_ANY_EXHDR(left->hash), VARSIZE_ANY_EXHDR(right->hash));
+	int			bytes;
+
+	if (kind)
+		return kind;
+	bytes = memcmp(VARDATA_ANY(left->hash), VARDATA_ANY(right->hash), length);
+	if (bytes)
+		return bytes;
+	return (int) VARSIZE_ANY_EXHDR(left->hash) - (int) VARSIZE_ANY_EXHDR(right->hash);
+}
+
+/* The members of |database| ordered by kind, then hash. */
+static DGMember *
+sorted_members(bytea *database, int *count)
+{
+	DGMember   *members = dg_database_members(database, count);
+
+	qsort(members, *count, sizeof(DGMember), compare_members);
+	return members;
+}
+static CatalogView *provider_branch_view(const char *branch, bytea *database);
 static char *json_value(const char *json, const char *key);
+static char *json_set_string(const char *json, const char *key, const char *value);
 
 static char *database_dependents(const char *json, Datum *members, int count);
 static char *routine_body_encode(HeapTuple tuple, char **dependencies);
@@ -694,7 +725,9 @@ static Capture
 capture_canonical(bytea *database, bool persist, bool definitions_only)
 {
 	Capture		result = {0};
-	CatalogView *view = provider_view(database);
+
+	/* The working schema of the session's branch, whose view is current. */
+	CatalogView *view = provider_branch_view(dg_current_branch(), database);
 	bytea	  **objects;
 	char	  **kinds;
 	Datum	   *members;
@@ -702,15 +735,15 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 				i;
 	StringInfoData json;
 
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
+	DGMember   *listed = sorted_members(database, &n);
+
 	objects = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	members = palloc_array(Datum, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		objects[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
+		objects[i] = listed[i].hash;
+		kinds[i] = (char *) listed[i].kind;
 	}
 	initStringInfo(&json);
 	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
@@ -733,26 +766,40 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 
 			if (!definitions_only)
 			{
-				DGStorage  *storage;
-				DGState    *state;
+				PLHash		content;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-				state = dg_storage_load(storage);
-				dg_storage_close(storage);
-				if (state->has_root)
+				if (dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content))
 				{
 					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
+					char	   *root;
+					char	   *recorded = json_value(payload, "content");
 
 					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-					memcpy(VARDATA(raw), state->content.root.bytes, PL_HASH_SIZE);
-					run("SELECT jsonb_set($1::jsonb,'{content}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payload), CStringGetTextDatum(hex(raw))), NULL, true);
-					payload = strcell(0, 1);
-					if (persist)
-						members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+					memcpy(VARDATA(raw), content.bytes, PL_HASH_SIZE);
+					root = hex(raw);
+
+					/*
+					 * A member that already records these contents is the
+					 * member this capture would make: its retained tree is
+					 * that root's. Only changed contents are loaded to be
+					 * retained.
+					 */
+					if (!recorded || strcmp(recorded, root))
+					{
+						payload = json_set_string(payload, "content", root);
+						if (persist)
+						{
+							DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+							DGState    *state = dg_storage_load(storage);
+
+							dg_storage_close(storage);
+							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+							dg_release(state);
+						}
+					}
 				}
-				dg_release(state);
 			}
 			appendStringInfoString(&json, payload);
 		}
@@ -797,11 +844,359 @@ capture(bool persist)
 	return capture_mode(persist, false);
 }
 
+/*
+ * Recently parsed definitions, by text. Decoding a schema reads many fields of
+ * each definition, so each is parsed once rather than once per field.
+ */
+#define PARSED_JSON_ENTRIES 32
+typedef struct ParsedJson
+{
+	char	   *text;
+	Size		len;
+	uint32		hash;
+	Jsonb	   *value;
+} ParsedJson;
+static ParsedJson parsed_json[PARSED_JSON_ENTRIES];
+static int	parsed_json_next;
+
+static Jsonb *
+json_parse(const char *json)
+{
+	Size		len = strlen(json);
+	uint32		hash = hash_bytes((const unsigned char *) json, len);
+	ParsedJson *entry;
+	Jsonb	   *value;
+	MemoryContext previous;
+
+	for (int i = 0; i < PARSED_JSON_ENTRIES; i++)
+	{
+		entry = &parsed_json[i];
+		if (entry->value && entry->hash == hash && entry->len == len && !memcmp(entry->text, json, len))
+			return entry->value;
+	}
+	value = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
+	entry = &parsed_json[parsed_json_next];
+	parsed_json_next = (parsed_json_next + 1) % PARSED_JSON_ENTRIES;
+	if (entry->value)
+	{
+		pfree(entry->text);
+		pfree(entry->value);
+	}
+	previous = MemoryContextSwitchTo(TopMemoryContext);
+	entry->text = pnstrdup(json, len);
+	entry->value = palloc(VARSIZE(value));
+	memcpy(entry->value, value, VARSIZE(value));
+	MemoryContextSwitchTo(previous);
+	entry->len = len;
+	entry->hash = hash;
+	return entry->value;
+}
+
+/* A JSON value as text, as the ->> operator gives it. */
+static char *
+json_text(JsonbValue *value)
+{
+	switch (value->type)
+	{
+		case jbvNull:
+			return NULL;
+		case jbvBool:
+			return pstrdup(value->val.boolean ? "true" : "false");
+		case jbvString:
+			return pnstrdup(value->val.string.val, value->val.string.len);
+		case jbvNumeric:
+			return DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(value->val.numeric)));
+		case jbvBinary:
+			{
+				StringInfoData text;
+
+				initStringInfo(&text);
+				(void) JsonbToCString(&text, value->val.binary.data, value->val.binary.len);
+				return text.data;
+			}
+		default:
+			elog(ERROR, "unrecognized jsonb type: %d", (int) value->type);
+			return NULL;
+	}
+}
+
+/* Field |key| of JSON object |json| as text, as $1::jsonb->>$2 gives it. */
 static char *
 json_value(const char *json, const char *key)
 {
-	run("SELECT $1::jsonb->>$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(key)), NULL, true);
-	return strcell(0, 1);
+	Jsonb	   *parsed = json_parse(json);
+	JsonbValue	buffer;
+	JsonbValue *value;
+
+	if (!JB_ROOT_IS_OBJECT(parsed))
+		return NULL;
+	value = getKeyJsonValueFromContainer(&parsed->root, key, strlen(key), &buffer);
+	return value ? json_text(value) : NULL;
+}
+
+/*
+ * Definition JSON read natively. A document is a jbvBinary value over a copy
+ * of its parsed container, valid for the caller's memory context.
+ */
+static JsonbValue
+json_document(const char *json)
+{
+	Jsonb	   *parsed = json_parse(json);
+	Jsonb	   *copy = palloc(VARSIZE(parsed));
+	JsonbValue	result;
+
+	memcpy(copy, parsed, VARSIZE(parsed));
+	result.type = jbvBinary;
+	result.val.binary.data = &copy->root;
+	result.val.binary.len = VARSIZE(copy) - VARHDRSZ;
+	return result;
+}
+
+/* Field |key| of object |object|; false when it is absent or JSON null. */
+static bool
+json_get(JsonbValue *object, const char *key, JsonbValue *result)
+{
+	if (object->type != jbvBinary || !JsonContainerIsObject(object->val.binary.data))
+		return false;
+	if (!getKeyJsonValueFromContainer(object->val.binary.data, key, strlen(key), result))
+		return false;
+	return result->type != jbvNull;
+}
+
+/* The number of elements of |array|, 0 if it is not an array. */
+static int
+json_length(JsonbValue *array)
+{
+	if (array->type != jbvBinary || !JsonContainerIsArray(array->val.binary.data) ||
+		JsonContainerIsScalar(array->val.binary.data))
+		return 0;
+	return JsonContainerSize(array->val.binary.data);
+}
+
+/* Element |index| of |array|. */
+static JsonbValue
+json_element(JsonbValue *array, int index)
+{
+	JsonbValue *element = getIthJsonbValueFromContainer(array->val.binary.data, index);
+
+	if (!element)
+		elog(ERROR, "JSON array element %d is missing", index);
+	return *element;
+}
+
+/* Element |index| of |array| as ->> gives it, or NULL. */
+static char *
+json_item_text(JsonbValue *array, int index)
+{
+	JsonbValue	element;
+
+	if (index >= json_length(array))
+		return NULL;
+	element = json_element(array, index);
+	return json_text(&element);
+}
+
+/* Element |index| of |array| as JSON text, as (->)::text gives it, or NULL. */
+static char *
+json_item_json(JsonbValue *array, int index)
+{
+	JsonbValue	element;
+	Jsonb	   *encoded;
+
+	if (index >= json_length(array))
+		return NULL;
+	element = json_element(array, index);
+	encoded = JsonbValueToJsonb(&element);
+	return JsonbToCString(NULL, &encoded->root, VARSIZE(encoded));
+}
+
+/*
+ * |json| with string field |key| set to |value|, as
+ * jsonb_set($1::jsonb,'{key}',to_jsonb($2::text))::text gives it.
+ */
+static char *
+json_set_string(const char *json, const char *key, const char *value)
+{
+	StringInfoData encoded;
+	Datum		path = CStringGetTextDatum(key);
+	Datum		result;
+
+	initStringInfo(&encoded);
+	escape_json(&encoded, value);
+	result = DirectFunctionCall4(jsonb_set,
+								 DirectFunctionCall1(jsonb_in, CStringGetDatum(json)),
+								 PointerGetDatum(construct_array_builtin(&path, 1, TEXTOID)),
+								 DirectFunctionCall1(jsonb_in, CStringGetDatum(encoded.data)),
+								 BoolGetDatum(true));
+	return DatumGetCString(DirectFunctionCall1(jsonb_out, result));
+}
+
+/*
+ * The elements of array field |key| of |json|, as jsonb_array_elements gives
+ * them, and their number in |count|: none if the field is absent.
+ */
+static JsonbValue *
+json_elements(const char *json, const char *key, int *count)
+{
+	JsonbValue	document = json_document(json);
+	JsonbValue	array;
+	JsonbValue *result;
+
+	*count = json_get(&document, key, &array) ? json_length(&array) : 0;
+	result = palloc_array(JsonbValue, Max(*count, 1));
+	for (int i = 0; i < *count; i++)
+		result[i] = json_element(&array, i);
+	return result;
+}
+
+/* |text| as ::int reads it; 0 for NULL, as an internal query's cell reads. */
+static int
+json_int(const char *text)
+{
+	return text ? DatumGetInt32(DirectFunctionCall1(int4in, CStringGetDatum(text))) : 0;
+}
+
+/* |text| as ::bool reads it; false for NULL. */
+static bool
+json_bool(const char *text)
+{
+	return text && DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(text)));
+}
+
+/*
+ * JSON built natively, as the SQL jsonb functions build it: jsonb_build_object
+ * keeps null values, jsonb_strip_nulls drops them, and keys come out in jsonb
+ * order.
+ */
+static JsonbValue
+jv_string(const char *text)
+{
+	JsonbValue	value;
+
+	value.type = jbvString;
+	value.val.string.val = pstrdup(text);
+	value.val.string.len = strlen(text);
+	return value;
+}
+
+static JsonbValue
+jv_null(void)
+{
+	JsonbValue	value;
+
+	value.type = jbvNull;
+	return value;
+}
+
+static JsonbValue
+jv_int(int number)
+{
+	JsonbValue	value;
+
+	value.type = jbvNumeric;
+	value.val.numeric = DatumGetNumeric(DirectFunctionCall1(int4_numeric, Int32GetDatum(number)));
+	return value;
+}
+
+static JsonbValue
+jv_bool(bool flag)
+{
+	JsonbValue	value;
+
+	value.type = jbvBool;
+	value.val.boolean = flag;
+	return value;
+}
+
+static JsonbValue
+jv_jsonb(Jsonb *jsonb)
+{
+	JsonbValue	value;
+
+	value.type = jbvBinary;
+	value.val.binary.data = &jsonb->root;
+	value.val.binary.len = VARSIZE(jsonb) - VARHDRSZ;
+	return value;
+}
+
+/* An object of |count| |keys| and |values|; with |strip|, without nulls. */
+static Jsonb *
+jb_object(int count, const char *const *keys, JsonbValue *values, bool strip)
+{
+	JsonbParseState *state = NULL;
+
+	pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+	for (int i = 0; i < count; i++)
+	{
+		JsonbValue	key = jv_string(keys[i]);
+
+		if (strip && values[i].type == jbvNull)
+			continue;
+		pushJsonbValue(&state, WJB_KEY, &key);
+		pushJsonbValue(&state, WJB_VALUE, &values[i]);
+	}
+	return JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+}
+
+/* An array of |count| |values|. */
+static Jsonb *
+jb_array(int count, JsonbValue *values)
+{
+	JsonbParseState *state = NULL;
+
+	pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
+	for (int i = 0; i < count; i++)
+		pushJsonbValue(&state, WJB_ELEM, &values[i]);
+	return JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_ARRAY, NULL));
+}
+
+/* |a| || |b|. */
+static Jsonb *
+jb_merge(Jsonb *a, Jsonb *b)
+{
+	return DatumGetJsonbP(DirectFunctionCall2(jsonb_concat, JsonbPGetDatum(a), JsonbPGetDatum(b)));
+}
+
+/* |object| - |key|. */
+static Jsonb *
+jb_without(Jsonb *object, const char *key)
+{
+	return DatumGetJsonbP(DirectFunctionCall2(jsonb_delete, JsonbPGetDatum(object), CStringGetTextDatum(key)));
+}
+
+/* |json| with field |key| set to |value|, as jsonb_set(...)::text gives it. */
+static char *
+json_set_jsonb(const char *json, const char *key, Jsonb *value)
+{
+	Datum		path = CStringGetTextDatum(key);
+	Datum		result = DirectFunctionCall4(jsonb_set,
+											 DirectFunctionCall1(jsonb_in, CStringGetDatum(json)),
+											 PointerGetDatum(construct_array_builtin(&path, 1, TEXTOID)),
+											 JsonbPGetDatum(value),
+											 BoolGetDatum(true));
+
+	return DatumGetCString(DirectFunctionCall1(jsonb_out, result));
+}
+
+/*
+ * Whether definitions |a| and |b| store alike: a schema object holds a
+ * definition's fields as jsonb text, so formatting does not matter.
+ */
+static bool
+json_same(const char *a, const char *b)
+{
+	return !strcmp(a, b) ||
+		!strcmp(DatumGetCString(DirectFunctionCall1(jsonb_out, DirectFunctionCall1(jsonb_in, CStringGetDatum(a)))),
+				DatumGetCString(DirectFunctionCall1(jsonb_out, DirectFunctionCall1(jsonb_in, CStringGetDatum(b)))));
+}
+
+/* Field |key| of |object| as ->> gives it, or NULL. */
+static char *
+json_field_text(JsonbValue *object, const char *key)
+{
+	JsonbValue	value;
+
+	return json_get(object, key, &value) ? json_text(&value) : NULL;
 }
 
 /* Doltgres derives the default committer email from the role and the client

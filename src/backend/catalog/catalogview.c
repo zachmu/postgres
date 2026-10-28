@@ -26,6 +26,8 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_class_d.h"
 #include "utils/inval.h"
+#include "utils/fmgroids.h"
+#include "utils/typcache.h"
 
 /*
  * Durable OIDs belong to a branch, not to one view: each schema version of
@@ -77,8 +79,43 @@ struct CatalogView
 	List	   *caches;
 	List	   *handles;
 	List	   *durable;		/* CatalogViewObjects bound to durable OIDs */
+	List	   *indexes;		/* CatalogViewIndexes over the rows */
+	MemoryContext index_memory;
+	CatalogViewBase *base;		/* shared rows each catalog's rows begin with */
 	dlist_node	link;
 };
+
+/* Rows several views share, which none of them copies. */
+struct CatalogViewBase
+{
+	MemoryContext memory;
+	uint64		references;
+	List	   *catalogs;		/* CatalogViewRows */
+};
+
+/*
+ * The rows of one catalog by the value of one of their OID columns, built
+ * when first asked for and forgotten whenever the view's rows change.
+ */
+typedef struct CatalogViewIndex
+{
+	Oid			catalog;
+	AttrNumber	attribute;
+	HTAB	   *entries;		/* CatalogViewIndexEntry */
+} CatalogViewIndex;
+
+typedef struct CatalogViewIndexEntry
+{
+	Oid			value;
+	List	   *tuples;
+} CatalogViewIndexEntry;
+
+static void
+forget_indexes(CatalogView *view)
+{
+	view->indexes = NIL;
+	MemoryContextReset(view->index_memory);
+}
 typedef struct CatalogViewPin
 {
 	MemoryContextCallback callback;
@@ -137,6 +174,7 @@ CatalogViewCreate(const char *identity)
 
 	view->memory = memory;
 	view->rows_memory = AllocSetContextCreate(memory, "catalog view rows", ALLOCSET_DEFAULT_SIZES);
+	view->index_memory = AllocSetContextCreate(memory, "catalog view indexes", ALLOCSET_SMALL_SIZES);
 	view->touched = ++view_clock;
 	if (!prune_registered)
 	{
@@ -144,6 +182,7 @@ CatalogViewCreate(const char *identity)
 		prune_registered = true;
 	}
 	view->identity = pstrdup(identity);
+	MemoryContextSetIdentifier(memory, view->identity);
 	if (!next_view_serial)
 		elog(ERROR, "catalog context identifier space exhausted");
 	view->serial = next_view_serial++;
@@ -163,6 +202,7 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 
 	if (view->sealed && !view->loading)
 		elog(ERROR, "cannot modify published catalog view");
+	forget_indexes(view);
 	foreach(lc, view->catalogs)
 	{
 		if (((CatalogViewRows *) lfirst(lc))->catalog != catalog)
@@ -182,6 +222,14 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	MemoryContextSwitchTo(view->rows_memory);
 	rows = palloc0(sizeof(*rows));
 	rows->catalog = catalog;
+	if (view->base)
+	{
+		foreach_ptr(CatalogViewRows, shared, view->base->catalogs)
+		{
+			if (shared->catalog == catalog)
+				rows->tuples = list_copy(shared->tuples);
+		}
+	}
 	foreach(lc, tuples)
 	{
 		HeapTuple	tuple = heap_copytuple(lfirst(lc));
@@ -196,6 +244,56 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	}
 	view->catalogs = lappend(view->catalogs, rows);
 	MemoryContextSwitchTo(previous);
+}
+
+CatalogViewBase *
+CatalogViewBaseCreate(void)
+{
+	MemoryContext memory = AllocSetContextCreate(TopMemoryContext, "catalog view base", ALLOCSET_DEFAULT_SIZES);
+	CatalogViewBase *base = MemoryContextAllocZero(memory, sizeof(*base));
+
+	base->memory = memory;
+	base->references = 1;
+	return base;
+}
+
+/* Copy |tuples| into |base| as its rows of |catalog|. */
+void
+CatalogViewBaseAddRows(CatalogViewBase *base, Oid catalog, List *tuples)
+{
+	MemoryContext previous = MemoryContextSwitchTo(base->memory);
+	CatalogViewRows *rows = palloc0(sizeof(*rows));
+	uint32		ordinal = 0;
+
+	rows->catalog = catalog;
+	foreach_ptr(HeapTupleData, source, tuples)
+	{
+		HeapTuple	tuple = heap_copytuple(source);
+
+		ItemPointerSet(&tuple->t_self, CatalogViewBaseBlock + ordinal / MaxOffsetNumber, ordinal % MaxOffsetNumber + 1);
+		ordinal++;
+		rows->tuples = lappend(rows->tuples, tuple);
+	}
+	base->catalogs = lappend(base->catalogs, rows);
+	MemoryContextSwitchTo(previous);
+}
+
+void
+CatalogViewBaseRelease(CatalogViewBase *base)
+{
+	Assert(base->references > 0);
+	if (--base->references == 0)
+		MemoryContextDelete(base->memory);
+}
+
+/* Begin each catalog |view| is given with |base|'s rows of it. */
+void
+CatalogViewSetBase(CatalogView *view, CatalogViewBase *base)
+{
+	if (view->base)
+		CatalogViewBaseRelease(view->base);
+	view->base = base;
+	base->references++;
 }
 
 void
@@ -231,6 +329,12 @@ CatalogViewRetain(CatalogView *view)
 	view->references++;
 }
 
+uint64
+CatalogViewReferences(CatalogView *view)
+{
+	return view->references;
+}
+
 void
 CatalogViewRelease(CatalogView *view)
 {
@@ -249,6 +353,8 @@ CatalogViewRelease(CatalogView *view)
 		hash_search(objects, &handle, HASH_REMOVE, NULL);
 	}
 	dlist_delete(&view->link);
+	if (view->base)
+		CatalogViewBaseRelease(view->base);
 	MemoryContextDelete(view->memory);
 }
 
@@ -337,6 +443,7 @@ release_scan_pin(void *arg)
 		{
 			view->baseline = view->catalogs = view->changes = NIL;
 			MemoryContextReset(view->rows_memory);
+			forget_indexes(view);
 		}
 		CatalogViewRelease(view);
 	}
@@ -406,6 +513,21 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 		if (rows->catalog == RelationGetRelid(relation))
 		{
 			scan->rows = rows->tuples;
+			break;
+		}
+	}
+
+	/* An OID equality key selects its rows through an index. */
+	for (i = 0; i < nkeys && !(CatalogViewIsProvisional(view) && snapshot && snapshot->snapshot_type == SNAPSHOT_SELF); i++)
+	{
+		int			attr = keys[i].sk_attno;
+
+		if (keys[i].sk_flags == 0 && keys[i].sk_strategy == BTEqualStrategyNumber &&
+			keys[i].sk_func.fn_oid == F_OIDEQ && attr > 0 &&
+			TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID)
+		{
+			scan->rows = CatalogViewTuplesWith(view, RelationGetRelid(relation), attr, DatumGetObjectId(keys[i].sk_argument));
+			scan->owns_rows = true;
 			break;
 		}
 	}
@@ -1055,17 +1177,35 @@ CatalogViewEnsureLoaded(CatalogView *view)
 		view->loaded = false;
 		view->catalogs = NIL;
 		MemoryContextReset(view->rows_memory);
+		forget_indexes(view);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	view->loading = false;
 }
 
+static void forget_descriptors(CatalogView *view);
+
 static void
 prune_catalog_views(XactEvent event, void *arg)
 {
+	dlist_mutable_iter miter;
+
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
 		return;
+
+	/* Descriptors open while DDL retired its view are closed by now. */
+	dlist_foreach_modify(miter, &views)
+	{
+		CatalogView *view = dlist_container(CatalogView, link, miter.cur);
+
+		if (view->retired)
+		{
+			CatalogViewRetain(view);
+			forget_descriptors(view);
+			CatalogViewRelease(view);
+		}
+	}
 	for (;;)
 	{
 		dlist_iter	it;
@@ -1106,6 +1246,7 @@ prune_catalog_views(XactEvent event, void *arg)
 		oldest->catalogs = NIL;
 		oldest->loaded = false;
 		MemoryContextReset(oldest->rows_memory);
+		forget_indexes(oldest);
 		MemoryContextSwitchTo(previous);
 	}
 }
@@ -1410,6 +1551,7 @@ refresh_mutation(CatalogView *view)
 	}
 	view->catalogs = catalogs;
 	view->dirty = false;
+	forget_indexes(view);
 	MemoryContextSwitchTo(previous);
 	foreach(lc, view->caches)
 		ResetCatalogCache(lfirst(lc), false);
@@ -1449,6 +1591,105 @@ CatalogViewTuples(CatalogView *view, Oid catalog)
 	return NIL;
 }
 
+/*
+ * Call |callback| for every tuple a provisional view's mutation staged, and
+ * for every published tuple one of them replaced or deleted.
+ */
+/*
+ * The rows of |catalog| whose OID column |attribute| holds |value|, in view
+ * order, through an index built on first use. The list is the caller's: the
+ * index is forgotten when the rows change, as they do between commands of a
+ * provisional view.
+ */
+List *
+CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid value)
+{
+	CatalogViewIndex *index = NULL;
+	CatalogViewIndexEntry *entry;
+
+	CatalogViewEnsureLoaded(view);
+	foreach_ptr(CatalogViewIndex, candidate, view->indexes)
+	{
+		if (candidate->catalog == catalog && candidate->attribute == attribute)
+			index = candidate;
+	}
+	if (!index)
+	{
+		MemoryContext previous = MemoryContextSwitchTo(view->index_memory);
+		Relation	rel = RelationIdGetRelation(catalog);
+		TupleDesc	desc = RelationGetDescr(rel);
+		HASHCTL		ctl = {0};
+
+		if (TupleDescAttr(desc, attribute - 1)->atttypid != OIDOID)
+			elog(ERROR, "catalog view index requires an OID column");
+		index = palloc(sizeof(*index));
+		index->catalog = catalog;
+		index->attribute = attribute;
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(CatalogViewIndexEntry);
+		ctl.hcxt = view->index_memory;
+		index->entries = hash_create("catalog view index", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		foreach_ptr(HeapTupleData, tuple, CatalogViewTuples(view, catalog))
+		{
+			bool		isnull;
+			Datum		key = heap_getattr(tuple, attribute, desc, &isnull);
+			Oid			oid = isnull ? InvalidOid : DatumGetObjectId(key);
+			bool		found;
+
+			entry = hash_search(index->entries, &oid, HASH_ENTER, &found);
+			if (!found)
+				entry->tuples = NIL;
+			entry->tuples = lappend(entry->tuples, tuple);
+		}
+		RelationClose(rel);
+		view->indexes = lappend(view->indexes, index);
+		MemoryContextSwitchTo(previous);
+	}
+	entry = hash_search(index->entries, &value, HASH_FIND, NULL);
+	return entry ? list_copy(entry->tuples) : NIL;
+}
+
+void
+CatalogViewForEachChange(CatalogView *view, void (*callback) (Oid catalog, HeapTuple tuple, void *arg), void *arg)
+{
+	ListCell   *lc;
+
+	Assert(CatalogViewIsProvisional(view));
+	foreach(lc, view->changes)
+	{
+		CatalogChange *change = lfirst(lc);
+
+		if (change->aborted)
+			continue;
+		if (change->tuple)
+			callback(change->catalog, change->tuple, arg);
+		foreach_ptr(CatalogViewRows, rows, view->baseline)
+		{
+			if (rows->catalog != change->catalog)
+				continue;
+			foreach_ptr(HeapTupleData, tuple, rows->tuples)
+			{
+				if (ItemPointerEquals(&tuple->t_self, &change->tid))
+					callback(change->catalog, tuple, arg);
+			}
+		}
+	}
+}
+
+/* Drop the unused relation and type descriptors of |view|'s objects. */
+static void
+forget_descriptors(CatalogView *view)
+{
+	foreach_oid(handle, view->handles)
+	{
+		CatalogViewObject *object = hash_search(objects, &handle, HASH_FIND, NULL);
+
+		if (object && object->objectclass == RelationRelationId)
+			InvalidateLocalRelation(handle);
+	}
+	TypeCacheForgetCatalogView(view);
+}
+
 void
 CatalogViewRetireMutation(CatalogView *view)
 {
@@ -1456,19 +1697,22 @@ CatalogViewRetireMutation(CatalogView *view)
 
 	if (!view->provisional || view == CatalogViewCurrent())
 		elog(ERROR, "invalid provisional catalog retirement");
-	view->retired = true;
-
 	/*
-	 * Existing local handle references fail explicitly after the statement.
-	 * Keep identity records until native type/relcache consumers release
-	 * them.
+	 * Unused descriptors of its relations and types go now, so that nothing
+	 * keeps the view; one still open is rebuilt while the view can serve it,
+	 * and goes at transaction end.
 	 */
+	forget_descriptors(view);
+
+	/* Existing local handle references fail explicitly after the statement. */
+	view->retired = true;
 	foreach(lc, view->caches)
 		ResetCatalogCache(lfirst(lc), false);
 	if (!view->scan_references)
 	{
 		view->baseline = view->catalogs = view->changes = NIL;
 		MemoryContextReset(view->rows_memory);
+		forget_indexes(view);
 	}
 }
 

@@ -30,14 +30,16 @@ database_members(bytea *db, int *count)
 		*count = 0;
 		return NULL;
 	}
-	run("SELECT o.objhash,o.objkind,CASE WHEN o.objkind='namespace' THEN NULL ELSE convert_from(o.objpayload,'UTF8')::jsonb->>'name' END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind,o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(db)), NULL, true);
-	*count = SPI_processed;
-	result = palloc0(sizeof(Member) * Max(*count, 1));
-	for (i = 0; i < *count; i++)
 	{
-		result[i].hash = DatumGetByteaPCopy(cell(i, 1));
-		result[i].kind = strcell(i, 2);
-		result[i].name = strcell(i, 3);
+		DGMember   *listed = sorted_members(db, count);
+
+		result = palloc0(sizeof(Member) * Max(*count, 1));
+		for (i = 0; i < *count; i++)
+		{
+			result[i].hash = listed[i].hash;
+			result[i].kind = (char *) listed[i].kind;
+			result[i].name = (char *) listed[i].name;
+		}
 	}
 	for (i = 0; i < *count; i++)
 	{

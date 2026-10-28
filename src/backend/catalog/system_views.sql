@@ -1423,8 +1423,12 @@ ALTER TABLE pg_catalog.pg_dolt_identity ALTER COLUMN identbranch SET STORAGE PLA
 ALTER TABLE pg_catalog.pg_dolt_identity ALTER COLUMN identname SET STORAGE PLAIN;
 REVOKE ALL ON pg_catalog.pg_dolt_chunk, pg_catalog.pg_dolt_root, pg_catalog.pg_dolt_lock, pg_catalog.pg_dolt_identity FROM PUBLIC;
 
+-- Independent transactions may insert the same content-addressed object; the
+-- copies are identical, so one per hash is shown. Unlike DISTINCT, this lets a
+-- query's hash qualifications reach the objhash index.
 CREATE VIEW pg_dolt_object_visible AS
- SELECT DISTINCT objhash,objkind,objpayload,objchildren FROM pg_dolt_object;
+ SELECT o.objhash,o.objkind,o.objpayload,o.objchildren FROM pg_dolt_object o
+  WHERE NOT EXISTS (SELECT 1 FROM pg_dolt_object d WHERE d.objhash=o.objhash AND d.objid<o.objid);
 REVOKE ALL ON pg_dolt_object_visible FROM PUBLIC;
 
 -- Dolt system tables live in the dolt schema (dolt.branches) and have

@@ -221,24 +221,26 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 			(DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId ||
 			 (CatalogViewIsDurable(DatumGetObjectId(keys[i])) && dg_catalog_provides(cache->cc_reloid))))
 			bound = true;
+
+	/* Which keys are OIDs decides the view, so the key types must be known. */
+	if ((bound || view) && !cache->cc_tupdesc)
+	{
+		CatalogView *previous = CatalogViewSwitch(NULL);
+
+		PG_TRY();
+		{
+			InitCatCachePhase2(cache, false);
+		}
+		PG_FINALLY();
+		{
+			CatalogViewSwitch(previous);
+		}
+		PG_END_TRY();
+	}
 	if (bound)
 	{
 		CatalogView *selected;
 
-		if (!cache->cc_tupdesc)
-		{
-			CatalogView *previous = CatalogViewSwitch(NULL);
-
-			PG_TRY();
-			{
-				InitCatCachePhase2(cache, false);
-			}
-			PG_FINALLY();
-			{
-				CatalogViewSwitch(previous);
-			}
-			PG_END_TRY();
-		}
 		selected = CatalogViewSelectKeys(NULL, cache->cc_tupdesc, nkeys, cache->cc_keyno, keys);
 		if (selected)
 			view = selected;

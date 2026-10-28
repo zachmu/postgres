@@ -42,20 +42,21 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 {
 	Relation	catalog = table_open(AttributeRelationId, AccessShareLock);
 	Relation	defaults = table_open(AttrDefaultRelationId, AccessShareLock);
-	ListCell   *lc;
-	StringInfoData columns;
 	HeapTuple	attributes[MaxHeapAttributeNumber] = {0};
+	JsonbValue	document = json_document(definition);
+	JsonbValue	oldcolumns;
+	int			oldcount;
+	JsonbValue *columns = palloc_array(JsonbValue, MaxHeapAttributeNumber);
+	List	   *defaultrows = CatalogViewTuplesWith(view, AttrDefaultRelationId, Anum_pg_attrdef_adrelid, relation);
 
 	*mapping = palloc_array(int, MaxHeapAttributeNumber);
 	*count = 0;
-	initStringInfo(&columns);
-	appendStringInfoChar(&columns, '[');
-	foreach(lc, CatalogViewTuples(view, AttributeRelationId))
+	oldcount = json_get(&document, "columns", &oldcolumns) ? json_length(&oldcolumns) : 0;
+	foreach_ptr(HeapTupleData, tuple, CatalogViewTuplesWith(view, AttributeRelationId, Anum_pg_attribute_attrelid, relation))
 	{
-		HeapTuple	tuple = lfirst(lc);
 		Form_pg_attribute attr = (Form_pg_attribute) GETSTRUCT(tuple);
 
-		if (attr->attrelid == relation && attr->attnum > 0)
+		if (attr->attnum > 0)
 			attributes[attr->attnum - 1] = tuple;
 	}
 
@@ -63,23 +64,15 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 	{
 		HeapTuple	tuple = attributes[ordinal];
 		Form_pg_attribute attr;
-		char	   *column,
-				   *typename;
-
-		bool		statsnull,
-					optionsnull;
-		Datum		stats,
-					options;
-		char		nulls[8] = "       ";
-		char		storage[2] = {0};
-		char		compression[2] = {0};
+		char	   *typename;
+		char	   *sql = NULL;
+		Jsonb	   *column;
+		JsonbValue	old;
+		bool		has_old;
 
 		if (!tuple)
 			continue;
 		attr = (Form_pg_attribute) GETSTRUCT(tuple);
-		storage[0] = attr->attstorage;
-		compression[0] = attr->attcompression;
-
 		if (attr->attisdropped)
 			continue;
 		if (attr->atthasmissing && !native_mutation_destination)
@@ -96,23 +89,77 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 				typename = routine_type_name(attr->atttypid);
 			ReleaseSysCache(type);
 		}
-		run("SELECT (coalesce($1::jsonb->'columns'->$2,'{}'::jsonb) || jsonb_build_object('name',$3::text,'comment',$1::jsonb->'columns'->$2->'comment','type',$4::text,'typmod',$5::int,'notnull',false,'collation',CASE WHEN $6::oid=0 THEN NULL ELSE (SELECT jsonb_build_array(n.nspname,c.collname,c.collprovider,c.collisdeterministic,c.collcollate,c.collctype,c.colllocale,c.collversion) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=$6) END))::text", 6, VC_TYPES(TEXTOID, INT4OID, TEXTOID, TEXTOID, INT4OID, OIDOID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(ordinal), CStringGetTextDatum(NameStr(attr->attname)), CStringGetTextDatum(typename), Int32GetDatum(attr->atttypmod), ObjectIdGetDatum(attr->attcollation)), NULL, true);
-		column = strcell(0, 1);
+
+		/*
+		 * The column's earlier definition, with its name, type and collation
+		 * restated. The comment is kept, or null.
+		 */
+		has_old = ordinal < oldcount;
+		if (has_old)
+			old = json_element(&oldcolumns, ordinal);
 		{
-			ListCell   *dc;
-			char	   *sql = NULL;
+			static const char *const keys[] = {"name", "comment", "type", "typmod", "notnull", "collation"};
+			JsonbValue	values[6];
+			JsonbValue	comment;
+
+			values[0] = jv_string(NameStr(attr->attname));
+			values[1] = has_old && old.type == jbvBinary && JsonContainerIsObject(old.val.binary.data) &&
+				getKeyJsonValueFromContainer(old.val.binary.data, "comment", 7, &comment) ? comment : jv_null();
+			values[2] = jv_string(typename);
+			values[3] = jv_int(attr->atttypmod);
+			values[4] = jv_bool(false);
+			values[5] = jv_null();
+			if (OidIsValid(attr->attcollation))
+			{
+				/* Collations are the database's own, as internal SQL reads them. */
+				CatalogView *previous = CatalogViewSwitch(NULL);
+				HeapTuple	collation = SearchSysCache1(COLLOID, ObjectIdGetDatum(attr->attcollation));
+
+				if (HeapTupleIsValid(collation))
+				{
+					Form_pg_collation form = (Form_pg_collation) GETSTRUCT(collation);
+					HeapTuple	namespace = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(form->collnamespace));
+
+					if (HeapTupleIsValid(namespace))
+					{
+						JsonbValue	items[8];
+						char		provider[2] = {form->collprovider, '\0'};
+						const int	fields[] = {Anum_pg_collation_collcollate, Anum_pg_collation_collctype, Anum_pg_collation_colllocale, Anum_pg_collation_collversion};
+
+						items[0] = jv_string(NameStr(((Form_pg_namespace) GETSTRUCT(namespace))->nspname));
+						items[1] = jv_string(NameStr(form->collname));
+						items[2] = jv_string(provider);
+						items[3] = jv_bool(form->collisdeterministic);
+						for (int f = 0; f < lengthof(fields); f++)
+						{
+							bool		isnull;
+							Datum		field = SysCacheGetAttr(COLLOID, collation, fields[f], &isnull);
+
+							items[4 + f] = isnull ? jv_null() : jv_string(TextDatumGetCString(field));
+						}
+						values[5] = jv_jsonb(jb_array(8, items));
+						ReleaseSysCache(namespace);
+					}
+					ReleaseSysCache(collation);
+				}
+				CatalogViewSwitch(previous);
+			}
+			column = has_old ? JsonbValueToJsonb(&old) : jb_object(0, NULL, NULL, false);
+			column = jb_merge(column, jb_object(6, keys, values, false));
+		}
+
+		{
 			CatalogView *previous = CatalogViewSwitch(view);
 
 			PG_TRY();
 			{
-				foreach(dc, CatalogViewTuples(view, AttrDefaultRelationId))
+				foreach_ptr(HeapTupleData, def, defaultrows)
 				{
-					HeapTuple	def = lfirst(dc);
 					Form_pg_attrdef form = (Form_pg_attrdef) GETSTRUCT(def);
 					bool		isnull;
 					Datum		expression;
 
-					if (form->adrelid != relation || form->adnum != attr->attnum)
+					if (form->adnum != attr->attnum)
 						continue;
 					expression = heap_getattr(def, Anum_pg_attrdef_adbin, RelationGetDescr(defaults), &isnull);
 					if (isnull)
@@ -127,56 +174,85 @@ mutation_columns(CatalogView *view, Oid relation, const char *definition, int **
 			PG_END_TRY();
 			if (attr->atthasdef != (sql != NULL))
 				elog(ERROR, "native attribute/default catalogs disagree");
-			{
-				/* A generated column's expression is its default's, with a kind. */
-				char		generated[2] = {attr->attgenerated, '\0'};
+		}
 
-				run("SELECT (($1::jsonb-'default'-'generated') || jsonb_strip_nulls(jsonb_build_object('default',$2::text,'generated',$3::text)))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID),
-					VC_ARGS(CStringGetTextDatum(column), sql ? CStringGetTextDatum(sql) : (Datum) 0, CStringGetTextDatum(generated)),
-					sql ? (attr->attgenerated ? NULL : "  n") : (attr->attgenerated ? " n " : " nn"), true);
-			}
-			column = strcell(0, 1);
+		/* A generated column's expression is its default's, with a kind. */
+		{
+			static const char *const keys[] = {"default", "generated"};
+			JsonbValue	values[2];
+			char		generated[2] = {attr->attgenerated, '\0'};
+
+			values[0] = sql ? jv_string(sql) : jv_null();
+			values[1] = attr->attgenerated ? jv_string(generated) : jv_null();
+			column = jb_merge(jb_without(jb_without(column, "default"), "generated"),
+								 jb_object(2, keys, values, true));
 		}
 
 		/* An identity column names its global sequence, never its OID. */
 		if (attr->attidentity)
 		{
+			static const char *const keys[] = {"identity", "sequence"};
+			JsonbValue	values[2];
 			char		identity[2] = {attr->attidentity, '\0'};
 			CatalogView *outer = CatalogViewSwitch(view);
 			Relation	rel = relation_open(relation, NoLock);
 			Oid			sequence = getIdentitySequence(rel, attr->attnum, false);
-			char	   *name;
 
 			relation_close(rel, NoLock);
 			CatalogViewSwitch(NULL);
-			name = dg_qualified_name(get_namespace_name(get_rel_namespace(sequence)), get_rel_name(sequence));
+			values[0] = jv_string(identity);
+			values[1] = jv_string(dg_qualified_name(get_namespace_name(get_rel_namespace(sequence)), get_rel_name(sequence)));
 			CatalogViewSwitch(outer);
-			run("SELECT ($1::jsonb || jsonb_build_object('identity',$2::text,'sequence',$3::text))::text", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID),
-				VC_ARGS(CStringGetTextDatum(column), CStringGetTextDatum(identity), CStringGetTextDatum(name)), NULL, true);
-			column = strcell(0, 1);
+			column = jb_merge(column, jb_object(2, keys, values, false));
 		}
 		else
+			column = jb_without(jb_without(column, "identity"), "sequence");
+
 		{
-			run("SELECT ($1::jsonb-'identity'-'sequence')::text", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(column)), NULL, true);
-			column = strcell(0, 1);
+			static const char *const keys[] = {"notnull", "statistics", "options", "storage", "compression"};
+			JsonbValue	values[5];
+			bool		isnull;
+			Datum		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &isnull);
+			Datum		options;
+			char		storage[2] = {attr->attstorage, '\0'};
+			char		compression[2] = {attr->attcompression, '\0'};
+
+			values[0] = jv_bool(attr->attnotnull);
+			values[1] = isnull ? jv_null() : jv_int(DatumGetInt16(stats));
+			values[2] = jv_null();
+			options = heap_getattr(tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &isnull);
+			if (!isnull)
+			{
+				Datum	   *items;
+				int			n;
+				JsonbValue *texts;
+
+				/* Sorted as jsonb_agg(v ORDER BY v COLLATE "C") sorts them. */
+				deconstruct_array_builtin(DatumGetArrayTypeP(options), TEXTOID, &items, NULL, &n);
+				if (n > 0)
+				{
+					char	  **strings = palloc_array(char *, n);
+
+					texts = palloc_array(JsonbValue, n);
+					for (int k = 0; k < n; k++)
+						strings[k] = TextDatumGetCString(items[k]);
+					qsort(strings, n, sizeof(char *), pg_qsort_strcmp);
+					for (int k = 0; k < n; k++)
+						texts[k] = jv_string(strings[k]);
+					values[2] = jv_jsonb(jb_array(n, texts));
+				}
+			}
+			values[3] = attr->attstorage == get_typstorage(attr->atttypid) ? jv_null() : jv_string(storage);
+			values[4] = attr->attcompression == '\0' ? jv_null() : jv_string(compression);
+			column = jb_merge(jb_without(jb_without(jb_without(jb_without(column, "statistics"), "options"), "storage"), "compression"),
+								 jb_object(5, keys, values, true));
 		}
-		stats = heap_getattr(tuple, Anum_pg_attribute_attstattarget, RelationGetDescr(catalog), &statsnull);
-		options = heap_getattr(tuple, Anum_pg_attribute_attoptions, RelationGetDescr(catalog), &optionsnull);
-		nulls[2] = statsnull ? 'n' : ' ';
-		nulls[3] = optionsnull ? 'n' : ' ';
-		nulls[4] = attr->attstorage == get_typstorage(attr->atttypid) ? 'n' : ' ';
-		nulls[5] = attr->attcompression == '\0' ? 'n' : ' ';
-		run("SELECT (($1::jsonb-'statistics'-'options'-'storage'-'compression') || jsonb_strip_nulls(jsonb_build_object('notnull',$7::boolean,'statistics',$3::int,'options',(SELECT jsonb_agg(v ORDER BY v COLLATE \"C\") FROM unnest($4::text[]) v),'storage',$5::text,'compression',$6::text)))::text", 7, VC_TYPES(TEXTOID, INT4OID, INT4OID, TEXTARRAYOID, TEXTOID, TEXTOID, BOOLOID), VC_ARGS(CStringGetTextDatum(column), Int32GetDatum(attr->attnum - 1), stats, options, CStringGetTextDatum(storage), CStringGetTextDatum(compression), BoolGetDatum(attr->attnotnull)), nulls, true);
-		if (*count)
-			appendStringInfoChar(&columns, ',');
-		appendStringInfoString(&columns, strcell(0, 1));
+		columns[*count] = jv_jsonb(column);
 		(*mapping)[(*count)++] = ordinal;
 	}
 	table_close(catalog, AccessShareLock);
 	table_close(defaults, AccessShareLock);
-	appendStringInfoChar(&columns, ']');
-	run("SELECT jsonb_set($1::jsonb,'{columns}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(columns.data)), NULL, true);
-	return strcell(0, 1);
+	return json_set_jsonb(definition, "columns", jb_array(*count, columns));
 }
 
 
@@ -278,6 +354,24 @@ dg_catalog_mutation_release(DGState *state)
 		dg_release(state);
 }
 
+/* A serialized constraint and its name. */
+typedef struct ConstraintEntry
+{
+	char	   *name;
+	JsonbValue	value;
+} ConstraintEntry;
+
+static int
+compare_constraint_entries(const void *a, const void *b)
+{
+	const ConstraintEntry *left = a;
+	const ConstraintEntry *right = b;
+
+	if (!left->name || !right->name)
+		return (left->name == NULL) - (right->name == NULL);
+	return strcmp(left->name, right->name);
+}
+
 static char *
 mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 {
@@ -290,14 +384,14 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 	appendStringInfoChar(&json, '[');
 	PG_TRY();
 	{
-		foreach(lc, CatalogViewTuples(view, ConstraintRelationId))
+		foreach(lc, CatalogViewTuplesWith(view, ConstraintRelationId, Anum_pg_constraint_conrelid, relation))
 		{
 			HeapTuple	tuple = lfirst(lc);
 			Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(tuple);
 			char	   *sql;
 
 			/* A constraint trigger defines its constraint. */
-			if (constraint->conrelid != relation || constraint->contype == CONSTRAINT_TRIGGER)
+			if (constraint->contype == CONSTRAINT_TRIGGER)
 				continue;
 			if (constraint->contype != CONSTRAINT_NOTNULL && constraint->contype != CONSTRAINT_PRIMARY && constraint->contype != CONSTRAINT_UNIQUE && constraint->contype != CONSTRAINT_CHECK && constraint->contype != CONSTRAINT_FOREIGN)
 				unsupported("canonical codec for native constraint type");
@@ -345,8 +439,23 @@ mutation_constraints(CatalogView *view, Oid relation, const char *definition)
 	}
 	PG_END_TRY();
 	appendStringInfoChar(&json, ']');
-	run("SELECT jsonb_set($1::jsonb,'{constraints}',coalesce((SELECT jsonb_agg(v ORDER BY (v->>0) COLLATE \"C\") FROM jsonb_array_elements($2::jsonb) v),'[]'::jsonb))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(definition), CStringGetTextDatum(json.data)), NULL, true);
-	return strcell(0, 1);
+	{
+		/* Ordered by name, as jsonb_agg(v ORDER BY (v->>0) COLLATE "C") orders them. */
+		JsonbValue	document = json_document(json.data);
+		int			n = json_length(&document);
+		ConstraintEntry *entries = palloc_array(ConstraintEntry, Max(n, 1));
+		JsonbValue *sorted = palloc_array(JsonbValue, Max(n, 1));
+
+		for (int i = 0; i < n; i++)
+		{
+			entries[i].value = json_element(&document, i);
+			entries[i].name = json_item_text(&entries[i].value, 0);
+		}
+		qsort(entries, n, sizeof(ConstraintEntry), compare_constraint_entries);
+		for (int i = 0; i < n; i++)
+			sorted[i] = entries[i].value;
+		return json_set_jsonb(definition, "constraints", jb_array(n, sorted));
+	}
 }
 
 typedef struct MutationIndex
@@ -596,6 +705,164 @@ mutation_identity(Oid relid, AlterTableCmd *action)
 	relation_close(rel, NoLock);
 }
 
+/*
+ * Which members a native ALTER may have changed. A member's definition reads
+ * the catalog rows its objects own. It changes when one of those rows changed,
+ * or when one names an object whose rows changed, as a foreign key names the
+ * table it references. Assertion builds serialize every member and check that
+ * the others are unchanged.
+ */
+static HTAB *
+oid_set(void)
+{
+	HASHCTL		ctl = {0};
+
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create("object set", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static bool
+oid_set_contains(HTAB *set, Oid oid)
+{
+	return hash_search(set, &oid, HASH_FIND, NULL) != NULL;
+}
+
+static void
+oid_set_add(HTAB *set, Oid oid)
+{
+	if (oid >= FirstNormalObjectId)
+		(void) hash_search(set, &oid, HASH_ENTER, NULL);
+}
+
+/*
+ * The objects whose definitions read row |tuple| of |catalog|, into |owners|;
+ * -1 for a catalog whose rows any object they name may read.
+ */
+static int
+row_owners(Oid catalog, HeapTuple tuple, Oid *owners)
+{
+	switch (catalog)
+	{
+		case RelationRelationId:
+			owners[0] = ((Form_pg_class) GETSTRUCT(tuple))->oid;
+			return 1;
+		case AttributeRelationId:
+			owners[0] = ((Form_pg_attribute) GETSTRUCT(tuple))->attrelid;
+			return 1;
+		case AttrDefaultRelationId:
+			owners[0] = ((Form_pg_attrdef) GETSTRUCT(tuple))->adrelid;
+			return 1;
+		case ConstraintRelationId:
+			owners[0] = ((Form_pg_constraint) GETSTRUCT(tuple))->conrelid;
+			owners[1] = ((Form_pg_constraint) GETSTRUCT(tuple))->contypid;
+			return 2;
+		case IndexRelationId:
+			owners[0] = ((Form_pg_index) GETSTRUCT(tuple))->indexrelid;
+			owners[1] = ((Form_pg_index) GETSTRUCT(tuple))->indrelid;
+			return 2;
+		case TypeRelationId:
+			owners[0] = ((Form_pg_type) GETSTRUCT(tuple))->oid;
+			owners[1] = ((Form_pg_type) GETSTRUCT(tuple))->typrelid;
+			return 2;
+		case TriggerRelationId:
+			owners[0] = ((Form_pg_trigger) GETSTRUCT(tuple))->tgrelid;
+			return 1;
+		case RewriteRelationId:
+			owners[0] = ((Form_pg_rewrite) GETSTRUCT(tuple))->ev_class;
+			return 1;
+		case DependRelationId:
+			owners[0] = ((Form_pg_depend) GETSTRUCT(tuple))->objid;
+			return 1;
+		case DescriptionRelationId:
+			owners[0] = ((Form_pg_description) GETSTRUCT(tuple))->objoid;
+			return 1;
+		default:
+			return -1;
+	}
+}
+
+/* Add the objects row |tuple| of |catalog| names to |set|. */
+static void
+add_named(HTAB *set, Oid catalog, HeapTuple tuple)
+{
+	Relation	rel = table_open(catalog, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		bool		isnull;
+		Datum		value;
+
+		if (TupleDescAttr(desc, i)->atttypid != OIDOID)
+			continue;
+		value = heap_getattr(tuple, i + 1, desc, &isnull);
+		if (!isnull)
+			oid_set_add(set, DatumGetObjectId(value));
+	}
+	table_close(rel, AccessShareLock);
+}
+
+/* Add the objects that read row |tuple| of |catalog| to |set|. */
+static void
+add_owners(HTAB *set, Oid catalog, HeapTuple tuple)
+{
+	Oid			owners[2];
+	int			count = row_owners(catalog, tuple, owners);
+
+	if (count < 0)
+		add_named(set, catalog, tuple);
+	for (int i = 0; i < count; i++)
+		oid_set_add(set, owners[i]);
+}
+
+static void
+note_changed_row(Oid catalog, HeapTuple tuple, void *arg)
+{
+	add_owners((HTAB *) arg, catalog, tuple);
+}
+
+/* The objects whose definitions a native ALTER may have changed. */
+static HTAB *
+mutation_affected(CatalogView *view)
+{
+	HTAB	   *changed = oid_set();
+	HTAB	   *affected = oid_set();
+	HASH_SEQ_STATUS status;
+	Oid		   *oid;
+
+	CatalogViewForEachChange(view, note_changed_row, changed);
+	for (int i = 0; i < lengthof(provider_catalogs); i++)
+	{
+		Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
+		TupleDesc	desc = RelationGetDescr(rel);
+
+		foreach_ptr(HeapTupleData, tuple, CatalogViewTuples(view, provider_catalogs[i]))
+		{
+			bool		names_changed = false;
+
+			for (int j = 0; j < desc->natts && !names_changed; j++)
+			{
+				bool		isnull;
+				Datum		value;
+
+				if (TupleDescAttr(desc, j)->atttypid != OIDOID)
+					continue;
+				value = heap_getattr(tuple, j + 1, desc, &isnull);
+				names_changed = !isnull && oid_set_contains(changed, DatumGetObjectId(value));
+			}
+			if (names_changed)
+				add_owners(affected, provider_catalogs[i], tuple);
+		}
+		table_close(rel, AccessShareLock);
+	}
+	hash_seq_init(&status, changed);
+	while ((oid = hash_seq_search(&status)) != NULL)
+		oid_set_add(affected, *oid);
+	return affected;
+}
+
 static void
 native_alter_publish(Capture current, VersionRef working, const char *name, AlterTableStmt *statement, DGState *state, int oldcount, Oid caller)
 {
@@ -620,6 +887,8 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	bool		saved_rewritten = native_mutation_rewritten;
 	bool		rewrite = false;
 	PLTree		tree = state->content;
+	HTAB	   *affected;
+	DGMember   *listed;
 
 	PG_TRY();
 	{
@@ -739,8 +1008,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		CommandCounterIncrement();
 		indexes = mutation_indexes(view, id);
 		CatalogViewSwitch(NULL);
-		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-		count = SPI_processed;
+		listed = dg_database_members(current.hash, &count);
 		members = palloc_array(bytea *, Max(count, 1));
 		kinds = palloc_array(char *, Max(count, 1));
 		names = palloc_array(char *, Max(count, 1));
@@ -748,9 +1016,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		children = palloc_array(Datum, Max(count + list_length(indexes), 1));
 		for (int i = 0; i < count; i++)
 		{
-			members[i] = DatumGetByteaPCopy(cell(i, 1));
-			kinds[i] = strcell(i, 2);
-			names[i] = strcell(i, 3);
+			members[i] = listed[i].hash;
+			kinds[i] = (char *) listed[i].kind;
+			/* Only tables and indexes are found by name here. */
+			names[i] = !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") ? (char *) listed[i].name : NULL;
 		}
 		for (int i = 0; i < count; i++)
 			if (names[i] && !strcmp(names[i], name))
@@ -786,18 +1055,26 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 			item->member = canonical_empty_member("index", item->name, definition, &empty);
 			item->schema = child(item->member, 1);
 		}
+		affected = mutation_affected(view);
 		initStringInfo(&json);
 		appendStringInfoChar(&json, '[');
 		for (int i = 0; i < count; i++)
 		{
+			bool		relation = !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index");
+			Oid			object = relation ? CatalogViewLookupObject(view, RelationRelationId, names[i]) : InvalidOid;
+			bool		touched = relation && (!strcmp(names[i], name) || oid_set_contains(affected, object));
+
 			payloads[i] = metadata(members[i], kinds[i]);
 			if (!strcmp(kinds[i], "index") && name_selected(oldindexes, names[i]))
 				continue;
-			if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+#ifdef USE_ASSERT_CHECKING
+			if (relation)
+#else
+			if (touched)
+#endif
 			{
 				bytea	   *oldschema = child(members[i], 1);
 				char	   *old = metadata(oldschema, "schema");
-				Oid			object = CatalogViewLookupObject(view, RelationRelationId, names[i]);
 				int		   *mapping;
 				int			attributes;
 				char	   *definition = mutation_columns(view, object, old, &mapping, &attributes);
@@ -821,8 +1098,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 					definition = mutation_constraints(view, object, definition);
 				if (!strcmp(names[i], name))
 					definition = mutation_index_list(definition, indexes);
+				if (!touched && !json_same(definition, old))
+					elog(ERROR, "native ALTER changed %s, whose catalog rows it did not touch", names[i]);
 
-				if (strcmp(definition, old))
+				if (!json_same(definition, old))
 				{
 					bytea	   *schema = put("schema", definition, NULL, 0);
 					bytea	   *content = rewrite && !strcmp(names[i], name) ? dg_history_export_tree(&tree) : child(members[i], 2);
@@ -838,8 +1117,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 
 						hex_encode((char *) tree.root.bytes, PL_HASH_SIZE, root);
 						root[PL_HASH_SIZE * 2] = 0;
-						run("SELECT jsonb_set($1::jsonb,'{content}',to_jsonb($2::text))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(payloads[i]), CStringGetTextDatum(root)), NULL, true);
-						payloads[i] = strcell(0, 1);
+						payloads[i] = json_set_string(payloads[i], "content", root);
 					}
 					members[i] = put(kinds[i], payloads[i], VC_ARGS(PointerGetDatum(schema), PointerGetDatum(content)), 2);
 					binding_record(dg_current_branch(), names[i], schema, resource);
@@ -867,19 +1145,12 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		{
 			bytea	   *database = canonical_database(strcell(0, 1), children, used);
 
-			CatalogView *final = provider_view(database);
-
 			foreach(lc, indexes)
 			{
 				MutationIndex *item = lfirst(lc);
 
 				if (!OidIsValid(item->resource))
-				{
-					Relation	index = relation_open(CatalogViewLookupObject(final, RelationRelationId, item->name), NoLock);
-
-					item->resource = dg_storage_allocate(index, dg_current_branch());
-					relation_close(index, NoLock);
-				}
+					item->resource = dg_storage_allocate_kind(RELKIND_INDEX, dg_current_branch());
 				binding_record(dg_current_branch(), item->name, item->schema, item->resource);
 			}
 			move_ref(branch_ref("working"), working, database);

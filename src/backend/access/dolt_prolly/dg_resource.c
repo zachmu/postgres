@@ -115,9 +115,24 @@ dg_storage_record(Relation source)
 Oid
 dg_storage_allocate(Relation definition, const char *branch)
 {
+	if (!definition->rd_catalogview ||
+		!((DG_ROWS_KIND(definition->rd_rel->relkind) && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
+		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
+		elog(ERROR, "storage allocation requires a canonical prolly definition");
+	return dg_storage_allocate_kind(definition->rd_rel->relkind, branch);
+}
+
+/*
+ * Allocate an empty storage resource on |branch| for a prolly table,
+ * materialized view or index of |relkind|. Storage needs only the kind of
+ * its rows, not the definition, which need not be built yet.
+ */
+Oid
+dg_storage_allocate_kind(char relkind, const char *branch)
+{
 	Relation	catalog;
 	Relation	resource = palloc0(sizeof(RelationData));
-	FormData_pg_class form;
+	FormData_pg_class form = {0};
 	Datum		values[Natts_pg_dolt_storage];
 	bool		nulls[Natts_pg_dolt_storage] = {false};
 	HeapTuple	tuple;
@@ -125,10 +140,11 @@ dg_storage_allocate(Relation definition, const char *branch)
 
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot allocate storage in a read-only transaction")));
-	if (!definition->rd_catalogview ||
-		!((DG_ROWS_KIND(definition->rd_rel->relkind) && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
-		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
-		elog(ERROR, "storage allocation requires a canonical prolly definition");
+	if (!DG_ROWS_KIND(relkind) && relkind != RELKIND_INDEX)
+		elog(ERROR, "storage allocation requires a prolly table or index");
+	form.relkind = relkind;
+	form.relam = relkind == RELKIND_INDEX ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
 	do
 	{
@@ -136,8 +152,6 @@ dg_storage_allocate(Relation definition, const char *branch)
 	}
 	while (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(id)));
 	LockRelationOid(id, AccessExclusiveLock);
-	*resource = *definition;
-	form = *definition->rd_rel;
 	resource->rd_rel = &form;
 	resource->rd_smgr = NULL;
 	resource->rd_locator.spcOid = MyDatabaseTableSpace;
@@ -286,6 +300,39 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	if (!smgrexists(RelationGetSmgr(&storage->relation), MAIN_FORKNUM))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource file is unavailable")));
 	return storage;
+}
+
+/*
+ * The content root of storage |resource| on |branch|, read without building its
+ * definition: false if it holds none there.
+ */
+bool
+dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content)
+{
+	LockRelId	lock = {resource, MyDatabaseId};
+	Relation	catalog;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	FormData_pg_dolt_storage form;
+	RelFileLocator locator;
+
+	LockRelationId(&lock, AccessShareLock);
+	catalog = table_open(DoltStorageRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
+	scan = systable_beginscan(catalog, DoltStorageKeyIndexId, true, snapshot, 1, &key);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is unavailable", resource)));
+	form = *(Form_pg_dolt_storage) GETSTRUCT(tuple);
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (form.storagedb != MyDatabaseId || !OidIsValid(form.storagespc) || !RelFileNumberIsValid(form.storagefile))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is invalid", resource)));
+	locator.spcOid = form.storagespc;
+	locator.dbOid = form.storagedb;
+	locator.relNumber = form.storagefile;
+	return dg_storage_content_root(locator, branch, snapshot, content);
 }
 
 /* Only this checked entrypoint admits a canonical descriptor to page storage.

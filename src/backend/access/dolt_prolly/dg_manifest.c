@@ -21,6 +21,10 @@
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "catalog/indexing.h"
+#include "utils/jsonb.h"
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
@@ -128,19 +132,55 @@ kind_id(const char *kind)
 	return -1;
 }
 
-static char *
-object_kind(bytea *hash, bool readonly)
+/*
+ * Read as an internal read-write statement does: under a new statement
+ * snapshot that sees this transaction's earlier commands.
+ */
+static void
+statement_snapshot_push(void)
 {
-	Oid			types[] = {BYTEAOID};
-	Datum		args[] = {PointerGetDatum(hash)};
+	PushActiveSnapshot(GetTransactionSnapshot());
+	CommandCounterIncrement();
+	UpdateActiveSnapshotCommandId();
+}
+
+/* The kind of visible object |hash|, under the active snapshot. */
+static char *
+object_kind(bytea *hash)
+{
 	char	   *kind;
 
 	check_hash(hash);
-	manifest_execute("SELECT objkind FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 1, types, args, NULL, readonly, 1);
-	if (SPI_processed != 1)
+	if (!dg_object_read(hash, NULL, &kind, NULL, NULL))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest target object is not visible")));
-	kind = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-	return pstrdup(kind);
+	return kind;
+}
+
+/* Whether arrays of hashes |a| and |b| hold the same hashes in order. */
+static bool
+same_children(ArrayType *a, ArrayType *b)
+{
+	Datum	   *left,
+			   *right;
+	bool	   *leftnulls,
+			   *rightnulls;
+	int			nleft,
+				nright;
+
+	deconstruct_array(a, BYTEAOID, -1, false, TYPALIGN_INT, &left, &leftnulls, &nleft);
+	deconstruct_array(b, BYTEAOID, -1, false, TYPALIGN_INT, &right, &rightnulls, &nright);
+	if (nleft != nright)
+		return false;
+	for (int i = 0; i < nleft; i++)
+	{
+		bytea	   *l = DatumGetByteaPP(left[i]);
+		bytea	   *r = DatumGetByteaPP(right[i]);
+
+		if (leftnulls[i] || rightnulls[i] || VARSIZE_ANY_EXHDR(l) != VARSIZE_ANY_EXHDR(r) ||
+			memcmp(VARDATA_ANY(l), VARDATA_ANY(r), VARSIZE_ANY_EXHDR(l)))
+			return false;
+	}
+	return true;
 }
 
 static ArrayType *
@@ -211,8 +251,9 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	PLHash		hash;
 	PLSlice		input;
 	bytea	   *address;
-	Oid			types[] = {BYTEAOID, TEXTOID, BYTEAOID, BYTEAARRAYOID};
-	Datum		args[4];
+	char	   *existing_kind;
+	bytea	   *existing_payload;
+	ArrayType  *existing_children;
 
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
@@ -223,6 +264,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		(VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
 		 memcmp(VARDATA_ANY(payload), DG_SCHEMA_TREE, strlen(DG_SCHEMA_TREE))))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid schema tree envelope")));
+	statement_snapshot_push();
 	for (i = 0; i < n; i++)
 	{
 		char	   *child;
@@ -230,7 +272,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 
 		if (nulls[i])
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("manifest child cannot be null")));
-		child = object_kind(DatumGetByteaPP(links[i]), false);
+		child = object_kind(DatumGetByteaPP(links[i]));
 		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
 			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0) :
@@ -259,29 +301,228 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (!pl_hash_bytes(input, &hash))
 		elog(ERROR, "manifest SHA-256 failed");
 	address = bytes(hash.bytes, PL_HASH_SIZE);
-	args[0] = PointerGetDatum(address);
-	args[1] = CStringGetTextDatum(kind);
-	args[2] = PointerGetDatum(payload);
-	args[3] = PointerGetDatum(children);
 
 	/*
 	 * Identical immutable objects can be inserted by independent
 	 * transactions. Their snapshot-visible logical representation is
 	 * deduplicated by the view.
 	 */
-	manifest_execute("SELECT objkind=$2 AND objpayload=$3 AND objchildren=$4 AS same FROM pg_catalog.pg_dolt_object_visible WHERE objhash=$1", 4, types, args, NULL, false, 1);
-	if (SPI_processed)
+	if (dg_object_read(address, NULL, &existing_kind, &existing_payload, &existing_children))
 	{
-		bool		isnull;
-		Datum		same = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-
-		if (isnull || !DatumGetBool(same))
+		if (strcmp(existing_kind, kind) ||
+			VARSIZE_ANY_EXHDR(existing_payload) != VARSIZE_ANY_EXHDR(payload) ||
+			memcmp(VARDATA_ANY(existing_payload), VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload)) ||
+			!same_children(existing_children, children))
 			elog(ERROR, "manifest object hash collision");
 	}
 	else
-		manifest_execute("INSERT INTO pg_catalog.pg_dolt_object(objhash,objkind,objpayload,objchildren,objid) VALUES($1,$2,$3,$4,gen_random_uuid())", 4, types, args, NULL, false, 0);
+	{
+		Relation	catalog = table_open(DoltObjectRelationId, RowExclusiveLock);
+		Datum		values[Natts_pg_dolt_object];
+		bool		valuenulls[Natts_pg_dolt_object] = {false};
+		HeapTuple	tuple;
+
+		values[Anum_pg_dolt_object_objhash - 1] = PointerGetDatum(address);
+		values[Anum_pg_dolt_object_objkind - 1] = CStringGetTextDatum(kind);
+		values[Anum_pg_dolt_object_objpayload - 1] = PointerGetDatum(payload);
+		values[Anum_pg_dolt_object_objchildren - 1] = PointerGetDatum(children);
+		values[Anum_pg_dolt_object_objid - 1] = DirectFunctionCall1(gen_random_uuid, (Datum) 0);
+		tuple = heap_form_tuple(RelationGetDescr(catalog), values, valuenulls);
+		CatalogTupleInsert(catalog, tuple);
+		heap_freetuple(tuple);
+		table_close(catalog, RowExclusiveLock);
+	}
+	PopActiveSnapshot();
 	pfree(encoding);
 	return address;
+}
+
+/*
+ * Members of database objects. An object's hash names immutable content, so a
+ * member's kind and name, and a database's members, are cached by hash; the
+ * database object is still read each time, which checks that it is visible.
+ * Its children then are too.
+ */
+typedef struct CachedMember
+{
+	uint8		hash[PL_HASH_SIZE];
+	char	   *kind;
+	char	   *name;
+} CachedMember;
+
+typedef struct CachedDatabase
+{
+	uint8		hash[PL_HASH_SIZE];
+	int			count;
+	DGMember   *members;		/* hashes by child order */
+	HTAB	   *names;			/* "kind/name" -> member index */
+} CachedDatabase;
+
+typedef struct NamedMember
+{
+	char		key[2 * (2 * NAMEDATALEN + 2) + 16];
+	int			index;
+} NamedMember;
+
+static MemoryContext member_memory;
+static HTAB *cached_members;
+static HTAB *cached_databases;
+static Size member_cache_bytes;
+
+#define MEMBER_CACHE_LIMIT (32 * 1024 * 1024)
+
+static void
+member_cache_init(void)
+{
+	HASHCTL		ctl = {0};
+
+	if (member_memory && member_cache_bytes < MEMBER_CACHE_LIMIT)
+		return;
+	if (member_memory)
+		MemoryContextDelete(member_memory);
+	member_memory = AllocSetContextCreate(TopMemoryContext, "database members", ALLOCSET_DEFAULT_SIZES);
+	member_cache_bytes = 0;
+	ctl.keysize = PL_HASH_SIZE;
+	ctl.entrysize = sizeof(CachedMember);
+	ctl.hcxt = member_memory;
+	cached_members = hash_create("database member kinds", 1024, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ctl.entrysize = sizeof(CachedDatabase);
+	cached_databases = hash_create("database members", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+member_key(char *key, const char *kind, const char *name)
+{
+	snprintf(key, sizeof(((NamedMember *) NULL)->key), "%s/%s", kind, name);
+}
+
+/* The kind and name of visible member |hash|. */
+static CachedMember *
+member_describe(bytea *hash)
+{
+	CachedMember *member;
+	bool		found;
+	char	   *kind;
+	bytea	   *payload;
+
+	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_FIND, NULL);
+	if (member)
+		return member;
+	if (!dg_object_read(hash, NULL, &kind, &payload, NULL))
+		elog(ERROR, "database member is not visible");
+	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_ENTER, &found);
+	member->kind = MemoryContextStrdup(member_memory, kind);
+	member->name = NULL;
+	if (strcmp(kind, "namespace") && VARSIZE_ANY_EXHDR(payload) > 0 && *VARDATA_ANY(payload) == '{')
+	{
+		/* A JSON object payload names its member, as ->>'name' reads it. */
+		char	   *text = pnstrdup(VARDATA_ANY(payload), VARSIZE_ANY_EXHDR(payload));
+		Jsonb	   *document;
+		JsonbValue	buffer;
+		JsonbValue *name;
+
+		document = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(pg_any_to_server(text, strlen(text), PG_UTF8))));
+		name = JB_ROOT_IS_OBJECT(document) ? getKeyJsonValueFromContainer(&document->root, "name", 4, &buffer) : NULL;
+		if (name && name->type == jbvString)
+			member->name = MemoryContextStrdup(member_memory, pnstrdup(name->val.string.val, name->val.string.len));
+		member_cache_bytes += VARSIZE_ANY_EXHDR(payload) / 8;
+	}
+	member_cache_bytes += sizeof(*member) + 64;
+	return member;
+}
+
+static CachedDatabase *
+database_describe(bytea *database)
+{
+	CachedDatabase *cached;
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+	bool		found;
+	HASHCTL		ctl = {0};
+
+	if (VARSIZE_ANY_EXHDR(database) != PL_HASH_SIZE ||
+		!dg_object_read(database, "database", NULL, NULL, &children))
+		elog(ERROR, "database object is not visible");
+	member_cache_init();
+	cached = hash_search(cached_databases, VARDATA_ANY(database), HASH_FIND, NULL);
+	if (cached)
+		return cached;
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	for (int i = 0; i < n; i++)
+		(void) member_describe(DatumGetByteaPP(values[i]));
+	cached = hash_search(cached_databases, VARDATA_ANY(database), HASH_ENTER, &found);
+	cached->count = n;
+	cached->members = MemoryContextAllocZero(member_memory, sizeof(DGMember) * Max(n, 1));
+	ctl.keysize = sizeof(((NamedMember *) NULL)->key);
+	ctl.entrysize = sizeof(NamedMember);
+	ctl.hcxt = member_memory;
+	cached->names = hash_create("database member names", Max(n, 16), &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *hash = DatumGetByteaPP(values[i]);
+		CachedMember *member = member_describe(hash);
+		bytea	   *copy = MemoryContextAlloc(member_memory, VARHDRSZ + PL_HASH_SIZE);
+
+		SET_VARSIZE(copy, VARHDRSZ + PL_HASH_SIZE);
+		memcpy(VARDATA(copy), VARDATA_ANY(hash), PL_HASH_SIZE);
+		cached->members[i].hash = copy;
+		cached->members[i].kind = member->kind;
+		cached->members[i].name = member->name;
+		if (member->name)
+		{
+			char		key[sizeof(((NamedMember *) NULL)->key)];
+			NamedMember *named;
+
+			member_key(key, member->kind, member->name);
+			named = hash_search(cached->names, key, HASH_ENTER, &found);
+			if (!found)
+				named->index = i;
+		}
+	}
+	member_cache_bytes += sizeof(*cached) + n * (sizeof(DGMember) + 96);
+	return cached;
+}
+
+/* The members of visible database object |database|, in its child order. */
+DGMember *
+dg_database_members(bytea *database, int *count)
+{
+	CachedDatabase *cached = database_describe(database);
+	DGMember   *result = palloc_array(DGMember, Max(cached->count, 1));
+
+	for (int i = 0; i < cached->count; i++)
+	{
+		result[i] = cached->members[i];
+		result[i].hash = DatumGetByteaPCopy(PointerGetDatum(cached->members[i].hash));
+		result[i].kind = pstrdup(cached->members[i].kind);
+		result[i].name = cached->members[i].name ? pstrdup(cached->members[i].name) : NULL;
+	}
+	*count = cached->count;
+	return result;
+}
+
+/* The member of |kind| named |name| in |database|, or NULL. */
+bytea *
+dg_database_member(bytea *database, const char *kind, const char *name)
+{
+	CachedDatabase *cached = database_describe(database);
+	char		key[sizeof(((NamedMember *) NULL)->key)];
+	NamedMember *named;
+
+	if (strlen(kind) + strlen(name) + 2 > sizeof(key))
+		return NULL;
+	member_key(key, kind, name);
+	named = hash_search(cached->names, key, HASH_FIND, NULL);
+	return named ? DatumGetByteaPCopy(PointerGetDatum(cached->members[named->index].hash)) : NULL;
+}
+
+/* Store an object natively, as dolt_manifest_put does. */
+bytea *
+dg_manifest_put(const char *kind, bytea *payload, ArrayType *children)
+{
+	return put_object(kind, payload, children);
 }
 
 Datum
@@ -382,9 +623,13 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		nulls[2] = 'n';
 	else
 	{
-		char	   *kind = object_kind(PG_GETARG_BYTEA_PP(2), false);
+		char	   *kind;
 		const char *refname = text_to_cstring(name);
 		char	   *expected = strncmp(refname, "merge/", 6) == 0 ? "merge" : strncmp(refname, "rebase/", 7) == 0 ? "rebase" : strncmp(refname, "stash/", 6) == 0 ? "stash" : (strncmp(refname, "working/", 8) == 0 || strncmp(refname, "staged/", 7) == 0) ? "database" : "commit";
+
+		statement_snapshot_push();
+		kind = object_kind(PG_GETARG_BYTEA_PP(2));
+		PopActiveSnapshot();
 
 		if (strcmp(kind, expected) != 0 &&
 			!(strncmp(text_to_cstring(name), "tags/", 5) == 0 && strcmp(kind, "tag") == 0))
@@ -421,21 +666,18 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		/* The branch's OIDs name exactly the objects of its new schema. */
 		if (!PG_ARGISNULL(2))
 		{
-			Oid			membertypes[] = {BYTEAOID};
-			Datum		memberargs[] = {PG_GETARG_DATUM(2)};
 			List	   *members = NIL,
 					   *tables = NIL;
+			int			count;
+			DGMember   *listed = dg_database_members(PG_GETARG_BYTEA_PP(2), &count);
 
-			if (SPI_execute_with_args("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objkind FROM pg_catalog.pg_dolt_object d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_catalog.pg_dolt_object t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')",
-									  1, membertypes, memberargs, NULL, false, 0) != SPI_OK_SELECT)
-				elog(ERROR, "could not read working schema members");
-			for (uint64 i = 0; i < SPI_processed; i++)
+			for (int i = 0; i < count; i++)
 			{
-				char	   *member = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-
-				members = lappend(members, member);
-				if (!strcmp(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2), "table"))
-					tables = lappend(tables, member);
+				if (!listed[i].name || (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index")))
+					continue;
+				members = lappend(members, (char *) listed[i].name);
+				if (!strcmp(listed[i].kind, "table"))
+					tables = lappend(tables, (char *) listed[i].name);
 			}
 			dg_identity_sync(branch, members, tables);
 		}
@@ -601,6 +843,48 @@ dg_schema_store(const char *kind, const char *json)
 	return result;
 }
 
+/*
+ * Decoded schema objects, by address. An address names immutable content, so
+ * its JSON never changes; reading the object still checks its visibility.
+ */
+typedef struct DecodedSchema
+{
+	uint8		address[PL_HASH_SIZE];
+	char	   *json;
+} DecodedSchema;
+static HTAB *decoded_schemas;
+static Size decoded_schema_bytes;
+
+#define DECODED_SCHEMA_LIMIT (32 * 1024 * 1024)
+
+static void
+remember_schema(bytea *address, const char *json)
+{
+	DecodedSchema *entry;
+	bool		found;
+
+	if (VARSIZE_ANY_EXHDR(address) != PL_HASH_SIZE)
+		return;
+	if (!decoded_schemas || decoded_schema_bytes > DECODED_SCHEMA_LIMIT)
+	{
+		HASHCTL		ctl = {0};
+
+		if (decoded_schemas)
+			MemoryContextDelete(GetMemoryChunkContext(decoded_schemas));
+		ctl.keysize = PL_HASH_SIZE;
+		ctl.entrysize = sizeof(DecodedSchema);
+		ctl.hcxt = AllocSetContextCreate(TopMemoryContext, "decoded schemas", ALLOCSET_DEFAULT_SIZES);
+		decoded_schemas = hash_create("decoded schemas", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		decoded_schema_bytes = 0;
+	}
+	entry = hash_search(decoded_schemas, VARDATA_ANY(address), HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->json = MemoryContextStrdup(GetMemoryChunkContext(decoded_schemas), json);
+		decoded_schema_bytes += strlen(json) + sizeof(*entry);
+	}
+}
+
 char *
 dg_schema_read(bytea *address, const char *kind)
 {
@@ -611,9 +895,14 @@ dg_schema_read(bytea *address, const char *kind)
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
+	DecodedSchema *decoded;
 
 	if (!dg_object_read(address, kind, NULL, &payload, &children))
 		elog(ERROR, "missing retained schema object");
+	decoded = decoded_schemas && VARSIZE_ANY_EXHDR(address) == PL_HASH_SIZE ?
+		hash_search(decoded_schemas, VARDATA_ANY(address), HASH_FIND, NULL) : NULL;
+	if (decoded)
+		return pstrdup(decoded->json);
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	if (n == 0)
 	{
@@ -660,5 +949,6 @@ dg_schema_read(bytea *address, const char *kind)
 		PG_END_TRY();
 	}
 	result = pg_any_to_server(result, strlen(result), PG_UTF8);
+	remember_schema(address, result);
 	return result;
 }

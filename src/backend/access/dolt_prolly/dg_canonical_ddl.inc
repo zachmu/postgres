@@ -270,7 +270,6 @@ dg_catalog_create(Node *statement, const char *query)
 					k,
 					total;
 		bytea	   *database;
-		CatalogView *view;
 		DGState    *empty = palloc0(sizeof(*empty));
 
 		nest = begin_api();
@@ -314,15 +313,13 @@ dg_catalog_create(Node *statement, const char *query)
 		appendStringInfoChar(&added, ']');
 		run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(added.data)), NULL, true);
 		database = canonical_database(strcell(0, 1), members, total);
-		view = provider_view(database);
 		for (int i = 0; i <= k; i++)
 		{
 			const char *membername = i ? (const char *) list_nth(index_names, i - 1) : name;
-			Relation	definition = relation_open(CatalogViewLookupObject(view, RelationRelationId, membername), NoLock);
-			Oid			resource = dg_storage_allocate(definition, dg_current_branch());
+			char		relkind = i ? RELKIND_INDEX : matview_pending ? RELKIND_MATVIEW : RELKIND_RELATION;
+			Oid			resource = dg_storage_allocate_kind(relkind, dg_current_branch());
 
 			binding_record(dg_current_branch(), membername, child(newmembers[i], 1), resource);
-			relation_close(definition, NoLock);
 		}
 		move_ref(branch_ref("working"), working, database);
 		advance_snapshot();
