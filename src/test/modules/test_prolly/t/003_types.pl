@@ -133,23 +133,7 @@ $covered{bpchar} = 1; # char(n)
 $covered{xml} = 1 unless $has_xml; # build-time PostgreSQL feature
 is_deeply([grep { !$covered{$_} } split /\n/, $ordinary], [], 'every ordinary built-in scalar/range has a fixture');
 
-# The catalog inventory above includes explicitly rejected identity-bearing
-# fixtures. Exercise their rejection rather than silently dropping coverage.
-my %nonportable = map { $_ => 1 } qw(pg_type pg_proc pg_class tid xid xid8 cid pg_lsn txid_snapshot pg_snapshot refcursor regproc regprocedure regoper regoperator regclass regcollation regtype regrole regnamespace regconfig regdictionary aclitem);
 my @portable;
-for my $case (@cases)
-{
- my $type = $case->[0];
- (my $base = $type) =~ s/\[\]//g;
- if ($nonportable{$base})
- {
-  my ($status, $out, $err) = $node->psql('postgres', "CREATE TABLE rejected(v $type) USING dolt_prolly_table");
-  isnt($status, 0, "$type rejected at table creation");
-  like($err, qr/prolly storage rejects type/, "$type portability diagnostic");
- }
- else { push @portable, $case; }
-}
-@cases = @portable;
 
 # These types were made before the database had a versioned table, so they
 # are native and unversioned, and versioned tables cannot use them. Types
@@ -202,9 +186,10 @@ for my $case (@cases)
  }
 }
 
-my ($node_status, $node_out, $node_err) = $node->psql('postgres', q{CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table});
-isnt($node_status, 0, 'pg_node_tree rejects embedded local object references');
-like($node_err, qr/prolly storage rejects type pg_node_tree/, 'node tree portability diagnostic');
+$node->safe_psql('postgres', q{CREATE TABLE nodes(v pg_node_tree) USING dolt_prolly_table;
+INSERT INTO nodes SELECT proargdefaults FROM pg_proc
+WHERE oid='pg_catalog.jsonb_set_lax(jsonb,text[],jsonb,boolean,text)'::regprocedure});
+is($node->safe_psql('postgres', q{SELECT n.v::text=p.proargdefaults::text FROM nodes n,pg_proc p WHERE p.oid='pg_catalog.jsonb_set_lax(jsonb,text[],jsonb,boolean,text)'::regprocedure}), 't', 'explicit node-tree payload retains its contents');
 
 # Table codecs must not require the old C collation restriction.
 $node->safe_psql('postgres', q{
