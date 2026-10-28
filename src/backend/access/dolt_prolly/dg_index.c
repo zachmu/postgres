@@ -19,6 +19,7 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/pg_locale.h"
+#include "optimizer/optimizer.h"
 #include "utils/selfuncs.h"
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
@@ -724,11 +725,64 @@ vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
 	return stats ? stats : palloc0(sizeof(*stats));
 }
+/*
+ * The rows a scan of |path| reads, as btcostestimate counts them: a scan
+ * reads every entry within its bounds, which come from equality quals on
+ * leading key columns and at most one range column after them, and a unique
+ * index bound by equality on every key column reads one. Without statistics,
+ * which branch tables do not have yet, a partly bound scan's estimate can be
+ * as small as a fully bound one's, and every estimate below one row rounds up
+ * to it; counting one row more than the bound quals select keeps both orders
+ * right: a unique lookup beats any other scan, and a scan bound on more
+ * columns beats one bound on fewer.
+ */
+static double
+bounded_rows(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *bound = NIL;
+	int			column = 0;
+	bool		equal_here = false,
+				all_equal = true;
+	ListCell   *lc;
+	double		rows;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *clause = lfirst_node(IndexClause, lc);
+		ListCell   *lq;
+
+		if (clause->indexcol != column)
+		{
+			if (!equal_here || clause->indexcol != column + 1)
+				break;
+			column = clause->indexcol;
+			equal_here = false;
+		}
+		foreach(lq, clause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lq);
+
+			if (IsA(rinfo->clause, OpExpr) &&
+				get_op_opfamily_strategy(((OpExpr *) rinfo->clause)->opno, index->opfamily[column]) == BTEqualStrategyNumber)
+				equal_here = true;
+			else
+				all_equal = false;
+			bound = lappend(bound, rinfo);
+		}
+	}
+	if (index->unique && equal_here && all_equal && column == index->nkeycolumns - 1)
+		return 1.0;
+	rows = clauselist_selectivity(root, bound, index->rel->relid, JOIN_INNER, NULL) * index->rel->tuples;
+	return 1.0 + rows;
+}
+
 static void
 cost(PlannerInfo *root, IndexPath *path, double loops, Cost *startup, Cost *total, Selectivity *selectivity, double *correlation, double *pages)
 {
 	GenericCosts costs = {0};
 
+	costs.numIndexTuples = bounded_rows(root, path);
 	genericcostestimate(root, path, loops, &costs);
 	*startup = costs.indexStartupCost;
 	*total = costs.indexTotalCost;
