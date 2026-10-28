@@ -14,6 +14,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/cash.h"
@@ -118,9 +119,30 @@ check_type_recursive(Oid type, List *ancestors)
 		switch (type)
 		{
 				/*
-				 * Scalar senders below serialize values, never local object
-				 * IDs, except explicit OID payloads requested by the user.
+				 * Scalar codecs serialize explicit SQL values, including identifiers
+				 * requested by the user, but never incidental runtime headers.
 				 */
+			case REGPROCOID:
+			case REGPROCEDUREOID:
+			case REGOPEROID:
+			case REGOPERATOROID:
+			case REGCLASSOID:
+			case REGCOLLATIONOID:
+			case REGTYPEOID:
+			case REGROLEOID:
+			case REGNAMESPACEOID:
+			case REGCONFIGOID:
+			case REGDICTIONARYOID:
+			case XIDOID:
+			case XID8OID:
+			case CIDOID:
+			case TIDOID:
+			case LSNOID:
+			case TXID_SNAPSHOTOID:
+			case PG_SNAPSHOTOID:
+			case REFCURSOROID:
+			case ACLITEMOID:
+			case PG_NODE_TREEOID:
 			case OIDOID: /* User data, not an incidental encoding header. */
 			case BOOLOID:
 			case BYTEAOID:
@@ -433,7 +455,7 @@ encode_value(Oid type, Datum value)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID)
+	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
 	{
 		struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
 
@@ -454,6 +476,17 @@ encode_value(Oid type, Datum value)
 		};
 	}
 
+	if (type == ACLITEMOID)
+	{
+		AclItem *acl = DatumGetAclItemP(value);
+
+		data = palloc(20);
+		memcpy(data, "DGA1", 4);
+		pl_write32(data + 4, acl->ai_grantee);
+		pl_write32(data + 8, acl->ai_grantor);
+		pl_write64(data + 12, acl->ai_privs);
+		return (PLSlice) {data, 20};
+	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return encode_array(element, value);
@@ -477,7 +510,7 @@ decode_value(Oid type, PLSlice bytes)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID)
+	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
 	{
 		struct varlena *v = palloc(VARHDRSZ + bytes.len);
 
@@ -495,6 +528,17 @@ decode_value(Oid type, PLSlice bytes)
 		return type == BOOLOID ? BoolGetDatum(n != 0) : type == INT2OID ? Int16GetDatum(n) : type == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
 	}
 
+	if (type == ACLITEMOID)
+	{
+		AclItem *acl = palloc(sizeof(AclItem));
+
+		if (bytes.len != 20 || memcmp(bytes.data, "DGA1", 4))
+			elog(ERROR, "invalid prolly ACL item encoding");
+		acl->ai_grantee = pl_read32(bytes.data + 4);
+		acl->ai_grantor = pl_read32(bytes.data + 8);
+		acl->ai_privs = pl_read64(bytes.data + 12);
+		return PointerGetDatum(acl);
+	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return decode_array(type, element, bytes);
@@ -684,7 +728,7 @@ decode_plan_build(DecodePlan *plan, TupleDesc desc)
 		if (column->dropped)
 			continue;
 		column->base = getBaseType(attr->atttypid);
-		if (column->base == TEXTOID || column->base == BYTEAOID)
+		if (column->base == TEXTOID || column->base == BYTEAOID || column->base == PG_NODE_TREEOID)
 			column->kind = DECODE_BYTES;
 		else if (column->base == BOOLOID || column->base == INT2OID || column->base == INT4OID || column->base == INT8OID)
 			column->kind = DECODE_INTEGER;
@@ -699,7 +743,7 @@ decode_plan_build(DecodePlan *plan, TupleDesc desc)
 			column->kind = DECODE_UUID;
 		else if (column->base == NUMERICOID)
 			column->kind = DECODE_NUMERIC;
-		else if (OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
+		else if (column->base == ACLITEMOID || OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
 			column->kind = DECODE_GENERAL;
 		else
 		{

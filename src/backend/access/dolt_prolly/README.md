@@ -59,7 +59,7 @@ to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL I
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
 XIDs, tuple padding and lock bits are not in canonical row encodings.
-Identifier-bearing SQL types are rejected pending portable translation.
+Explicit identifier-bearing SQL values are supported; incidental runtime identifiers are excluded from canonical encodings.
 Row fetches resolve the handle to a digest, then look up the actual tuple in the
 canonical content tree. Both trees physically live in the relation's chunk container.
 
@@ -191,12 +191,19 @@ the stored value. Incidental type OIDs in container headers are still stripped;
 canonical metadata still uses symbolic identities.
 
 These formats are experimental and tied to this PostgreSQL/type-codec version.
-Until identifier translation is implemented, the following SQL types are rejected:
-every `reg*` alias, `aclitem`, `pg_node_tree`, `xid`, `xid8`,
-`cid`, `tid`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`, and `refcursor`. This also
-rejects catalog composites whose fields include those types. Their numbers or
-names identify local catalog objects, transactions, physical locations or
-session objects; they are not portable value encodings.
+Explicit user values also support every `reg*` alias, `aclitem`,
+`pg_node_tree`, `xid`, `xid8`, `cid`, `tid`, `pg_lsn`,
+`txid_snapshot`, `pg_snapshot`, and `refcursor`, including nested
+containers and catalog composites. These values retain their supplied identifiers;
+they do not imply portable resolution of those identifiers on another server.
+This permission does not extend to incidental identifiers in tuple/container
+headers or canonical schema metadata. It also does not imply ordered index
+support for every such type.
+
+`aclitem` has no native binary I/O pair: its `DGA1` encoding stores a
+four-byte marker, two unsigned 32-bit role identifiers, and an unsigned 64-bit
+privilege mask, all integers in network byte order. `pg_node_tree` stores its
+explicit text payload directly because its native receiver rejects input.
 
 Validation recursively checks domains, array elements and composite fields at
 table creation and before encoding/decoding or rebuilding an index. It validates
@@ -281,11 +288,11 @@ encoding isolation, XML parsing settings, binary float/numeric fidelity, and
 unchanged domain constraint enforcement. XML cases run when PostgreSQL was built
 with libxml.
 
-`004_portability.pl` tests rejected identifier types through domains and nested
-composite arrays, NULL/empty/CTAS bypass attempts, opaque custom OID senders,
-user ranges, and nested type changes affecting scans and index rebuilds. It also
-checks identical serialized roots for enum/array/composite values instantiated
-with independently allocated runtime type OIDs.
+`004_portability.pl` retains rejection tests for opaque custom senders and
+range senders containing incidental array type identities.
+`039_explicit_identifiers.pl` verifies explicit identifiers through domains and
+nested composites, history and restart, preserves vector-domain identity, and
+checks that incidental composite type OIDs do not affect serialized roots.
 
 `005_native.pl` verifies built-in availability without extension installation,
 unchanged heap/btree defaults and availability of upstream AMs, diagnostic
