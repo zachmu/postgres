@@ -128,17 +128,6 @@ with one TID until a later write allocates for one of them; nothing waits or
 fails. A reservation on the derived handle, as unique keys use, would close
 this.
 
-**Fold cache (2026-10-28).** The row journal's folds, the in-memory trees a
-backend builds from a stream, survive statements and transactions: each
-storage's handle slot carries a journal generation, moved by a journaling
-transaction before it commits, and a count of journal writers in flight. A
-fold built from the latest state with no writer in flight holds the whole
-committed stream and stays valid while the generation does not move; a
-backend's own journaled entries are applied to its folds as they are written.
-MVCC loads reuse such a fold only when their snapshot saw no transaction in
-progress and is no older than the fold, and never for rows their own command
-wrote.
-
 ### Decision: prolly handle trees plus heap lock records (2026-10-25)
 
 > Superseded in part on 2026-10-28, above: the handle and key-to-handle trees

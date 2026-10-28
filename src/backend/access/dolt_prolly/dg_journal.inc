@@ -777,7 +777,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		fold = journal_fold_find(&key, true);
 		memset(((char *) fold) + sizeof(RootKey), 0, sizeof(*fold) - sizeof(RootKey));
 	}
-	fold->relid = dg_storage_bound(rel) ? InvalidOid : RelationGetRelid(rel);
+	fold->relid = dg_storage_bound(rel) || CatalogViewObjectContext(RelationGetRelid(rel)) ? InvalidOid : RelationGetRelid(rel);
 	fold->latest = !mvcc && generation != 0;
 
 	/*
