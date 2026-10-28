@@ -96,10 +96,13 @@ on every branch and in every revision, and a branch inherits nothing.
 occurrences that cannot take the derived handle:
 - further occurrences of a row already present (duplicates in a keyless table);
 - a row whose prefix another live row holds (about n²/2^41 of n rows);
-- a row whose derived handle was recently used: a lock record still names it,
-  the command's own batch removed it, or an unfolded journal entry carries it.
-  A record's handle must not name a new row, since the record describes the
-  old one.
+- a row whose derived handle a live lock record still names, as the root or
+  current handle of an update chain, or a row the command's own batch removed
+  and adds back. A record's handle must not name a new row while the record
+  describes the old one; a record whose row was deleted by a committed
+  transaction is dead, and a row that returns takes the handle and a new
+  record. The journal tolerates a repeated sequence for the same reason: a
+  removal and the addition after it net out.
 
 The catalog `pg_dolt_handle` maps (storage, branch, handle) to digest, with a
 second index by digest. Rows are inserted when the occurrence is written and
@@ -114,7 +117,7 @@ the TID space, as does a reader of a branch whose storage has no roots yet.
 `roothandles` and `rootkeys` columns, branch creation deriving handles by
 diffing, handles derived 1 to n in content order, and "IDs are never reused"
 (a derived handle is the row's; it is reused when the same row returns, unless
-a record or journal entry still names it). The counter still restarts above
+a live record still names it). The counter still restarts above
 the largest allocated handle, now read from `pg_dolt_handle` and the journal.
 
 **Known limitation of the experiment.** Two transactions that concurrently

@@ -463,31 +463,12 @@ dg_handle_count(DGState *s)
 	return (double) pl_count(&s->content) + (s->delta ? s->delta->count : 0);
 }
 
-/* Whether the journal entries folded into |s| include one for |handle|. */
-static bool
-journal_seq_folded(const DGState *s, uint64 handle)
-{
-	int64		first = (int64) (handle * 2);
-	int			lo = 0,
-				hi = s->journal_count;
-
-	while (lo < hi)
-	{
-		int			mid = (lo + hi) / 2;
-
-		if (s->journal_seqs[mid] < first)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
-	return lo < s->journal_count && s->journal_seqs[lo] <= first + 1;
-}
-
 /*
  * The handle for a new occurrence of |digest| in |s|, recorded through |b|
  * if the command batches its edits: derived when no live row holds its
- * prefix, nothing of this command names it, and no record or unfolded
- * journal entry still refers to it; else allocated.
+ * prefix, nothing of this command names it, and no lock record still names
+ * it; else allocated. A journal entry may name it: the stream tolerates a
+ * repeated sequence, since a removal and the addition after it net out.
  */
 uint64
 dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
@@ -497,12 +478,8 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 
 	if (!taken)
 		taken = prefix_rows(&s->content, handle).count > 0;
-	if (!taken && !s->delta_private)
-	{
-		taken = journal_seq_folded(s, handle);
-		if (!taken && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
-			taken = dg_record_exists(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
-	}
+	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
+		taken = dg_record_exists(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
 	if (!taken)
 		return handle;
 	return handle_allocate(rel, s);

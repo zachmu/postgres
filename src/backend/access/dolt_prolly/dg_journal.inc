@@ -258,7 +258,7 @@ journal_append_entry(Relation catalog, Relation index, IndexInfo *info, CommandI
 	index_values[1] = values[Anum_pg_dolt_journal_jrnfile - 1];
 	index_values[2] = values[Anum_pg_dolt_journal_jrnbranch - 1];
 	index_values[3] = values[Anum_pg_dolt_journal_jrnseq - 1];
-	index_insert(index, index_values, index_nulls, &tuple->t_self, catalog, UNIQUE_CHECK_YES, false, info);
+	index_insert(index, index_values, index_nulls, &tuple->t_self, catalog, UNIQUE_CHECK_NO, false, info);
 	heap_freetuple(tuple);
 }
 
@@ -618,6 +618,7 @@ journal_fold_covered(const JournalFold *fold, const JournalEntries *entries)
 			j++;
 		if (j == entries->count || entries->items[j].seq != fold->seqs[i])
 			return false;
+		j++;
 	}
 	return true;
 }
@@ -697,7 +698,10 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 			while (j < fold->seq_count && fold->seqs[j] < entries.items[i].seq)
 				j++;
 			if (j < fold->seq_count && fold->seqs[j] == entries.items[i].seq)
+			{
+				j++;			/* a sequence may repeat: a row removed and added back */
 				continue;
+			}
 			rest.items[rest.count++] = entries.items[i];
 		}
 		current = fold->folded;

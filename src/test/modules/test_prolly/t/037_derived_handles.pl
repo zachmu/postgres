@@ -51,7 +51,7 @@ sql(q{DELETE FROM dup WHERE x = 1});
 is(sql(q{SELECT count(*) FROM dup}), '1', 'deleting the row removes every occurrence');
 is(sql(q{SELECT count(*) FROM pg_dolt_handle}), '0', 'and their catalog rows');
 sql(q{INSERT INTO dup VALUES (1, 'a'), (1, 'a')});
-is(sql(q{SELECT count(*) FROM pg_dolt_handle}), '2', 'reinserted duplicates take allocated handles: a lock record names their derived one');
+is(sql(q{SELECT count(*) FROM pg_dolt_handle}), '1', 'reinserted duplicates take the derived handle again, and one allocated one');
 
 # A branch inherits derived handles for free and allocates for the duplicates it meets.
 sql(q{SELECT dolt_commit('-Am', 'dup')});
@@ -61,16 +61,20 @@ is(sql(q{SELECT string_agg(ctid::text, ',' ORDER BY ctid) FROM "postgres/dups".p
 	sql(q{SELECT string_agg(ctid::text, ',' ORDER BY ctid) FROM dup WHERE x = 2}), 'and shares the distinct row\'s handle');
 is(sql(q{SELECT count(DISTINCT ctid) FROM dup AS OF 'HEAD'}), '3', 'as does a revision');
 
-# A handle a lock record still names is not derived again for a re-inserted row.
+# A row deleted for good and re-inserted takes its derived handle again; the
+# dead lock record of the old row does not shadow it. A handle a live record
+# still names, one of a row deleted in an open transaction, is not reused.
 my $before = sql(q{SELECT ctid FROM t WHERE id = 100});
 sql(q{DELETE FROM t WHERE id = 100});
 sql(q{INSERT INTO t VALUES (100, 0, 'v100')});
-my $after = sql(q{SELECT ctid FROM t WHERE id = 100});
-isnt($after, $before, 'a re-inserted row whose handle has a lock record gets a new one');
-is(sql(qq{SELECT $handle >= $derived FROM t WHERE id = 100}), 't', 'an allocated one');
+is(sql(q{SELECT ctid FROM t WHERE id = 100}), $before, 'a re-inserted row takes its derived handle again');
 sql(q{UPDATE t SET v = 'hundred' WHERE id = 100});
 is(sql(q{SELECT v FROM t WHERE id = 100}), 'hundred', 'which locks and updates');
 is(sql(q{SELECT count(*) FROM t WHERE id = 100}), '1', 'as one row');
+my $root = sql(q{SELECT ctid FROM dup WHERE x = 2});
+sql(q{UPDATE dup SET y = 'c' WHERE x = 2});
+isnt(sql(q{INSERT INTO dup VALUES (2, 'b') RETURNING ctid}), $root, 'a handle at the root of a live update chain is not derived again');
+is(sql(qq{SELECT count(*) FILTER (WHERE $handle >= $derived), count(*) FROM dup WHERE x = 2}), '1|2', 'the row takes an allocated one');
 
 # Lossy bitmap pages: a page is a digest range, scanned once.
 sql(q{CREATE TABLE big(id int PRIMARY KEY, k int NOT NULL); CREATE INDEX big_k ON big(k)});

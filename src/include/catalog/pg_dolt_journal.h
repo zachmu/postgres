@@ -39,6 +39,6 @@ typedef FormData_pg_dolt_journal *Form_pg_dolt_journal;
 
 DECLARE_TOAST(pg_dolt_journal, 9137, 9138);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_journal_key_index, 9136, DoltJournalKeyIndexId, pg_dolt_journal, btree(jrnspace oid_ops, jrnfile oid_ops, jrnbranch text_ops, jrnseq int8_ops));
+DECLARE_INDEX(pg_dolt_journal_key_index, 9136, DoltJournalKeyIndexId, pg_dolt_journal, btree(jrnspace oid_ops, jrnfile oid_ops, jrnbranch text_ops, jrnseq int8_ops));
 
 #endif							/* PG_DOLT_JOURNAL_H */

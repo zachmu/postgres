@@ -43,7 +43,7 @@ CATALOG(pg_dolt_lock,9129,DoltLockRelationId)
 
 typedef FormData_pg_dolt_lock *Form_pg_dolt_lock;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_lock_key_index, 9130, DoltLockKeyIndexId, pg_dolt_lock, btree(lockspace oid_ops, lockfile oid_ops, lockroot int8_ops, lockbranch text_ops));
+DECLARE_INDEX(pg_dolt_lock_key_index, 9130, DoltLockKeyIndexId, pg_dolt_lock, btree(lockspace oid_ops, lockfile oid_ops, lockroot int8_ops, lockbranch text_ops));
 DECLARE_INDEX(pg_dolt_lock_handle_index, 9131, DoltLockHandleIndexId, pg_dolt_lock, btree(lockspace oid_ops, lockfile oid_ops, lockhandle int8_ops, lockbranch text_ops));
 
 #endif							/* PG_DOLT_LOCK_H */

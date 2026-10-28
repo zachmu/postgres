@@ -91,6 +91,28 @@ inserter_failed(TupleTableSlot *slot)
 		!TransactionIdDidCommit(xmin);
 }
 
+/*
+ * Whether the record version in |slot| was deleted by a committed transaction
+ * and never updated: its row is gone for good, and a new row may take the
+ * handle, with a record of its own. The dead version stays until vacuum.
+ */
+static bool
+deleted_for_good(TupleTableSlot *slot)
+{
+	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
+	HeapTupleHeader header = tuple->t_data;
+	uint16		infomask = header->t_infomask;
+	TransactionId xmax;
+
+	if ((infomask & HEAP_XMAX_INVALID) || (infomask & HEAP_XMAX_IS_MULTI) || HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+		return false;
+	if (!ItemPointerEquals(&tuple->t_self, &header->t_ctid))
+		return false;
+	xmax = HeapTupleHeaderGetRawXmax(header);
+	return TransactionIdIsValid(xmax) && !TransactionIdIsCurrentTransactionId(xmax) &&
+		!TransactionIdIsInProgress(xmax) && TransactionIdDidCommit(xmax);
+}
+
 /* The record whose current handle is |id|; false if there is none. */
 static bool
 find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid)
@@ -117,7 +139,7 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 		 * have been allocated again: handles restart above the committed ones.
 		 */
 		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id &&
-			!inserter_failed(slot))
+			!inserter_failed(slot) && !deleted_for_good(slot))
 		{
 			*tid = slot->tts_tid;
 			found = true;
@@ -195,9 +217,10 @@ record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, It
 }
 
 /*
- * Whether any record ever named |id| on |branch|, as its root or current
- * handle: a derived handle with a record must not name a new row, since the
- * record would still describe the old one.
+ * Whether a record still names |id| on |branch|, as its root or current
+ * handle: a derived handle with such a record must not name a new row, since
+ * the record would describe the old one. A record deleted for good does not
+ * count: its row is gone, and a new row with the handle gets a new record.
  */
 bool
 dg_record_exists(RelFileLocator *locator, const char *branch, int64 id)
@@ -210,14 +233,21 @@ dg_record_exists(RelFileLocator *locator, const char *branch, int64 id)
 	{
 		ScanKeyData keys[4];
 		SysScanDesc scan;
+		HeapTuple	tuple;
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(r.heap), &TTSOpsHeapTuple);
 
 		ScanKeyInit(&keys[0], Anum_pg_dolt_lock_lockspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->spcOid));
 		ScanKeyInit(&keys[1], Anum_pg_dolt_lock_lockfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->relNumber));
 		ScanKeyInit(&keys[2], Anum_pg_dolt_lock_lockroot, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(id));
 		ScanKeyInit(&keys[3], Anum_pg_dolt_lock_lockbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
 		scan = systable_beginscan(r.heap, DoltLockKeyIndexId, true, SnapshotAny, 4, keys);
-		found = HeapTupleIsValid(systable_getnext(scan));
+		while (!found && HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			ExecStoreHeapTuple(tuple, slot, false);
+			found = !inserter_failed(slot) && !deleted_for_good(slot);
+		}
 		systable_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
 	}
 	records_close(&r);
 	return found;
