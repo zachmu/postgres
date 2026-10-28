@@ -479,7 +479,13 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 	if (!taken)
 		taken = prefix_rows(&s->content, handle).count > 0;
 	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
-		taken = dg_record_exists(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+	{
+		int			status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+
+		taken = status == DG_RECORD_LIVE;
+		if (status == DG_RECORD_DEAD)
+			dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+	}
 	if (!taken)
 		return handle;
 	return handle_allocate(rel, s);

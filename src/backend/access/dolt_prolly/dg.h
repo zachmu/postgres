@@ -106,7 +106,12 @@ extern void dg_handle_note(DGState *s, uint64 handle, PLHash digest, bool presen
 extern void dg_handle_install(Relation rel, DGState *s, PLTree contents);
 extern bool dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row);
 extern bool dg_handle_range(uint64 first, uint64 count, PLHash *lower, PLHash *upper);
-extern bool dg_record_exists(RelFileLocator *locator, const char *branch, int64 id);
+/* What lock records say of a handle: none, a live one, or only ones deleted for good. */
+#define DG_RECORD_NONE 0
+#define DG_RECORD_LIVE 1
+#define DG_RECORD_DEAD 2
+extern int	dg_record_status(RelFileLocator *locator, const char *branch, int64 id);
+extern void dg_record_renew(RelFileLocator *locator, const char *branch, int64 id);
 extern bool dg_records_exist(Oid space, RelFileNumber file);
 extern void dg_handle_records_note(RelFileLocator *locator);
 extern void dg_serializable_write(Relation rel);

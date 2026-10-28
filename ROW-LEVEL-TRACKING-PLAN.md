@@ -100,8 +100,9 @@ occurrences that cannot take the derived handle:
   current handle of an update chain, or a row the command's own batch removed
   and adds back. A record's handle must not name a new row while the record
   describes the old one; a record whose row was deleted by a committed
-  transaction is dead, and a row that returns takes the handle and a new
-  record. The journal tolerates a repeated sequence for the same reason: a
+  transaction is dead: a row that returns takes the handle and creates a new
+  record, lookups prefer a live record over a dead one, and a locker holding
+  the old row's TID still finds the dead record and learns of the deletion. The journal tolerates a repeated sequence for the same reason: a
   removal and the addition after it net out.
 
 The catalog `pg_dolt_handle` maps (storage, branch, handle) to digest, with a
