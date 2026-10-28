@@ -310,6 +310,24 @@ dg_catalog_active(void)
 		return false;
 	if (active_committed)
 		return true;
+	/* A repository may contain routines or types before its first table.
+	 * Use a catalog snapshot: parser callers need not have an active snapshot. */
+	{
+		ScanKeyData key;
+
+		bindings = table_open(DoltRefRelationId, AccessShareLock);
+		ScanKeyInit(&key, Anum_pg_dolt_ref_refname, BTEqualStrategyNumber,
+					F_TEXTEQ, CStringGetTextDatum("views/enabled"));
+		scan = systable_beginscan(bindings, DoltRefKeyIndexId, true, NULL, 1, &key);
+		tuple = systable_getnext(scan);
+		active = HeapTupleIsValid(tuple);
+		if (active && !TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple->t_data)))
+			active_committed = true;
+		systable_endscan(scan);
+		table_close(bindings, AccessShareLock);
+		if (active)
+			return true;
+	}
 	bindings = table_open(DoltBindingRelationId, AccessShareLock);
 	scan = systable_beginscan(bindings, InvalidOid, false, NULL, 0, NULL);
 	tuple = systable_getnext(scan);
