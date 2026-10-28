@@ -7,7 +7,7 @@
 
 /* Whether a type DDL statement creates a type in a versioned schema. */
 static bool
-creates_versioned_type(Node *statement)
+creates_versioned_type(Node *statement, Oid *namespaceid)
 {
 	Oid			namespace;
 	char	   *name;
@@ -22,6 +22,7 @@ creates_versioned_type(Node *statement)
 		namespace = QualifiedNameGetCreationNamespace(((CreateRangeStmt *) statement)->typeName, &name);
 	else
 		return false;
+	*namespaceid = namespace;
 	return !isAnyTempNamespace(namespace) && !dg_system_namespace(get_namespace_name(namespace));
 }
 
@@ -352,13 +353,24 @@ bool
 dg_catalog_type_ddl(ParseState *pstate, Node *statement)
 {
 	bool		pushed = false;
+	bool		creating;
+	Oid			namespaceid = InvalidOid;
 
 	if (!IsA(statement, CreateEnumStmt) && !IsA(statement, CreateDomainStmt) &&
 		!IsA(statement, CompositeTypeStmt) && !IsA(statement, CreateRangeStmt) && !IsA(statement, AlterEnumStmt) &&
 		!IsA(statement, AlterDomainStmt) && !IsA(statement, AlterTableStmt))
 		return false;
-	if (!dg_catalog_active() || !(creates_versioned_type(statement) || alters_versioned_type(statement)))
+	creating = creates_versioned_type(statement, &namespaceid);
+	if (!dg_catalog_active())
+	{
+		if (!creating || !default_table_access_method || strcmp(default_table_access_method, "dolt_prolly_table"))
+			return false;
+		catalog_activate();
+	}
+	if (!creating && !alters_versioned_type(statement))
 		return false;
+	if (creating)
+		adopt_schema(namespaceid);
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());

@@ -3677,7 +3677,8 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
 					 errmsg("no schema has been selected to create in")));
 	}
 
-	return namespaceId;
+	/* The search path caches physical namespace OIDs, not revision handles. */
+	return CatalogViewNamespace(CatalogViewCurrent(), namespaceId);
 }
 
 /*
