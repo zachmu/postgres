@@ -585,7 +585,9 @@ static DGState *journal_fold_loaded(Relation rel, const char *branch, Snapshot s
 static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
 static uint64 journal_max_handle(Oid space, RelFileNumber file);
-static void journal_xact_end(bool committed);
+static void journal_xact_end(bool committed, bool prepared);
+static void journal_pre_commit(void);
+static void journal_invalidate(void);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
 static bool relation_has_unique_index(Relation rel);
@@ -904,6 +906,7 @@ store_xact(XactEvent event, void *arg)
 						CheckRelationForSerializableConflictIn(serializable_writes[i].db, serializable_writes[i].relid);
 					batch_flush_all();
 					publish_all();
+					journal_pre_commit();
 					working_close(true);
 				}
 				PG_FINALLY();
@@ -933,7 +936,7 @@ store_xact(XactEvent event, void *arg)
 			 * aborting, when resource owners clean up instead.
 			 */
 			working_close(event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT);
-			journal_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT);
+			journal_xact_end(event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT, event == XACT_EVENT_PREPARE);
 			overlays = NULL;	/* in TopTransactionContext */
 			batches = NULL;
 			journal_marks = NULL;
@@ -979,7 +982,10 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	if (event == SUBXACT_EVENT_PRE_START_SUB || event == SUBXACT_EVENT_PRE_COMMIT_SUB)
 		batch_flush_all();
 	else if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
 		batch_discard(mySubid);
+		journal_invalidate();	/* folds may hold the subtransaction's entries */
+	}
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
 		return;
 
@@ -1244,7 +1250,8 @@ typedef struct HandleSlot
 	RelFileNumber file;
 	pg_atomic_uint32 used;
 	pg_atomic_uint64 next;
-	pg_atomic_uint64 journal_generation;	/* bumped when a journal write to the storage commits */
+	pg_atomic_uint64 journal_generation;	/* moved before a journal writer of the storage commits */
+	pg_atomic_uint32 journal_writers;	/* transactions that journaled to the storage and have not ended */
 	pg_atomic_uint32 records;	/* whether any row of the storage ever had a lock record */
 } HandleSlot;
 
@@ -1371,6 +1378,7 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
 			pg_atomic_write_u64(&candidate->journal_generation, 1);
+			pg_atomic_write_u32(&candidate->journal_writers, 0);
 			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
 			pg_atomic_write_u32(&candidate->used, 1);

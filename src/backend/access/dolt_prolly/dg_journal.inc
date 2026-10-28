@@ -52,15 +52,27 @@ typedef struct JournalEntries
 				capacity;
 } JournalEntries;
 
-/* The folded trees of one state key, kept across statements while valid. */
+/*
+ * The folded tree of one state key, kept across statements while valid: the
+ * identity of what it folded (see journal_fold_state), and the storage's
+ * journal generation and this backend's own write version it is current
+ * with, which let it stand across statements and transactions while nothing
+ * new reached the stream. This backend's own journaled entries are applied
+ * to it as they are written, so its own writes never force a re-read.
+ */
 typedef struct JournalFold
 {
 	RootKey		key;			/* hash key: the state's own key */
 	RootKey		table_key;		/* whose journal applies */
+	Oid			relid;			/* the relation folded, for applying entries; invalid if bound */
 	uint64		store_epoch;
 	uint64		roots_generation;
 	uint64		local_version;
+	uint64		journal_generation;
 	Visibility	seen;
+	TransactionId own_xid;		/* the transaction whose uncommitted entries it holds, if any */
+	CommandId	own_cid;		/* up to this command of it */
+	bool		latest;			/* folded from the latest state with no writer in flight */
 	bool		table;
 	PLHash		base;			/* the tree the entries were applied to */
 	PLHash		folded;			/* the result */
@@ -88,6 +100,9 @@ static int	journal_touched_count,
 			journal_touched_capacity;
 
 static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
+static bool journal_touched_is(const RootKey *table_key);
+static int	compare_journal_seq(const void *a, const void *b);
+static void journal_folds_apply(const RootKey *table_key, const JournalEntries *entries, CommandId cid);
 static PLTree journal_table_base(Relation table, const RootKey *table_key, Snapshot snapshot, const char *branch, DGState **state);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
 static void journal_state_seqs(DGState *s, const JournalFold *fold);
@@ -116,17 +131,29 @@ journal_touch(Oid db, Oid space, RelFileNumber file)
 	journal_touched_count++;
 	journal_local_version++;
 	MemoryContextSwitchTo(old);
+
+	/* A writer in progress: folds built meanwhile cannot trust the generation. */
+	pg_atomic_fetch_add_u32(&handle_slot_claim(db, space, file)->journal_writers, 1);
 }
 
 /* At commit: readers of the touched storages must refold. */
 static void
-journal_xact_end(bool committed)
+journal_invalidate(void)
+{
+	journal_local_version++;
+}
+
+static void
+journal_xact_end(bool committed, bool prepared)
 {
 	/*
-	 * Only a claimed slot can be cached by anyone; claiming one here would
-	 * read catalogs, which a commit callback may not do.
+	 * The generations moved before commit, in journal_pre_commit. Folds that
+	 * hold this transaction's entries stay right when it commits; when it
+	 * aborts they hold entries no one will see, and the version moves. The
+	 * writer count drops when the transaction ends: a prepared one keeps
+	 * its count, since its rows appear only when it commits, unseen here.
 	 */
-	if (committed)
+	if (!prepared)
 	{
 		shared_handles();
 		for (int i = 0; i < journal_touched_count; i++)
@@ -134,12 +161,13 @@ journal_xact_end(bool committed)
 			HandleSlot *slot = handle_slot_find(journal_touched[i].db, journal_touched[i].space, journal_touched[i].file);
 
 			if (slot)
-				pg_atomic_fetch_add_u64(&slot->journal_generation, 1);
+				pg_atomic_fetch_sub_u32(&slot->journal_writers, 1);
 		}
 	}
 	journal_touched = NULL;
 	journal_touched_count = journal_touched_capacity = 0;
-	journal_local_version++;
+	if (!committed)
+		journal_local_version++;
 }
 
 static void
@@ -325,7 +353,37 @@ journal_batch(DGBatch *b, bool forced)
 		PopActiveSnapshot();
 	handle_delta_write(&b->key, b->handles, b->cid);
 	journal_touch(MyDatabaseId, b->key.space, b->key.file);
+
+	/* The entries, in sequence order, for the folds this backend keeps. */
+	{
+		JournalEntries entries = {palloc(Max(n, 1) * sizeof(JournalEntry)), 0, (int) n};
+
+		hash_seq_init(&status, b->handles);
+		while ((mapping = hash_seq_search(&status)) != NULL)
+		{
+			PendingRow *pending = hash_search(b->rows, &mapping->digest, HASH_FIND, NULL);
+			JournalEntry *entry = &entries.items[entries.count++];
+
+			entry->seq = (int64) (mapping->handle * 2 + (mapping->present ? 0 : 1));
+			entry->handle = mapping->handle;
+			entry->added = mapping->present;
+			entry->digest = mapping->digest;
+			entry->row = pending ? pending->row : (PLSlice) {NULL, 0};
+		}
+		qsort(entries.items, entries.count, sizeof(JournalEntry), compare_journal_seq);
+		journal_folds_apply(&b->key, &entries, b->cid);
+		pfree(entries.items);
+	}
 	return true;
+}
+
+static int
+compare_journal_seq(const void *a, const void *b)
+{
+	const JournalEntry *x = a,
+			   *y = b;
+
+	return x->seq < y->seq ? -1 : x->seq > y->seq ? 1 : 0;
 }
 
 /*
@@ -546,6 +604,47 @@ journal_fold_find(const RootKey *key, bool enter)
 	return hash_search(journal_folds, key, enter ? HASH_ENTER : HASH_FIND, NULL);
 }
 
+/*
+ * Whether a fold holding this transaction's own entries may serve a load
+ * under |seen|: the latest state sees them all; an MVCC snapshot only those
+ * of earlier commands.
+ */
+static bool
+journal_fold_own_visible(const JournalFold *fold, const Visibility *seen, bool mvcc)
+{
+	if (!mvcc || !TransactionIdIsValid(fold->own_xid) || fold->own_xid != GetTopTransactionIdIfAny())
+		return true;
+	return fold->own_cid < seen->cid;
+}
+
+/*
+ * The storage's journal generation, moved before a journaling transaction
+ * commits, or 0 when a writer is in progress: its rows may appear without
+ * the generation moving again, so a fold built now cannot be trusted by it.
+ */
+static uint64
+journal_generation_of(const RootKey *table_key)
+{
+	HandleSlot *slot = handle_slot_claim(MyDatabaseId, table_key->space, table_key->file);
+	uint32		writers = pg_atomic_read_u32(&slot->journal_writers);
+	uint64		generation = pg_atomic_read_u64(&slot->journal_generation);
+
+	pg_read_barrier();
+	if (writers > 0 && !(writers == 1 && journal_touched_count && journal_touched_is(table_key)))
+		return 0;
+	return generation;
+}
+
+/* Whether this transaction has journaled to |table_key|'s storage. */
+static bool
+journal_touched_is(const RootKey *table_key)
+{
+	for (int i = 0; i < journal_touched_count; i++)
+		if (journal_touched[i].space == table_key->space && journal_touched[i].file == table_key->file)
+			return true;
+	return false;
+}
+
 /* Release the nodes a fold kept; they drop with the next transaction if unwritten. */
 static void
 journal_fold_unpin(JournalFold *fold)
@@ -636,20 +735,36 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 				table_key = *table_key_in;
 	bool		is_table = rel->rd_rel->relkind != RELKIND_INDEX;
 	uint64		roots_gen = roots_generation();
+	bool		mvcc = snapshot && IsMVCCSnapshot(snapshot);
 	Visibility	seen;
 	JournalFold *fold = journal_fold_find(&key, false);
 	PLHash		current = s->content.root;
 	JournalEntries entries;
 	MemoryContext old;
+	uint64		generation;
 
 	if (s->store != dg_working_store())
 		return;
 	visibility_capture(snapshot, &seen);
+	generation = journal_generation_of(&table_key);
 
-	/* Nothing moved since the last fold: its result stands. */
+	/*
+	 * The last fold stands when nothing moved since: the same tree base, the
+	 * same visible stream, and nothing of this backend's written since. The
+	 * stream is the same when the snapshot identity is. It is also the same
+	 * when the fold holds the whole committed stream, having been built from
+	 * the latest state with no writer in flight, no journaling transaction
+	 * has committed since (the generation), and this snapshot sees every
+	 * transaction the fold saw: the latest state does; an MVCC snapshot does
+	 * when it saw none in progress and is no older than the fold.
+	 */
 	if (fold && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
-		visibility_equal(&fold->seen, &seen) && fold->local_version == journal_local_version &&
-		fold->table == is_table && pl_hash_equal(fold->base, current))
+		fold->local_version == journal_local_version && fold->table == is_table && pl_hash_equal(fold->base, current) &&
+		journal_fold_own_visible(fold, &seen, mvcc) &&
+		(visibility_equal(&fold->seen, &seen) ||
+		 (fold->latest && generation != 0 && fold->journal_generation == generation &&
+		  (!mvcc || (!seen.overflow && seen.xcnt == 0 && seen.subxcnt == 0 &&
+					 TransactionIdFollowsOrEquals(seen.xmax, fold->seen.xmax))))))
 	{
 		if (fold->seq_count)
 			journal_fold_install(s, fold->folded, fold);
@@ -661,6 +776,23 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	{
 		fold = journal_fold_find(&key, true);
 		memset(((char *) fold) + sizeof(RootKey), 0, sizeof(*fold) - sizeof(RootKey));
+	}
+	fold->relid = dg_storage_bound(rel) || CatalogViewObjectContext(RelationGetRelid(rel)) ? InvalidOid : RelationGetRelid(rel);
+	fold->latest = !mvcc && generation != 0;
+
+	/*
+	 * Entries of this transaction the read includes: all of them under the
+	 * latest state, those of earlier commands under an MVCC snapshot.
+	 */
+	if (journal_touched_count)
+	{
+		fold->own_xid = GetTopTransactionIdIfAny();
+		fold->own_cid = mvcc ? (seen.cid > 0 ? seen.cid - 1 : 0) : GetCurrentCommandId(false);
+	}
+	else
+	{
+		fold->own_xid = InvalidTransactionId;
+		fold->own_cid = 0;
 	}
 
 	/*
@@ -677,6 +809,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		fold->store_epoch = store_epoch;
 		fold->roots_generation = roots_gen;
 		fold->local_version = journal_local_version;
+		fold->journal_generation = generation;
 		fold->seen = seen;
 		fold->table = is_table;
 		fold->table_key = table_key;
@@ -759,11 +892,121 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	fold->store_epoch = store_epoch;
 	fold->roots_generation = roots_gen;
 	fold->local_version = journal_local_version;
+	fold->journal_generation = generation;
 	fold->seen = seen;
 	fold->table = is_table;
 	fold->table_key = table_key;
 	journal_fold_pin_tree(fold, s->store, current);
 	journal_fold_install(s, current, fold);
+}
+
+/* Merge the ascending |seqs| into |fold|'s, keeping the multiset order. */
+static void
+journal_fold_add_seqs(JournalFold *fold, const int64 *seqs, int count)
+{
+	int64	   *merged;
+	int			i = 0,
+				j = 0,
+				n = 0;
+	MemoryContext old = MemoryContextSwitchTo(CacheMemoryContext);
+
+	merged = palloc((fold->seq_count + count) * sizeof(int64));
+	while (i < fold->seq_count || j < count)
+	{
+		if (j == count || (i < fold->seq_count && fold->seqs[i] <= seqs[j]))
+			merged[n++] = fold->seqs[i++];
+		else
+			merged[n++] = seqs[j++];
+	}
+	if (fold->seqs)
+		pfree(fold->seqs);
+	fold->seqs = merged;
+	fold->seq_count = fold->seq_capacity = n;
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Apply the entries a batch just journaled for |table_key| to every cached
+ * fold of the table and of its indexes, so that this backend's later loads
+ * need not re-read the stream. A fold that cannot take them, one of a bound
+ * storage, stays behind its version and re-reads.
+ */
+static void
+journal_folds_apply(const RootKey *table_key, const JournalEntries *entries, CommandId cid)
+{
+	HASH_SEQ_STATUS status;
+	JournalFold *fold;
+	PLStore    *store = dg_working_store();
+	int64	   *seqs = palloc(Max(entries->count, 1) * sizeof(int64));
+
+	if (!journal_folds || !entries->count)
+		return;
+	for (int i = 0; i < entries->count; i++)
+		seqs[i] = entries->items[i].seq;
+	hash_seq_init(&status, journal_folds);
+	while ((fold = hash_seq_search(&status)) != NULL)
+	{
+		PLTree		tree;
+
+		if (fold->store_epoch != store_epoch || memcmp(&fold->table_key, table_key, sizeof(RootKey)) != 0 ||
+			fold->local_version != journal_local_version - 1 || !OidIsValid(fold->relid))
+			continue;
+		tree.store = store;
+		tree.root = fold->folded;
+		if (fold->table)
+			journal_apply_table(store, &tree, entries);
+		else
+		{
+			Relation	index = relation_open(fold->relid, NoLock);
+			PLTree		content = {store, fold->folded};	/* every removal carries its row */
+
+			journal_apply_index(index, store, &tree, entries, entries, &content);
+			relation_close(index, NoLock);
+		}
+		fold->folded = tree.root;
+		journal_fold_add_seqs(fold, seqs, entries->count);
+		journal_fold_pin_tree(fold, store, tree.root);
+		fold->local_version = journal_local_version;
+		fold->own_xid = GetTopTransactionIdIfAny();
+		fold->own_cid = Max(fold->own_cid, cid);
+	}
+	pfree(seqs);
+}
+
+/*
+ * Before a journaling transaction commits: move the generation of every
+ * storage it wrote, so that other backends' folds re-read, and keep this
+ * backend's folds current with the move, as they already hold the entries.
+ */
+static void
+journal_pre_commit(void)
+{
+	HASH_SEQ_STATUS status;
+	JournalFold *fold;
+
+	if (!journal_touched_count)
+		return;
+	shared_handles();
+	for (int i = 0; i < journal_touched_count; i++)
+	{
+		HandleSlot *slot = handle_slot_find(journal_touched[i].db, journal_touched[i].space, journal_touched[i].file);
+		uint64		generation;
+
+		if (!slot)
+			continue;
+		generation = pg_atomic_fetch_add_u64(&slot->journal_generation, 1) + 1;
+		if (!journal_folds)
+			continue;
+		hash_seq_init(&status, journal_folds);
+		while ((fold = hash_seq_search(&status)) != NULL)
+			if (fold->table_key.space == journal_touched[i].space && fold->table_key.file == journal_touched[i].file &&
+				fold->local_version == journal_local_version)
+			{
+				fold->journal_generation = generation;
+				fold->own_xid = InvalidTransactionId;	/* committed: visible to every later snapshot */
+				fold->own_cid = 0;
+			}
+	}
 }
 
 /*
