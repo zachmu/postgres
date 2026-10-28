@@ -957,9 +957,18 @@ journal_folds_apply(const RootKey *table_key, const JournalEntries *entries, Com
 			journal_apply_table(store, &tree, entries);
 		else
 		{
-			Relation	index = relation_open(fold->relid, NoLock);
+			/* The index may be gone, or have new storage: the fold goes stale then. */
+			Relation	index = try_relation_open(fold->relid, NoLock);
 			PLTree		content = {store, fold->folded};	/* every removal carries its row */
 
+			if (!index)
+				continue;
+			if (index->rd_rel->relkind != RELKIND_INDEX || index->rd_locator.relNumber != fold->key.file ||
+				index->rd_locator.spcOid != fold->key.space)
+			{
+				relation_close(index, NoLock);
+				continue;
+			}
 			journal_apply_index(index, store, &tree, entries, entries, &content);
 			relation_close(index, NoLock);
 		}
