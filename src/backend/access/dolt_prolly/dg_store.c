@@ -1803,6 +1803,37 @@ dg_save(Relation rel, DGState *s, CommandId cid)
 
 #include "dg_batch.inc"
 
+/*
+ * The content root of storage file |locator| on |branch| as |snapshot| and this
+ * transaction's own changes show it, as a load of its relation would: false
+ * if the storage holds no root there.
+ */
+bool
+dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content)
+{
+	RootKey		key = {0};
+	Roots		committed,
+				view;
+	OverlayEntry *entry;
+
+	if (strlen(branch) >= sizeof(key.branch))
+		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG), errmsg("branch name is too long for prolly storage")));
+	key.space = locator.spcOid;
+	key.file = locator.relNumber;
+	strlcpy(key.branch, branch, sizeof(key.branch));
+	if (!loading_for_batch)
+		batch_flush_key(&key);
+	committed = roots_read(&key, snapshot);
+	view = committed;
+	entry = overlay_entry(overlay_find(&key, false), snapshot);
+	if (entry)
+		view = roots_equal(&entry->base, &committed) ? entry->roots : roots_merge(&entry->base, &entry->roots, &committed);
+	if (!view.present)
+		return false;
+	*content = view.content;
+	return true;
+}
+
 /* Only the transactional resource allocator calls this, before publishing any
  * branch binding: the new storage starts empty on its branch. */
 void

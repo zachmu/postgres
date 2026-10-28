@@ -302,6 +302,39 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
 	return storage;
 }
 
+/*
+ * The content root of storage |resource| on |branch|, read without building its
+ * definition: false if it holds none there.
+ */
+bool
+dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content)
+{
+	LockRelId	lock = {resource, MyDatabaseId};
+	Relation	catalog;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	FormData_pg_dolt_storage form;
+	RelFileLocator locator;
+
+	LockRelationId(&lock, AccessShareLock);
+	catalog = table_open(DoltStorageRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_dolt_storage_storageid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(resource));
+	scan = systable_beginscan(catalog, DoltStorageKeyIndexId, true, snapshot, 1, &key);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is unavailable", resource)));
+	form = *(Form_pg_dolt_storage) GETSTRUCT(tuple);
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (form.storagedb != MyDatabaseId || !OidIsValid(form.storagespc) || !RelFileNumberIsValid(form.storagefile))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("storage resource %u is invalid", resource)));
+	locator.spcOid = form.storagespc;
+	locator.dbOid = form.storagedb;
+	locator.relNumber = form.storagefile;
+	return dg_storage_content_root(locator, branch, snapshot, content);
+}
+
 /* Only this checked entrypoint admits a canonical descriptor to page storage.
  * There is no ambient authority to write a retained/schema-only handle. */
 DGState *

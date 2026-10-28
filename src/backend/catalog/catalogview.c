@@ -26,6 +26,7 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_class_d.h"
 #include "utils/inval.h"
+#include "utils/fmgroids.h"
 
 /*
  * Durable OIDs belong to a branch, not to one view: each schema version of
@@ -435,6 +436,21 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 		if (rows->catalog == RelationGetRelid(relation))
 		{
 			scan->rows = rows->tuples;
+			break;
+		}
+	}
+
+	/* An OID equality key selects its rows through an index. */
+	for (i = 0; i < nkeys && !(CatalogViewIsProvisional(view) && snapshot && snapshot->snapshot_type == SNAPSHOT_SELF); i++)
+	{
+		int			attr = keys[i].sk_attno;
+
+		if (keys[i].sk_flags == 0 && keys[i].sk_strategy == BTEqualStrategyNumber &&
+			keys[i].sk_func.fn_oid == F_OIDEQ && attr > 0 &&
+			TupleDescAttr(RelationGetDescr(relation), attr - 1)->atttypid == OIDOID)
+		{
+			scan->rows = CatalogViewTuplesWith(view, RelationGetRelid(relation), attr, DatumGetObjectId(keys[i].sk_argument));
+			scan->owns_rows = true;
 			break;
 		}
 	}
@@ -1487,7 +1503,9 @@ CatalogViewTuples(CatalogView *view, Oid catalog)
  */
 /*
  * The rows of |catalog| whose OID column |attribute| holds |value|, in view
- * order, through an index built on first use.
+ * order, through an index built on first use. The list is the caller's: the
+ * index is forgotten when the rows change, as they do between commands of a
+ * provisional view.
  */
 List *
 CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid value)
@@ -1534,7 +1552,7 @@ CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid 
 		MemoryContextSwitchTo(previous);
 	}
 	entry = hash_search(index->entries, &value, HASH_FIND, NULL);
-	return entry ? entry->tuples : NIL;
+	return entry ? list_copy(entry->tuples) : NIL;
 }
 
 void

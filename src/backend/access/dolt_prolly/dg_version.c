@@ -739,37 +739,40 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 
 			if (!definitions_only)
 			{
-				DGStorage  *storage;
-				DGState    *state;
+				PLHash		content;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-				state = dg_storage_load(storage);
-				dg_storage_close(storage);
-				if (state->has_root)
+				if (dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content))
 				{
 					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
 					char	   *root;
 					char	   *recorded = json_value(payload, "content");
 
 					SET_VARSIZE(raw, VARHDRSZ + PL_HASH_SIZE);
-					memcpy(VARDATA(raw), state->content.root.bytes, PL_HASH_SIZE);
+					memcpy(VARDATA(raw), content.bytes, PL_HASH_SIZE);
 					root = hex(raw);
 
 					/*
 					 * A member that already records these contents is the
 					 * member this capture would make: its retained tree is
-					 * that root's.
+					 * that root's. Only changed contents are loaded to be
+					 * retained.
 					 */
 					if (!recorded || strcmp(recorded, root))
 					{
 						payload = json_set_string(payload, "content", root);
 						if (persist)
+						{
+							DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+							DGState    *state = dg_storage_load(storage);
+
+							dg_storage_close(storage);
 							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
+							dg_release(state);
+						}
 					}
 				}
-				dg_release(state);
 			}
 			appendStringInfoString(&json, payload);
 		}
