@@ -95,5 +95,10 @@ is(sql(q{SELECT string_agg(ctid::text, ',' ORDER BY id) FROM t}), $ctids, 'with 
 sql(q{INSERT INTO t VALUES (4, 1, 'four')});
 is(sql(q{SELECT count(*) FROM (SELECT DISTINCT ctid FROM t) x}), '4', 'a new handle does not collide after the restart');
 is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 1}), '4', 'the index agrees');
+
+# A crash loses the shared handle slots; the first commit after it must not claim one.
+$node->stop('immediate');
+$node->start;
+is(sql(q{ALTER TABLE t ALTER COLUMN v TYPE varchar(20); SELECT v FROM t WHERE id = 4}), 'four', 'a rewrite commits first after a crash');
 $node->stop;
 done_testing();

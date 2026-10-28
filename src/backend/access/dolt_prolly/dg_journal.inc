@@ -122,13 +122,21 @@ journal_touch(Oid db, Oid space, RelFileNumber file)
 static void
 journal_xact_end(bool committed)
 {
+	/*
+	 * Only a claimed slot can be cached by anyone; claiming one here would
+	 * read catalogs, which a commit callback may not do.
+	 */
 	if (committed)
+	{
+		shared_handles();
 		for (int i = 0; i < journal_touched_count; i++)
 		{
-			HandleSlot *slot = handle_slot_claim(journal_touched[i].db, journal_touched[i].space, journal_touched[i].file);
+			HandleSlot *slot = handle_slot_find(journal_touched[i].db, journal_touched[i].space, journal_touched[i].file);
 
-			pg_atomic_fetch_add_u64(&slot->journal_generation, 1);
+			if (slot)
+				pg_atomic_fetch_add_u64(&slot->journal_generation, 1);
 		}
+	}
 	journal_touched = NULL;
 	journal_touched_count = journal_touched_capacity = 0;
 	journal_local_version++;
