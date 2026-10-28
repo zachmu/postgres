@@ -686,6 +686,8 @@ reservation_key(Relation index, const char *branch, uint64 hash)
 {
 	ReservationKey key;
 
+	/* The key is hashed and compared as bytes: its padding must be zero. */
+	memset(&key, 0, sizeof(key));
 	key.index = index->rd_locator.relNumber;
 	key.branch = hash_bytes_extended((const unsigned char *) branch, strlen(branch), 0);
 	key.key = hash;

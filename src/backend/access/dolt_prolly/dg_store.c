@@ -47,6 +47,8 @@
 #include "catalog/index.h"
 #include "catalog/pg_dolt_journal.h"
 #include "catalog/pg_dolt_handle.h"
+#include "catalog/pg_index.h"
+#include "utils/syscache.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "access/doltbranch.h"
@@ -586,6 +588,7 @@ static uint64 journal_max_handle(Oid space, RelFileNumber file);
 static void journal_xact_end(bool committed);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
+static bool relation_has_unique_index(Relation rel);
 struct HandleDelta;
 static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
 static void handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid);

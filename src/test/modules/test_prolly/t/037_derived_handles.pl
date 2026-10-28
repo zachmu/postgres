@@ -76,6 +76,24 @@ sql(q{UPDATE dup SET y = 'c' WHERE x = 2});
 isnt(sql(q{INSERT INTO dup VALUES (2, 'b') RETURNING ctid}), $root, 'a handle at the root of a live update chain is not derived again');
 is(sql(qq{SELECT count(*) FILTER (WHERE $handle >= $derived), count(*) FROM dup WHERE x = 2}), '1|2', 'the row takes an allocated one');
 
+# Concurrent first inserters of identical rows into a keyless table: the
+# first reserves the derived handle until it ends, the second allocates, and
+# each occurrence keeps a handle of its own.
+sql(q{CREATE TABLE race(x int, y text)});
+my $first = $node->background_psql('postgres');
+$first->query_safe(q{BEGIN; INSERT INTO race VALUES (1, 'same')});
+my $second = sql(q{INSERT INTO race VALUES (1, 'same') RETURNING ctid});
+$first->query_safe('COMMIT');
+my $held = $first->query_safe(q{SELECT ctid FROM race ORDER BY ctid LIMIT 1});
+$first->quit;
+isnt($second, $held, 'a concurrent inserter of an identical row takes a different handle');
+is(sql(qq{SELECT count(*), count(DISTINCT ctid), count(*) FILTER (WHERE $handle >= $derived) FROM race}), '2|2|1', 'one derived, one allocated');
+is(sql(q{WITH d AS (DELETE FROM race WHERE x = 1 RETURNING 1) SELECT count(*) FROM d}), '2', 'and a delete removes both');
+$first = $node->background_psql('postgres');
+$first->query_safe(q{BEGIN; INSERT INTO race VALUES (2, 'gone'); ROLLBACK});
+$first->quit;
+is(sql(qq{INSERT INTO race VALUES (2, 'gone') RETURNING $handle < $derived}), 't', 'a reservation of an aborted transaction does not block the derived handle');
+
 # Lossy bitmap pages: a page is a digest range, scanned once.
 sql(q{CREATE TABLE big(id int PRIMARY KEY, k int NOT NULL); CREATE INDEX big_k ON big(k)});
 sql(q{INSERT INTO big SELECT g, g % 100 FROM generate_series(1, 20000) g});

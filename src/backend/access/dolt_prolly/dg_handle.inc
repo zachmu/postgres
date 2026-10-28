@@ -464,11 +464,44 @@ dg_handle_count(DGState *s)
 }
 
 /*
+ * Whether |rel| has a unique index: concurrent inserters of identical rows
+ * then serialize on its key reservation, so the derived handle needs no
+ * reservation of its own.
+ */
+static bool
+relation_has_unique_index(Relation rel)
+{
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+	bool		unique = false;
+
+	foreach(lc, indexes)
+	{
+		HeapTuple	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+
+		if (!HeapTupleIsValid(tuple))
+			continue;
+		unique = ((Form_pg_index) GETSTRUCT(tuple))->indisunique;
+		ReleaseSysCache(tuple);
+		if (unique)
+			break;
+	}
+	list_free(indexes);
+	return unique;
+}
+
+/*
  * The handle for a new occurrence of |digest| in |s|, recorded through |b|
  * if the command batches its edits: derived when no live row holds its
- * prefix, nothing of this command names it, and no lock record still names
- * it; else allocated. A journal entry may name it: the stream tolerates a
- * repeated sequence, since a removal and the addition after it net out.
+ * prefix, nothing of this command names it, no lock record still names it,
+ * and no other running transaction has reserved it; else allocated. A
+ * journal entry may name it: the stream tolerates a repeated sequence, since
+ * a removal and the addition after it net out.
+ *
+ * Two transactions inserting the first occurrence of identical rows cannot
+ * see each other's, so the first reserves the derived handle until it ends
+ * and the second allocates. A table with a unique index serializes such
+ * inserters on the key already and skips the reservation.
  */
 uint64
 dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
@@ -486,6 +519,8 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 		if (status == DG_RECORD_DEAD)
 			dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
 	}
+	if (!taken && !s->delta_private && !(b ? dg_batch_has_unique_index(b) : relation_has_unique_index(rel)))
+		taken = !dg_key_reserve(rel, dg_relation_branch(rel), handle, false);
 	if (!taken)
 		return handle;
 	return handle_allocate(rel, s);
