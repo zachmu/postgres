@@ -24,6 +24,8 @@ sql(q{SELECT dolt_commit('-m','one overload')});
 is(sql(q{SET default_table_access_method=heap; SELECT f(4)}), '5',
    'activation survives a session changing its default access method');
 sql(q{CREATE OR REPLACE FUNCTION f(i int) RETURNS int LANGUAGE sql AS 'SELECT i+10'});
+is(sql(q{SELECT data_change,schema_change FROM dolt_diff_summary('HEAD','WORKING','f(integer)')}),
+   't|f', 'routine body change is a property-data change in diff summary');
 sql(q{SELECT dolt_checkout('f(integer)')});
 is(sql(q{SELECT f(4), f('text'::text)}), '5|text', 'restore preserves unrelated overload');
 sql(q{SELECT dolt_clean('f(text)')});
@@ -44,6 +46,16 @@ sql(q{SELECT dolt_conflicts_resolve('--theirs','f(integer)')});
 is(sql(q{SELECT f(1)}), '21', 'routine conflict resolution normalizes signature aliases');
 sql(q{SELECT dolt_commit('-Am','resolved')});
 is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'resolved routine merge commits cleanly');
+
+sql(q{CREATE TABLE tr_table(id int); CREATE FUNCTION tr_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; SELECT dolt_commit('-Am','trigger base')});
+sql(q{CREATE TRIGGER tr BEFORE INSERT ON tr_table FOR EACH ROW EXECUTE FUNCTION tr_fn()});
+is(sql(q{SELECT count(*) FROM dolt_status}), '1', 'trigger is an independently visible workspace change');
+sql(q{SELECT dolt_add('tr_table.tr')});
+is(sql(q{SELECT count(*) FROM dolt_status WHERE staged}), '1', 'named trigger staging');
+sql(q{SELECT dolt_reset('tr_table.tr')});
+sql(q{SELECT dolt_clean('tr_table.tr')});
+is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'clean removes only the untracked trigger');
+is(sql(q{SELECT count(*) FROM tr_table}), '0', 'clean retains the tracked owning table');
 
 sql(q{CREATE SCHEMA "sp ace"});
 sql(q{CREATE FUNCTION "sp ace"."f.dot"(i int) RETURNS int LANGUAGE sql AS 'SELECT i'});
