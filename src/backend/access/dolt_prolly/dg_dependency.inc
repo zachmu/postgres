@@ -157,9 +157,10 @@ publish_deletions(List *objects, CatalogView *view)
 			{
 				DeletedColumns *columns = palloc0(sizeof(DeletedColumns));
 				ArrayBuildState *positions = initArrayResult(INT4OID, CurrentMemoryContext, false);
+				JsonbValue	document = json_document(definition);
+				JsonbValue	list;
 
-				run("SELECT jsonb_array_length($1::jsonb->'columns')", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-				columns->oldcount = DatumGetInt32(cell(0, 1));
+				columns->oldcount = json_get(&document, "columns", &list) ? json_length(&list) : 0;
 				columns->mapping = palloc_array(int, Max(columns->oldcount, 1));
 				for (int attnum = 1; attnum <= columns->oldcount; attnum++)
 				{

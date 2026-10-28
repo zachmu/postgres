@@ -122,19 +122,19 @@ dg_catalog_permission(const char *descriptor, Oid user)
 static char *
 catalog_namespace_find(bytea *db, const char *name)
 {
-	bytea	  **addresses;
 	int			n,
 				i;
+	DGMember   *members = dg_database_members(db, &n);
 
-	run("SELECT o.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind='namespace'", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(db)), NULL, true);
-	n = SPI_processed;
-	addresses = palloc(sizeof(bytea *) * Max(n, 1));
-	for (i = 0; i < n; i++)
-		addresses[i] = DatumGetByteaPCopy(cell(i, 1));
 	for (i = 0; i < n; i++)
 	{
-		char	   *definition = metadata(addresses[i], "namespace");
-		char	   *candidate = json_value(definition, "name");
+		char	   *definition;
+		char	   *candidate;
+
+		if (strcmp(members[i].kind, "namespace"))
+			continue;
+		definition = metadata(members[i].hash, "namespace");
+		candidate = json_value(definition, "name");
 
 		if (candidate && !strcmp(candidate, name))
 			return definition;
@@ -874,10 +874,9 @@ catalog_open_table(const char *branch, const char *name, AclMode permission)
 		db = read_ref(psprintf("working/%s", branch)).target;
 		if (!db)
 			elog(ERROR, "canonical working set disappeared");
-		run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='table' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-		if (SPI_processed != 1)
+		descriptor = dg_database_member(db, "table", name);
+		if (!descriptor)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s does not exist on branch %s", name, branch)));
-		descriptor = DatumGetByteaPCopy(cell(0, 1));
 		schema = child(descriptor, 1);
 		definition = metadata(schema, "schema");
 		catalog_acl(catalog_namespace(db, strVal(linitial(parts))), "USAGE", user);
@@ -903,10 +902,9 @@ catalog_open_table(const char *branch, const char *name, AclMode permission)
 				Oid			indexresource;
 				DGStorage  *indexstorage;
 
-				run("SELECT t.objhash FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind='index' AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(indexname)), NULL, true);
-				if (SPI_processed != 1)
+				indexdesc = dg_database_member(db, "index", indexname);
+				if (!indexdesc)
 					elog(ERROR, "canonical index membership is unavailable");
-				indexdesc = DatumGetByteaPCopy(cell(0, 1));
 				indexschema = child(indexdesc, 1);
 				indexresource = binding_relation(branch, indexname, indexschema);
 				if (!OidIsValid(indexresource))

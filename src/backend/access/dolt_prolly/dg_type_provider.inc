@@ -328,11 +328,13 @@ provider_type(DGProviderRows *rows, CatalogView *view, const char *definition)
 	if (type->typtype == TYPTYPE_ENUM)
 	{
 		/* Labels are bound in sort order, so even OIDs compare in label order. */
-		run("SELECT l FROM jsonb_array_elements_text($1::jsonb->'labels') WITH ORDINALITY a(l,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-		for (uint64 j = 0; j < SPI_processed; j++)
+		int			count;
+		JsonbValue *labels = json_elements(definition, "labels", &count);
+
+		for (int j = 0; j < count; j++)
 		{
 			FormData_pg_enum label = {0};
-			char	   *text = strcell(j, 1);
+			char	   *text = json_text(&labels[j]);
 
 			label.oid = CatalogViewBindObject(view, EnumRelationId, psprintf("%s/%s", name, text), InvalidOid);
 			label.enumtypid = type->oid;
@@ -356,6 +358,7 @@ provider_type_relation(DGProviderRows *rows, CatalogView *view, const char *defi
 	{
 		FormData_pg_class form = {0};
 		int			natts;
+		JsonbValue *attributes;
 
 		form.oid = type->typrelid;
 		form.relnamespace = type->typnamespace;
@@ -367,8 +370,8 @@ provider_type_relation(DGProviderRows *rows, CatalogView *view, const char *defi
 		form.reltuples = -1;
 		form.relispopulated = true;
 		form.relreplident = REPLICA_IDENTITY_NOTHING;
-		run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,v->>'collation' FROM jsonb_array_elements($1::jsonb->'attributes') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-		natts = SPI_processed;
+		attributes = json_elements(definition, "attributes", &natts);
+
 		form.relnatts = natts;
 		{
 			char	  **names = palloc_array(char *, Max(natts, 1));
@@ -378,10 +381,10 @@ provider_type_relation(DGProviderRows *rows, CatalogView *view, const char *defi
 
 			for (int j = 0; j < natts; j++)
 			{
-				names[j] = strcell(j, 1);
-				types[j] = strcell(j, 2);
-				mods[j] = DatumGetInt32(cell(j, 3));
-				collations[j] = strcell(j, 4);
+				names[j] = json_field_text(&attributes[j], "name");
+				types[j] = json_field_text(&attributes[j], "type");
+				mods[j] = json_int(json_field_text(&attributes[j], "typmod"));
+				collations[j] = json_field_text(&attributes[j], "collation");
 			}
 			provider_add(rows, RelationRelationId, &form, sizeof(form), Anum_pg_class_relminmxid);
 			for (int j = 0; j < natts; j++)
@@ -420,6 +423,7 @@ provider_domain(DGProviderRows *rows, CatalogView *view, const char *definition)
 	char	  **names,
 			  **defs;
 	bool	   *validated;
+	JsonbValue *constraints;
 	int			n;
 
 	foreach(cell_of_type, rows->rows[tslot])
@@ -443,16 +447,15 @@ provider_domain(DGProviderRows *rows, CatalogView *view, const char *definition)
 		type = (Form_pg_type) GETSTRUCT(tuple);
 		provider_expression_dependencies(rows, TypeRelationId, oid, expression);
 	}
-	run("SELECT v->>0,v->>1,(v->>2)::bool FROM jsonb_array_elements($1::jsonb->'constraints') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	n = SPI_processed;
+	constraints = json_elements(definition, "constraints", &n);
 	names = palloc_array(char *, Max(n, 1));
 	defs = palloc_array(char *, Max(n, 1));
 	validated = palloc_array(bool, Max(n, 1));
 	for (int i = 0; i < n; i++)
 	{
-		names[i] = strcell(i, 1);
-		defs[i] = strcell(i, 2);
-		validated[i] = DatumGetBool(cell(i, 3));
+		names[i] = json_item_text(&constraints[i], 0);
+		defs[i] = json_item_text(&constraints[i], 1);
+		validated[i] = json_bool(json_item_text(&constraints[i], 2));
 	}
 	for (int i = 0; i < n; i++)
 	{

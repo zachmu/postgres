@@ -54,6 +54,20 @@ typedef struct DGStorage DGStorage;
 extern struct _SPI_plan *dg_manifest_plan(const char *sql, int nargs, Oid *types);
 extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, struct ArrayType **children);
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
+extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
+extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
+extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content);
+extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
+
+/* A member of a database object: its hash, kind and, unless a namespace, name. */
+typedef struct DGMember
+{
+	bytea	   *hash;
+	const char *kind;
+	const char *name;
+} DGMember;
+extern DGMember *dg_database_members(bytea *database, int *count);
+extern bytea *dg_database_member(bytea *database, const char *kind, const char *name);
 extern void dg_initialize_resource(Relation rel, const char *branch);
 extern void dg_storage_record(Relation source);
 extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);

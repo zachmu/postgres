@@ -104,11 +104,32 @@ binding_lookup(const char *branch, const char *name, bytea *schema, Snapshot sna
 	return resource;
 }
 
+/* The storage resource bound to |name| on |branch|, whatever its schema. */
+static Oid
+binding_storage(const char *branch, const char *name)
+{
+	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			resource = InvalidOid;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true,
+							  ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+		resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return resource;
+}
+
 static Oid
 binding_relation(const char *branch, const char *name, bytea *schema)
 {
-	run("SELECT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindbranch=$1 AND b.bindname=$2 AND b.bindschema=$3", 3, VC_TYPES(TEXTOID, TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
-	return SPI_processed ? DatumGetObjectId(cell(0, 1)) : InvalidOid;
+	return binding_lookup(branch, name, schema, GetActiveSnapshot());
 }
 
 /* Branch administration selects an allocation; the retained descriptor supplies
@@ -124,16 +145,22 @@ binding_prepare(const char *branch, bytea *database, bool required)
 			  **kinds;
 	bytea	  **schemas;
 
-	run("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
-	names = palloc(sizeof(char *) * Max(n, 1));
-	schemas = palloc(sizeof(bytea *) * Max(n, 1));
-	kinds = palloc_array(char *, Max(n, 1));
-	for (i = 0; i < n; i++)
 	{
-		names[i] = strcell(i, 1);
-		schemas[i] = DatumGetByteaPCopy(cell(i, 2));
-		kinds[i] = strcell(i, 3);
+		int			count;
+		DGMember   *listed = dg_database_members(database, &count);
+
+		names = palloc(sizeof(char *) * Max(count, 1));
+		schemas = palloc(sizeof(bytea *) * Max(count, 1));
+		kinds = palloc_array(char *, Max(count, 1));
+		n = 0;
+		for (i = 0; i < count; i++)
+		{
+			if (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index"))
+				continue;
+			names[n] = (char *) listed[i].name;
+			schemas[n] = object_child(listed[i].hash, 1);
+			kinds[n++] = (char *) listed[i].kind;
+		}
 	}
 	for (i = 0; i < n; i++)
 	{

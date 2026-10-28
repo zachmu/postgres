@@ -1539,11 +1539,14 @@ pg_dolt_commit_visible| WITH RECURSIVE walk(h) AS (
    FROM (walk w
      JOIN pg_dolt_object_visible c ON ((c.objhash = w.h)))
   WHERE (c.objkind = 'commit'::text);
-pg_dolt_object_visible| SELECT DISTINCT objhash,
+pg_dolt_object_visible| SELECT objhash,
     objkind,
     objpayload,
     objchildren
-   FROM pg_dolt_object;
+   FROM pg_dolt_object o
+  WHERE (NOT (EXISTS ( SELECT 1
+           FROM pg_dolt_object d
+          WHERE ((d.objhash = o.objhash) AND (d.objid < o.objid)))));
 pg_file_settings| SELECT sourcefile,
     sourceline,
     seqno,

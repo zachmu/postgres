@@ -8,13 +8,30 @@ typedef struct DGProvider
 	char	   *database;
 	CatalogView *view;
 	uint64		generation;		/* identity generation a branch view binds */
+	List	   *bindings;		/* the durable OIDs a branch view binds */
+	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
 } DGProvider;
 static DGProvider *providers;
 
+
+/* A durable OID bound by a branch view, and the storage bound with it. */
+typedef struct ProviderBinding
+{
+	char		kind;
+	Oid			oid;
+	Oid			storage;
+	char		name[FLEXIBLE_ARRAY_MEMBER];
+} ProviderBinding;
+
+/* The entry whose view is being built, which records its bindings. */
+static DGProvider *provider_current_entry;
+
+
 /*
- * A branch view binds its objects' durable OIDs. Any change to the identity
- * catalog may rebind a name, so it retires every branch view built before.
+ * A branch view binds its objects' durable OIDs. A change to the identity
+ * catalog may rebind a name, so a branch view built before one is checked
+ * against it before it is used again.
  */
 static uint64 identity_generation = 1;
 static bool identity_callback;
@@ -26,13 +43,36 @@ provider_identities_changed(Datum arg, Oid relid)
 		identity_generation++;
 }
 
+/* Whether every durable OID |entry|'s view binds is still bound so. */
+static bool
+provider_bindings_current(DGProvider *entry)
+{
+	foreach_ptr(ProviderBinding, binding, entry->bindings)
+	{
+		if (dg_identity_lookup(entry->branch, binding->kind, binding->name) != binding->oid)
+			return false;
+		if (binding->kind == DOLT_IDENTITY_RELATION &&
+			binding_storage(entry->branch, binding->name) != binding->storage)
+			return false;
+	}
+	return true;
+}
+
 /* Whether |entry| may serve lookups of |branch|'s views, or revision views. */
 static bool
 provider_current(DGProvider *entry, const char *branch)
 {
 	if (!branch)
 		return !entry->branch;
-	return entry->branch && !strcmp(entry->branch, branch) && entry->generation == identity_generation;
+	if (!entry->branch || strcmp(entry->branch, branch))
+		return false;
+	if (entry->generation != identity_generation)
+	{
+		if (!provider_bindings_current(entry))
+			return false;
+		entry->generation = identity_generation;
+	}
+	return true;
 }
 
 static const Oid provider_catalogs[] = {
@@ -66,7 +106,145 @@ static DGProviderRows *provider_current_rows;
 static int	provider_definition_count;
 static char **provider_definition_kinds;
 static char **provider_definition_list;
+
+/* Its tables, indexes and views by name; relations share one namespace. */
+typedef struct ProviderMember
+{
+	char		name[2 * (2 * NAMEDATALEN + 2) + 2];
+	int			index;
+} ProviderMember;
+static HTAB *provider_members;
+
+/*
+ * Decoded columns of its definitions. A table's columns resolve against the
+ * types built so far, so an entry is reused only while that count holds.
+ */
+typedef struct ProviderColumns
+{
+	const char *definition;
+	int			types;
+	TupleDesc	desc;
+} ProviderColumns;
+static HTAB *provider_column_cache;
 static Oid routine_type_oid(DGProviderRows *rows, CatalogView *view, const char *name);
+
+static void
+provider_index_members(void)
+{
+	HASHCTL		ctl = {0};
+
+	ctl.keysize = sizeof(((ProviderMember *) NULL)->name);
+	ctl.entrysize = sizeof(ProviderMember);
+	ctl.hcxt = CurrentMemoryContext;
+	provider_members = hash_create("canonical members", Max(provider_definition_count, 16), &ctl,
+								   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	ctl.keysize = sizeof(const char *);
+	ctl.entrysize = sizeof(ProviderColumns);
+	provider_column_cache = hash_create("canonical columns", Max(provider_definition_count, 16), &ctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < provider_definition_count; i++)
+	{
+		const char *kind = provider_definition_kinds[i];
+		char	   *name;
+		ProviderMember *member;
+		bool		found;
+
+		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view"))
+			continue;
+		name = json_value(provider_definition_list[i], "name");
+		if (strlen(name) >= sizeof(member->name))
+			elog(ERROR, "canonical member name is too long");
+		member = hash_search(provider_members, name, HASH_ENTER, &found);
+		if (!found)
+			member->index = i;
+	}
+}
+
+/*
+ * The member of the schema being rebuilt named |name|, or -1: a table, index
+ * or view, or only one of |kind| when given.
+ */
+static int
+provider_member(const char *name, const char *kind)
+{
+	ProviderMember *member;
+
+	if (strlen(name) >= sizeof(member->name))
+		return -1;
+	member = hash_search(provider_members, name, HASH_FIND, NULL);
+	if (!member || (kind && strcmp(provider_definition_kinds[member->index], kind)))
+		return -1;
+	return member->index;
+}
+
+/*
+ * The bootstrap catalogs' rows, which every view shares. A change to a
+ * built-in object goes through one of these caches; any invalidation of them
+ * makes the next view read the catalogs again.
+ */
+static CatalogViewBase *provider_base;
+static bool provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc);
+
+static void
+provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
+{
+	if (provider_base)
+		CatalogViewBaseRelease(provider_base);
+	provider_base = NULL;
+}
+
+static CatalogViewBase *
+provider_shared_base(void)
+{
+	static bool registered;
+	CatalogViewBase *base;
+	MemoryContext scratch;
+	MemoryContext previous;
+
+	if (!registered)
+	{
+		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID};
+
+		for (int i = 0; i < lengthof(caches); i++)
+			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
+		registered = true;
+	}
+	if (provider_base)
+		return provider_base;
+	base = CatalogViewBaseCreate();
+	scratch = AllocSetContextCreate(CurrentMemoryContext, "bootstrap rows", ALLOCSET_DEFAULT_SIZES);
+	previous = MemoryContextSwitchTo(scratch);
+	PG_TRY();
+	{
+		for (int i = 0; i < lengthof(provider_catalogs); i++)
+		{
+			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
+			TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+			HeapTuple	tuple;
+			List	   *tuples = NIL;
+
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+				if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rel)))
+					tuples = lappend(tuples, heap_copytuple(tuple));
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+			CatalogViewBaseAddRows(base, provider_catalogs[i], tuples);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(previous);
+		CatalogViewBaseRelease(base);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(previous);
+	MemoryContextDelete(scratch);
+	if (provider_base)
+		CatalogViewBaseRelease(provider_base);
+	provider_base = base;
+	return base;
+}
 
 static int
 provider_catalog_index(Oid id)
@@ -150,16 +328,20 @@ provider_acl(const char *definition)
 	static const char *names[] = {"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE", "CREATE", "MAINTAIN"};
 	static const AclMode modes[] = {ACL_SELECT, ACL_INSERT, ACL_UPDATE, ACL_DELETE, ACL_TRUNCATE, ACL_REFERENCES, ACL_TRIGGER, ACL_USAGE, ACL_CREATE, ACL_MAINTAIN};
 
-	run("SELECT v->>0,v->>1,v->>2,(v->>3)::bool FROM jsonb_array_elements(COALESCE($1::jsonb->'acl','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	n = SPI_processed;
+	JsonbValue	document = json_document(definition);
+	JsonbValue	acl;
+
+	n = json_get(&document, "acl", &acl) ? json_length(&acl) : 0;
 	items = palloc_array(Datum, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		AclItem    *item = palloc0(sizeof(*item));
-		char	   *grantor = strcell(i, 1),
-				   *grantee = strcell(i, 2),
-				   *priv = strcell(i, 3);
-		bool		grant = DatumGetBool(cell(i, 4));
+		JsonbValue	entry = json_element(&acl, i);
+		char	   *grantor = json_item_text(&entry, 0),
+				   *grantee = json_item_text(&entry, 1),
+				   *priv = json_item_text(&entry, 2),
+				   *granttext = json_item_text(&entry, 3);
+		bool		grant = granttext && DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(granttext)));
 		AclMode		mode = 0;
 		int			j;
 
@@ -247,8 +429,46 @@ provider_init_entry(TupleDesc desc, int attno, const char *name, Oid type, int32
 	populate_compact_attribute(desc, attno - 1);
 }
 
+static TupleDesc provider_decode_columns(const char *definition);
+
+/* A copy of |desc|, keeping its column properties. */
+static TupleDesc
+provider_copy_columns(TupleDesc desc)
+{
+	TupleDesc	copy = palloc(TupleDescSize(desc));
+
+	memcpy(copy, desc, TupleDescSize(desc));
+	copy->tdrefcount = -1;
+	return copy;
+}
+
+/* The columns of |definition|, which the caller may change. */
 static TupleDesc
 provider_columns(const char *definition)
+{
+	ProviderColumns *entry;
+	int			types;
+	bool		found;
+	MemoryContext previous;
+
+	if (!provider_column_cache)
+		return provider_decode_columns(definition);
+	types = list_length(provider_current_rows->rows[provider_catalog_index(TypeRelationId)]);
+	entry = hash_search(provider_column_cache, &definition, HASH_ENTER, &found);
+	if (!found || entry->types != types)
+	{
+		TupleDesc	desc = provider_decode_columns(definition);
+
+		previous = MemoryContextSwitchTo(GetMemoryChunkContext(provider_column_cache));
+		entry->desc = provider_copy_columns(desc);
+		MemoryContextSwitchTo(previous);
+		entry->types = types;
+	}
+	return provider_copy_columns(entry->desc);
+}
+
+static TupleDesc
+provider_decode_columns(const char *definition)
 {
 	TupleDesc	desc;
 	char	  **names,
@@ -264,8 +484,12 @@ provider_columns(const char *definition)
 	int			i,
 				n;
 
-	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,CASE WHEN v->'collation' IS NOT NULL AND v->'collation'<>'null'::jsonb THEN quote_ident(v->'collation'->>0)||'.'||quote_ident(v->'collation'->>1) ELSE NULL END,COALESCE((v->>'notnull')::bool,false),v->>'storage',v->>'compression',(v->>'default') IS NOT NULL,v->>'generated',v->>'identity' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	n = SPI_processed;
+	JsonbValue	document = json_document(definition);
+	JsonbValue	columns;
+	JsonbValue	statement;
+	bool		index = json_get(&document, "index_definition", &statement);
+
+	n = json_get(&document, "columns", &columns) ? json_length(&columns) : 0;
 	names = palloc_array(char *, Max(n, 1));
 	types = palloc_array(char *, Max(n, 1));
 	collations = palloc_array(char *, Max(n, 1));
@@ -278,16 +502,30 @@ provider_columns(const char *definition)
 	identities = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		names[i] = strcell(i, 1);
-		types[i] = strcell(i, 2);
-		mods[i] = DatumGetInt32(cell(i, 3));
-		collations[i] = strcell(i, 4);
-		notnull[i] = DatumGetBool(cell(i, 5));
-		storages[i] = strcell(i, 6);
-		compressions[i] = strcell(i, 7);
-		hasdef[i] = DatumGetBool(cell(i, 8));
-		generated[i] = strcell(i, 9);
-		identities[i] = strcell(i, 10);
+		JsonbValue	column = json_element(&columns, i);
+		JsonbValue	collation;
+		char	   *text;
+
+		names[i] = json_field_text(&column, "name");
+		types[i] = json_field_text(&column, "type");
+		text = json_field_text(&column, "typmod");
+		mods[i] = text ? DatumGetInt32(DirectFunctionCall1(int4in, CStringGetDatum(text))) : 0;
+		collations[i] = NULL;
+		if (json_get(&column, "collation", &collation))
+		{
+			char	   *schematext = json_item_text(&collation, 0);
+			char	   *nametext = json_item_text(&collation, 1);
+
+			if (schematext && nametext)
+				collations[i] = psprintf("%s.%s", quote_identifier(schematext), quote_identifier(nametext));
+		}
+		text = json_field_text(&column, "notnull");
+		notnull[i] = text && DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(text)));
+		storages[i] = json_field_text(&column, "storage");
+		compressions[i] = json_field_text(&column, "compression");
+		hasdef[i] = json_field_text(&column, "default") != NULL;
+		generated[i] = json_field_text(&column, "generated");
+		identities[i] = json_field_text(&column, "identity");
 	}
 	desc = CreateTemplateTupleDesc(n);
 	for (i = 0; i < n; i++)
@@ -304,6 +542,11 @@ provider_columns(const char *definition)
 		provider_init_entry(desc, i + 1, names[i], type, mods[i]);
 		if (collations[i])
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
+		else if (index)
+		{
+			/* An index's included columns have no collation, as natively. */
+			TupleDescAttr(desc, i)->attcollation = InvalidOid;
+		}
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
 		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
@@ -418,9 +661,14 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 	char	   *name = json_value(definition, "name");
 	Oid			relation = CatalogViewLookupObject(view, RelationRelationId, name);
 	TupleDesc	desc = provider_columns(definition);
+	JsonbValue	document = json_document(definition);
+	JsonbValue	columns;
 
+	if (!json_get(&document, "columns", &columns) || json_length(&columns) != desc->natts)
+		elog(ERROR, "canonical column count mismatch");
 	for (int i = 0; i < desc->natts; i++)
 	{
+		JsonbValue	column = json_element(&columns, i);
 		char	   *sql;
 		Node	   *raw,
 				   *expression;
@@ -435,8 +683,7 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 			List	   *qualified;
 			Oid			sequence;
 
-			run("SELECT $1::jsonb->'columns'->$2->>'sequence'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
-			qualified = stringToQualifiedNameList(strcell(0, 1), NULL);
+			qualified = stringToQualifiedNameList(json_field_text(&column, "sequence"), NULL);
 			sequence = get_relname_relid(strVal(lsecond(qualified)), get_namespace_oid(strVal(linitial(qualified)), true));
 			CatalogViewSwitch(previous);
 			if (OidIsValid(sequence))
@@ -444,8 +691,7 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		}
 		if (!TupleDescAttr(desc, i)->atthasdef)
 			continue;
-		run("SELECT $1::jsonb->'columns'->$2->>'default'", 2, VC_TYPES(TEXTOID, INT4OID), VC_ARGS(CStringGetTextDatum(definition), Int32GetDatum(i)), NULL, true);
-		sql = strcell(0, 1);
+		sql = json_field_text(&column, "default");
 		raw = schema_expression_raw(sql);
 		expression = schema_expression_bind(view, relation, name, desc, raw, i + 1);
 		form.oid = CatalogViewBindObject(view, AttrDefaultRelationId, psprintf("%s/%s", name, NameStr(TupleDescAttr(desc, i)->attname)), InvalidOid);
@@ -492,16 +738,20 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	int			n,
 				i;
 
-	run("SELECT v->>0,v->>1,(v->2)::text FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]'::jsonb)) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	n = SPI_processed;
+	JsonbValue	document = json_document(definition);
+	JsonbValue	constraints;
+
+	n = json_get(&document, "constraints", &constraints) ? json_length(&constraints) : 0;
 	names = palloc_array(char *, Max(n, 1));
 	defs = palloc_array(char *, Max(n, 1));
 	metadata = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		names[i] = strcell(i, 1);
-		defs[i] = strcell(i, 2);
-		metadata[i] = strcell(i, 3);
+		JsonbValue	constraint = json_element(&constraints, i);
+
+		names[i] = json_item_text(&constraint, 0);
+		defs[i] = json_item_text(&constraint, 1);
+		metadata[i] = json_item_json(&constraint, 2);
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -630,14 +880,10 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	if (!stmt->relation->schemaname)
 		elog(ERROR, "unqualified canonical index table");
 	table = dg_qualified_name(stmt->relation->schemaname, stmt->relation->relname);
-	for (i = 0; i < count; i++)
-		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), table))
-		{
-			desc = provider_columns(definitions[i]);
-			break;
-		}
-	if (!desc)
+	i = provider_member(table, "table");
+	if (i < 0)
 		elog(ERROR, "canonical index table is missing");
+	desc = provider_columns(definitions[i]);
 	form.indexrelid = CatalogViewLookupObject(view, RelationRelationId, json_value(definition, "name"));
 	form.indrelid = CatalogViewLookupObject(view, RelationRelationId, table);
 	form.indnkeyatts = list_length(stmt->indexParams);
@@ -789,15 +1035,22 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 		return existing;
 	if (branch && OidIsValid(oid = dg_identity_lookup(branch, kind, name)))
 	{
+		/* A relation without a binding fails when accessed, not here. */
 		if (kind == DOLT_IDENTITY_RELATION)
-		{
-			run("SELECT bindrelid FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1 AND bindname=$2", 2,
-				VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name)), NULL, true);
-			/* A relation without a binding fails when accessed, not here. */
-			if (SPI_processed == 1)
-				storage = DatumGetObjectId(cell(0, 1));
-		}
+			storage = binding_storage(branch, name);
 		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
+		if (provider_current_entry)
+		{
+			MemoryContext previous = MemoryContextSwitchTo(provider_current_entry->memory);
+			ProviderBinding *binding = palloc(offsetof(ProviderBinding, name) + strlen(name) + 1);
+
+			binding->kind = kind;
+			binding->oid = oid;
+			binding->storage = storage;
+			strcpy(binding->name, name);
+			provider_current_entry->bindings = lappend(provider_current_entry->bindings, binding);
+			MemoryContextSwitchTo(previous);
+		}
 		return oid;
 	}
 	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
@@ -832,7 +1085,7 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 	for (;;)
 	{
 		arrayidentity = dg_qualified_name(strVal(linitial(parts)), arrayname);
-		if (!catalog_contains(database, arrayidentity) &&
+		if (provider_member(arrayidentity, NULL) < 0 &&
 			!provider_has_type(rows, form.relnamespace, arrayname))
 			break;
 		pfree(arrayname);
@@ -886,6 +1139,7 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
+	DGMember   *listed;
 	bytea	  **addresses,
 			  **schemas,
 			  **contents;
@@ -897,20 +1151,10 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 
 	provider_current_view = view;
 	provider_current_rows = &rows;
+	CatalogViewSetBase(view, provider_shared_base());
 	for (i = 0; i < lengthof(provider_catalogs); i++)
-	{
-		TableScanDesc scan;
-		HeapTuple	tuple;
-
 		rows.relations[i] = table_open(provider_catalogs[i], AccessShareLock);
-		scan = table_beginscan_catalog(rows.relations[i], 0, NULL);
-		while ((tuple = heap_getnext(scan, ForwardScanDirection)))
-			if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rows.relations[i])))
-				rows.rows[i] = lappend(rows.rows[i], heap_copytuple(tuple));
-		table_endscan(scan);
-	}
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
+	listed = dg_database_members(database, &n);
 	addresses = palloc_array(bytea *, Max(n, 1));
 	schemas = palloc0_array(bytea *, Max(n, 1));
 	contents = palloc0_array(bytea *, Max(n, 1));
@@ -918,8 +1162,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	definitions = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		addresses[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
+		addresses[i] = listed[i].hash;
+		kinds[i] = (char *) listed[i].kind;
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -938,6 +1182,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	provider_definition_count = n;
 	provider_definition_kinds = kinds;
 	provider_definition_list = definitions;
+	provider_index_members();
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "namespace"))
 		{
@@ -998,6 +1243,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			FormData_pg_class form = {0};
 			TupleDesc	desc = provider_columns(definition);
 			bool		index = !strcmp(kinds[i], "index");
+			JsonbValue	document;
+			JsonbValue	list;
 			char	   *matview;
 			HeapTuple	tuple;
 			int			slot = provider_catalog_index(RelationRelationId);
@@ -1021,13 +1268,21 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 			}
 			form.relpersistence = RELPERSISTENCE_PERMANENT;
 			form.relnatts = desc->natts;
-			run("SELECT count(*) FROM jsonb_array_elements($1::jsonb->'constraints') v WHERE v->>1 LIKE 'CHECK %'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-			form.relchecks = DatumGetInt64(cell(0, 1));
+			document = json_document(definition);
+			form.relchecks = 0;
+			if (json_get(&document, "constraints", &list))
+				for (j = 0; j < json_length(&list); j++)
+				{
+					JsonbValue	constraint = json_element(&list, j);
+					char	   *text = json_item_text(&constraint, 1);
+
+					if (text && !strncmp(text, "CHECK ", 6))
+						form.relchecks++;
+				}
 			form.reltuples = -1;
 			form.relispopulated = !matview || !strcmp(json_value(matview, "populated"), "true");
 			form.relreplident = REPLICA_IDENTITY_DEFAULT;
-			run("SELECT jsonb_array_length(COALESCE($1::jsonb->'indexes','[]'::jsonb))>0", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-			form.relhasindex = DatumGetBool(cell(0, 1));
+			form.relhasindex = json_get(&document, "indexes", &list) && json_length(&list) > 0;
 			tuple = provider_fixed(rows.relations[slot], &form, sizeof(form), Anum_pg_class_relminmxid);
 			tuple = provider_set(rows.relations[slot], tuple, Anum_pg_class_relacl, PointerGetDatum(provider_acl(definition)));
 			rows.rows[slot] = lappend(rows.rows[slot], tuple);
@@ -1039,19 +1294,36 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 				bool	   *nostatistics = palloc_array(bool, Max(desc->natts, 1)),
 						   *nooptions = palloc_array(bool, Max(desc->natts, 1));
 
-				/* Per-column statistics targets and options, in one statement. */
-				run("SELECT (v->>'statistics')::int,ARRAY(SELECT jsonb_array_elements_text(v->'options')) FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-				if (SPI_processed != desc->natts)
+				/* Per-column statistics targets and options. */
+				if (!json_get(&document, "columns", &list) || json_length(&list) != desc->natts)
 					elog(ERROR, "canonical column count mismatch");
 				for (j = 0; j < desc->natts; j++)
 				{
-					Datum		value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nostatistics[j]);
+					JsonbValue	column = json_element(&list, j);
+					JsonbValue	items;
+					char	   *text = json_field_text(&column, "statistics");
+					int			count = json_get(&column, "options", &items) ? json_length(&items) : 0;
 
-					if (!nostatistics[j])
-						statistics[j] = value;
-					value = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nooptions[j]);
-					if (!nooptions[j])
-						options[j] = PointerGetDatum(DatumGetArrayTypePCopy(value));
+					nostatistics[j] = text == NULL;
+					if (text)
+						statistics[j] = DirectFunctionCall1(int4in, CStringGetDatum(text));
+					nooptions[j] = count == 0;
+					if (count)
+					{
+						Datum	   *elements = palloc_array(Datum, count);
+						bool	   *elementnulls = palloc_array(bool, count);
+						int			dims[1] = {count};
+						int			lbs[1] = {1};
+
+						for (int k = 0; k < count; k++)
+						{
+							char	   *option = json_item_text(&items, k);
+
+							elementnulls[k] = option == NULL;
+							elements[k] = option ? CStringGetTextDatum(option) : (Datum) 0;
+						}
+						options[j] = PointerGetDatum(construct_md_array(elements, elementnulls, 1, dims, lbs, TEXTOID, -1, false, TYPALIGN_INT));
+					}
 				}
 				for (j = 0; j < desc->natts; j++)
 				{
@@ -1081,9 +1353,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 					provider_add(&rows, AttributeRelationId, &attr, sizeof(attr), Anum_pg_attribute_attcollation);
 				}
 			}
-			run("SELECT ord::int,v->>'comment' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'comment' IS NOT NULL", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-			for (j = 0; j < SPI_processed; j++)
-				provider_description(&rows, form.oid, RelationRelationId, DatumGetInt32(cell(j, 1)), strcell(j, 2));
+			if (json_get(&document, "columns", &list))
+				for (j = 0; j < json_length(&list); j++)
+				{
+					JsonbValue	column = json_element(&list, j);
+
+					provider_description(&rows, form.oid, RelationRelationId, j + 1, json_field_text(&column, "comment"));
+				}
 			if (matview)
 				provider_view_rule(&rows, view, name, form.oid, matview);
 		}
@@ -1146,6 +1422,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	provider_current_view = NULL;
 	provider_current_rows = NULL;
 	provider_definition_count = 0;
+	provider_members = NULL;
+	provider_column_cache = NULL;
 	CatalogViewSeal(view);
 }
 
@@ -1153,6 +1431,7 @@ static void
 provider_reload(CatalogView *view, void *arg)
 {
 	DGProvider *entry = arg;
+	DGProvider *saved_entry = provider_current_entry;
 	Oid			user;
 	int			security,
 				nest;
@@ -1177,11 +1456,14 @@ provider_reload(CatalogView *view, void *arg)
 		database = unhex(entry->database);
 		if (!object_read(database, "database", NULL, NULL, NULL))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
+		/* The view keeps its durable OIDs, and so the bindings recorded. */
+		provider_current_entry = NULL;
 		provider_populate(view, database, entry->branch);
 		end_api(nest);
 	}
 	PG_FINALLY();
 	{
+		provider_current_entry = saved_entry;
 		if (pushed)
 			PopActiveSnapshot();
 		MemoryContextSwitchTo(caller);
@@ -1213,7 +1495,9 @@ provider_lookup(const char *branch, bytea *database)
 {
 	char	   *key = hex(database);
 	DGProvider *entry;
+	DGProvider *saved_entry;
 	CatalogView *view;
+	MemoryContext memory;
 	Oid			user;
 	int			security,
 				nest;
@@ -1247,13 +1531,16 @@ provider_lookup(const char *branch, bytea *database)
 	 * Register before populating, so lookups made while building the view,
 	 * including of its own durable objects, find it rather than recurse.
 	 */
-	entry = MemoryContextAlloc(TopMemoryContext, sizeof(*entry));
-	entry->database = MemoryContextStrdup(TopMemoryContext, key);
-	entry->branch = branch ? MemoryContextStrdup(TopMemoryContext, branch) : NULL;
+	memory = AllocSetContextCreate(TopMemoryContext, "catalog provider", ALLOCSET_SMALL_SIZES);
+	entry = MemoryContextAllocZero(memory, sizeof(*entry));
+	entry->memory = memory;
+	entry->database = MemoryContextStrdup(memory, key);
+	entry->branch = branch ? MemoryContextStrdup(memory, branch) : NULL;
 	entry->view = view;
 	entry->generation = identity_generation;
 	entry->next = providers;
 	providers = entry;
+	saved_entry = provider_current_entry;
 	GetUserIdAndSecContext(&user, &security);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
@@ -1261,17 +1548,17 @@ provider_lookup(const char *branch, bytea *database)
 		/* Decoding the schema runs internal SQL, in its own scope. */
 		nest = begin_api();
 		CatalogViewSetCreator(view, provider_creator(database));
+		provider_current_entry = entry;
 		provider_populate(view, database, branch);
+		provider_current_entry = saved_entry;
 		end_api(nest);
 	}
 	PG_CATCH();
 	{
+		provider_current_entry = saved_entry;
 		SetUserIdAndSecContext(user, security);
 		providers = entry->next;
-		pfree(entry->database);
-		if (entry->branch)
-			pfree(entry->branch);
-		pfree(entry);
+		MemoryContextDelete(memory);
 		CatalogViewRelease(view);
 		PG_RE_THROW();
 	}

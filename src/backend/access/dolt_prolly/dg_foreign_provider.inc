@@ -119,11 +119,13 @@ provider_foreign(DGProviderRows *rows, CatalogView *view, HeapTuple tuple,
 	if (!metadata || !constraint->pktable->schemaname)
 		elog(ERROR, "foreign key metadata requires qualified identities");
 	name = dg_qualified_name(constraint->pktable->schemaname, constraint->pktable->relname);
-	for (int i = 0; i < count; i++)
-		if (!strcmp(kinds[i], "table") && !strcmp(json_value(definitions[i], "name"), name))
-			referenced = provider_columns(definitions[i]);
-	if (!referenced)
-		elog(ERROR, "canonical referenced table is missing");
+	{
+		int			member = provider_member(name, "table");
+
+		if (member < 0)
+			elog(ERROR, "canonical referenced table is missing");
+		referenced = provider_columns(definitions[member]);
+	}
 	con->confrelid = CatalogViewLookupObject(view, RelationRelationId, name);
 	con->conindid = CatalogViewLookupObject(view, RelationRelationId, json_value(metadata, "index"));
 	con->confupdtype = constraint->fk_upd_action;
@@ -143,12 +145,13 @@ provider_foreign(DGProviderRows *rows, CatalogView *view, HeapTuple tuple,
 	for (int i = 0; i < lengthof(fields); i++)
 	{
 		Datum		operators[INDEX_MAX_KEYS];
+		int			arity;
+		JsonbValue *names = json_elements(metadata, labels[i], &arity);
 
-		run("SELECT jsonb_array_elements_text($1::jsonb->$2)", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(metadata), CStringGetTextDatum(labels[i])), NULL, true);
-		if (SPI_processed != k)
+		if (arity != k)
 			elog(ERROR, "foreign key operator arity mismatch");
 		for (int j = 0; j < k; j++)
-			operators[j] = DirectFunctionCall1(regoperatorin, CStringGetDatum(strcell(j, 1)));
+			operators[j] = DirectFunctionCall1(regoperatorin, CStringGetDatum(json_text(&names[j])));
 		tuple = provider_set(rows->relations[slot], tuple, fields[i], PointerGetDatum(construct_array(operators, k, OIDOID, sizeof(Oid), true, TYPALIGN_INT)));
 	}
 	if (constraint->fk_del_set_cols)

@@ -48,6 +48,7 @@
 
 #include "access/parallel.h"
 #include "access/table.h"
+#include "catalog/catalogview.h"
 #include "access/tableam.h"
 #include "executor/executor.h"
 #include "executor/nodeModifyTable.h"
@@ -850,7 +851,8 @@ ExecGetRangeTableRelation(EState *estate, Index rti, bool isResultRel)
 			 * than the minimum.
 			 */
 			rel = table_open(rte->relid, NoLock);
-			Assert(rte->rellockmode == AccessShareLock ||
+			/* A revision's backend-local handle is never locked; see relation_open. */
+			Assert(rte->rellockmode == AccessShareLock || CatalogViewIsLeased(rte->relid) ||
 				   CheckRelationLockedByMe(rel, rte->rellockmode, false));
 		}
 		else

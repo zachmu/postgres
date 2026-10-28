@@ -2399,6 +2399,16 @@ InvalidateCompositeTypeCacheEntry(TypeCacheEntry *typentry)
 	hadTupDescOrOpclass = (typentry->tupDesc != NULL) ||
 		(typentry->flags & TCFLAGS_OPERATOR_FLAGS);
 
+	/*
+	 * A branch object's durable OID finds its branch's current view without
+	 * a pin; the pin would keep the view the type was first seen in.
+	 */
+	if (typentry->catalogview && CatalogViewIsDurable(typentry->type_id))
+	{
+		CatalogViewRelease(typentry->catalogview);
+		typentry->catalogview = NULL;
+	}
+
 	/* Delete tupdesc if we have it */
 	if (typentry->tupDesc != NULL)
 	{
@@ -2528,6 +2538,32 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 					typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
 			}
 		}
+	}
+}
+
+/*
+ * TypeCacheForgetCatalogView
+ *		Forget the types of a provisional catalog view that DDL has retired:
+ *		their handles are never valid again.
+ */
+void
+TypeCacheForgetCatalogView(struct CatalogView *view)
+{
+	HASH_SEQ_STATUS status;
+	TypeCacheEntry *typentry;
+
+	if (TypeCacheHash == NULL)
+		return;
+	hash_seq_init(&status, TypeCacheHash);
+	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (typentry->catalogview != view)
+			continue;
+		if (typentry->typtype == TYPTYPE_COMPOSITE && OidIsValid(typentry->typrelid))
+			InvalidateCompositeTypeCacheEntry(typentry);
+		typentry->flags &= ~(TCFLAGS_HAVE_PG_TYPE_DATA | TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
+		CatalogViewRelease(view);
+		typentry->catalogview = NULL;
 	}
 }
 

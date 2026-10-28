@@ -212,6 +212,9 @@ extern void SharedRecordTypmodRegistryAttach(SharedRecordTypmodRegistry *);
 
 extern void AtEOXact_TypeCache(void);
 
+struct CatalogView;
+extern void TypeCacheForgetCatalogView(struct CatalogView *view);
+
 extern void AtEOSubXact_TypeCache(void);
 
 #endif							/* TYPCACHE_H */
