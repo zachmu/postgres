@@ -135,7 +135,7 @@ is_deeply([grep { !$covered{$_} } split /\n/, $ordinary], [], 'every ordinary bu
 
 # The catalog inventory above includes explicitly rejected identity-bearing
 # fixtures. Exercise their rejection rather than silently dropping coverage.
-my %nonportable = map { $_ => 1 } qw(pg_type pg_proc pg_class oid oidvector tid xid xid8 cid pg_lsn txid_snapshot pg_snapshot refcursor regproc regprocedure regoper regoperator regclass regcollation regtype regrole regnamespace regconfig regdictionary aclitem);
+my %nonportable = map { $_ => 1 } qw(pg_type pg_proc pg_class tid xid xid8 cid pg_lsn txid_snapshot pg_snapshot refcursor regproc regprocedure regoper regoperator regclass regcollation regtype regrole regnamespace regconfig regdictionary aclitem);
 my @portable;
 for my $case (@cases)
 {
@@ -174,7 +174,7 @@ for my $case (@cases)
 my @checks;
 my $n = 0;
 # Types whose index keys order as their btree operator class does.
-my %ordered = map { $_ => 1 } qw(bool bytea char name int2 int4 int8 text varchar float4 float8 numeric money date time timetz timestamp timestamptz interval uuid macaddr macaddr8);
+my %ordered = map { $_ => 1 } qw(bool bytea char name int2 int4 int8 oid text varchar float4 float8 numeric money date time timetz timestamp timestamptz interval uuid macaddr macaddr8);
 for my $case (@cases)
 {
  my ($type, $a, $b) = @$case;
@@ -263,7 +263,7 @@ isnt($status, 0, 'numeric index keys equate scales');
 like($stderr, qr/duplicate key value violates unique constraint "scales"/, 'numeric uniqueness diagnostic');
 # Reject unavailable ordered encodings rather than applying byte ordering to a
 # generic binary representation.
-($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE TABLE unordered(j jsonb) USING dolt_prolly_table; CREATE INDEX unordered_j ON unordered(j)});
+($status, $stdout, $stderr) = $node->psql('postgres', q{CREATE TABLE unordered(j json) USING dolt_prolly_table; CREATE INDEX unordered_j ON unordered(j)});
 isnt($status, 0, 'types without an ordered key encoding have no prolly index');
 like($stderr, qr/no default operator class/, 'missing ordered opclass is explicit');
 # TODO: user-defined types in versioned tables.

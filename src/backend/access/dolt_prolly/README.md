@@ -166,14 +166,14 @@ pointers. Domains use their base-type codec: assignment still enforces domain
 constraints, but reads do not revalidate already stored values. Enums use their
 standard binary label serialization, which omits enum value OIDs. Only reviewed
 built-in binary codecs may use the generic binary path. Opaque custom base-type
-serializers and user-defined ranges/multiranges are rejected for now: a binary
-I/O pair does not prove that its payload excludes local identifiers. In particular,
-a custom range can delegate to PostgreSQL's array/composite binary senders, which
-embed type OIDs even when the element/field values themselves are portable.
+serializers remain rejected: a binary I/O pair alone does not establish a safe
+encoding. User-defined ranges/multiranges with audited scalar subtypes are
+supported. Range subtypes that delegate to PostgreSQL's array/composite binary
+senders remain rejected because those senders embed incidental type OIDs.
 
 Explicit exceptions to generic binary I/O:
 
-* Empty `int2vector` values retain the one-dimensional, zero-based catalog
+* Empty `int2vector` and `oidvector` values retain the one-dimensional, zero-based catalog
   vector layout instead of the ordinary empty-array layout.
 * PostgreSQL 18's binary `tsquery` receiver rejects a zero-item query. The adapter
   recognizes its exact four-byte zero-count payload and reconstructs an empty
@@ -184,9 +184,15 @@ format definitions, not SQL equality. Numeric scales and signed floating-point
 zeros can retain distinct bytes. Comparisons, ordering and uniqueness still
 belong to PostgreSQL's operators and the index adapter.
 
+Explicit user `oid` values are stored numerically and ordered as unsigned 32-bit
+integers. The same applies inside domains, arrays, records and supported ranges.
+Their numeric contents are not translated: changing a user-provided OID changes
+the stored value. Incidental type OIDs in container headers are still stripped;
+canonical metadata still uses symbolic identities.
+
 These formats are experimental and tied to this PostgreSQL/type-codec version.
 Until identifier translation is implemented, the following SQL types are rejected:
-`oid`, `oidvector`, every `reg*` alias, `aclitem`, `pg_node_tree`, `xid`, `xid8`,
+every `reg*` alias, `aclitem`, `pg_node_tree`, `xid`, `xid8`,
 `cid`, `tid`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`, and `refcursor`. This also
 rejects catalog composites whose fields include those types. Their numbers or
 names identify local catalog objects, transactions, physical locations or
@@ -221,11 +227,16 @@ ordering and INCLUDE; immediate unique/primary-key constraints;
 insert/update/delete and RETURNING; joins; transaction/savepoint rollback;
 transactional TRUNCATE; retained reader snapshots and crash recovery.
 
-Ordered index keys still support only boolean, int2/int4/int8, text with C-like
-collation, and bytea. New types may appear in other table columns and INCLUDE
-payloads. Their binary serialization is not an order-preserving key encoding;
-new ordered opclasses require separate implementation. Non-C index collations
-and custom comparators remain rejected.
+Ordered index keys support integers, explicit OIDs, booleans, text/bytea,
+floating-point/numeric, date/time/interval, UUID, money, MAC addresses, enums,
+bit/varbit, inet/cidr, JSONB, records, ranges and multiranges. Arrays and domains
+of supported types are supported recursively. Keys preserve PostgreSQL ordering
+and normalize SQL-equal values for uniqueness independently of row serialization.
+Non-C index collations and custom comparators remain rejected, including nested
+record field/range collations. JSONB uses the database default collation and is
+currently indexable only when that collation is C-like. Ranges require the
+subtype's default comparison procedure. `json` has no native B-tree comparison
+family and remains unindexable by this ordered AM.
 
 Internal-only types `gtsvector`, `pg_ndistinct`, `pg_dependencies`, `pg_mcv_list`,
 `pg_brin_bloom_summary` and `pg_brin_minmax_multi_summary` are explicitly rejected.

@@ -332,4 +332,15 @@
 
 { oid => '9028', opfmethod => 'dolt_prolly_index', opfname => 'dolt_array_ops' },
 
+
+# Additional native ordering families.
+{ oid => '9030', opfmethod => 'dolt_prolly_index', opfname => 'dolt_oid_ops' },
+{ oid => '9031', opfmethod => 'dolt_prolly_index', opfname => 'dolt_bit_ops' },
+{ oid => '9032', opfmethod => 'dolt_prolly_index', opfname => 'dolt_varbit_ops' },
+{ oid => '9033', opfmethod => 'dolt_prolly_index', opfname => 'dolt_network_ops' },
+{ oid => '9034', opfmethod => 'dolt_prolly_index', opfname => 'dolt_jsonb_ops' },
+{ oid => '9035', opfmethod => 'dolt_prolly_index', opfname => 'dolt_record_ops' },
+{ oid => '9036', opfmethod => 'dolt_prolly_index', opfname => 'dolt_range_ops' },
+{ oid => '9037', opfmethod => 'dolt_prolly_index', opfname => 'dolt_multirange_ops' },
+
 ]
