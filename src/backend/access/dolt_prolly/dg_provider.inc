@@ -31,13 +31,17 @@ static DGProvider *provider_current_entry;
 
 /*
  * Branch views kept for reuse. A branch's next schema replaces its view, so
- * older ones are released once nothing else holds them.
+ * older ones are released once nothing else holds them. That is only at
+ * transaction end: within a statement, callers keep the views lookups return
+ * without taking references.
  */
 #define PROVIDER_BRANCH_VIEWS 8
 
 static void
-provider_prune(void)
+provider_prune(XactEvent event, void *arg)
 {
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
+		return;
 	for (;;)
 	{
 		DGProvider **oldest = NULL;
@@ -1549,6 +1553,7 @@ provider_lookup(const char *branch, bytea *database)
 	if (!identity_callback)
 	{
 		CacheRegisterRelcacheCallback(provider_identities_changed, (Datum) 0);
+		RegisterXactCallback(provider_prune, NULL);
 		identity_callback = true;
 	}
 	for (entry = providers; entry; entry = entry->next)
@@ -1605,7 +1610,6 @@ provider_lookup(const char *branch, bytea *database)
 	PG_END_TRY();
 	SetUserIdAndSecContext(user, security);
 	CatalogViewSetLoader(view, provider_reload, entry);
-	provider_prune();
 	return view;
 }
 

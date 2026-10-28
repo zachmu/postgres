@@ -11,7 +11,7 @@ $node->init(extra=>['--encoding=UTF8','--locale=C']);
 $node->append_conf('postgresql.conf',"default_table_access_method='dolt_prolly_table'\nshared_preload_libraries='pg_stat_statements'\npg_stat_statements.track='all'\n");
 $node->start;
 $node->safe_psql('postgres',q{CREATE EXTENSION pg_stat_statements});
-my $s=$node->background_psql('postgres');
+my $s=$node->background_psql('postgres',on_error_stop=>0);
 
 # Tables with rows, so that capturing the branch's state records their contents.
 sub add_tables {
@@ -47,6 +47,14 @@ for my $kind (@order) {
    or diag($s->query_safe(q{SELECT calls||' '||left(regexp_replace(query,'\s+',' ','g'),200) FROM pg_stat_statements WHERE query NOT LIKE '%pg_stat_statements%' ORDER BY calls DESC LIMIT 12}));
 }
 is($s->query_safe(q{SELECT count(*) FROM t40}),'2','tables keep their rows');
+
+# A statement keeps the views its lookups return although many branch views
+# exist: superseded ones are released only at transaction end.
+$s->query_safe(q{create type two_ints as (a int, b int); create type two_ints_range as range (subtype = two_ints)});
+my ($out,$failed)=$s->query(q{alter type two_ints add attribute c two_ints_range});
+like($s->{stderr},qr/cannot be made a member of itself/,'a type lookup among many branch views reports the type error');
+$s->{stderr}='';
+is($s->query_safe(q{SELECT 1}),'1','the session survives the lookup');
 
 # A session keeps a bounded number of catalog views however much DDL it runs:
 # each DDL's private view is freed, and a branch's superseded views are too.
