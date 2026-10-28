@@ -1810,7 +1810,6 @@ dg_initialize_resource(Relation rel, const char *branch)
 {
 	DGState    *state;
 
-	Assert(CatalogViewObjectContext(RelationGetRelid(rel)));
 	state = dg_load_bound(rel, SnapshotSelf, branch);
 	save_state(rel, state, GetCurrentCommandId(true), branch);
 	dg_release(state);

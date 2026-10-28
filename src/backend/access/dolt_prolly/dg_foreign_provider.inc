@@ -145,12 +145,13 @@ provider_foreign(DGProviderRows *rows, CatalogView *view, HeapTuple tuple,
 	for (int i = 0; i < lengthof(fields); i++)
 	{
 		Datum		operators[INDEX_MAX_KEYS];
+		int			arity;
+		JsonbValue *names = json_elements(metadata, labels[i], &arity);
 
-		run("SELECT jsonb_array_elements_text($1::jsonb->$2)", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(metadata), CStringGetTextDatum(labels[i])), NULL, true);
-		if (SPI_processed != k)
+		if (arity != k)
 			elog(ERROR, "foreign key operator arity mismatch");
 		for (int j = 0; j < k; j++)
-			operators[j] = DirectFunctionCall1(regoperatorin, CStringGetDatum(strcell(j, 1)));
+			operators[j] = DirectFunctionCall1(regoperatorin, CStringGetDatum(json_text(&names[j])));
 		tuple = provider_set(rows->relations[slot], tuple, fields[i], PointerGetDatum(construct_array(operators, k, OIDOID, sizeof(Oid), true, TYPALIGN_INT)));
 	}
 	if (constraint->fk_del_set_cols)

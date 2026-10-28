@@ -55,20 +55,20 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 						 CStringGetTextDatum(nodeToString(list_make1(makeString(json_value(definition, "query"))))));
 	rows->rows[rslot] = lappend(rows->rows[rslot], tuple);
 	provider_dependency(rows, RewriteRelationId, rule.oid, 0, RelationRelationId, relation, 0, DEPENDENCY_INTERNAL);
-	run("SELECT v->>0,v->>1,v->>2 FROM jsonb_array_elements($1::jsonb->'dependencies') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	{
-		uint64		n = SPI_processed;
+		int			n;
+		JsonbValue *dependencies = json_elements(definition, "dependencies", &n);
 		char	  **kinds = palloc_array(char *, Max(n, 1));
 		char	  **targets = palloc_array(char *, Max(n, 1));
 		char	  **columns = palloc_array(char *, Max(n, 1));
 
-		for (uint64 i = 0; i < n; i++)
+		for (int i = 0; i < n; i++)
 		{
-			kinds[i] = strcell(i, 1);
-			targets[i] = strcell(i, 2);
-			columns[i] = strcell(i, 3);
+			kinds[i] = json_item_text(&dependencies[i], 0);
+			targets[i] = json_item_text(&dependencies[i], 1);
+			columns[i] = json_item_text(&dependencies[i], 2);
 		}
-		for (uint64 i = 0; i < n; i++)
+		for (int i = 0; i < n; i++)
 		{
 			Oid			target = provider_view_dependency(view, kinds[i], targets[i]);
 			int			column = 0;
@@ -89,9 +89,16 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 				}
 				else if (j >= 0 && !strcmp(provider_definition_kinds[j], "view"))
 				{
-					run("SELECT ord::int FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) WHERE v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(provider_definition_list[j]), CStringGetTextDatum(columns[i])), NULL, true);
-					if (SPI_processed)
-						column = DatumGetInt32(cell(0, 1));
+					int			count;
+					JsonbValue *viewcolumns = json_elements(provider_definition_list[j], "columns", &count);
+
+					for (int k = count - 1; k >= 0; k--)
+					{
+						char	   *columnname = json_field_text(&viewcolumns[k], "name");
+
+						if (columnname && !strcmp(columnname, columns[i]))
+							column = k + 1;
+					}
 					versioned = true;
 				}
 				if (!versioned)
@@ -138,28 +145,46 @@ provider_view_member(DGProviderRows *rows, CatalogView *view, const char *defini
 	form.relispopulated = true;
 	form.relreplident = REPLICA_IDENTITY_NOTHING;
 	form.relhasrules = true;
-	run("SELECT v->>'name',v->>'type',(v->>'typmod')::int,v->>'collation' FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY a(v,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-	ncolumns = SPI_processed;
-	names = palloc_array(char *, Max(ncolumns, 1));
-	types = palloc_array(char *, Max(ncolumns, 1));
-	collations = palloc_array(char *, Max(ncolumns, 1));
-	mods = palloc_array(int, Max(ncolumns, 1));
-	for (uint64 i = 0; i < ncolumns; i++)
 	{
-		names[i] = strcell(i, 1);
-		types[i] = strcell(i, 2);
-		mods[i] = DatumGetInt32(cell(i, 3));
-		collations[i] = strcell(i, 4);
+		int			count;
+		JsonbValue *columns = json_elements(definition, "columns", &count);
+
+		ncolumns = count;
+		names = palloc_array(char *, Max(ncolumns, 1));
+		types = palloc_array(char *, Max(ncolumns, 1));
+		collations = palloc_array(char *, Max(ncolumns, 1));
+		mods = palloc_array(int, Max(ncolumns, 1));
+		for (int i = 0; i < count; i++)
+		{
+			names[i] = json_field_text(&columns[i], "name");
+			types[i] = json_field_text(&columns[i], "type");
+			mods[i] = json_int(json_field_text(&columns[i], "typmod"));
+			collations[i] = json_field_text(&columns[i], "collation");
+		}
 	}
 	form.relnatts = ncolumns;
 	tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_class_relminmxid);
-	run("SELECT ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'options'))", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	{
-		bool		isnull;
-		Datum		options = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		int			count;
+		JsonbValue *items = json_elements(definition, "options", &count);
 
-		if (!isnull && ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(options)), ARR_DIMS(DatumGetArrayTypeP(options))) > 0)
-			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_class_reloptions, options);
+		if (count > 0)
+		{
+			Datum	   *options = palloc_array(Datum, count);
+			bool	   *optionnulls = palloc_array(bool, count);
+			int			dims[1] = {count};
+			int			lbs[1] = {1};
+
+			for (int i = 0; i < count; i++)
+			{
+				char	   *option = json_text(&items[i]);
+
+				optionnulls[i] = option == NULL;
+				options[i] = option ? CStringGetTextDatum(option) : (Datum) 0;
+			}
+			tuple = provider_set(rows->relations[slot], tuple, Anum_pg_class_reloptions,
+								 PointerGetDatum(construct_md_array(options, optionnulls, 1, dims, lbs, TEXTOID, -1, false, TYPALIGN_INT)));
+		}
 	}
 	rows->rows[slot] = lappend(rows->rows[slot], tuple);
 	provider_dependency(rows, RelationRelationId, form.oid, 0, NamespaceRelationId, form.relnamespace, 0, DEPENDENCY_NORMAL);

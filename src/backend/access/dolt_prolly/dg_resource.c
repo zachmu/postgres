@@ -115,9 +115,24 @@ dg_storage_record(Relation source)
 Oid
 dg_storage_allocate(Relation definition, const char *branch)
 {
+	if (!definition->rd_catalogview ||
+		!((DG_ROWS_KIND(definition->rd_rel->relkind) && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
+		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
+		elog(ERROR, "storage allocation requires a canonical prolly definition");
+	return dg_storage_allocate_kind(definition->rd_rel->relkind, branch);
+}
+
+/*
+ * Allocate an empty storage resource on |branch| for a prolly table,
+ * materialized view or index of |relkind|. Storage needs only the kind of
+ * its rows, not the definition, which need not be built yet.
+ */
+Oid
+dg_storage_allocate_kind(char relkind, const char *branch)
+{
 	Relation	catalog;
 	Relation	resource = palloc0(sizeof(RelationData));
-	FormData_pg_class form;
+	FormData_pg_class form = {0};
 	Datum		values[Natts_pg_dolt_storage];
 	bool		nulls[Natts_pg_dolt_storage] = {false};
 	HeapTuple	tuple;
@@ -125,10 +140,11 @@ dg_storage_allocate(Relation definition, const char *branch)
 
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot allocate storage in a read-only transaction")));
-	if (!definition->rd_catalogview ||
-		!((DG_ROWS_KIND(definition->rd_rel->relkind) && definition->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID) ||
-		  (definition->rd_rel->relkind == RELKIND_INDEX && definition->rd_rel->relam == DOLT_PROLLY_INDEX_AM_OID)))
-		elog(ERROR, "storage allocation requires a canonical prolly definition");
+	if (!DG_ROWS_KIND(relkind) && relkind != RELKIND_INDEX)
+		elog(ERROR, "storage allocation requires a prolly table or index");
+	form.relkind = relkind;
+	form.relam = relkind == RELKIND_INDEX ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
 	do
 	{
@@ -136,8 +152,6 @@ dg_storage_allocate(Relation definition, const char *branch)
 	}
 	while (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(id)));
 	LockRelationOid(id, AccessExclusiveLock);
-	*resource = *definition;
-	form = *definition->rd_rel;
 	resource->rd_rel = &form;
 	resource->rd_smgr = NULL;
 	resource->rd_locator.spcOid = MyDatabaseTableSpace;

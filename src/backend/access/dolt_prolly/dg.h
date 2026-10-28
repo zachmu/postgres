@@ -47,6 +47,8 @@ typedef struct DGStorage DGStorage;
 extern struct _SPI_plan *dg_manifest_plan(const char *sql, int nargs, Oid *types);
 extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea **payload, struct ArrayType **children);
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
+extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
+extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 extern void dg_initialize_resource(Relation rel, const char *branch);
 extern void dg_storage_record(Relation source);
 extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);

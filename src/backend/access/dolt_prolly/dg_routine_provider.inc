@@ -154,18 +154,18 @@ provider_routine(DGProviderRows *rows, CatalogView *view, const char *definition
 			provider_dependency(rows, ProcedureRelationId, proc->oid, 0, TypeRelationId, proc->proargtypes.values[i], 0, DEPENDENCY_NORMAL);
 
 	/* What a SQL-standard body uses, as CreateFunction records it. */
-	run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'dependencies','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
 	{
-		uint64		n = SPI_processed;
+		int			n;
+		JsonbValue *dependencies = json_elements(definition, "dependencies", &n);
 		char	  **kinds = palloc_array(char *, Max(n, 1));
 		char	  **names = palloc_array(char *, Max(n, 1));
 
-		for (uint64 i = 0; i < n; i++)
+		for (int i = 0; i < n; i++)
 		{
-			kinds[i] = strcell(i, 1);
-			names[i] = strcell(i, 2);
+			kinds[i] = json_item_text(&dependencies[i], 0);
+			names[i] = json_item_text(&dependencies[i], 1);
 		}
-		for (uint64 i = 0; i < n; i++)
+		for (int i = 0; i < n; i++)
 		{
 			Oid			referenced = provider_view_dependency(view, kinds[i], names[i]);
 

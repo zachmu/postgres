@@ -104,11 +104,32 @@ binding_lookup(const char *branch, const char *name, bytea *schema, Snapshot sna
 	return resource;
 }
 
+/* The storage resource bound to |name| on |branch|, whatever its schema. */
+static Oid
+binding_storage(const char *branch, const char *name)
+{
+	Relation	rel = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			resource = InvalidOid;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(rel, DoltBindingKeyIndexId, true,
+							  ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, 2, keys);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+		resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return resource;
+}
+
 static Oid
 binding_relation(const char *branch, const char *name, bytea *schema)
 {
-	run("SELECT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindbranch=$1 AND b.bindname=$2 AND b.bindschema=$3", 3, VC_TYPES(TEXTOID, TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name), PointerGetDatum(schema)), NULL, true);
-	return SPI_processed ? DatumGetObjectId(cell(0, 1)) : InvalidOid;
+	return binding_lookup(branch, name, schema, GetActiveSnapshot());
 }
 
 /* Branch administration selects an allocation; the retained descriptor supplies

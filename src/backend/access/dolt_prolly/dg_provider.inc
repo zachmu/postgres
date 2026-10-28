@@ -8,13 +8,28 @@ typedef struct DGProvider
 	char	   *database;
 	CatalogView *view;
 	uint64		generation;		/* identity generation a branch view binds */
+	List	   *bindings;		/* the durable OIDs a branch view binds */
+	MemoryContext memory;		/* holds the entry */
 	struct DGProvider *next;
 } DGProvider;
 static DGProvider *providers;
 
+/* A durable OID bound by a branch view, and the storage bound with it. */
+typedef struct ProviderBinding
+{
+	char		kind;
+	Oid			oid;
+	Oid			storage;
+	char		name[FLEXIBLE_ARRAY_MEMBER];
+} ProviderBinding;
+
+/* The entry whose view is being built, which records its bindings. */
+static DGProvider *provider_current_entry;
+
 /*
- * A branch view binds its objects' durable OIDs. Any change to the identity
- * catalog may rebind a name, so it retires every branch view built before.
+ * A branch view binds its objects' durable OIDs. A change to the identity
+ * catalog may rebind a name, so a branch view built before one is checked
+ * against it before it is used again.
  */
 static uint64 identity_generation = 1;
 static bool identity_callback;
@@ -26,13 +41,36 @@ provider_identities_changed(Datum arg, Oid relid)
 		identity_generation++;
 }
 
+/* Whether every durable OID |entry|'s view binds is still bound so. */
+static bool
+provider_bindings_current(DGProvider *entry)
+{
+	foreach_ptr(ProviderBinding, binding, entry->bindings)
+	{
+		if (dg_identity_lookup(entry->branch, binding->kind, binding->name) != binding->oid)
+			return false;
+		if (binding->kind == DOLT_IDENTITY_RELATION &&
+			binding_storage(entry->branch, binding->name) != binding->storage)
+			return false;
+	}
+	return true;
+}
+
 /* Whether |entry| may serve lookups of |branch|'s views, or revision views. */
 static bool
 provider_current(DGProvider *entry, const char *branch)
 {
 	if (!branch)
 		return !entry->branch;
-	return entry->branch && !strcmp(entry->branch, branch) && entry->generation == identity_generation;
+	if (!entry->branch || strcmp(entry->branch, branch))
+		return false;
+	if (entry->generation != identity_generation)
+	{
+		if (!provider_bindings_current(entry))
+			return false;
+		entry->generation = identity_generation;
+	}
+	return true;
 }
 
 static const Oid provider_catalogs[] = {
@@ -919,15 +957,22 @@ provider_bind(CatalogView *view, const char *branch, Oid objectclass, char kind,
 		return existing;
 	if (branch && OidIsValid(oid = dg_identity_lookup(branch, kind, name)))
 	{
+		/* A relation without a binding fails when accessed, not here. */
 		if (kind == DOLT_IDENTITY_RELATION)
-		{
-			run("SELECT bindrelid FROM pg_catalog.pg_dolt_binding WHERE bindbranch=$1 AND bindname=$2", 2,
-				VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(branch), CStringGetTextDatum(name)), NULL, true);
-			/* A relation without a binding fails when accessed, not here. */
-			if (SPI_processed == 1)
-				storage = DatumGetObjectId(cell(0, 1));
-		}
+			storage = binding_storage(branch, name);
 		CatalogViewBindDurable(view, objectclass, identity, oid, storage);
+		if (provider_current_entry)
+		{
+			MemoryContext previous = MemoryContextSwitchTo(provider_current_entry->memory);
+			ProviderBinding *binding = palloc(offsetof(ProviderBinding, name) + strlen(name) + 1);
+
+			binding->kind = kind;
+			binding->oid = oid;
+			binding->storage = storage;
+			strcpy(binding->name, name);
+			provider_current_entry->bindings = lappend(provider_current_entry->bindings, binding);
+			MemoryContextSwitchTo(previous);
+		}
 		return oid;
 	}
 	return CatalogViewBindObject(view, objectclass, identity, InvalidOid);
@@ -1317,6 +1362,7 @@ static void
 provider_reload(CatalogView *view, void *arg)
 {
 	DGProvider *entry = arg;
+	DGProvider *saved_entry = provider_current_entry;
 	Oid			user;
 	int			security,
 				nest;
@@ -1341,11 +1387,14 @@ provider_reload(CatalogView *view, void *arg)
 		database = unhex(entry->database);
 		if (!object_read(database, "database", NULL, NULL, NULL))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("revision does not name a visible database object")));
+		/* The view keeps its durable OIDs, and so the bindings recorded. */
+		provider_current_entry = NULL;
 		provider_populate(view, database, entry->branch);
 		end_api(nest);
 	}
 	PG_FINALLY();
 	{
+		provider_current_entry = saved_entry;
 		if (pushed)
 			PopActiveSnapshot();
 		MemoryContextSwitchTo(caller);
@@ -1377,7 +1426,9 @@ provider_lookup(const char *branch, bytea *database)
 {
 	char	   *key = hex(database);
 	DGProvider *entry;
+	DGProvider *saved_entry;
 	CatalogView *view;
+	MemoryContext memory;
 	Oid			user;
 	int			security,
 				nest;
@@ -1411,13 +1462,16 @@ provider_lookup(const char *branch, bytea *database)
 	 * Register before populating, so lookups made while building the view,
 	 * including of its own durable objects, find it rather than recurse.
 	 */
-	entry = MemoryContextAlloc(TopMemoryContext, sizeof(*entry));
-	entry->database = MemoryContextStrdup(TopMemoryContext, key);
-	entry->branch = branch ? MemoryContextStrdup(TopMemoryContext, branch) : NULL;
+	memory = AllocSetContextCreate(TopMemoryContext, "catalog provider", ALLOCSET_SMALL_SIZES);
+	entry = MemoryContextAllocZero(memory, sizeof(*entry));
+	entry->memory = memory;
+	entry->database = MemoryContextStrdup(memory, key);
+	entry->branch = branch ? MemoryContextStrdup(memory, branch) : NULL;
 	entry->view = view;
 	entry->generation = identity_generation;
 	entry->next = providers;
 	providers = entry;
+	saved_entry = provider_current_entry;
 	GetUserIdAndSecContext(&user, &security);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 	PG_TRY();
@@ -1425,17 +1479,17 @@ provider_lookup(const char *branch, bytea *database)
 		/* Decoding the schema runs internal SQL, in its own scope. */
 		nest = begin_api();
 		CatalogViewSetCreator(view, provider_creator(database));
+		provider_current_entry = entry;
 		provider_populate(view, database, branch);
+		provider_current_entry = saved_entry;
 		end_api(nest);
 	}
 	PG_CATCH();
 	{
+		provider_current_entry = saved_entry;
 		SetUserIdAndSecContext(user, security);
 		providers = entry->next;
-		pfree(entry->database);
-		if (entry->branch)
-			pfree(entry->branch);
-		pfree(entry);
+		MemoryContextDelete(memory);
 		CatalogViewRelease(view);
 		PG_RE_THROW();
 	}

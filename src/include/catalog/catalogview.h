@@ -87,6 +87,8 @@ extern Oid	CatalogViewNewObject(Oid catalog);
 extern void CatalogViewNameObject(Oid handle, const char *identity);
 extern void CatalogViewMutationCommandEnd(void);
 extern List *CatalogViewTuples(CatalogView *view, Oid catalog);
+extern List *CatalogViewTuplesWith(CatalogView *view, Oid catalog, AttrNumber attribute, Oid value);
+extern void CatalogViewForEachChange(CatalogView *view, void (*callback) (Oid catalog, HeapTuple tuple, void *arg), void *arg);
 extern void CatalogViewRetireMutation(CatalogView *view);
 extern CatalogViewScan *CatalogViewBeginScan(Relation relation, int nkeys, ScanKey keys);
 extern CatalogViewScan *CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapshot snapshot);
