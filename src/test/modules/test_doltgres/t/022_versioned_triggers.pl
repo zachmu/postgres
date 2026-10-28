@@ -84,6 +84,14 @@ sql(q{DROP TABLE t});
 is(sql(q{SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal}),'0','DROP TABLE removes its triggers');
 is(sql(q{SELECT count(*) FROM "postgres/other".pg_catalog.pg_trigger WHERE NOT tgisinternal}),'2','another branch keeps its triggers');
 
+# ---- views ----
+sql(q{CREATE TABLE vt(a int, b int); CREATE VIEW vt_view AS SELECT a, b FROM vt;
+ CREATE FUNCTION vt_insert() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO vt VALUES (NEW.a, NEW.b * 10); RETURN NEW; END$$;
+ CREATE TRIGGER vt_instead INSTEAD OF INSERT ON vt_view FOR EACH ROW EXECUTE FUNCTION vt_insert()});
+is(sql(q{SELECT tgname FROM pg_trigger WHERE tgrelid='vt_view'::regclass}),'vt_instead','an INSTEAD OF trigger on a versioned view is cataloged');
+sql(q{INSERT INTO vt_view VALUES (1, 2)});
+is(sql(q{SELECT a||':'||b FROM vt}),'1:20','an INSTEAD OF trigger writes through a versioned view');
+
 # ---- not versioned ----
 sql(q{CREATE TABLE h(id int) USING heap; CREATE FUNCTION h_upcase() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.id := NEW.id * 10; RETURN NEW; END$$});
 fails(q{CREATE TRIGGER h_t BEFORE INSERT ON h FOR EACH ROW EXECUTE FUNCTION h_upcase()},qr/cannot make an unversioned object depend on a versioned one/,'a native table cannot use a versioned trigger function');

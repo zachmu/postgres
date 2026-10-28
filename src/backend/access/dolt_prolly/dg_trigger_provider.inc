@@ -26,8 +26,11 @@ provider_trigger(DGProviderRows *rows, CatalogView *view, const char *definition
 		elog(ERROR, "invalid canonical trigger definition");
 	stmt = castNode(CreateTrigStmt, linitial_node(RawStmt, parsed)->stmt);
 	{
+		/* A trigger is on a table, or INSTEAD OF on a view. */
 		int			member = provider_member(table, "table");
 
+		if (member < 0)
+			member = provider_member(table, "view");
 		if (member < 0)
 			elog(ERROR, "canonical trigger's table is missing: %s", table);
 		desc = provider_columns(definitions[member]);
