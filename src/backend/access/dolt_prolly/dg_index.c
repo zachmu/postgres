@@ -537,6 +537,8 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 		int			n = rows_batch ? dg_batch_handles(rows_batch, found.digests[i], &pending) : 0;
 		bool		gone = false;
 
+		int			own = 0;
+
 		/* An entry the command removed no longer names a live row. */
 		foreach(lc, removed)
 			if (pl_hash_equal(*(PLHash *) lfirst(lc), found.digests[i]))
@@ -544,9 +546,20 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 		for (int j = 0; j < handles.count && !conflict && !gone; j++)
 			if (handles.items[j] != self)
 				conflict = handles.items[j];
+			else
+				own++;
 		for (int j = 0; j < n && !conflict; j++)
 			if (pending[j] != self)
 				conflict = pending[j];
+			else
+				own++;
+
+		/*
+		 * A committed row identical to ours derives the same handle: two
+		 * occurrences named by our handle are our row and a conflicting one.
+		 */
+		if (!conflict && own > 1)
+			conflict = self;
 	}
 	dg_release(rows);
 	dg_release(entries);
@@ -628,7 +641,7 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 		if (check == UNIQUE_CHECK_PARTIAL)
 			return false;
-		if (!dg_row_modified(table, branch, conflict, &cid))
+		if (conflict != self && !dg_row_modified(table, branch, conflict, &cid))
 		{
 			dg_record_lock(table, branch, (int64) conflict, GetCurrentCommandId(true), LockTupleKeyShare, LockWaitBlock, false, &failure, &next);
 			if (unique_conflict(table, index, self, key) != conflict)
