@@ -28,7 +28,7 @@ is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 2}), '2', 'ind
 is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 1}), '20', 'and the others remain');
 
 # Uniqueness against rows the same statement changes.
-is(sql(q{UPDATE t SET id = id + 10000 WHERE id > 1990 RETURNING id}), "11991\n11993\n11995\n11997\n11999", 'key change in a multi-row update');
+is(sql(q{WITH u AS (UPDATE t SET id = id + 10000 WHERE id > 1990 RETURNING id) SELECT string_agg(id::text, ',' ORDER BY id) FROM u}), "11991,11993,11995,11997,11999", 'key change in a multi-row update');
 is(sql(q{SELECT count(*) FROM t WHERE id > 10000}), '5', 'the old keys are free');
 sql(q{UPDATE t SET v = 'same' WHERE id = 5});
 is(sql(q{SELECT v FROM t WHERE id = 5}), 'same', 'update without a key change keeps the key');
@@ -43,7 +43,7 @@ is(sql(q{BEGIN; UPDATE t SET v = 'first' WHERE id = 11; UPDATE t SET v = v || ',
 is(sql(q{BEGIN; UPDATE t SET v = 'gone' WHERE id = 13; DELETE FROM t WHERE v = 'gone'; SELECT count(*) FROM t WHERE id = 13; COMMIT}), '0', 'a later command deletes the pending version');
 is(sql(q{BEGIN; DELETE FROM t WHERE id = 15; INSERT INTO t VALUES (15, 1, 'back'); SELECT v FROM t WHERE id = 15; COMMIT}), 'back', 'a deleted key is reinserted by a later command');
 is(sql(q{BEGIN; UPDATE t SET k = k + 1000 WHERE id BETWEEN 100 AND 110; SET LOCAL enable_seqscan=off; SELECT count(*) FROM t WHERE k > 1000; COMMIT}), '11', 'index scan before commit sees the pending update');
-is(sql(q{UPDATE t SET v = 'j' FROM t t2 WHERE t.id = t2.id AND t.id < 20 RETURNING t.id}), sql(q{SELECT id FROM t WHERE id < 20 ORDER BY ctid}), 'self-join update returns each row');
+is(sql(q{WITH u AS (UPDATE t SET v = 'j' FROM t t2 WHERE t.id = t2.id AND t.id < 20 RETURNING t.id) SELECT string_agg(id::text, ',' ORDER BY id) FROM u}), sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE id < 20}), 'self-join update returns each row');
 
 # Duplicate rows without a key share one content entry.
 sql(q{UPDATE dup SET b = 'changed' WHERE ctid = (SELECT min(ctid) FROM dup WHERE a = 1)});

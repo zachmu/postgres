@@ -3,9 +3,8 @@
  * pg_dolt_root.h
  *	  Committed working roots of prolly relations, per branch.
  *
- * One row per (relation storage, branch) holds the roots of that relation's
- * trees in the chunk store: content, and for tables the handle and
- * key-to-handle trees. Rows change only when a transaction publishes, just
+ * One row per (relation storage, branch) holds the root of that relation's
+ * content tree in the chunk store. Rows change only when a transaction publishes, just
  * before it commits, so ordinary MVCC selects the roots a snapshot sees.
  * Storage is identified by tablespace and file number, so TRUNCATE (a new
  * file) starts from empty roots and rolling it back restores the old ones.
@@ -28,8 +27,6 @@ CATALOG(pg_dolt_root,9127,DoltRootRelationId)
 #ifdef CATALOG_VARLEN
 	text		rootbranch BKI_FORCE_NOT_NULL;
 	bytea		rootcontent BKI_FORCE_NOT_NULL;
-	bytea		roothandles BKI_FORCE_NULL; /* tables only */
-	bytea		rootkeys BKI_FORCE_NULL;	/* tables only */
 #endif
 } FormData_pg_dolt_root;
 

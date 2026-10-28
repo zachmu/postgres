@@ -46,6 +46,9 @@
 #include "catalog/pg_dolt_root.h"
 #include "catalog/index.h"
 #include "catalog/pg_dolt_journal.h"
+#include "catalog/pg_dolt_handle.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
 #include "access/doltbranch.h"
 #include "access/doltcatalog.h"
 #include "fmgr.h"
@@ -93,10 +96,7 @@ typedef struct RootKey
 typedef struct Roots
 {
 	bool		present;
-	bool		table;			/* has handle and key trees */
 	PLHash		content;
-	PLHash		handles;
-	PLHash		keys;
 } Roots;
 
 static bool
@@ -106,8 +106,7 @@ roots_equal(const Roots *a, const Roots *b)
 		return false;
 	if (!a->present)
 		return true;
-	return pl_hash_equal(a->content, b->content) && a->table == b->table &&
-		(!a->table || (pl_hash_equal(a->handles, b->handles) && pl_hash_equal(a->keys, b->keys)));
+	return pl_hash_equal(a->content, b->content);
 }
 
 static RootKey
@@ -157,13 +156,10 @@ static Roots
 roots_from_tuple(HeapTuple tuple, TupleDesc desc)
 {
 	Roots		roots = {.present = true};
-	bool		present,
-				keys;
+	bool		present;
 
 	hash_column(tuple, desc, Anum_pg_dolt_root_rootcontent, &present, &roots.content);
-	hash_column(tuple, desc, Anum_pg_dolt_root_roothandles, &roots.table, &roots.handles);
-	hash_column(tuple, desc, Anum_pg_dolt_root_rootkeys, &keys, &roots.keys);
-	if (!present || roots.table != keys)
+	if (!present)
 		elog(ERROR, "invalid prolly root row");
 	return roots;
 }
@@ -446,11 +442,6 @@ persist_roots(const Roots *roots)
 	if (!roots->present)
 		return;
 	collect_unbacked(store, roots->content, &pending);
-	if (roots->table)
-	{
-		collect_unbacked(store, roots->handles, &pending);
-		collect_unbacked(store, roots->keys, &pending);
-	}
 	if (pending.count)
 	{
 		DoltChunkStore *chunks = dolt_chunk_open(DOLT_CHUNK_WRITE);
@@ -545,8 +536,7 @@ roots_merge(const Roots *base, const Roots *ours, const Roots *theirs)
 		PLTree		e = empty_tree();
 
 		b.present = true;
-		b.table = ours->table;
-		b.content = b.handles = b.keys = e.root;
+		b.content = e.root;
 	}
 	if (!theirs->present)
 	{
@@ -555,11 +545,6 @@ roots_merge(const Roots *base, const Roots *ours, const Roots *theirs)
 		theirs = &empty;
 	}
 	result.content = merge_tree(b.content, ours->content, theirs->content, true);
-	if (ours->table)
-	{
-		result.handles = merge_tree(b.handles, ours->handles, theirs->handles, false);
-		result.keys = merge_tree(b.keys, ours->keys, theirs->keys, false);
-	}
 	return result;
 }
 
@@ -594,13 +579,27 @@ static HTAB *journal_marks;		/* (relid, cid, subxid) of batches that were journa
 static bool journal_batch(DGBatch *b, bool forced);
 static bool batch_adds_handle(const RootKey *key, uint64 handle);
 static void journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid);
-static DGState *journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s, const uint64 *wanted);
+static DGState *journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s);
 static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
 static uint64 journal_max_handle(Oid space, RelFileNumber file);
 static void journal_xact_end(bool committed);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
+struct HandleDelta;
+static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
+static void handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid);
+static uint64 handle_delta_max(Oid space, RelFileNumber file);
+static bool handle_delta_committed(const RootKey *key, uint64 handle);
+static bool handle_records_exist(Oid db, Oid space, RelFileNumber file);
+static inline bool handle_is_derived(uint64 handle);
+typedef struct PrefixRows
+{
+	PLHash		digests[8];
+	int64		counts[8];
+	int			count;
+} PrefixRows;
+static PrefixRows prefix_rows(const PLTree *tree, uint64 handle);
 static void batch_flush_key(const RootKey *key);
 static void batch_flush_all(void);
 static void batch_discard(SubTransactionId subxid);
@@ -608,7 +607,7 @@ static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid
 static uint64 roots_generation(void);
 static void roots_generation_bump(void);
 static void handle_table_init(void *ptr);
-static bool tree_has(PLTree *tree, uint64 id);
+static bool journal_entry_any(const RootKey *key, uint64 handle, PLHash *digest, PLSlice *row);
 static void writer_forget(TransactionId xid, int slot);
 
 /*
@@ -809,24 +808,15 @@ roots_write(Relation catalog, const RootKey *key, ItemPointer tid, const Roots *
 {
 	Datum		values[Natts_pg_dolt_root];
 	bool		nulls[Natts_pg_dolt_root] = {false};
-	bytea	   *hashes[3];
-	PLHash		sources[3] = {roots->content, roots->handles, roots->keys};
+	bytea	   *hash = palloc(VARHDRSZ + PL_HASH_SIZE);
 	HeapTuple	tuple;
 
-	for (int i = 0; i < 3; i++)
-	{
-		hashes[i] = palloc(VARHDRSZ + PL_HASH_SIZE);
-		SET_VARSIZE(hashes[i], VARHDRSZ + PL_HASH_SIZE);
-		memcpy(VARDATA(hashes[i]), sources[i].bytes, PL_HASH_SIZE);
-	}
+	SET_VARSIZE(hash, VARHDRSZ + PL_HASH_SIZE);
+	memcpy(VARDATA(hash), roots->content.bytes, PL_HASH_SIZE);
 	values[Anum_pg_dolt_root_rootspace - 1] = ObjectIdGetDatum(key->space);
 	values[Anum_pg_dolt_root_rootfile - 1] = ObjectIdGetDatum(key->file);
 	values[Anum_pg_dolt_root_rootbranch - 1] = CStringGetTextDatum(key->branch);
-	values[Anum_pg_dolt_root_rootcontent - 1] = PointerGetDatum(hashes[0]);
-	values[Anum_pg_dolt_root_roothandles - 1] = PointerGetDatum(hashes[1]);
-	values[Anum_pg_dolt_root_rootkeys - 1] = PointerGetDatum(hashes[2]);
-	nulls[Anum_pg_dolt_root_roothandles - 1] = !roots->table;
-	nulls[Anum_pg_dolt_root_rootkeys - 1] = !roots->table;
+	values[Anum_pg_dolt_root_rootcontent - 1] = PointerGetDatum(hash);
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	if (ItemPointerIsValid(tid))
 		CatalogTupleUpdate(catalog, tid, tuple);
@@ -1189,20 +1179,25 @@ dg_row_committed(Relation rel, uint64 handle)
 {
 	RootKey		key = root_key(rel, dg_relation_branch(rel));
 	Roots		committed;
-	PLTree		handles;
 
-	/* Derived handles name rows of a branch's committed content. */
-	if (handle <= DG_DERIVED_HANDLES)
-		return true;
-	committed = roots_latest(&key);
-	if (committed.present && committed.table)
+	/*
+	 * A derived handle is committed when a committed row holds its prefix;
+	 * an allocated one when a committed transaction mapped it. A row another
+	 * transaction journaled and committed is committed too.
+	 */
+	if (handle_is_derived(handle))
 	{
-		handles = tree_at(committed.handles);
-		if (tree_has(&handles, handle))
-			return true;
-	}
+		committed = roots_latest(&key);
+		if (committed.present)
+		{
+			PLTree		content = tree_at(committed.content);
 
-	/* A row another transaction journaled and committed is committed too. */
+			if (prefix_rows(&content, handle).count > 0)
+				return true;
+		}
+	}
+	else if (handle_delta_committed(&key, handle))
+		return true;
 	return journal_handle_committed(&key, handle);
 }
 
@@ -1247,6 +1242,7 @@ typedef struct HandleSlot
 	pg_atomic_uint32 used;
 	pg_atomic_uint64 next;
 	pg_atomic_uint64 journal_generation;	/* bumped when a journal write to the storage commits */
+	pg_atomic_uint32 records;	/* whether any row of the storage ever had a lock record */
 } HandleSlot;
 
 typedef struct HandleTable
@@ -1337,45 +1333,7 @@ handle_slot_find(Oid db, Oid space, RelFileNumber file)
 static uint64
 max_handle(Oid space, RelFileNumber file)
 {
-	Relation	catalog = table_open(DoltRootRelationId, AccessShareLock);
-	ScanKeyData keys[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	uint64		max = 0;
-
-	ScanKeyInit(&keys[0], Anum_pg_dolt_root_rootspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(space));
-	ScanKeyInit(&keys[1], Anum_pg_dolt_root_rootfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(file));
-	scan = systable_beginscan(catalog, DoltRootKeyIndexId, true, SnapshotAny, 2, keys);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		TransactionId xmin = HeapTupleHeaderGetXmin(tuple->t_data);
-		Roots		roots;
-		PLNode	   *node;
-
-		if (!TransactionIdIsCurrentTransactionId(xmin) && !TransactionIdIsInProgress(xmin) &&
-			!TransactionIdDidCommit(xmin))
-			continue;
-		roots = roots_from_tuple(tuple, RelationGetDescr(catalog));
-		if (!roots.table)
-			continue;
-
-		/* Handles are keys in order: the largest is the rightmost leaf's last. */
-		node = pl_find(dg_working_store(), roots.handles);
-		while (node && node->level)
-		{
-			PLHash		child;
-
-			memcpy(child.bytes, pl_node_value(node, node->count - 1).data, PL_HASH_SIZE);
-			node = pl_find(dg_working_store(), child);
-		}
-		if (!node)
-			elog(ERROR, "prolly handle tree is unavailable");
-		if (node->count)
-			max = Max(max, pl_read64(pl_node_key(node, node->count - 1).data));
-	}
-	systable_endscan(scan);
-	table_close(catalog, AccessShareLock);
-	return Max(max, journal_max_handle(space, file));
+	return Max(handle_delta_max(space, file), journal_max_handle(space, file));
 }
 
 /* The slot of a storage, claimed with the next handle after any in use. */
@@ -1410,6 +1368,7 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
 			pg_atomic_write_u64(&candidate->journal_generation, 1);
+			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
 			pg_atomic_write_u32(&candidate->used, 1);
 			slot = candidate;
@@ -1430,11 +1389,21 @@ dg_allocate_handle(Relation rel)
 	return pg_atomic_fetch_add_u64(&slot->next, 1);
 }
 
-void
-dg_handle_key(PLHash digest, uint64 handle, uint8 *key)
+/* Whether any row of a storage ever had a lock record, so that a derived handle may be its root. */
+static bool
+handle_records_exist(Oid db, Oid space, RelFileNumber file)
 {
-	memcpy(key, digest.bytes, PL_HASH_SIZE);
-	pl_write64(key + PL_HASH_SIZE, handle);
+	HandleSlot *slot = handle_slot_claim(db, space, file);
+
+	return pg_atomic_read_u32(&slot->records) != 0;
+}
+
+void
+dg_handle_records_note(RelFileLocator *locator)
+{
+	HandleSlot *slot = handle_slot_claim(locator->dbOid, locator->spcOid, locator->relNumber);
+
+	pg_atomic_write_u32(&slot->records, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1504,11 +1473,10 @@ dg_collect(void)
 	for (int i = 0; i < live_count; i++)
 	{
 		DGState    *s = live_states[i];
-		PLHash		trees[3] = {s->content.root, s->handles.root, s->keys.root};
 
-		add_roots(&roots, &count, &capacity, trees, 3);
+		add_roots(&roots, &count, &capacity, &s->content.root, 1);
 		if (s->based)
-			add_roots(&roots, &count, &capacity, s->base, 3);
+			add_roots(&roots, &count, &capacity, &s->base, 1);
 	}
 	if (overlays)
 	{
@@ -1519,12 +1487,8 @@ dg_collect(void)
 				const Roots *both[2] = {&overlay->entries[i].roots, &overlay->entries[i].base};
 
 				for (int j = 0; j < 2; j++)
-				{
-					PLHash		trees[3] = {both[j]->content, both[j]->handles, both[j]->keys};
-
 					if (both[j]->present)
-						add_roots(&roots, &count, &capacity, trees, both[j]->table ? 3 : 1);
-				}
+						add_roots(&roots, &count, &capacity, &both[j]->content, 1);
 			}
 	}
 	journal_fold_roots(&roots, &count, &capacity);
@@ -1567,34 +1531,10 @@ new_state(Relation rel)
 }
 
 static void
-state_set(DGState *s, const Roots *roots, bool table)
+state_set(DGState *s, const Roots *roots)
 {
-	if (roots->present)
-	{
-		s->content = tree_at(roots->content);
-		if (roots->table)
-		{
-			s->handles = tree_at(roots->handles);
-			s->keys = tree_at(roots->keys);
-		}
-		else
-			s->handles = s->keys = empty_tree();
-	}
-	else
-		s->content = s->handles = s->keys = empty_tree();
+	s->content = roots->present ? tree_at(roots->content) : empty_tree();
 	s->has_root = roots->present;
-}
-
-static bool
-tree_has(PLTree *tree, uint64 id)
-{
-	uint8		key[8];
-	PLSlice		k = {key, 8};
-	PLValue		value;
-
-	pl_write64(key, id);
-	dg_check(pl_get(tree, k, &value));
-	return value.present;
 }
 
 /*
@@ -1644,7 +1584,7 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 	if (!bound)
 		dg_catalog_check_relation(rel, branch, snap);
 	/* A dirty snapshot reads as SnapshotSelf; uniqueness checks wait on reservations. */
-	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && snap->snapshot_type != SNAPSHOT_DIRTY && !wanted)
+	if (snap && !IsMVCCSnapshot(snap) && snap != SnapshotSelf && snap->snapshot_type != SNAPSHOT_DIRTY)
 		dg_unsupported("non-MVCC snapshots");
 	key = root_key(rel, branch);
 	if (table && snap && IsMVCCSnapshot(snap) && IsolationIsSerializable())
@@ -1666,36 +1606,6 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		committed = roots_latest(&key);
 	view = base = committed;
 	entry = overlay_entry(overlay, snap);
-	if (wanted)
-	{
-		/* SnapshotAny row fetches: the newest own or committed state holding it. */
-		entry = NULL;
-		for (int i = overlay ? overlay->count - 1 : -1; i >= 0 && !entry; i--)
-		{
-			PLTree		handles = tree_at(overlay->entries[i].roots.handles);
-
-			if (overlay->entries[i].roots.present && overlay->entries[i].roots.table && tree_has(&handles, *wanted))
-				entry = &overlay->entries[i];
-		}
-
-		/*
-		 * A version another transaction replaced after the statement's
-		 * snapshot is gone from the latest roots, but the executor may still
-		 * fetch it by TID, as heap fetches dead tuples with SnapshotAny.
-		 */
-		if (!entry && committed.present && committed.table && ActiveSnapshotSet())
-		{
-			PLTree		handles = tree_at(committed.handles);
-
-			if (!tree_has(&handles, *wanted))
-			{
-				Roots		seen = roots_read(&key, GetActiveSnapshot());
-
-				if (seen.present)
-					view = base = committed = seen;
-			}
-		}
-	}
 	if (entry)
 	{
 		if (roots_equal(&entry->base, &committed))
@@ -1706,14 +1616,12 @@ load_state(Relation rel, Snapshot snap, const uint64 *wanted, const char *branch
 		else
 			view = roots_merge(&entry->base, &entry->roots, &committed);
 	}
-	state_set(s, &view, table);
+	state_set(s, &view);
 	s->based = base.present;
 	if (base.present)
-	{
-		s->base[0] = base.content;
-		s->base[1] = base.table ? base.handles : base.content;
-		s->base[2] = base.table ? base.keys : base.content;
-	}
+		s->base = base.content;
+	if (table)
+		s->delta = handle_delta_get(&key, snap);
 	if (!view.present && use_base)
 		dg_branch_base(rel, s);
 	return s;
@@ -1730,8 +1638,6 @@ import_content(Relation rel, DGState *state, bytea *content)
 	PG_TRY();
 	{
 		state->content = dg_history_import(state->store, content);
-		if (DG_ROWS_KIND(rel->rd_rel->relkind))
-			dg_history_handles(state);
 	}
 	PG_FINALLY();
 	{
@@ -1770,7 +1676,6 @@ revision_state(Relation rel)
 	if (!content)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("revision relation \"%s\" has no content", RelationGetRelationName(rel))));
-	s->handles = s->keys = empty_tree();
 	import_content(rel, s, content);
 	return s;
 }
@@ -1808,7 +1713,7 @@ dg_load(Relation rel, Snapshot snap)
 	bool		foldable;
 	DGState    *s = load_unfolded(rel, snap, &foldable);
 
-	return foldable ? journal_fold_loaded(rel, dg_relation_branch(rel), snap, s, NULL) : s;
+	return foldable ? journal_fold_loaded(rel, dg_relation_branch(rel), snap, s) : s;
 }
 DGState *
 dg_load_branch(Relation rel, Snapshot snap, const char *branch)
@@ -1825,14 +1730,14 @@ dg_load_tid(Relation rel, uint64 id)
 		return dg_storage_am_load_tid(rel, id);
 	if (CatalogViewIsDurable(RelationGetRelid(rel)))
 		return journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf,
-								   durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true)), &id);
+								   durable_base(rel, load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), false, true)));
 	if (revision_relation(rel))
 		return revision_state(rel);
 	if (CatalogViewObjectContext(RelationGetRelid(rel)))
 		return dg_storage_am_load_tid(rel, id);
 
 	return journal_fold_loaded(rel, dg_relation_branch(rel), SnapshotSelf,
-							   load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false), &id);
+							   load_state(rel, SnapshotSelf, &id, dg_relation_branch(rel), true, false));
 }
 
 /* Internal page-reader entrypoint; only dg_resource.c supplies this descriptor. */
@@ -1841,13 +1746,13 @@ dg_load_bound(Relation rel, Snapshot snap, const char *branch)
 {
 	Assert(RelFileNumberIsValid(rel->rd_locator.relNumber));
 	Assert(rel->rd_lockInfo.lockRelId.relId < FirstCatalogViewObjectId);
-	return journal_fold_loaded(rel, branch, snap, load_state(rel, snap, NULL, branch, false, true), NULL);
+	return journal_fold_loaded(rel, branch, snap, load_state(rel, snap, NULL, branch, false, true));
 }
 
 DGState *
 dg_load_bound_tid(Relation rel, uint64 id, const char *branch)
 {
-	return journal_fold_loaded(rel, branch, SnapshotSelf, load_state(rel, SnapshotSelf, &id, branch, false, true), &id);
+	return journal_fold_loaded(rel, branch, SnapshotSelf, load_state(rel, SnapshotSelf, &id, branch, false, true));
 }
 
 static void
@@ -1859,20 +1764,11 @@ save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransac
 	register_callbacks();
 	if (s->store != dg_working_store())
 		elog(ERROR, "prolly state does not belong to this transaction");
-	roots.table = table;
 	roots.content = s->content.root;
-	if (roots.table)
-	{
-		roots.handles = s->handles.root;
-		roots.keys = s->keys.root;
-	}
 	if (s->based)
 	{
 		base.present = true;
-		base.table = roots.table;
-		base.content = s->base[0];
-		base.handles = s->base[1];
-		base.keys = s->base[2];
+		base.content = s->base;
 	}
 	overlay_push(key, cid, subxid, &base, &roots);
 
@@ -1951,6 +1847,7 @@ visibility_equal(const Visibility *a, const Visibility *b)
 
 #include "dg_batch.inc"
 #include "dg_journal.inc"
+#include "dg_handle.inc"
 
 /* Only the transactional resource allocator calls this, before publishing any
  * branch binding: the new storage starts empty on its branch. */

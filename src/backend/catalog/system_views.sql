@@ -1416,8 +1416,7 @@ ALTER TABLE pg_catalog.pg_dolt_chunk ALTER COLUMN chunkdata SET STORAGE PLAIN;
 -- Roots and lock records are small and fixed in shape; they stay inline too.
 ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootbranch SET STORAGE PLAIN;
 ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootcontent SET STORAGE PLAIN;
-ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN roothandles SET STORAGE PLAIN;
-ALTER TABLE pg_catalog.pg_dolt_root ALTER COLUMN rootkeys SET STORAGE PLAIN;
+ALTER TABLE pg_catalog.pg_dolt_handle ALTER COLUMN hdldigest SET STORAGE PLAIN;
 ALTER TABLE pg_catalog.pg_dolt_lock ALTER COLUMN lockbranch SET STORAGE PLAIN;
 ALTER TABLE pg_catalog.pg_dolt_identity ALTER COLUMN identbranch SET STORAGE PLAIN;
 ALTER TABLE pg_catalog.pg_dolt_identity ALTER COLUMN identname SET STORAGE PLAIN;

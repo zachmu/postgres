@@ -448,8 +448,6 @@ dg_storage_require_write(Relation rel)
 static void
 storage_base(DGStorage *storage, DGState *state)
 {
-	Relation	rel = &storage->relation;
-
 	if (!state->has_root && storage->base)
 	{
 		Oid			user;
@@ -461,8 +459,6 @@ storage_base(DGStorage *storage, DGState *state)
 		PG_TRY();
 		{
 			state->content = dg_history_import(state->store, storage->base);
-			if (DG_ROWS_KIND(rel->rd_rel->relkind))
-				dg_history_handles(state);
 		}
 		PG_FINALLY();
 		{

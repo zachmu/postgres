@@ -179,6 +179,7 @@ record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, It
 	LockDatabaseObject(DoltLockRelationId, tag, 0, ExclusiveLock);
 	if (!find_record(r, locator, branch, id, tid))
 	{
+		dg_handle_records_note(locator);
 		values[Anum_pg_dolt_lock_lockspace - 1] = ObjectIdGetDatum(locator->spcOid);
 		values[Anum_pg_dolt_lock_lockfile - 1] = ObjectIdGetDatum(locator->relNumber);
 		values[Anum_pg_dolt_lock_lockroot - 1] = Int64GetDatum(id);
@@ -191,6 +192,53 @@ record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, It
 		heap_freetuple(tuple);
 	}
 	UnlockDatabaseObject(DoltLockRelationId, tag, 0, ExclusiveLock);
+}
+
+/*
+ * Whether any record ever named |id| on |branch|, as its root or current
+ * handle: a derived handle with a record must not name a new row, since the
+ * record would still describe the old one.
+ */
+bool
+dg_record_exists(RelFileLocator *locator, const char *branch, int64 id)
+{
+	Records		r = records_open();
+	ItemPointerData tid;
+	bool		found = find_record(&r, locator, branch, id, &tid);
+
+	if (!found)
+	{
+		ScanKeyData keys[4];
+		SysScanDesc scan;
+
+		ScanKeyInit(&keys[0], Anum_pg_dolt_lock_lockspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->spcOid));
+		ScanKeyInit(&keys[1], Anum_pg_dolt_lock_lockfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->relNumber));
+		ScanKeyInit(&keys[2], Anum_pg_dolt_lock_lockroot, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(id));
+		ScanKeyInit(&keys[3], Anum_pg_dolt_lock_lockbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+		scan = systable_beginscan(r.heap, DoltLockKeyIndexId, true, SnapshotAny, 4, keys);
+		found = HeapTupleIsValid(systable_getnext(scan));
+		systable_endscan(scan);
+	}
+	records_close(&r);
+	return found;
+}
+
+/* Whether any row of storage |space|/|file| ever had a record, on any branch. */
+bool
+dg_records_exist(Oid space, RelFileNumber file)
+{
+	Relation	heap = table_open(DoltLockRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_lock_lockspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_lock_lockfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(file));
+	scan = systable_beginscan(heap, DoltLockKeyIndexId, true, SnapshotAny, 2, keys);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(heap, AccessShareLock);
+	return found;
 }
 
 /* The current handle of the record version at |tid|. */

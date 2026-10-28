@@ -13,7 +13,7 @@ $node->start;
 sub sql { $node->safe_psql('postgres', $_[0]); }
 sub fails { my ($q, $re, $label) = @_; my ($code, $out, $err) = $node->psql('postgres', $q); isnt($code, 0, $label); like($err, $re, "$label diagnostic"); }
 sub journal_rows { sql(q{SELECT count(*) FROM pg_dolt_journal}); }
-sub roots { sql(q{SELECT encode(rootcontent, 'hex') FROM pg_dolt_root WHERE roothandles IS NOT NULL ORDER BY rootfile LIMIT 1}); }
+sub roots { sql(q{SELECT encode(rootcontent, 'hex') FROM pg_dolt_root ORDER BY rootfile LIMIT 1}); }
 
 sql(q{CREATE TABLE t(id int PRIMARY KEY, k int NOT NULL, v text); CREATE INDEX t_k ON t(k)});
 sql(q{INSERT INTO t SELECT g, g % 10, 'v'||g FROM generate_series(1, 1000) g});

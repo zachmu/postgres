@@ -30,6 +30,12 @@
 static TableAmRoutine methods;
 static bool initialized;
 
+typedef struct MaterializedRow
+{
+	uint64		handle;
+	PLSlice		row;
+} MaterializedRow;
+
 typedef struct DGScan
 {
 	TableScanDescData base;
@@ -37,16 +43,26 @@ typedef struct DGScan
 	DGState    *state;
 
 	/*
-	 * A forward scan walks the content tree and the key tree in step: both
-	 * are ordered by row digest, so each row's handles follow its bytes
-	 * without a lookup. Backward scans materialize the handles instead.
+	 * A forward scan walks the content tree, each entry yielding its row's
+	 * occurrences: the derived handle, plus the allocated ones the delta
+	 * holds for the row. Backward scans materialize the rows instead.
 	 */
 	bool		streaming;
 	PLCursor	content;
-	PLCursor	keys;
-	DGRows		rows;
+	PLSlice		row;			/* the current entry's row */
+	uint64	   *handles;		/* its handles */
+	int			handle_count,
+				handle_capacity,
+				handle_position;
+	MaterializedRow *rows;
+	int64		row_count,
+				row_capacity;
 	bool		materialized;
 	int64		position;
+	MaterializedRow *page_rows;	/* a lossy bitmap page's rows, from one range scan */
+	int			page_count,
+				page_capacity;
+	bool		page_scanned;
 	TBMIterateResult bitmap_page;
 	OffsetNumber bitmap_offsets[TBM_MAX_TUPLES_PER_PAGE];
 	int			bitmap_count;
@@ -82,6 +98,8 @@ slots(Relation rel)
 {
 	return &TTSOpsProlly;
 }
+static void materialize(DGScan *scan);
+
 static TableScanDesc
 begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc parallel, uint32 flags)
 {
@@ -102,21 +120,41 @@ begin(Relation rel, Snapshot snap, int nkeys, ScanKey key, ParallelTableScanDesc
 	scan->state = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
 	scan->streaming = !(flags & SO_TYPE_BITMAPSCAN) && !CatalogViewIsProvisional(rel->rd_catalogview) && scan->state->has_root;
 	if (scan->streaming)
-	{
 		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
-		dg_check(pl_cursor_init(&scan->keys, &scan->state->keys, NULL));
-	}
 	else if (!(flags & SO_TYPE_BITMAPSCAN))
-	{
-		scan->rows = dg_rows(&scan->state->handles);
-		scan->materialized = true;
-	}
+		materialize(scan);
 	scan->position = -1;
 	MemoryContextSwitchTo(old);
 	return &scan->base;
 }
 
-/* The handles of a scan, for the directions the merged walk does not serve. */
+static PLStatus
+collect_materialized(void *arg, PLSlice key, PLSlice value)
+{
+	DGScan	   *scan = arg;
+	PLHash		digest;
+	int			n;
+
+	if (key.len != PL_HASH_SIZE || value.len < 8)
+		elog(ERROR, "invalid prolly scan entry");
+	memcpy(digest.bytes, key.data, PL_HASH_SIZE);
+	n = dg_handles_of(scan->state, digest, (int64) pl_read64(value.data), &scan->handles, &scan->handle_capacity);
+	for (int i = 0; i < n; i++)
+	{
+		if (scan->row_count == scan->row_capacity)
+		{
+			scan->row_capacity = scan->row_capacity ? scan->row_capacity * 2 : 64;
+			scan->rows = scan->rows ? repalloc(scan->rows, scan->row_capacity * sizeof(MaterializedRow)) :
+				palloc(scan->row_capacity * sizeof(MaterializedRow));
+		}
+		scan->rows[scan->row_count].handle = scan->handles[i];
+		scan->rows[scan->row_count].row = (PLSlice) {value.data + 8, value.len - 8};
+		scan->row_count++;
+	}
+	return PL_OK;
+}
+
+/* Every row occurrence of a scan, for the directions the walk does not serve. */
 static void
 materialize(DGScan *scan)
 {
@@ -124,7 +162,8 @@ materialize(DGScan *scan)
 
 	if (!scan->materialized)
 	{
-		scan->rows = dg_rows(&scan->state->handles);
+		scan->row_count = 0;
+		dg_check(pl_scan(&scan->state->content, NULL, NULL, collect_materialized, scan));
 		scan->materialized = true;
 	}
 	scan->streaming = false;
@@ -148,60 +187,48 @@ rescan(TableScanDesc base, ScanKey key, bool set, bool strat, bool sync, bool pa
 	scan->position = -1;
 	scan->bitmap_count = 0;
 	scan->bitmap_position = 0;
+	scan->handle_count = scan->handle_position = 0;
 	if (scan->streaming)
-	{
 		dg_check(pl_cursor_init(&scan->content, &scan->state->content, NULL));
-		dg_check(pl_cursor_init(&scan->keys, &scan->state->keys, NULL));
-	}
 }
 
-/* The next row of the merged walk: the content entry each key entry names. */
+/* The next row occurrence of the walk: the current entry's next handle, or the next entry's first. */
 static bool
 next_streamed(DGScan *scan, TupleTableSlot *slot)
 {
-	for (;;)
-	{
-		PLEntry		content,
-					key;
-		int			order;
-		ItemPointerData tid;
-		PLSlice		row;
+	ItemPointerData tid;
 
-		if (!scan->keys.valid || !scan->content.valid)
+	while (scan->handle_position >= scan->handle_count)
+	{
+		PLEntry		content;
+		PLHash		digest;
+
+		if (!scan->content.valid)
 		{
 			ExecClearTuple(slot);
 			return false;
 		}
-		key = pl_cursor_entry(&scan->keys);
 		content = pl_cursor_entry(&scan->content);
-		if (key.key.len != DG_KEY_SIZE || content.key.len != PL_HASH_SIZE || content.value.len < 8)
+		if (content.key.len != PL_HASH_SIZE || content.value.len < 8)
 			elog(ERROR, "invalid prolly scan entry");
-		order = memcmp(key.key.data, content.key.data, PL_HASH_SIZE);
-		if (order > 0)
-		{
-			dg_check(pl_cursor_next(&scan->content));
-			continue;
-		}
-		if (order < 0)
-		{
-			/* A key without its row: stale, as a handle-only tree never is. */
-			dg_check(pl_cursor_next(&scan->keys));
-			continue;
-		}
-		dg_tid(pl_read64(key.key.data + PL_HASH_SIZE), &tid);
-		row.data = content.value.data + 8;
-		row.len = content.value.len - 8;
-		dg_check(pl_cursor_next(&scan->keys));
-		dg_decode(scan->base.rs_rd, row, &tid, slot);
-		return true;
+		memcpy(digest.bytes, content.key.data, PL_HASH_SIZE);
+		scan->row.data = content.value.data + 8;
+		scan->row.len = content.value.len - 8;
+		scan->handle_count = dg_handles_of(scan->state, digest, (int64) pl_read64(content.value.data),
+										   &scan->handles, &scan->handle_capacity);
+		scan->handle_position = 0;
+		dg_check(pl_cursor_next(&scan->content));
 	}
+	dg_tid(scan->handles[scan->handle_position++], &tid);
+	dg_decode(scan->base.rs_rd, scan->row, &tid, slot);
+	return true;
 }
 
 static bool
 next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 {
 	DGScan	   *scan = (DGScan *) base;
-	PLEntry    *entry;
+	MaterializedRow *entry;
 	ItemPointerData tid;
 
 	if (scan->streaming && ScanDirectionIsForward(dir))
@@ -211,25 +238,58 @@ next(TableScanDesc base, ScanDirection dir, TupleTableSlot *slot)
 	if (ScanDirectionIsBackward(dir))
 	{
 		if (scan->position < 0)
-			scan->position = scan->rows.count;
+			scan->position = scan->row_count;
 		--scan->position;
 	}
 	else
 		++scan->position;
-	if (scan->position < 0 || scan->position >= (int64) scan->rows.count)
+	if (scan->position < 0 || scan->position >= scan->row_count)
 	{
 		ExecClearTuple(slot);
 		return false;
 	}
-	entry = &scan->rows.items[scan->position];
-	dg_tid(pl_read64(entry->key.data), &tid);
+	entry = &scan->rows[scan->position];
+	dg_tid(entry->handle, &tid);
 	if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
-		dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+		dg_decode_mutation(base->rs_rd, entry->row, &tid, slot);
 	else
-		dg_decode(base->rs_rd, row_for_handle(scan->state, entry->value), &tid, slot);
+		dg_decode(base->rs_rd, entry->row, &tid, slot);
 	return true;
 }
-/* Bitmap blocks are logical handle ranges, not physical relation pages. */
+/* The rows of a lossy bitmap page's derived handle range, collected by one range scan. */
+static PLStatus
+collect_page_row(void *arg, PLSlice key, PLSlice value)
+{
+	DGScan	   *scan = arg;
+	PLHash		digest;
+	int			n;
+
+	if (key.len != PL_HASH_SIZE || value.len < 8)
+		elog(ERROR, "invalid prolly scan entry");
+	memcpy(digest.bytes, key.data, PL_HASH_SIZE);
+	n = dg_handles_of(scan->state, digest, (int64) pl_read64(value.data), &scan->handles, &scan->handle_capacity);
+	for (int i = 0; i < n; i++)
+	{
+		if (scan->handles[i] / TBM_MAX_TUPLES_PER_PAGE != scan->bitmap_page.blockno)
+			continue;
+		if (scan->page_count == scan->page_capacity)
+		{
+			scan->page_capacity = scan->page_capacity ? scan->page_capacity * 2 : 16;
+			scan->page_rows = scan->page_rows ? repalloc(scan->page_rows, scan->page_capacity * sizeof(MaterializedRow)) :
+				palloc(scan->page_capacity * sizeof(MaterializedRow));
+		}
+		scan->page_rows[scan->page_count].handle = scan->handles[i];
+		scan->page_rows[scan->page_count].row = (PLSlice) {value.data + 8, value.len - 8};
+		scan->page_count++;
+	}
+	return PL_OK;
+}
+
+/*
+ * Bitmap blocks are logical handle ranges, not physical relation pages. A
+ * lossy page of derived handles is one digest range of the content tree,
+ * scanned once; one of allocated handles is probed handle by handle.
+ */
 static bool
 bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 			uint64 *lossy_pages, uint64 *exact_pages)
@@ -239,8 +299,7 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 	for (;;)
 	{
 		ItemPointerData tid;
-		uint8		key[8];
-		PLValue		value;
+		PLHash		digest;
 		PLSlice		row;
 
 		CHECK_FOR_INTERRUPTS();
@@ -252,11 +311,29 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 				return false;
 			}
 			scan->bitmap_position = 0;
+			scan->page_scanned = false;
 			if (scan->bitmap_page.lossy)
 			{
-				/* Visit every possible handle on a lossy logical page. */
-				scan->bitmap_count = TBM_MAX_TUPLES_PER_PAGE;
+				uint64		first = (uint64) scan->bitmap_page.blockno * TBM_MAX_TUPLES_PER_PAGE;
+
 				++*lossy_pages;
+				if (first + TBM_MAX_TUPLES_PER_PAGE <= DG_DERIVED_HANDLES && !CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
+				{
+					PLHash		lower,
+								upper;
+					bool		bounded = dg_handle_range(first, TBM_MAX_TUPLES_PER_PAGE, &lower, &upper);
+					PLSlice		lo = {lower.bytes, PL_HASH_SIZE},
+								hi = {upper.bytes, PL_HASH_SIZE};
+					MemoryContext old = MemoryContextSwitchTo(scan->context);
+
+					scan->page_count = 0;
+					dg_check(pl_scan(&scan->state->content, &lo, bounded ? &hi : NULL, collect_page_row, scan));
+					MemoryContextSwitchTo(old);
+					scan->page_scanned = true;
+					scan->bitmap_count = scan->page_count;
+				}
+				else
+					scan->bitmap_count = TBM_MAX_TUPLES_PER_PAGE;	/* visit every possible handle */
 			}
 			else
 			{
@@ -264,6 +341,16 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 					scan->bitmap_offsets, TBM_MAX_TUPLES_PER_PAGE);
 				++*exact_pages;
 			}
+			continue;
+		}
+		if (scan->page_scanned)
+		{
+			MaterializedRow *entry = &scan->page_rows[scan->bitmap_position++];
+
+			*recheck = true;
+			dg_tid(entry->handle, &tid);
+			dg_decode(base->rs_rd, entry->row, &tid, slot);
+			return true;
 		}
 		ItemPointerSet(&tid, scan->bitmap_page.blockno,
 			scan->bitmap_page.lossy ? scan->bitmap_position + 1 :
@@ -276,14 +363,13 @@ bitmap_next(TableScanDesc base, TupleTableSlot *slot, bool *recheck,
 			dg_decode(base->rs_rd, row, &tid, slot);
 			return true;
 		}
-		pl_write64(key, dg_id(&tid));
-		dg_check(pl_get(&scan->state->handles, (PLSlice) {key, sizeof(key)}, &value));
-		if (!value.present)
+		if (!dg_handle_digest(scan->state, dg_id(&tid), &digest))
 			continue;
+		row = row_for_handle(scan->state, (PLSlice) {digest.bytes, PL_HASH_SIZE});
 		if (CatalogViewIsProvisional(base->rs_rd->rd_catalogview))
-			dg_decode_mutation(base->rs_rd, row_for_handle(scan->state, value.bytes), &tid, slot);
+			dg_decode_mutation(base->rs_rd, row, &tid, slot);
 		else
-			dg_decode(base->rs_rd, row_for_handle(scan->state, value.bytes), &tid, slot);
+			dg_decode(base->rs_rd, row, &tid, slot);
 		return true;
 	}
 }
@@ -299,24 +385,30 @@ release_state(Relation rel, DGState *s)
 static bool
 fetch(Relation rel, ItemPointer tid, Snapshot snap, TupleTableSlot *slot)
 {
-	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
-		dg_catalog_mutation_load(rel, snap) :
-		(snap == SnapshotAny ? dg_load_tid(rel, dg_id(tid)) : dg_load(rel, snap));
-	uint8		key[8];
-	PLSlice		k = {key, 8};
-	PLValue		value;
-	PLStatus	status;
+	DGState    *s;
+	PLHash		digest;
 
-	pl_write64(key, dg_id(tid));
-	status = pl_get(&s->handles, k, &value);
-	if (status == PL_OK && !value.present)
+	/* Any version at all, as heap serves dead tuples under SnapshotAny. */
+	if (snap == SnapshotAny && !CatalogViewIsProvisional(rel->rd_catalogview))
+	{
+		PLSlice		row;
+
+		if (!dg_handle_version(rel, dg_id(tid), &digest, &row))
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		dg_decode(rel, row, tid, slot);
+		return true;
+	}
+	s = CatalogViewIsProvisional(rel->rd_catalogview) ? dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
+	if (!dg_handle_digest(s, dg_id(tid), &digest))
 	{
 		release_state(rel, s);
 		ExecClearTuple(slot);
 		return false;
 	}
-	dg_check(status);
-	dg_decode(rel, row_for_handle(s, value.bytes), tid, slot);
+	dg_decode(rel, row_for_handle(s, (PLSlice) {digest.bytes, PL_HASH_SIZE}), tid, slot);
 	release_state(rel, s);
 	return true;
 }
@@ -391,7 +483,7 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 	entry = hash_search(stash, &key, HASH_ENTER, &found);
 	if (found)
 	{
-		if (pl_hash_equal(entry->content, state->content.root) && pl_hash_equal(entry->handles, state->handles.root))
+		if (pl_hash_equal(entry->content, state->content.root))
 			return;
 		stash_bytes -= entry->row.len;
 		pfree(unconstify(uint8 *, entry->row.data));
@@ -399,7 +491,6 @@ dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice row)
 	copy = MemoryContextAlloc(stash_memory, Max(row.len, 1));
 	memcpy(copy, row.data, row.len);
 	entry->content = state->content.root;
-	entry->handles = state->handles.root;
 	entry->row.data = copy;
 	entry->row.len = row.len;
 	stash_bytes += row.len;
@@ -414,7 +505,7 @@ dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row)
 	if (!stash)
 		return false;
 	entry = hash_search(stash, &key, HASH_FIND, NULL);
-	if (!entry || !pl_hash_equal(entry->content, state->content.root) || !pl_hash_equal(entry->handles, state->handles.root))
+	if (!entry || !pl_hash_equal(entry->content, state->content.root))
 		return false;
 	*row = entry->row;
 	return true;
@@ -447,10 +538,7 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 {
 	DGFetch    *f = (DGFetch *) base;
 	Relation	rel = base->rel;
-	uint8		key[8];
-	PLSlice		k = {key, 8},
-				row;
-	PLValue		value;
+	PLSlice		row;
 
 	*again = false;
 	if (dead)
@@ -477,14 +565,14 @@ fetch_index(IndexFetchTableData *base, ItemPointer tid, Snapshot snap, TupleTabl
 	}
 	if (!dg_stash_get(RelationGetRelid(rel), f->state, dg_id(tid), &row))
 	{
-		pl_write64(key, dg_id(tid));
-		dg_check(pl_get(&f->state->handles, k, &value));
-		if (!value.present)
+		PLHash		digest;
+
+		if (!dg_handle_digest(f->state, dg_id(tid), &digest))
 		{
 			ExecClearTuple(slot);
 			return false;
 		}
-		row = row_for_handle(f->state, value.bytes);
+		row = row_for_handle(f->state, (PLSlice) {digest.bytes, PL_HASH_SIZE});
 	}
 	dg_decode(rel, row, tid, slot);
 
@@ -509,14 +597,11 @@ visible(Relation rel, ItemPointer tid, Snapshot snap)
 {
 	DGState    *s = CatalogViewIsProvisional(rel->rd_catalogview) ?
 		dg_catalog_mutation_load(rel, snap) : dg_load(rel, snap);
-	uint8		key[8];
-	PLSlice		k = {key, 8};
-	PLValue		value;
+	PLHash		digest;
+	bool		present = dg_handle_digest(s, dg_id(tid), &digest);
 
-	pl_write64(key, dg_id(tid));
-	dg_check(pl_get(&s->handles, k, &value));
 	release_state(rel, s);
-	return value.present;
+	return present;
 }
 static bool
 satisfies(Relation rel, TupleTableSlot *slot, Snapshot snap)
@@ -588,34 +673,6 @@ multiplicity(DGState *s, PLSlice row, int delta)
 	dg_check(pl_apply(&s->content, &edit, 1, &s->content));
 	pfree(bytes);
 }
-/* Map |handle| to |digest|, or remove that mapping, in the handle and key trees. */
-static void
-handle_edit(DGState *s, uint64 handle, PLHash digest, bool present)
-{
-	uint8		id[8];
-	uint8		key[DG_KEY_SIZE];
-	PLEdit		edit = {0};
-
-	pl_write64(id, handle);
-	edit.key.data = id;
-	edit.key.len = 8;
-	edit.value.present = present;
-	edit.value.bytes.data = digest.bytes;
-	edit.value.bytes.len = present ? PL_HASH_SIZE : 0;
-	dg_check(pl_apply(&s->handles, &edit, 1, &s->handles));
-	dg_handle_key(digest, handle, key);
-	edit.key.data = key;
-	edit.key.len = DG_KEY_SIZE;
-	edit.value.bytes.data = present ? key : NULL;
-	edit.value.bytes.len = 0;
-	dg_check(pl_apply(&s->keys, &edit, 1, &s->keys));
-}
-
-static uint64
-next_handle(Relation rel, DGState *s)
-{
-	return s->nextid ? s->nextid++ : dg_allocate_handle(rel);
-}
 /*
  * An ordinary insert records its edits in the command's batch, applied to
  * the trees in one pass when something else reads them; a rewrite's state
@@ -630,11 +687,13 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 	if (CatalogViewIsProvisional(rel->rd_catalogview))
 	{
 		DGState    *s = dg_catalog_rewrite_state(rel);
+		PLHash		digest;
 
 		row = dg_encode(rel, slot);
+		digest = dg_rowhash(row);
+		handle = dg_handle_choose(rel, s, NULL, digest);
 		multiplicity(s, row, 1);
-		handle = next_handle(rel, s);
-		handle_edit(s, handle, dg_rowhash(row), true);
+		dg_handle_note(s, handle, digest, true);
 	}
 	else
 	{
@@ -643,7 +702,7 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 		writer(rel);
 		batch = dg_batch(rel, cid);
 		row = dg_encode(rel, slot);
-		handle = next_handle(rel, dg_batch_state(batch));
+		handle = dg_handle_choose(rel, dg_batch_state(batch), batch, dg_rowhash(row));
 		dg_batch_insert(batch, row, handle);
 		dg_index_apply(rel, row, 1, handle);
 		dg_collect();
@@ -699,15 +758,7 @@ copy_slice(PLSlice bytes)
 static bool
 handle_digest(DGState *s, uint64 handle, PLHash *digest)
 {
-	uint8		key[8];
-	PLSlice		k = {key, 8};
-	PLValue		value;
-
-	pl_write64(key, handle);
-	dg_check(pl_get(&s->handles, k, &value));
-	if (value.present)
-		memcpy(digest->bytes, value.bytes.data, PL_HASH_SIZE);
-	return value.present;
+	return dg_handle_digest(s, handle, digest);
 }
 
 /*
@@ -880,6 +931,15 @@ current_row(Relation rel, uint64 handle, Snapshot snapshot, PLHash *digest, PLSl
 	return present;
 }
 
+/* The handle of a row version about to replace another: derived from its digest when it can be. */
+static uint64
+successor_handle(Relation rel, CommandId cid, PLHash digest)
+{
+	DGBatch    *b = dg_batch_latest(rel, cid);
+
+	return dg_handle_choose(rel, dg_batch_state(b), b, digest);
+}
+
 static TM_Result
 update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *failure, LockTupleMode *mode, TU_UpdateIndexes *indexes)
 {
@@ -914,7 +974,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	*mode = key_change ? LockTupleExclusive : LockTupleNoKeyExclusive;
 	if (self_modified(rel, handle, snapshot, failure, &result))
 		return result;
-	successor = dg_allocate_handle(rel);
+	successor = successor_handle(rel, cid, new_digest);
 	result = dg_record_update(rel, dg_relation_branch(rel), (int64) handle, (int64) successor, cid, key_change,
 							  wait, failure, &next);
 	if (result == TM_Ok && !crosscheck_visible(rel, crosscheck, handle))
@@ -1118,7 +1178,7 @@ estimate(Relation rel, int32 *widths, BlockNumber *pages, double *tuples, double
 	 * handle root carries the exact count, including duplicate occurrences.
 	 * Use logical row volume for costing until chunk statistics are exposed.
 	 */
-	*tuples = pl_count(&state->handles);
+	*tuples = dg_handle_count(state);
 
 	/*
 	 * A row costs about the same to reach by handle as in sequence: there are
@@ -1259,160 +1319,13 @@ dolt_prolly_table_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(dg_table_routine());
 }
 
-/*
- * Give every row occurrence in |state|'s content a derived handle, numbered
- * 1..n in content order. The same content always derives the same handles, so
- * readers of a branch that has no roots of its own agree on TIDs. Allocated
- * handles start above DG_DERIVED_HANDLES, so the two never collide.
- */
-void
-dg_history_handles(DGState *state)
-{
-	DGRows		rows = dg_rows(&state->content);
-	PLEntry    *handles = NULL,
-			   *keys = NULL;
-	uint8	   *ids = NULL,
-			   *keybytes = NULL;
-	size_t		total = 0,
-				n = 0;
-
-	for (size_t i = 0; i < rows.count; i++)
-		total += pl_read64(rows.items[i].value.data);
-	if (total >= DG_DERIVED_HANDLES)
-		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("too many prolly rows to derive handles")));
-	if (total)
-	{
-		handles = palloc_array(PLEntry, total);
-		keys = palloc_array(PLEntry, total);
-		ids = palloc(total * 8);
-		keybytes = palloc(total * DG_KEY_SIZE);
-	}
-	for (size_t i = 0; i < rows.count; i++)
-	{
-		uint64		count = pl_read64(rows.items[i].value.data);
-		PLHash		digest;
-
-		CHECK_FOR_INTERRUPTS();
-		memcpy(digest.bytes, rows.items[i].key.data, PL_HASH_SIZE);
-		for (uint64 j = 0; j < count; j++, n++)
-		{
-			pl_write64(ids + n * 8, n + 1);
-			handles[n].key = (PLSlice) {ids + n * 8, 8};
-			handles[n].value = rows.items[i].key;
-			dg_handle_key(digest, n + 1, keybytes + n * DG_KEY_SIZE);
-			keys[n].key = (PLSlice) {keybytes + n * DG_KEY_SIZE, DG_KEY_SIZE};
-			keys[n].value = (PLSlice) {keybytes, 0};
-		}
-	}
-	dg_check(pl_build(state->store, handles, total, &state->handles));
-	dg_check(pl_build(state->store, keys, total, &state->keys));
-}
-
-typedef struct HandleChange
-{
-	PLHash		digest;
-	int64		delta;
-} HandleChange;
-
-typedef struct HandleChanges
-{
-	HandleChange *items;
-	int			count;
-	int			capacity;
-} HandleChanges;
-
-static PLStatus
-collect_change(void *arg, PLSlice key, PLValue before, PLValue after)
-{
-	HandleChanges *changes = arg;
-	int64		delta = (after.present ? (int64) pl_read64(after.bytes.data) : 0) -
-		(before.present ? (int64) pl_read64(before.bytes.data) : 0);
-
-	if (!delta)
-		return PL_OK;
-	if (changes->count == changes->capacity)
-	{
-		changes->capacity = changes->capacity ? changes->capacity * 2 : 64;
-		changes->items = changes->items ? repalloc_array(changes->items, HandleChange, changes->capacity) :
-			palloc_array(HandleChange, changes->capacity);
-	}
-	memcpy(changes->items[changes->count].digest.bytes, key.data, PL_HASH_SIZE);
-	changes->items[changes->count++].delta = delta;
-	return PL_OK;
-}
-
-typedef struct FoundHandles
-{
-	uint64	   *handles;
-	int64		wanted;
-	int64		count;
-} FoundHandles;
-
-static PLStatus
-collect_handle(void *arg, PLSlice key, PLSlice value)
-{
-	FoundHandles *found = arg;
-
-	if (found->count == found->wanted)
-		return PL_CONFLICT;		/* stops the scan */
-	found->handles[found->count++] = pl_read64(key.data + PL_HASH_SIZE);
-	return PL_OK;
-}
-
-/*
- * Replace |state|'s content with |contents|, keeping the handles of row
- * occurrences present in both: only rows the diff adds or removes gain or lose
- * handles. Cost is proportional to the difference, not the table.
- */
-static void
-install_handles(Relation rel, DGState *state, PLTree contents)
-{
-	PLTree		before = state->content;
-	HandleChanges changes = {0};
-
-	dg_check(pl_diff(&before, &contents, collect_change, &changes));
-	for (int i = 0; i < changes.count; i++)
-	{
-		HandleChange *change = &changes.items[i];
-
-		CHECK_FOR_INTERRUPTS();
-		if (change->delta > 0)
-		{
-			for (int64 j = 0; j < change->delta; j++)
-				handle_edit(state, next_handle(rel, state), change->digest, true);
-		}
-		else
-		{
-			uint8		lower[DG_KEY_SIZE],
-						upper[DG_KEY_SIZE];
-			PLSlice		lo = {lower, DG_KEY_SIZE},
-						hi = {upper, DG_KEY_SIZE};
-			FoundHandles found = {.wanted = -change->delta};
-			PLStatus	status;
-
-			found.handles = palloc_array(uint64, found.wanted);
-			dg_handle_key(change->digest, 0, lower);
-			dg_handle_key(change->digest, PG_UINT64_MAX, upper);
-			status = pl_scan(&state->keys, &lo, &hi, collect_handle, &found);
-			if (status != PL_CONFLICT)
-				dg_check(status);
-			if (found.count != found.wanted)
-				elog(ERROR, "prolly key tree is missing row handles");
-			for (int64 j = 0; j < found.count; j++)
-				handle_edit(state, found.handles[j], change->digest, false);
-			pfree(found.handles);
-		}
-	}
-	state->content = contents;
-}
-
 void
 dg_history_install(Relation rel, DGState *state, PLTree contents)
 {
 	/* Bound resources retain their original snapshot during root publication. */
 	if (rel->rd_catalogview)
 		PushCopiedSnapshot(GetActiveSnapshot());
-	install_handles(rel, state, contents);
+	dg_handle_install(rel, state, contents);
 	dg_save(rel, state, GetCurrentCommandId(true));
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();

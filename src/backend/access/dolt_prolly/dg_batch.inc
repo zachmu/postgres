@@ -27,12 +27,6 @@ typedef struct PendingHandle
 	bool		present;
 } PendingHandle;
 
-typedef struct PendingKey
-{
-	uint8		key[DG_KEY_SIZE];	/* hash key */
-	bool		present;
-} PendingKey;
-
 /* An index entry: its key, as index_entry encodes it, and the row it holds. */
 typedef struct PendingEntry
 {
@@ -66,7 +60,6 @@ struct DGBatch
 	DGState    *state;			/* the trees the edits apply to */
 	HTAB	   *rows;			/* PendingRow by digest */
 	HTAB	   *handles;		/* PendingHandle by handle */
-	HTAB	   *keys;			/* PendingKey by key */
 	PendingEntry **entries;		/* an index's edits, in arrival order */
 	int			entry_count,
 				entry_capacity;
@@ -143,8 +136,6 @@ batch_flush_table(DGBatch *b)
 	DGState    *s = b->state;
 	HASH_SEQ_STATUS status;
 	PendingRow *row;
-	PendingHandle *handle;
-	PendingKey *key;
 	PLEdit	   *edits;
 	long		n;
 	int			i;
@@ -173,43 +164,8 @@ batch_flush_table(DGBatch *b)
 		dg_check(pl_apply(&s->content, edits, i, &s->content));
 	}
 
-	n = hash_get_num_entries(b->handles);
-	edits = repalloc(edits, Max(n, 1) * sizeof(PLEdit));
-	i = 0;
-	hash_seq_init(&status, b->handles);
-	while ((handle = hash_seq_search(&status)) != NULL)
-	{
-		uint8	   *id = palloc(8);
-
-		pl_write64(id, handle->handle);
-		edits[i].key = (PLSlice) {id, 8};
-		edits[i].value.present = handle->present;
-		edits[i].value.bytes = (PLSlice) {handle->digest.bytes, handle->present ? PL_HASH_SIZE : 0};
-		i++;
-	}
-	if (i)
-	{
-		qsort(edits, i, sizeof(PLEdit), compare_edits);
-		dg_check(pl_apply(&s->handles, edits, i, &s->handles));
-	}
-
-	n = hash_get_num_entries(b->keys);
-	edits = repalloc(edits, Max(n, 1) * sizeof(PLEdit));
-	i = 0;
-	hash_seq_init(&status, b->keys);
-	while ((key = hash_seq_search(&status)) != NULL)
-	{
-		edits[i].key = (PLSlice) {key->key, DG_KEY_SIZE};
-		edits[i].value.present = key->present;
-		edits[i].value.bytes = (PLSlice) {key->present ? key->key : NULL, 0};
-		i++;
-	}
-	if (i)
-	{
-		qsort(edits, i, sizeof(PLEdit), compare_edits);
-		dg_check(pl_apply(&s->keys, edits, i, &s->keys));
-	}
 	pfree(edits);
+	handle_delta_write(&b->key, b->handles, b->cid);
 }
 
 /* Apply an index batch's edits: entries with equal keys combine. */
@@ -497,12 +453,11 @@ dg_batch(Relation rel, CommandId cid)
 	{
 		b->rows = batch_table(b->memory, "prolly pending rows", sizeof(PLHash), sizeof(PendingRow));
 		b->handles = batch_table(b->memory, "prolly pending handles", sizeof(uint64), sizeof(PendingHandle));
-		b->keys = batch_table(b->memory, "prolly pending keys", DG_KEY_SIZE, sizeof(PendingKey));
 		b->prefixes = NULL;
 	}
 	else
 	{
-		b->rows = b->handles = b->keys = NULL;
+		b->rows = b->handles = NULL;
 		b->prefixes = batch_table(b->memory, "prolly pending prefixes", sizeof(uint64), sizeof(PendingPrefix));
 	}
 	MemoryContextSwitchTo(old);
@@ -595,7 +550,6 @@ dg_batch_insert(DGBatch *b, PLSlice row, uint64 handle)
 	MemoryContext old = MemoryContextSwitchTo(b->memory);
 	PendingRow *pending;
 	PendingHandle *mapping;
-	PendingKey *key;
 	bool		found;
 
 	pending = hash_search(b->rows, &digest, HASH_ENTER, &found);
@@ -612,18 +566,11 @@ dg_batch_insert(DGBatch *b, PLSlice row, uint64 handle)
 	mapping = hash_search(b->handles, &handle, HASH_ENTER, NULL);
 	mapping->digest = digest;
 	mapping->present = true;
-	{
-		uint8		bytes[DG_KEY_SIZE];
-
-		dg_handle_key(digest, handle, bytes);
-		key = hash_search(b->keys, bytes, HASH_ENTER, NULL);
-		key->present = true;
-	}
 	b->count++;
 	MemoryContextSwitchTo(old);
 }
 
-/* Record one occurrence of |row| under |handle| removed: content, handle and key. */
+/* Record one occurrence of |row| under |handle| removed. */
 void
 dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 {
@@ -631,7 +578,6 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 	MemoryContext old = MemoryContextSwitchTo(b->memory);
 	PendingRow *pending;
 	PendingHandle *mapping;
-	PendingKey *key;
 	bool		found;
 
 	pending = hash_search(b->rows, &digest, HASH_ENTER, &found);
@@ -649,13 +595,6 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 	mapping = hash_search(b->handles, &handle, HASH_ENTER, NULL);
 	mapping->digest = digest;
 	mapping->present = false;
-	{
-		uint8		bytes[DG_KEY_SIZE];
-
-		dg_handle_key(digest, handle, bytes);
-		key = hash_search(b->keys, bytes, HASH_ENTER, NULL);
-		key->present = false;
-	}
 	b->count++;
 	MemoryContextSwitchTo(old);
 }
@@ -725,19 +664,28 @@ bool
 dg_batch_handle_digest(DGBatch *b, uint64 handle, PLHash *digest)
 {
 	PendingHandle *mapping = hash_search(b->handles, &handle, HASH_FIND, NULL);
-	uint8		key[8];
-	PLValue		value;
 
 	if (mapping)
 	{
 		*digest = mapping->digest;
 		return mapping->present;
 	}
-	pl_write64(key, handle);
-	dg_check(pl_get(&b->state->handles, (PLSlice) {key, 8}, &value));
-	if (value.present)
-		memcpy(digest->bytes, value.bytes.data, PL_HASH_SIZE);
-	return value.present;
+	return dg_handle_digest(b->state, handle, digest);
+}
+
+/*
+ * Whether the command's pending edits keep a new occurrence of |digest| from
+ * taking the derived |handle|: an occurrence of the row already added, or
+ * any edit naming the handle, as a row removed and re-added would.
+ */
+bool
+dg_batch_blocks_handle(DGBatch *b, PLHash digest, uint64 handle)
+{
+	PendingRow *pending = hash_search(b->rows, &digest, HASH_FIND, NULL);
+
+	if (pending && pending->delta > 0)
+		return true;
+	return hash_search(b->handles, &handle, HASH_FIND, NULL) != NULL;
 }
 
 /* The row with |digest|, as the batch's command sees it. */

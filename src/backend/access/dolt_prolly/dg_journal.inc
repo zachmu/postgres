@@ -62,8 +62,8 @@ typedef struct JournalFold
 	uint64		local_version;
 	Visibility	seen;
 	bool		table;
-	PLHash		base[3];		/* the trees the entries were applied to */
-	PLHash		folded[3];		/* the result */
+	PLHash		base;			/* the tree the entries were applied to */
+	PLHash		folded;			/* the result */
 	int64	   *seqs;			/* entries applied, ascending */
 	int			seq_count,
 				seq_capacity;
@@ -323,6 +323,7 @@ journal_batch(DGBatch *b, bool forced)
 	table_close(catalog, RowExclusiveLock);
 	if (pushed)
 		PopActiveSnapshot();
+	handle_delta_write(&b->key, b->handles, b->cid);
 	journal_touch(MyDatabaseId, b->key.space, b->key.file);
 	return true;
 }
@@ -384,31 +385,9 @@ compare_journal_digest(const void *a, const void *b)
 	return memcmp((*(const JournalEntry *const *) a)->digest.bytes, (*(const JournalEntry *const *) b)->digest.bytes, PL_HASH_SIZE);
 }
 
-/* Sort |edits| by key and collapse equal keys: one absent edit makes the key absent. */
-static int
-journal_merge_absent(PLEdit *edits, int n)
-{
-	int			j = 0;
-
-	if (!n)
-		return 0;
-	qsort(edits, n, sizeof(PLEdit), compare_edits);
-	for (int i = 0; i < n; i++)
-	{
-		if (j && pl_compare(edits[j - 1].key, edits[i].key) == 0)
-		{
-			if (!edits[i].value.present)
-				edits[j - 1].value = edits[i].value;
-		}
-		else
-			edits[j++] = edits[i];
-	}
-	return j;
-}
-
-/* Apply |entries| to a table's three trees: content by digest, then handles, then keys. */
+/* Apply |entries| to a table's content tree: one edit per digest. */
 static void
-journal_apply_table(PLStore *store, PLTree trees[3], const JournalEntries *entries)
+journal_apply_table(PLStore *store, PLTree *tree, const JournalEntries *entries)
 {
 	JournalEntry **order = palloc(Max(entries->count, 1) * sizeof(JournalEntry *));
 	PLEdit	   *edits = palloc(Max(entries->count, 1) * sizeof(PLEdit));
@@ -433,7 +412,7 @@ journal_apply_table(PLStore *store, PLTree trees[3], const JournalEntries *entri
 			if (order[i]->added)
 				row = order[i]->row;
 		}
-		count = tree_count(&trees[0], (PLSlice) {first->digest.bytes, PL_HASH_SIZE}, &old) + delta;
+		count = tree_count(tree, (PLSlice) {first->digest.bytes, PL_HASH_SIZE}, &old) + delta;
 		if (count < 0)
 			elog(ERROR, "prolly journal removes a missing row");
 		if (!row.data && old.present)
@@ -448,42 +427,7 @@ journal_apply_table(PLStore *store, PLTree trees[3], const JournalEntries *entri
 		n++;
 	}
 	if (n)
-		dg_check(pl_apply(&trees[0], edits, n, &trees[0]));
-
-	/*
-	 * Handles and keys: an occurrence is added once and removed at most once,
-	 * never re-added, so within a group of equal keys a removal decides.
-	 */
-	n = 0;
-	for (int i = 0; i < entries->count; i++)
-	{
-		JournalEntry *entry = &entries->items[i];
-		uint8	   *id = palloc(8);
-
-		pl_write64(id, entry->handle);
-		edits[n].key = (PLSlice) {id, 8};
-		edits[n].value.present = entry->added;
-		edits[n].value.bytes = (PLSlice) {entry->digest.bytes, entry->added ? PL_HASH_SIZE : 0};
-		n++;
-	}
-	n = journal_merge_absent(edits, n);
-	if (n)
-		dg_check(pl_apply(&trees[1], edits, n, &trees[1]));
-	n = 0;
-	for (int i = 0; i < entries->count; i++)
-	{
-		JournalEntry *entry = &entries->items[i];
-		uint8	   *key = palloc(DG_KEY_SIZE);
-
-		dg_handle_key(entry->digest, entry->handle, key);
-		edits[n].key = (PLSlice) {key, DG_KEY_SIZE};
-		edits[n].value.present = entry->added;
-		edits[n].value.bytes = (PLSlice) {entry->added ? key : NULL, 0};
-		n++;
-	}
-	n = journal_merge_absent(edits, n);
-	if (n)
-		dg_check(pl_apply(&trees[2], edits, n, &trees[2]));
+		dg_check(pl_apply(tree, edits, n, tree));
 	pfree(edits);
 	pfree(order);
 }
@@ -645,24 +589,11 @@ journal_fold_pin_tree(JournalFold *fold, PLStore *store, PLHash root)
 	fold->pinned[fold->pinned_count++] = root;
 }
 
-/*
- * Give |s| the folded trees |roots|, unless it was loaded to fetch the row
- * version |wanted| and only the unfolded trees hold that version: a fetch by
- * TID under SnapshotAny may want a version the stream has since removed.
- */
+/* Give |s| the folded tree |root|, and the sequences it folds. */
 static void
-journal_fold_install(DGState *s, const PLHash *roots, const JournalFold *fold, const uint64 *wanted)
+journal_fold_install(DGState *s, PLHash root, const JournalFold *fold)
 {
-	if (wanted && fold->table)
-	{
-		PLTree		folded = {s->store, roots[1]};
-
-		if (!tree_has(&folded, *wanted) && tree_has(&s->handles, *wanted))
-			return;
-	}
-	s->content.root = roots[0];
-	s->handles.root = roots[1];
-	s->keys.root = roots[2];
+	s->content.root = root;
 	journal_state_seqs(s, fold);
 }
 
@@ -698,7 +629,7 @@ journal_fold_covered(const JournalFold *fold, const JournalEntries *entries)
  * that saving the state deletes them.
  */
 static void
-journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, const char *branch, Snapshot snapshot, DGState *s, const uint64 *wanted)
+journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, const char *branch, Snapshot snapshot, DGState *s)
 {
 	RootKey		key = root_key(rel, branch),
 				table_key = *table_key_in;
@@ -706,7 +637,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	uint64		roots_gen = roots_generation();
 	Visibility	seen;
 	JournalFold *fold = journal_fold_find(&key, false);
-	PLHash		current[3] = {s->content.root, s->handles.root, s->keys.root};
+	PLHash		current = s->content.root;
 	JournalEntries entries;
 	MemoryContext old;
 
@@ -714,56 +645,17 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		return;
 	visibility_capture(snapshot, &seen);
 
-	/*
-	 * Nothing moved since the last fold: its result stands, unless it lacks a
-	 * version wanted by TID, which the stream may have removed since.
-	 */
+	/* Nothing moved since the last fold: its result stands. */
 	if (fold && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
 		visibility_equal(&fold->seen, &seen) && fold->local_version == journal_local_version &&
-		fold->table == is_table && memcmp(fold->base, current, sizeof(current)) == 0)
+		fold->table == is_table && pl_hash_equal(fold->base, current))
 	{
-		PLTree		folded = {s->store, fold->folded[1]};
-
-		if (!(wanted && is_table && fold->seq_count && !tree_has(&folded, *wanted)))
-		{
-			if (fold->seq_count)
-				journal_fold_install(s, fold->folded, fold, wanted);
-			return;
-		}
+		if (fold->seq_count)
+			journal_fold_install(s, fold->folded, fold);
+		return;
 	}
 
 	entries = journal_read(&table_key, snapshot ? snapshot : SnapshotSelf);
-
-	/*
-	 * A fetch of one version by TID wants that version whatever happened
-	 * to it since, as heap serves any version under SnapshotAny. If the
-	 * stream removes it, fold once more without that removal, for this
-	 * state only: nothing is cached and the state is not to be saved.
-	 */
-	if (wanted && is_table)
-	{
-		int			removal = -1;
-
-		for (int i = 0; i < entries.count; i++)
-			if (!entries.items[i].added && entries.items[i].handle == *wanted)
-				removal = i;
-		if (removal >= 0)
-		{
-			PLTree		trees[3] = {{s->store, current[0]}, {s->store, current[1]}, {s->store, current[2]}};
-			JournalEntries kept = {palloc(Max(entries.count, 1) * sizeof(JournalEntry)), 0, 0};
-
-			for (int i = 0; i < entries.count; i++)
-				if (i != removal)
-					kept.items[kept.count++] = entries.items[i];
-			journal_apply_table(s->store, trees, &kept);
-			s->content.root = trees[0].root;
-			s->handles.root = trees[1].root;
-			s->keys.root = trees[2].root;
-			s->journal_seqs = NULL;
-			s->journal_count = 0;
-			return;
-		}
-	}
 	if (!fold)
 	{
 		fold = journal_fold_find(&key, true);
@@ -778,8 +670,8 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	if (!entries.count)
 	{
 		journal_fold_unpin(fold);
-		memcpy(fold->base, current, sizeof(current));
-		memcpy(fold->folded, current, sizeof(current));
+		fold->base = current;
+		fold->folded = current;
 		fold->seq_count = 0;
 		fold->store_epoch = store_epoch;
 		fold->roots_generation = roots_gen;
@@ -794,7 +686,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 
 	/* Continue from the last result when it is a prefix of what is visible now. */
 	if (fold->seq_count && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
-		memcmp(fold->base, current, sizeof(current)) == 0 && fold->table == is_table &&
+		pl_hash_equal(fold->base, current) && fold->table == is_table &&
 		journal_fold_covered(fold, &entries))
 	{
 		JournalEntries rest = {0};
@@ -808,51 +700,43 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 				continue;
 			rest.items[rest.count++] = entries.items[i];
 		}
-		current[0] = fold->folded[0];
-		current[1] = fold->folded[1];
-		current[2] = fold->folded[2];
+		current = fold->folded;
 		if (rest.count)
 		{
-			PLTree		trees[3] = {{s->store, current[0]}, {s->store, current[1]}, {s->store, current[2]}};
+			PLTree		tree = {s->store, current};
 
 			if (is_table)
-				journal_apply_table(s->store, trees, &rest);
+				journal_apply_table(s->store, &tree, &rest);
 			else
 			{
 				DGState    *table_state;
 				PLTree		content = journal_table_base(table, &table_key, snapshot, branch, &table_state);
 
-				journal_apply_index(rel, s->store, &trees[0], &rest, &entries, &content);
+				journal_apply_index(rel, s->store, &tree, &rest, &entries, &content);
 				if (table_state)
 					dg_release(table_state);
 			}
-			current[0] = trees[0].root;
-			current[1] = trees[1].root;
-			current[2] = trees[2].root;
+			current = tree.root;
 		}
 	}
 	else
 	{
-		PLTree		trees[3] = {{s->store, current[0]}, {s->store, current[1]}, {s->store, current[2]}};
+		PLTree		tree = {s->store, current};
 
 		journal_fold_unpin(fold);
-		fold->base[0] = s->content.root;
-		fold->base[1] = s->handles.root;
-		fold->base[2] = s->keys.root;
+		fold->base = s->content.root;
 		if (is_table)
-			journal_apply_table(s->store, trees, &entries);
+			journal_apply_table(s->store, &tree, &entries);
 		else
 		{
 			DGState    *table_state;
 			PLTree		content = journal_table_base(table, &table_key, snapshot, branch, &table_state);
 
-			journal_apply_index(rel, s->store, &trees[0], &entries, &entries, &content);
+			journal_apply_index(rel, s->store, &tree, &entries, &entries, &content);
 			if (table_state)
 				dg_release(table_state);
 		}
-		current[0] = trees[0].root;
-		current[1] = trees[1].root;
-		current[2] = trees[2].root;
+		current = tree.root;
 		fold->seq_count = 0;
 	}
 
@@ -867,18 +751,15 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	for (int i = 0; i < entries.count; i++)
 		fold->seqs[i] = entries.items[i].seq;
 	fold->seq_count = entries.count;
-	fold->folded[0] = current[0];
-	fold->folded[1] = current[1];
-	fold->folded[2] = current[2];
+	fold->folded = current;
 	fold->store_epoch = store_epoch;
 	fold->roots_generation = roots_gen;
 	fold->local_version = journal_local_version;
 	fold->seen = seen;
 	fold->table = is_table;
 	fold->table_key = table_key;
-	for (int i = 0; i < (is_table ? 3 : 1); i++)
-		journal_fold_pin_tree(fold, s->store, current[i]);
-	journal_fold_install(s, current, fold, wanted);
+	journal_fold_pin_tree(fold, s->store, current);
+	journal_fold_install(s, current, fold);
 }
 
 /*
@@ -936,7 +817,7 @@ journal_index_table(Relation index, const char *branch, Relation *table)
 
 /* The state of |rel| folded with its table's journal, for the public loaders. */
 static DGState *
-journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s, const uint64 *wanted)
+journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState *s)
 {
 	Relation	table = NULL;
 	RootKey		table_key;
@@ -947,7 +828,7 @@ journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState
 		table_key = journal_index_table(rel, branch, &table);
 	else
 		table_key = root_key(rel, branch);
-	journal_fold_state(rel, &table_key, table, branch, snapshot, s, wanted);
+	journal_fold_state(rel, &table_key, table, branch, snapshot, s);
 	if (table)
 		relation_close(table, NoLock);
 	return s;
@@ -965,7 +846,7 @@ journal_fold_roots(PLHash **roots, int *count, int *capacity)
 	hash_seq_init(&status, journal_folds);
 	while ((fold = hash_seq_search(&status)) != NULL)
 		if (fold->store_epoch == store_epoch && fold->seq_count)
-			add_roots(roots, count, capacity, fold->folded, fold->table ? 3 : 1);
+			add_roots(roots, count, capacity, &fold->folded, 1);
 }
 
 /* Whether a committed transaction other than this one journaled the addition of |handle|. */
@@ -999,6 +880,54 @@ journal_handle_committed(const RootKey *key, uint64 handle)
 	if (pushed)
 		PopActiveSnapshot();
 	return committed;
+}
+
+/* The addition entry naming |handle| in |key|'s stream, whatever its visibility: its digest and a copy of its row. */
+static bool
+journal_entry_any(const RootKey *key, uint64 handle, PLHash *digest, PLSlice *row)
+{
+	Relation	catalog = table_open(DoltJournalRelationId, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(catalog);
+	ScanKeyData keys[4];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+	bool		pushed = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	journal_scan_keys(key, keys);
+	ScanKeyInit(&keys[3], Anum_pg_dolt_journal_jrnseq, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum((int64) (handle * 2)));
+	scan = systable_beginscan(catalog, DoltJournalKeyIndexId, true, SnapshotAny, 4, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		value = heap_getattr(tuple, Anum_pg_dolt_journal_jrndigest, desc, &isnull);
+		bytea	   *bytes = DatumGetByteaPP(value);
+		bytea	   *rowbytes;
+		uint8	   *copy;
+
+		if (isnull || VARSIZE_ANY_EXHDR(bytes) != PL_HASH_SIZE)
+			continue;
+		value = heap_getattr(tuple, Anum_pg_dolt_journal_jrnrow, desc, &isnull);
+		if (isnull)
+			continue;
+		rowbytes = DatumGetByteaPP(value);
+		memcpy(digest->bytes, VARDATA_ANY(bytes), PL_HASH_SIZE);
+		copy = palloc(Max(VARSIZE_ANY_EXHDR(rowbytes), 1));
+		memcpy(copy, VARDATA_ANY(rowbytes), VARSIZE_ANY_EXHDR(rowbytes));
+		row->data = copy;
+		row->len = VARSIZE_ANY_EXHDR(rowbytes);
+		found = true;
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (pushed)
+		PopActiveSnapshot();
+	return found;
 }
 
 /* The largest handle in any entry of |space|/|file| on any branch. */

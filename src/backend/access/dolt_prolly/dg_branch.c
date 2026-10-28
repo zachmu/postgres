@@ -245,8 +245,6 @@ dg_branch_base(Relation rel, DGState *state)
 	if (!address)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation %s has no state on branch %s", RelationGetRelationName(rel), dg_relation_branch(rel))));
 	state->content = dg_history_import(state->store, address);
-	if (DG_ROWS_KIND(rel->rd_rel->relkind))
-		dg_history_handles(state);
 }
 
 const char *

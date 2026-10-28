@@ -48,8 +48,8 @@ namespaces, and a full tree walk per capture.
 **Table and index access methods stay as adapters into PostgreSQL's executor.**
 Their own relation storage holds only non-canonical runtime state:
 - which root is current per branch and snapshot (root records today);
-- the mapping between TIDs and rows (handle trees today; later the row identity,
-  version and lock state of the row-level plan);
+- the mapping between TIDs and rows (derived from row digests since 2026-10-28,
+  with `pg_dolt_handle` for the allocated remainder; see the row-level plan);
 - any other per-transaction metadata.
 
 This state is updated outside prolly content and has to live in a relation that
@@ -309,8 +309,9 @@ PostgreSQL's own structures.
      replaces the earlier plan to bound nodes and chunk large values.
 4. **AM integration**, superseding the earlier per-head heap design (see
    [row-level tracking §2](ROW-LEVEL-TRACKING-PLAN.md)).
-   - **Content, index, handle and key-to-handle trees** all live in the chunk
-     store.
+   - **Content and index trees** live in the chunk store. (The handle and
+     key-to-handle trees did too until 2026-10-28; handles are now derived
+     from content, see [row-level tracking](ROW-LEVEL-TRACKING-PLAN.md).)
    - **Working roots** live in a roots catalog keyed by (storage resource, branch
      name), not in `pg_dolt_binding`. Binding rows exist only for captured or
      canonical relations, and they are rewritten when schemas change.
@@ -340,8 +341,8 @@ PostgreSQL's own structures.
      between proceeding, waiting, rechecking (Read Committed) or a serialization
      error (Repeatable Read).
    - **Indexes are maintained incrementally,** and index scans use key bounds
-     plus the key-to-handle tree. Both replace whole-index rebuilds and
-     nested-loop scans.
+     and derive each entry's handle from its digest (formerly the key-to-handle
+     tree). Both replace whole-index rebuilds and nested-loop scans.
    As built (2026-10-24):
    - The roots catalog is `pg_dolt_root`, keyed by (tablespace, file number,
      branch), so TRUNCATE's new file starts empty and its rollback restores the

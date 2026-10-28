@@ -255,22 +255,27 @@ isnt(sql('SELECT ctid FROM t WHERE id = 2'), $before, 'an update gives the row a
 is(sql(q{UPDATE t SET v = 23 WHERE id = 2 RETURNING old.v || '->' || new.v}), '22->23',
 	'RETURNING old and new');
 
-# Handles of committed rows are never reused across a restart. One an aborted
-# update allocated may be, and its dead lock record must not shadow the row
-# that has it now.
+# A row's handle is derived from its content and survives a restart. Handles
+# the counter allocates, for duplicate rows, never repeat a committed one
+# across a restart. The handle an aborted update derived for its new version
+# is derived again when that version is inserted, and the dead lock record
+# the update left must not shadow the row that has it now.
 $a->quit;
 $b->quit;
-my $max = sql('SELECT max((ctid::text::point)[0] * 65535 + (ctid::text::point)[1]) FROM t');
+sql('CREATE TABLE dup(x int); INSERT INTO dup VALUES (1), (1)');
+my $max = sql('SELECT max((ctid::text::point)[0] * 65535 + (ctid::text::point)[1]) FROM dup');
+my $derived = sql('INSERT INTO t VALUES (8, 80) RETURNING ctid');
 $node->restart;
-sql('INSERT INTO t VALUES (8, 80)');
-cmp_ok(sql('SELECT (ctid::text::point)[0] * 65535 + (ctid::text::point)[1] FROM t WHERE id = 8'),
+is(sql('SELECT ctid FROM t WHERE id = 8'), $derived, 'a derived handle survives a restart');
+sql('INSERT INTO dup VALUES (1)');
+cmp_ok(sql('SELECT max((ctid::text::point)[0] * 65535 + (ctid::text::point)[1]) FROM dup'),
 	'>', $max, 'handles allocated after a restart exceed every committed one');
 my $aborted = sql('BEGIN; UPDATE t SET v = 0 WHERE id = 1 RETURNING ctid; ROLLBACK');
 $node->restart;
-is(sql('INSERT INTO t VALUES (9, 90) RETURNING ctid'), $aborted,
-	'a handle an aborted update allocated is allocated again');
-sql('UPDATE t SET v = 91 WHERE id = 9; UPDATE t SET v = v + 1 WHERE id = 9');
-is(sql('SELECT v FROM t WHERE id = 9'), '92', 'the row with a reused handle locks and updates');
+is(sql('DELETE FROM t WHERE id = 1; INSERT INTO t VALUES (1, 0) RETURNING ctid'), $aborted,
+	'the handle an aborted update derived is derived again');
+sql('UPDATE t SET v = 91 WHERE id = 1; UPDATE t SET v = v + 1 WHERE id = 1');
+is(sql('SELECT v FROM t WHERE id = 1'), '92', 'the row with a reused handle locks and updates');
 
 ($a, $apid) = session();
 ($b, $bpid) = session();

@@ -432,94 +432,13 @@ typedef struct HandleList
 	int			capacity;
 } HandleList;
 
-static PLStatus
-collect_handles(void *arg, PLSlice key, PLSlice value)
-{
-	HandleList *list = arg;
-
-	if (list->count == list->capacity)
-	{
-		list->capacity = list->capacity ? list->capacity * 2 : 8;
-		list->items = list->items ? repalloc_array(list->items, uint64, list->capacity) :
-			palloc_array(uint64, list->capacity);
-	}
-	list->items[list->count++] = pl_read64(key.data + PL_HASH_SIZE);
-	return PL_OK;
-}
-
-/*
- * The handles of many rows in one ordered walk of the key tree. A scan
- * that selects a large part of a table would otherwise descend the tree once
- * per row; walking it once and merging against the rows' sorted digests
- * visits each node once.
- */
-typedef struct DigestOrder
-{
-	uint64		prefix;			/* the digest's first bytes, compared first */
-	int			row;
-} DigestOrder;
-
-typedef struct MergeHandles
-{
-	DigestOrder *order;
-	PLHash	   *digests;		/* by row */
-	int			count,
-				position;
-	HandleList *lists;
-} MergeHandles;
-
-static const PLHash *sort_digests;
-
-static int
-compare_digest_order(const void *a, const void *b)
-{
-	const DigestOrder *x = a,
-			   *y = b;
-
-	if (x->prefix != y->prefix)
-		return x->prefix < y->prefix ? -1 : 1;
-	return memcmp(sort_digests[x->row].bytes, sort_digests[y->row].bytes, PL_HASH_SIZE);
-}
-
-static PLStatus
-merge_handles(void *arg, PLSlice key, PLSlice value)
-{
-	MergeHandles *m = arg;
-	int			cmp = 1;
-
-	while (m->position < m->count &&
-		   (cmp = memcmp(m->digests[m->order[m->position].row].bytes, key.data, PL_HASH_SIZE)) < 0)
-		m->position++;
-	if (m->position >= m->count)
-		return PL_STOP;
-	if (cmp == 0)
-	{
-		HandleList *list = &m->lists[m->order[m->position].row];
-
-		if (list->count == list->capacity)
-		{
-			list->capacity = list->capacity ? list->capacity * 2 : 2;
-			list->items = list->items ? repalloc_array(list->items, uint64, list->capacity) :
-				palloc_array(uint64, list->capacity);
-		}
-		list->items[list->count++] = pl_read64(key.data + PL_HASH_SIZE);
-	}
-	return PL_OK;
-}
-
-/* The handles of every occurrence of row |digest| in |table|'s key tree. */
+/* The handles of every occurrence of row |digest| in |table|, |count| of them if known. */
 static HandleList
-handles_of(DGState *table, PLHash digest)
+handles_of(DGState *table, PLHash digest, int64 count)
 {
 	HandleList	list = {0};
-	uint8		lower[DG_KEY_SIZE],
-				upper[DG_KEY_SIZE];
-	PLSlice		lo = {lower, DG_KEY_SIZE},
-				hi = {upper, DG_KEY_SIZE};
 
-	dg_handle_key(digest, 0, lower);
-	dg_handle_key(digest, PG_UINT64_MAX, upper);
-	dg_check(pl_scan(&table->keys, &lo, &hi, collect_handles, &list));
+	list.count = dg_handles_of(table, digest, count, &list.items, &list.capacity);
 	return list;
 }
 
@@ -552,14 +471,7 @@ collect_key_rows(void *arg, PLSlice key, PLSlice value)
 static bool
 handle_digest_of(DGState *s, uint64 handle, PLHash *digest)
 {
-	uint8		id[8];
-	PLValue		value;
-
-	pl_write64(id, handle);
-	dg_check(pl_get(&s->handles, (PLSlice) {id, 8}, &value));
-	if (value.present)
-		memcpy(digest->bytes, value.bytes.data, PL_HASH_SIZE);
-	return value.present;
+	return dg_handle_digest(s, handle, digest);
 }
 static bool
 row_of(DGState *s, PLHash digest, PLSlice *row)
@@ -620,7 +532,7 @@ unique_conflict(Relation table, Relation index, uint64 self, StringInfo prefix)
 	}
 	for (int i = 0; i < found.count && !conflict; i++)
 	{
-		HandleList	handles = handles_of(rows, found.digests[i]);
+		HandleList	handles = handles_of(rows, found.digests[i], -1);
 		uint64	   *pending;
 		int			n = rows_batch ? dg_batch_handles(rows_batch, found.digests[i], &pending) : 0;
 		bool		gone = false;
@@ -711,10 +623,8 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 		Datum		values[INDEX_MAX_KEYS];
 		bool		isnull[INDEX_MAX_KEYS];
 		DGState    *rows;
-		PLValue		digest,
-					found;
-		uint8		id[8];
-		PLSlice		k = {id, 8};
+		PLHash		digest;
+		PLValue		found;
 
 		if (check == UNIQUE_CHECK_PARTIAL)
 			return false;
@@ -733,9 +643,9 @@ check_key(Relation table, Relation index, uint64 self, StringInfo key, PLSlice r
 
 		/* Describe the key from our row, which the error reports. */
 		rows = dg_load(table, SnapshotSelf);
-		pl_write64(id, self);
-		dg_check(pl_get(&rows->handles, k, &digest));
-		dg_check(pl_get(&rows->content, digest.bytes, &found));
+		if (!dg_handle_digest(rows, self, &digest))
+			elog(ERROR, "prolly row of a unique check is missing");
+		dg_check(pl_get(&rows->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &found));
 		slot = table_slot_create(table, NULL);
 		dg_tid(self, &tid);
 		if (row.data)
@@ -770,7 +680,7 @@ build(Relation table, Relation index, IndexInfo *info)
 		dg_unsupported("concurrent index builds");
 	dg_index_rebuild(table, index);
 	s = dg_load(table, SnapshotSelf);
-	result->heap_tuples = result->index_tuples = pl_count(&s->handles);
+	result->heap_tuples = result->index_tuples = dg_handle_count(s);
 	dg_release(s);
 	return result;
 }
@@ -1036,43 +946,21 @@ rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norder
 	 * An index-only scan returns entries, not rows: it needs no handles,
 	 * only each entry's number of occurrences, and its TIDs are never
 	 * fetched. Other scans find the rows' handles, which name the TIDs:
-	 * one tree descent per row, or one walk of the key tree merged against
-	 * the sorted digests when the rows are a large part of the table.
+	 * derived from each entry's digest, plus any allocated ones the delta
+	 * holds for it.
 	 */
 	if (!scan->xs_want_itup && rows.count)
 	{
-		MergeHandles merge = {palloc(rows.count * sizeof(DigestOrder)), palloc(rows.count * sizeof(PLHash)),
-		(int) rows.count, 0, palloc0(rows.count * sizeof(HandleList))};
-
-		lists = merge.lists;
+		lists = palloc0(rows.count * sizeof(HandleList));
 		for (size_t i = 0; i < rows.count; i++)
 		{
 			PLSlice		row = {rows.items[i].value.data + 8, rows.items[i].value.len - 8};
+			PLHash		digest;
 
-			if (!key_digest(scan->indexRelation, rows.items[i].key, &merge.digests[i]))
-				merge.digests[i] = dg_rowhash(row);
-			merge.order[i].prefix = pl_read64(merge.digests[i].bytes);
-			merge.order[i].row = (int) i;
+			if (!key_digest(scan->indexRelation, rows.items[i].key, &digest))
+				digest = dg_rowhash(row);
+			lists[i] = handles_of(table, digest, (int64) pl_read64(rows.items[i].value.data));
 		}
-		if (rows.count * 8 >= pl_count(&table->keys))
-		{
-			uint8		lower[DG_KEY_SIZE],
-						upper[DG_KEY_SIZE];
-			PLSlice		klo = {lower, DG_KEY_SIZE},
-						khi = {upper, DG_KEY_SIZE};
-			PLStatus	status;
-
-			sort_digests = merge.digests;
-			qsort(merge.order, rows.count, sizeof(DigestOrder), compare_digest_order);
-			dg_handle_key(merge.digests[merge.order[0].row], 0, lower);
-			dg_handle_key(merge.digests[merge.order[rows.count - 1].row], PG_UINT64_MAX, upper);
-			status = pl_scan(&table->keys, &klo, &khi, merge_handles, &merge);
-			if (status != PL_STOP)
-				dg_check(status);
-		}
-		else
-			for (size_t i = 0; i < rows.count; i++)
-				lists[i] = handles_of(table, merge.digests[i]);
 	}
 	slot = table_slot_create(scan->heapRelation, NULL);
 	for (size_t i = 0; i < rows.count; i++)
