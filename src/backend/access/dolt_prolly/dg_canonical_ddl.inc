@@ -144,6 +144,8 @@ catalog_activate(void)
 		nest = begin_api();
 		LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
 		ensure_repository();
+		if (!read_ref("views/enabled").target)
+			move_ref("views/enabled", empty_ref, read_ref("heads/main").target);
 		end_api(nest);
 	}
 	PG_FINALLY();
@@ -154,6 +156,8 @@ catalog_activate(void)
 	}
 	PG_END_TRY();
 	CommandCounterIncrement();
+	if (ActiveSnapshotSet())
+		UpdateActiveSnapshotCommandId();
 }
 
 /* A materialized view being created: its definition's "matview" object. */

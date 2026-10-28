@@ -94,6 +94,10 @@ selected_objects(Member * members, int count, List *tables)
 	for (i = 0; i < count; i++)
 		if (!strcmp(members[i].kind, "table") && name_selected(tables, members[i].name))
 			result = list_concat(result, table_index_names(metadata(child(members[i].hash, 1), "schema"), members[i].name));
+	for (i = 0; i < count; i++)
+		if (!strcmp(members[i].kind, "trigger") &&
+			name_selected(tables, json_value(metadata(child(members[i].hash, 1), "schema"), "table")))
+			result = lappend(result, members[i].name);
 	return result;
 }
 
@@ -137,7 +141,10 @@ compose_database(bytea *base, bytea *source, List *tables)
 
 			foreach(lc, take)
 			{
-				char	   *ns = strVal(linitial(stringToQualifiedNameList((char *) lfirst(lc), NULL)));
+				char *ns;
+
+				run("SELECT (parse_ident($1,false))[1]", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum((char *) lfirst(lc))), NULL, true);
+				ns = strcell(0, 1);
 
 				if (!strcmp(ns, sm[i].name))
 					wanted = true;
@@ -435,6 +442,89 @@ merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, S
 		validate_working_foreign_keys(dg_current_branch());
 }
 
+/* Workspace selectors include independently versioned schema objects. Keep
+ * row-diff resolution table-only: a routine has no row descriptor. */
+static char *
+resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required)
+{
+	List *parts;
+	char *qualified = NULL;
+	char *local;
+	char *suffix = "";
+
+	if (!*arg)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("object name cannot be empty")));
+	if (arg[strlen(arg) - 1] == ')')
+	{
+		List *parsed = raw_parser(psprintf("DROP ROUTINE %s", arg), RAW_PARSE_DEFAULT);
+		DropStmt *drop;
+		ObjectWithArgs *object;
+		StringInfoData signature;
+
+		if (list_length(parsed) != 1 || !IsA(linitial_node(RawStmt, parsed)->stmt, DropStmt))
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid routine name: %s", arg)));
+		drop = castNode(DropStmt, linitial_node(RawStmt, parsed)->stmt);
+		if (drop->removeType != OBJECT_ROUTINE || list_length(drop->objects) != 1)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("expected one routine signature")));
+		object = linitial_node(ObjectWithArgs, drop->objects);
+		parts = object->objname;
+		initStringInfo(&signature);
+		appendStringInfoChar(&signature, '(');
+		foreach_ptr(TypeName, type, object->objargs)
+		{
+			if (foreach_current_index(type))
+				appendStringInfoChar(&signature, ',');
+			appendStringInfoString(&signature, routine_type_name(typenameTypeId(NULL, type)));
+		}
+		appendStringInfoChar(&signature, ')');
+		suffix = signature.data;
+	}
+	else
+		parts = stringToQualifiedNameList(arg, NULL);
+	if (!*suffix && (list_length(parts) == 2 || list_length(parts) == 3))
+	{
+		char *table = list_length(parts) == 3 ?
+			dg_qualified_name(strVal(linitial(parts)), strVal(lsecond(parts))) :
+			pstrdup(quote_identifier(strVal(linitial(parts))));
+		char *wanted = psprintf("%s/%s", table, strVal(llast(parts)));
+
+		run("WITH m AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) SELECT DISTINCT v->>'name' FROM m WHERE v->>'kind'='trigger' AND (v->>'name'=$3 OR substr(v->>'name',length(quote_ident((parse_ident(v->>'name',false))[1]))+2)=$3)", 3, VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),CStringGetTextDatum(wanted)), NULL, true);
+		if (SPI_processed > 1)
+			ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous trigger name: %s", arg)));
+		if (SPI_processed)
+			return strcell(0, 1);
+	}
+	if (list_length(parts) < 1 || list_length(parts) > 2)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid object name: %s", arg)));
+	local = psprintf("%s%s", quote_identifier(strVal(llast(parts))), suffix);
+	if (list_length(parts) == 2)
+		qualified = psprintf("%s%s", dg_qualified_name(strVal(linitial(parts)), strVal(lsecond(parts))), suffix);
+
+	/* parse_ident(...,false) stops at the signature, retaining quoted names.
+	 * Compare the full suffix as well, so overloads never select each other. */
+	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
+	if (!SPI_processed)
+	{
+		if (!required)
+			return NULL;
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("versioned object not found: %s", arg)));
+	}
+	if (SPI_processed > 1 && !DatumGetBool(cell(0, 2)))
+		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous versioned object name: %s", arg)));
+	return strcell(0, 1);
+}
+
+static List *
+state_objects(const char *json)
+{
+	List *result = NIL;
+
+	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	for (int i = 0; i < SPI_processed; i++)
+		result = lappend(result, strcell(i, 1));
+	return result;
+}
+
 /* Resolve table arguments of a workspace command against the given states. */
 static List *
 table_arguments(char **args, int n, int first, const char *json_a, const char *json_b)
@@ -446,7 +536,7 @@ table_arguments(char **args, int n, int first, const char *json_a, const char *j
 	{
 		if (!strcmp(args[i], "."))
 			return NIL;
-		result = lappend(result, resolve_table_argument(args[i], json_a, json_b, true));
+		result = lappend(result, resolve_object_argument(args[i], json_a, json_b, true));
 	}
 	return result;
 }
@@ -547,14 +637,52 @@ restore_table(bytea *db, const char *name)
 	restore_table_on(dg_current_branch(), db, name);
 }
 
-/* Drop a live table through ordinary DDL, which the branch-local catalog
- * provider handles once branch views are active. */
+/* Drop selected objects in dependency order, batching tables so native DROP
+ * can remove foreign keys between selected tables without CASCADE. Objects
+ * outside the selection remain protected by PostgreSQL dependency checks. */
 static void
-drop_table(const char *name)
+drop_objects(List *names)
 {
-	run_context(psprintf("DROP TABLE %s", name), 0, NULL, NULL, NULL, false);
-	CommandCounterIncrement();
-	UpdateActiveSnapshotCommandId();
+	const char *kinds[] = {"view", "table", "routine", "type"};
+	const char *commands[] = {"VIEW", "TABLE", "ROUTINE", "TYPE"};
+	char *json = working_state();
+	int count;
+	Member *members = database_members(capture(true).hash, &count);
+
+	for (int i = 0; i < count; i++)
+		if (!strcmp(members[i].kind, "trigger") && name_selected(names, members[i].name))
+		{
+			char *definition = metadata(child(members[i].hash, 1), "schema");
+			char *table = json_value(definition, "table");
+			const char *trigger = members[i].name + strlen(table) + 1;
+
+			run_context(psprintf("DROP TRIGGER %s ON %s", quote_identifier(trigger), table), 0, NULL, NULL, NULL, false);
+			CommandCounterIncrement();
+			UpdateActiveSnapshotCommandId();
+		}
+
+	for (int kind = 0; kind < lengthof(kinds); kind++)
+	{
+		StringInfoData command;
+		bool found = false;
+
+		initStringInfo(&command);
+		appendStringInfo(&command, "DROP %s ", commands[kind]);
+		foreach_ptr(char, name, names)
+		{
+			run("SELECT 1 FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'name'=$2 AND v->>'kind'=$3", 3, VC_TYPES(TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json),CStringGetTextDatum(name),CStringGetTextDatum(kinds[kind])), NULL, true);
+			if (!SPI_processed)
+				continue;
+			appendStringInfo(&command, "%s%s", found ? "," : "", name);
+			found = true;
+		}
+		if (found)
+		{
+			run_context(command.data, 0, NULL, NULL, NULL, false);
+			CommandCounterIncrement();
+			UpdateActiveSnapshotCommandId();
+		}
+	}
 }
 
 /* Persist the live working state and make its objects visible to the API
@@ -588,7 +716,7 @@ stage_tables(List *tables)
 static void
 stage_modified_tables(void)
 {
-	stage_tables(state_tables(staged_state()));
+	stage_tables(state_objects(staged_state()));
 	CommandCounterIncrement();
 	UpdateActiveSnapshotCommandId();
 }
@@ -657,7 +785,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		char	   *stagedjson = staged_state(),
 				   *headjson = head_state();
-		bool		is_table = resolve_table_argument((char *) linitial(names), stagedjson, headjson, false) != NULL;
+		bool		is_table = resolve_object_argument((char *) linitial(names), stagedjson, headjson, false) != NULL;
 
 		if (!is_table && list_length(names) == 1)
 		{
@@ -717,12 +845,12 @@ dolt_clean(PG_FUNCTION_ARGS)
 			names = lappend(names, args[i]);
 	}
 	workingjson = working_state();
-	tracked = list_concat(state_tables(head_state()), state_tables(staged_state()));
-	live = state_tables(workingjson);
+	tracked = list_concat(state_objects(head_state()), state_objects(staged_state()));
+	live = state_objects(workingjson);
 	if (names)
 		foreach(lc, names)
 	{
-		char	   *name = resolve_table_argument((char *) lfirst(lc), workingjson, workingjson, false);
+		char	   *name = resolve_object_argument((char *) lfirst(lc), workingjson, workingjson, false);
 
 		if (!name)
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("table not found: '%s'", (char *) lfirst(lc))));
@@ -734,8 +862,7 @@ dolt_clean(PG_FUNCTION_ARGS)
 		if (!name_selected(tracked, (char *) lfirst(lc)))
 		untracked = lappend(untracked, lfirst(lc));
 	if (!dry)
-		foreach(lc, untracked)
-			drop_table((char *) lfirst(lc));
+		drop_objects(untracked);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
@@ -757,7 +884,6 @@ dolt_rm(PG_FUNCTION_ARGS)
 	char	  **args = arguments(fcinfo, &n);
 	bool		cached = false;
 	List	   *tables = NIL;
-	ListCell   *lc;
 	VersionRef	staged;
 	char	   *stagedjson;
 
@@ -772,15 +898,14 @@ dolt_rm(PG_FUNCTION_ARGS)
 		else if (args[i][0] == '-')
 			unsupported(args[i]);
 		else
-			tables = lappend(tables, resolve_table_argument(args[i], stagedjson, working_state(), true));
+			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, working_state(), true));
 	}
 	if (!tables)
 		unsupported("dolt_rm requires table names");
 	staged = read_ref(branch_ref("staged"));
 	move_ref(branch_ref("staged"), staged, compose_database(staged.target ? staged.target : child(read_ref(branch_ref("heads")).target, 1), NULL, tables));
 	if (!cached)
-		foreach(lc, tables)
-			drop_table((char *) lfirst(lc));
+		drop_objects(tables);
 	end_api(nest);
 	PG_RETURN_INT64(0);
 }
@@ -793,14 +918,14 @@ checkout_tables(char **args, int n)
 	char	   *headjson = head_state(),
 			   *workingjson = working_state();
 	bytea	   *headdb = child(read_ref(branch_ref("heads")).target, 1);
-	List	   *headtables = state_tables(headjson);
+	List	   *headtables = state_objects(headjson);
 	int			i;
 	StringInfoData missing;
 
 	initStringInfo(&missing);
 	for (i = 0; i < n; i++)
 	{
-		char	   *name = resolve_table_argument(args[i], headjson, workingjson, false);
+		char	   *name = resolve_object_argument(args[i], headjson, workingjson, false);
 
 		if (!name)
 		{
@@ -812,7 +937,7 @@ checkout_tables(char **args, int n)
 		if (name_selected(headtables, name))
 			restore_table(headdb, name);
 		else
-			drop_table(name);
+			drop_objects(list_make1(name));
 	}
 	if (missing.len)
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("%s", missing.data)));
@@ -1055,7 +1180,7 @@ dolt_hashof_table(PG_FUNCTION_ARGS)
 {
 	int			nest = begin_api();
 	char	   *working = working_state();
-	char	   *name = resolve_table_argument(text_to_cstring(PG_GETARG_TEXT_PP(0)), working, working, true);
+	char	   *name = resolve_object_argument(text_to_cstring(PG_GETARG_TEXT_PP(0)), working, working, true);
 	char	   *answer;
 
 	run("SELECT v->>'content' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind'='table' AND v->>'name'=$2", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(working), CStringGetTextDatum(name)), NULL, true);

@@ -155,6 +155,7 @@ static PLTree check_violations(Relation rel, PLTree content, const char *name, S
 static bytea *staged_capture(Capture *full);
 static bool branch_management(char **args, int n);
 static void checkout_tables(char **args, int n);
+static char *resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required);
 static char *resolve_table_argument(const char *arg, const char *json_a, const char *json_b, bool required);
 static char *staged_state(void);
 static char *working_state(void);
@@ -1501,7 +1502,7 @@ dolt_add(PG_FUNCTION_ARGS)
 		{
 			if (args[i][0] == '-')
 				unsupported(args[i]);
-			tables = lappend(tables, resolve_table_argument(args[i], stagedjson, workingjson, true));
+			tables = lappend(tables, resolve_object_argument(args[i], stagedjson, workingjson, true));
 		}
 		stage_tables(tables);
 		end_api(nest);

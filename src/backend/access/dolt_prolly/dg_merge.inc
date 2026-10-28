@@ -982,6 +982,15 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 
 		if (!strcmp(args[i], "."))
 			continue;
+		if (strchr(args[i], '('))
+		{
+			char *resolved = resolve_object_argument(args[i],
+				metadata(child(child(pending.target, 1), 1), "database"),
+				metadata(child(child(pending.target, 2), 1), "database"), false);
+
+			if (resolved)
+				args[i] = resolved;
+		}
 		run("SELECT count(DISTINCT v->>'table')::int FROM jsonb_array_elements($1::jsonb->'conflicts' || coalesce($1::jsonb->'schema_conflicts','[]')) v WHERE v->>'table'=$2 OR CASE WHEN strpos($2,'(')>0 OR strpos(v->>'table','(')>0 THEN false ELSE array_length(parse_ident($2),1)=1 AND (parse_ident(v->>'table'))[2]=(parse_ident($2))[1] END", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(json), CStringGetTextDatum(args[i])), NULL, true);
 		matches = DatumGetInt32(cell(0, 1));
 		if (matches > 1)

@@ -206,9 +206,21 @@ dg_catalog_routine_ddl(ParseState *pstate, Node *statement)
 			PopActiveSnapshot();
 		return true;
 	}
-	if (!IsA(statement, CreateFunctionStmt) || !dg_catalog_active() ||
+	if (!IsA(statement, CreateFunctionStmt) ||
 		!creates_versioned_routine((CreateFunctionStmt *) statement))
 		return false;
+	if (!dg_catalog_active())
+	{
+		if (!default_table_access_method || strcmp(default_table_access_method, "dolt_prolly_table"))
+			return false;
+		catalog_activate();
+	}
+	{
+		char *name;
+		Oid namespaceid = QualifiedNameGetCreationNamespace(((CreateFunctionStmt *) statement)->funcname, &name);
+
+		adopt_schema(namespaceid);
+	}
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
