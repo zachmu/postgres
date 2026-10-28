@@ -934,6 +934,40 @@ journal_entry_any(const RootKey *key, uint64 handle, PLHash *digest, PLSlice *ro
 	return found;
 }
 
+/*
+ * Whether any stream on |branch| has an entry |snapshot| sees. The catalog
+ * holds only unfolded entries, a few hundred per journaled table at most,
+ * so a scan is cheap.
+ */
+static bool
+journal_branch_pending(const char *branch, Snapshot snapshot)
+{
+	Relation	catalog = table_open(DoltJournalRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		pending;
+	bool		registered = snapshot && IsMVCCSnapshot(snapshot);
+	bool		pushed = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	if (registered)
+		snapshot = RegisterSnapshot(snapshot);
+	ScanKeyInit(&key, Anum_pg_dolt_journal_jrnbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	scan = systable_beginscan(catalog, InvalidOid, false, registered ? snapshot : SnapshotSelf, 1, &key);
+	pending = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (registered)
+		UnregisterSnapshot(snapshot);
+	if (pushed)
+		PopActiveSnapshot();
+	return pending;
+}
+
 /* The largest handle in any entry of |space|/|file| on any branch. */
 static uint64
 journal_max_handle(Oid space, RelFileNumber file)

@@ -307,7 +307,7 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
  * definition: false if it holds none there.
  */
 bool
-dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content)
+dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load)
 {
 	LockRelId	lock = {resource, MyDatabaseId};
 	Relation	catalog;
@@ -332,6 +332,15 @@ dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PL
 	locator.spcOid = form.storagespc;
 	locator.dbOid = form.storagedb;
 	locator.relNumber = form.storagefile;
+
+	/*
+	 * An index's content includes the entries its table's journal implies,
+	 * and only a load through its definition knows that table: the caller
+	 * loads instead while any stream on the branch has entries.
+	 */
+	*load = form.storagekind == RELKIND_INDEX && dg_journal_pending(branch, snapshot);
+	if (*load)
+		return false;
 	return dg_storage_content_root(locator, branch, snapshot, content);
 }
 

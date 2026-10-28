@@ -56,7 +56,8 @@ extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea *
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
 extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
-extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content);
+extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load);
+extern bool dg_journal_pending(const char *branch, Snapshot snapshot);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 
 /* A member of a database object: its hash, kind and, unless a namespace, name. */

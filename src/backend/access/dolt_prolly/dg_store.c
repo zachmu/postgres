@@ -1877,20 +1877,46 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 	entry = overlay_entry(overlay_find(&key, false), snapshot);
 	if (entry)
 		view = roots_equal(&entry->base, &committed) ? entry->roots : roots_merge(&entry->base, &entry->roots, &committed);
+	/*
+	 * Rows journaled to a table's stream are part of its content, though not
+	 * yet of its roots: fold them in. An index has no stream of its own;
+	 * dg_storage_resource_root sends its callers to a full load instead.
+	 */
+	{
+		JournalEntries entries = journal_read(&key, snapshot ? snapshot : SnapshotSelf);
+
+		if (entries.count)
+		{
+			PLTree		tree = view.present ? tree_at(view.content) : empty_tree();
+
+			journal_apply_table(dg_working_store(), &tree, &entries);
+			*content = tree.root;
+			return true;
+		}
+	}
 	if (!view.present)
 		return false;
 	*content = view.content;
 	return true;
 }
 
+/* Whether any journal entry on |branch| is visible to |snapshot|, in any stream. */
+bool
+dg_journal_pending(const char *branch, Snapshot snapshot)
+{
+	return journal_branch_pending(branch, snapshot);
+}
+
 /* Only the transactional resource allocator calls this, before publishing any
- * branch binding: the new storage starts empty on its branch. */
+ * branch binding: the new storage starts empty on its branch. A new storage
+ * has no journal stream, and its bare descriptor names no definition, so the
+ * load does not fold. */
 void
 dg_initialize_resource(Relation rel, const char *branch)
 {
 	DGState    *state;
 
-	state = dg_load_bound(rel, SnapshotSelf, branch);
+	state = load_state(rel, SnapshotSelf, NULL, branch, false, true);
 	save_state(rel, state, GetCurrentCommandId(true), branch);
 	dg_release(state);
 }

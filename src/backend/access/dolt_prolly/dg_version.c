@@ -767,10 +767,25 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			if (!definitions_only)
 			{
 				PLHash		content;
+				bool		load;
+				bool		present;
+				DGState    *loaded = NULL;
 
 				if (!OidIsValid(resource))
 					ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
-				if (dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content))
+				present = dg_storage_resource_root(resource, dg_current_branch(), GetActiveSnapshot(), &content, &load);
+
+				/* Only a full load folds the journal into an index's content. */
+				if (load)
+				{
+					DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+
+					loaded = dg_storage_load(storage);
+					dg_storage_close(storage);
+					present = loaded->has_root;
+					content = loaded->content.root;
+				}
+				if (present)
 				{
 					bytea	   *raw = palloc(VARHDRSZ + PL_HASH_SIZE);
 					char	   *root;
@@ -791,15 +806,23 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 						payload = json_set_string(payload, "content", root);
 						if (persist)
 						{
-							DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
-							DGState    *state = dg_storage_load(storage);
+							DGState    *state = loaded;
 
-							dg_storage_close(storage);
+							if (!state)
+							{
+								DGStorage  *storage = dg_storage_open(CatalogViewLookupObject(view, RelationRelationId, name), dg_current_branch(), name, schema, resource, GetActiveSnapshot());
+
+								state = dg_storage_load(storage);
+								dg_storage_close(storage);
+							}
 							members[i] = PointerGetDatum(put(kinds[i], payload, VC_ARGS(PointerGetDatum(schema), PointerGetDatum(dg_history_export_tree(&state->content))), 2));
-							dg_release(state);
+							if (state != loaded)
+								dg_release(state);
 						}
 					}
 				}
+				if (loaded)
+					dg_release(loaded);
 			}
 			appendStringInfoString(&json, payload);
 		}
