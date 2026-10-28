@@ -122,6 +122,8 @@ $a->query_safe('COMMIT');
 $a->quit; $b->quit;
 is(sql("SELECT count(*) FROM pg_dolt_object_visible WHERE objhash=".hasharg($shared)), '1', 'logical object reads deduplicate concurrent copies');
 is(sql("SELECT count(*) FROM pg_dolt_object WHERE objhash=".hasharg($shared)), '2', 'physical immutable copies retain independent transaction visibility');
+is(sql("SELECT count(*) FROM unnest(ARRAY[".hasharg($shared)."]) h(x) JOIN pg_dolt_object_visible o ON o.objhash=h.x"), '1', 'joined object reads deduplicate concurrent copies');
+unlike(sql("EXPLAIN SELECT o.objkind FROM unnest(ARRAY[".hasharg($shared)."]) h(x) JOIN pg_dolt_object_visible o ON o.objhash=h.x"), qr/Aggregate|Unique/, 'joined object reads do not deduplicate the whole store');
 
 # An old RR snapshot cannot adopt an object committed after its snapshot.
 $a = $node->background_psql('postgres', on_error_stop => 0);
