@@ -586,6 +586,7 @@ static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
 static uint64 journal_max_handle(Oid space, RelFileNumber file);
 static void journal_xact_end(bool committed);
+static void journal_local_invalidate(void);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
 static bool relation_has_unique_index(Relation rel);
@@ -979,7 +980,10 @@ store_subxact(SubXactEvent event, SubTransactionId mySubid, SubTransactionId par
 	if (event == SUBXACT_EVENT_PRE_START_SUB || event == SUBXACT_EVENT_PRE_COMMIT_SUB)
 		batch_flush_all();
 	else if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
 		batch_discard(mySubid);
+		journal_local_invalidate();
+	}
 	if (event != SUBXACT_EVENT_ABORT_SUB || !overlays)
 		return;
 

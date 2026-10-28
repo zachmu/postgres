@@ -35,6 +35,18 @@ is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=o
 sql(q{UPDATE t SET k = k + 100 WHERE id <= 50});
 is(sql(q{SET enable_hashjoin=off; SET enable_mergejoin=off; SET enable_seqscan=off; SELECT count(*), sum(b.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= 50}), '50|1275', 'and after the join keys change');
 
+# Without statistics, an index's cost counts the rows its bounds select: a
+# unique index bound on every key column wins over an index sharing only its
+# leading columns, as a foreign key check needs, and an index bound on more
+# columns wins over one bound on fewer.
+sql(q{CREATE TABLE c(w smallint, d smallint, id int, last text, PRIMARY KEY(w, d, id)); CREATE INDEX c_last ON c(w, d, last);
+ INSERT INTO c SELECT 1, d, i, 'last' || (i % 100) FROM generate_series(1, 300) i, generate_series(1, 10) d;
+ CREATE TABLE o(id int PRIMARY KEY, w smallint, d smallint, cid int, FOREIGN KEY (w, d, cid) REFERENCES c(w, d, id))});
+like(sql(q{EXPLAIN (COSTS OFF) SELECT 1 FROM c WHERE w = 1 AND d = 2 AND id = 5}), qr/c_pkey/, 'a fully bound unique index is chosen');
+like(sql(q{EXPLAIN (COSTS OFF) SELECT 1 FROM c WHERE w = 1 AND d = 2 AND last = 'last5'}), qr/Index Cond: .*last/, 'the index binding more columns is chosen');
+sql(q{INSERT INTO o SELECT i, 1, 1 + i % 10, 1 + i % 300 FROM generate_series(1, 200) i});
+is(sql(q{SELECT count(*) FROM o}), '200', 'foreign key checks pass through the unique index');
+
 # Index-only scans are chosen for covering queries and need no heap visit.
 is(plan_of(q{SELECT count(k) FROM t WHERE k > 10}), 'Index Only Scan', 'covering query uses an index-only scan');
 is(sql(q{SELECT count(k) FROM t WHERE k > 10}), sql(q{SET enable_indexonlyscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(k) FROM t WHERE k > 10}), 'index-only count matches');

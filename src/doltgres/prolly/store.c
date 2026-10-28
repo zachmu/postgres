@@ -199,6 +199,16 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 	for (size_t i = 0; i < count; i++)
 		mark_reachable(store, roots[i]);
 
+	/*
+	 * A pinned node is kept, with what it reaches, whatever the roots: its
+	 * holders remember it by hash and would take a rebuilt copy of it for
+	 * the one they pinned.
+	 */
+	for (size_t i = 0; i < store->capacity; i++)
+		for (PLNode *node = store->buckets[i]; node; node = node->next)
+			if (node->pins > 0 && !node->marked)
+				mark_reachable(store, node->hash);
+
 	/* Unreachable nodes are about to be freed: forget them first. */
 	{
 		size_t		kept = 0;
@@ -238,16 +248,16 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 
 /*
  * Keep |node| through pl_store_drop_unbacked until it is written: for a node
- * every transaction would otherwise rebuild, such as the empty tree.
+ * every transaction would otherwise rebuild, such as the empty tree. Pins
+ * count: each holder releases its own.
  */
 void
 pl_node_pin(PLStore *store, PLNode *node)
 {
 	size_t		i;
 
-	if (node->pinned || node->backed)
+	if (node->backed || node->pins++ > 0)
 		return;
-	node->pinned = true;
 	i = node->unbacked_slot;
 	if (i >= store->unbacked_count || store->unbacked[i] != node)
 	{
@@ -260,13 +270,15 @@ pl_node_pin(PLStore *store, PLNode *node)
 	store->unbacked[i]->unbacked_slot = i;
 }
 
-/* Let a pinned node drop with the next pl_store_drop_unbacked, unless written by then. */
+/*
+ * Release one pin of |node|; with the last, it drops with the next
+ * pl_store_drop_unbacked unless written by then.
+ */
 void
 pl_node_unpin(PLStore *store, PLNode *node)
 {
-	if (!node->pinned)
+	if (node->pins == 0 || --node->pins > 0)
 		return;
-	node->pinned = false;
 	if (node->backed)
 		return;
 	if (store->unbacked_count == store->unbacked_capacity)

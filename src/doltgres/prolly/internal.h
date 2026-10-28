@@ -25,7 +25,7 @@ typedef struct PLNode
 	uint32_t	value_bytes;
 	bool		backed;			/* known to be in the backing store */
 	bool		marked;			/* reachable, during pl_store_retain */
-	bool		pinned;			/* kept until written, across pl_store_drop_unbacked */
+	uint32_t	pins;			/* holders keeping it until written, across pl_store_drop_unbacked */
 	size_t		unbacked_slot;	/* position in the store's unbacked list, while listed */
 	struct PLNode *next;
 } PLNode;
