@@ -48,6 +48,7 @@ extern void CatalogViewEnsureLoaded(CatalogView *view);
 extern void CatalogViewSetCreator(CatalogView *view, TransactionId creator);
 extern bool CatalogViewCreatorAborted(CatalogView *view);
 extern void CatalogViewRetain(CatalogView *view);
+extern uint64 CatalogViewReferences(CatalogView *view);
 extern void CatalogViewRelease(CatalogView *view);
 extern CatalogView *CatalogViewCurrent(void);
 extern Oid	CatalogViewNamespace(CatalogView *view, Oid namespaceid);

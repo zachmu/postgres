@@ -10,9 +10,12 @@ typedef struct DGProvider
 	uint64		generation;		/* identity generation a branch view binds */
 	List	   *bindings;		/* the durable OIDs a branch view binds */
 	MemoryContext memory;		/* holds the entry */
+	uint64		used;			/* when it last served a lookup */
 	struct DGProvider *next;
 } DGProvider;
 static DGProvider *providers;
+static uint64 provider_clock;
+
 
 /* A durable OID bound by a branch view, and the storage bound with it. */
 typedef struct ProviderBinding
@@ -25,6 +28,43 @@ typedef struct ProviderBinding
 
 /* The entry whose view is being built, which records its bindings. */
 static DGProvider *provider_current_entry;
+
+/*
+ * Branch views kept for reuse. A branch's next schema replaces its view, so
+ * older ones are released once nothing else holds them.
+ */
+#define PROVIDER_BRANCH_VIEWS 8
+
+static void
+provider_prune(void)
+{
+	for (;;)
+	{
+		DGProvider **oldest = NULL;
+		int			count = 0;
+
+		for (DGProvider **link = &providers; *link; link = &(*link)->next)
+		{
+			DGProvider *entry = *link;
+
+			if (!entry->branch)
+				continue;
+			count++;
+			if (CatalogViewReferences(entry->view) == 1 && entry->view != CatalogViewCurrent() &&
+				entry != provider_current_entry && (!oldest || entry->used < (*oldest)->used))
+				oldest = link;
+		}
+		if (count <= PROVIDER_BRANCH_VIEWS || !oldest)
+			break;
+		{
+			DGProvider *entry = *oldest;
+
+			*oldest = entry->next;
+			CatalogViewRelease(entry->view);
+			MemoryContextDelete(entry->memory);
+		}
+	}
+}
 
 /*
  * A branch view binds its objects' durable OIDs. A change to the identity
@@ -1518,6 +1558,7 @@ provider_lookup(const char *branch, bytea *database)
 			if (CatalogViewCreatorAborted(entry->view))
 				CatalogViewSetCreator(entry->view, provider_creator(database));
 			CatalogViewEnsureLoaded(entry->view);
+			entry->used = ++provider_clock;
 			return entry->view;
 		}
 	}
@@ -1536,6 +1577,7 @@ provider_lookup(const char *branch, bytea *database)
 	entry->branch = branch ? MemoryContextStrdup(memory, branch) : NULL;
 	entry->view = view;
 	entry->generation = identity_generation;
+	entry->used = ++provider_clock;
 	entry->next = providers;
 	providers = entry;
 	saved_entry = provider_current_entry;
@@ -1563,6 +1605,7 @@ provider_lookup(const char *branch, bytea *database)
 	PG_END_TRY();
 	SetUserIdAndSecContext(user, security);
 	CatalogViewSetLoader(view, provider_reload, entry);
+	provider_prune();
 	return view;
 }
 

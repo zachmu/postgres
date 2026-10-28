@@ -48,5 +48,9 @@ for my $kind (@order) {
 }
 is($s->query_safe(q{SELECT count(*) FROM t40}),'2','tables keep their rows');
 
+# A session keeps a bounded number of catalog views however much DDL it runs:
+# each DDL's private view is freed, and a branch's superseded views are too.
+cmp_ok($s->query_safe(q{SELECT count(*) FROM pg_backend_memory_contexts WHERE name='catalog view'}),'<=',16,'catalog views stay bounded across DDL');
+
 $s->quit;
 done_testing();

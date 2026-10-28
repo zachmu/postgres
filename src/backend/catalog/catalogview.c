@@ -27,6 +27,7 @@
 #include "catalog/pg_class_d.h"
 #include "utils/inval.h"
 #include "utils/fmgroids.h"
+#include "utils/typcache.h"
 
 /*
  * Durable OIDs belong to a branch, not to one view: each schema version of
@@ -326,6 +327,12 @@ CatalogViewRetain(CatalogView *view)
 {
 	Assert(view->references > 0);
 	view->references++;
+}
+
+uint64
+CatalogViewReferences(CatalogView *view)
+{
+	return view->references;
 }
 
 void
@@ -1177,11 +1184,28 @@ CatalogViewEnsureLoaded(CatalogView *view)
 	view->loading = false;
 }
 
+static void forget_descriptors(CatalogView *view);
+
 static void
 prune_catalog_views(XactEvent event, void *arg)
 {
+	dlist_mutable_iter miter;
+
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
 		return;
+
+	/* Descriptors open while DDL retired its view are closed by now. */
+	dlist_foreach_modify(miter, &views)
+	{
+		CatalogView *view = dlist_container(CatalogView, link, miter.cur);
+
+		if (view->retired)
+		{
+			CatalogViewRetain(view);
+			forget_descriptors(view);
+			CatalogViewRelease(view);
+		}
+	}
 	for (;;)
 	{
 		dlist_iter	it;
@@ -1652,6 +1676,20 @@ CatalogViewForEachChange(CatalogView *view, void (*callback) (Oid catalog, HeapT
 	}
 }
 
+/* Drop the unused relation and type descriptors of |view|'s objects. */
+static void
+forget_descriptors(CatalogView *view)
+{
+	foreach_oid(handle, view->handles)
+	{
+		CatalogViewObject *object = hash_search(objects, &handle, HASH_FIND, NULL);
+
+		if (object && object->objectclass == RelationRelationId)
+			InvalidateLocalRelation(handle);
+	}
+	TypeCacheForgetCatalogView(view);
+}
+
 void
 CatalogViewRetireMutation(CatalogView *view)
 {
@@ -1659,13 +1697,15 @@ CatalogViewRetireMutation(CatalogView *view)
 
 	if (!view->provisional || view == CatalogViewCurrent())
 		elog(ERROR, "invalid provisional catalog retirement");
-	view->retired = true;
-
 	/*
-	 * Existing local handle references fail explicitly after the statement.
-	 * Keep identity records until native type/relcache consumers release
-	 * them.
+	 * Unused descriptors of its relations and types go now, so that nothing
+	 * keeps the view; one still open is rebuilt while the view can serve it,
+	 * and goes at transaction end.
 	 */
+	forget_descriptors(view);
+
+	/* Existing local handle references fail explicitly after the statement. */
+	view->retired = true;
 	foreach(lc, view->caches)
 		ResetCatalogCache(lfirst(lc), false);
 	if (!view->scan_references)
