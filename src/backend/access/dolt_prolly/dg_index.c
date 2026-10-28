@@ -141,8 +141,28 @@ index_comparator(Oid type)
 {
 	if (OidIsValid(get_element_type(type)))
 		return "btarraycmp";
+	switch (get_typtype(type))
+	{
+		case TYPTYPE_COMPOSITE:
+			return "btrecordcmp";
+		case TYPTYPE_RANGE:
+			return "range_cmp";
+		case TYPTYPE_MULTIRANGE:
+			return "multirange_cmp";
+	}
 	switch (type)
 	{
+		case OIDOID:
+			return "btoidcmp";
+		case BITOID:
+			return "bitcmp";
+		case VARBITOID:
+			return "varbitcmp";
+		case INETOID:
+		case CIDROID:
+			return "network_cmp";
+		case JSONBOID:
+			return "jsonb_cmp";
 		case BOOLOID:
 			return "btboolcmp";
 		case INT2OID:
@@ -229,8 +249,16 @@ dg_index_validate(Relation table, Relation index)
 			type = ANYARRAYOID;
 		else if (type == VARCHAROID)
 			type = TEXTOID;
+		else if (type == CIDROID)
+			type = INETOID;
 		else if (get_typtype(type) == TYPTYPE_ENUM)
 			type = ANYENUMOID;
+		else if (get_typtype(type) == TYPTYPE_COMPOSITE)
+			type = RECORDOID;
+		else if (get_typtype(type) == TYPTYPE_RANGE)
+			type = ANYRANGEOID;
+		else if (get_typtype(type) == TYPTYPE_MULTIRANGE)
+			type = ANYMULTIRANGEOID;
 		for (strategy = 1; strategy <= 5; strategy++)
 		{
 			Oid			actual = get_opfamily_member(index->rd_opfamily[j], type, type, strategy);
@@ -798,7 +826,8 @@ static void
 append_key_value(IndexScanDesc scan, int j, ScanKey key, StringInfo out)
 {
 	Relation	index = scan->indexRelation;
-	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID && key->sk_subtype != ANYARRAYOID ? key->sk_subtype :
+	Oid			type = OidIsValid(key->sk_subtype) && key->sk_subtype != ANYENUMOID && key->sk_subtype != ANYARRAYOID &&
+		key->sk_subtype != RECORDOID && key->sk_subtype != ANYRANGEOID && key->sk_subtype != ANYMULTIRANGEOID ? key->sk_subtype :
 		TupleDescAttr(RelationGetDescr(scan->heapRelation), index->rd_index->indkey.values[j] - 1)->atttypid;
 
 	appendStringInfoChar(out, 1);

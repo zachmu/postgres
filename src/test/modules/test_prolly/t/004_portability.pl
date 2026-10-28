@@ -18,8 +18,9 @@ sub rejected
  like($err, qr/prolly storage rejects type/, "$label: codec policy error");
 }
 
-# All identifier-bearing built-ins, including aliases and container wrappers.
-my @identifiers = qw(oid oidvector regproc regprocedure regoper regoperator
+# Untranslated symbolic references and internal identifiers remain restricted.
+# Explicit numeric OID payloads are allowed, including container wrappers.
+my @identifiers = qw(regproc regprocedure regoper regoperator
  regclass regcollation regtype regrole regnamespace regconfig regdictionary
  aclitem pg_node_tree xid xid8 cid tid pg_lsn txid_snapshot pg_snapshot refcursor);
 my $i = 0;
@@ -36,7 +37,7 @@ for my $type (@identifiers)
 # once supported, these must still be rejected by the type codec.
 rejected(q{CREATE TABLE forbidden(v regclass) USING dolt_prolly_table}, 'NULL is not a schema bypass');
 rejected(q{CREATE TABLE forbidden(v regclass[]) USING dolt_prolly_table}, 'empty array is not a schema bypass');
-rejected(q{CREATE TABLE forbidden(v oid) USING dolt_prolly_table}, 'empty table still validates schema');
+rejected(q{CREATE TABLE forbidden(v regclass) USING dolt_prolly_table}, 'empty table still validates schema');
 
 # Uninspected binary serializers are not trusted merely because I/O exists.
 $node->safe_psql('postgres', q{
@@ -51,7 +52,7 @@ CREATE TYPE array_range AS RANGE (SUBTYPE=integer[]);
 });
 rejected(q{CREATE TABLE forbidden(v opaque) USING dolt_prolly_table}, 'opaque custom OID sender rejected');
 rejected(q{CREATE TABLE forbidden(v opaque[]) USING dolt_prolly_table}, 'nested opaque custom OID sender rejected');
-rejected(q{CREATE TABLE forbidden(v local_range) USING dolt_prolly_table}, 'user range with OID bounds rejected');
+# Explicit OID range payloads are tested in 038_index_types.pl.
 rejected(q{CREATE TABLE forbidden(v array_range) USING dolt_prolly_table}, 'range delegating to array_send with embedded type OIDs rejected');
 
 # Revalidate after nested schema changes, including writes of NULL and index

@@ -2091,4 +2091,23 @@
 { amprocfamily => 'dolt_prolly_index/dolt_array_ops', amproclefttype => 'anyarray',
   amprocrighttype => 'anyarray', amprocnum => '1', amproc => 'btarraycmp' },
 
+
+# Additional native ordering families.
+{ amprocfamily => 'dolt_prolly_index/dolt_oid_ops', amproclefttype => 'oid',
+  amprocrighttype => 'oid', amprocnum => '1', amproc => 'btoidcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_bit_ops', amproclefttype => 'bit',
+  amprocrighttype => 'bit', amprocnum => '1', amproc => 'bitcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_varbit_ops', amproclefttype => 'varbit',
+  amprocrighttype => 'varbit', amprocnum => '1', amproc => 'varbitcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_network_ops', amproclefttype => 'inet',
+  amprocrighttype => 'inet', amprocnum => '1', amproc => 'network_cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_jsonb_ops', amproclefttype => 'jsonb',
+  amprocrighttype => 'jsonb', amprocnum => '1', amproc => 'jsonb_cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_record_ops', amproclefttype => 'record',
+  amprocrighttype => 'record', amprocnum => '1', amproc => 'btrecordcmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_range_ops', amproclefttype => 'anyrange',
+  amprocrighttype => 'anyrange', amprocnum => '1', amproc => 'range_cmp' },
+{ amprocfamily => 'dolt_prolly_index/dolt_multirange_ops', amproclefttype => 'anymultirange',
+  amprocrighttype => 'anymultirange', amprocnum => '1', amproc => 'multirange_cmp' },
+
 ]
