@@ -1177,6 +1177,7 @@ static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
 	DGProviderRows rows = {0};
+	DGMember   *listed;
 	bytea	  **addresses,
 			  **schemas,
 			  **contents;
@@ -1191,8 +1192,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	CatalogViewSetBase(view, provider_shared_base());
 	for (i = 0; i < lengthof(provider_catalogs); i++)
 		rows.relations[i] = table_open(provider_catalogs[i], AccessShareLock);
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
+	listed = dg_database_members(database, &n);
 	addresses = palloc_array(bytea *, Max(n, 1));
 	schemas = palloc0_array(bytea *, Max(n, 1));
 	contents = palloc0_array(bytea *, Max(n, 1));
@@ -1200,8 +1200,8 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	definitions = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		addresses[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
+		addresses[i] = listed[i].hash;
+		kinds[i] = (char *) listed[i].kind;
 	}
 	for (i = 0; i < n; i++)
 	{

@@ -888,6 +888,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 	bool		rewrite = false;
 	PLTree		tree = state->content;
 	HTAB	   *affected;
+	DGMember   *listed;
 
 	PG_TRY();
 	{
@@ -1007,8 +1008,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		CommandCounterIncrement();
 		indexes = mutation_indexes(view, id);
 		CatalogViewSwitch(NULL);
-		run("SELECT t.objhash,t.objkind,CASE WHEN t.objkind IN ('table','index') THEN CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END END FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
-		count = SPI_processed;
+		listed = dg_database_members(current.hash, &count);
 		members = palloc_array(bytea *, Max(count, 1));
 		kinds = palloc_array(char *, Max(count, 1));
 		names = palloc_array(char *, Max(count, 1));
@@ -1016,9 +1016,10 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		children = palloc_array(Datum, Max(count + list_length(indexes), 1));
 		for (int i = 0; i < count; i++)
 		{
-			members[i] = DatumGetByteaPCopy(cell(i, 1));
-			kinds[i] = strcell(i, 2);
-			names[i] = strcell(i, 3);
+			members[i] = listed[i].hash;
+			kinds[i] = (char *) listed[i].kind;
+			/* Only tables and indexes are found by name here. */
+			names[i] = !strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") ? (char *) listed[i].name : NULL;
 		}
 		for (int i = 0; i < count; i++)
 			if (names[i] && !strcmp(names[i], name))

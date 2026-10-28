@@ -145,16 +145,22 @@ binding_prepare(const char *branch, bytea *database, bool required)
 			  **kinds;
 	bytea	  **schemas;
 
-	run("SELECT CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END,t.objchildren[1],t.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index')", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
-	names = palloc(sizeof(char *) * Max(n, 1));
-	schemas = palloc(sizeof(bytea *) * Max(n, 1));
-	kinds = palloc_array(char *, Max(n, 1));
-	for (i = 0; i < n; i++)
 	{
-		names[i] = strcell(i, 1);
-		schemas[i] = DatumGetByteaPCopy(cell(i, 2));
-		kinds[i] = strcell(i, 3);
+		int			count;
+		DGMember   *listed = dg_database_members(database, &count);
+
+		names = palloc(sizeof(char *) * Max(count, 1));
+		schemas = palloc(sizeof(bytea *) * Max(count, 1));
+		kinds = palloc_array(char *, Max(count, 1));
+		n = 0;
+		for (i = 0; i < count; i++)
+		{
+			if (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index"))
+				continue;
+			names[n] = (char *) listed[i].name;
+			schemas[n] = object_child(listed[i].hash, 1);
+			kinds[n++] = (char *) listed[i].kind;
+		}
 	}
 	for (i = 0; i < n; i++)
 	{

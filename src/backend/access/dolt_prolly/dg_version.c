@@ -634,11 +634,38 @@ catalog_contains(bytea *db, const char *name)
 {
 	if (!db)
 		return true;
-	run("SELECT 1 FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible t ON t.objhash=ch WHERE d.objhash=$1 AND t.objkind IN ('table','index','view') AND CASE WHEN convert_from(t.objpayload,'UTF8') IS JSON OBJECT THEN convert_from(t.objpayload,'UTF8')::jsonb->>'name' END=$2", 2, VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
-	return SPI_processed != 0;
+	return dg_database_member(db, "table", name) || dg_database_member(db, "index", name) ||
+		dg_database_member(db, "view", name);
 }
 
 static CatalogView *provider_view(bytea *database);
+
+static int
+compare_members(const void *a, const void *b)
+{
+	const DGMember *left = a;
+	const DGMember *right = b;
+	int			kind = strcmp(left->kind, right->kind);
+	int			length = Min(VARSIZE_ANY_EXHDR(left->hash), VARSIZE_ANY_EXHDR(right->hash));
+	int			bytes;
+
+	if (kind)
+		return kind;
+	bytes = memcmp(VARDATA_ANY(left->hash), VARDATA_ANY(right->hash), length);
+	if (bytes)
+		return bytes;
+	return (int) VARSIZE_ANY_EXHDR(left->hash) - (int) VARSIZE_ANY_EXHDR(right->hash);
+}
+
+/* The members of |database| ordered by kind, then hash. */
+static DGMember *
+sorted_members(bytea *database, int *count)
+{
+	DGMember   *members = dg_database_members(database, count);
+
+	qsort(members, *count, sizeof(DGMember), compare_members);
+	return members;
+}
 static CatalogView *provider_branch_view(const char *branch, bytea *database);
 static char *json_value(const char *json, const char *key);
 static char *json_set_string(const char *json, const char *key, const char *value);
@@ -708,15 +735,15 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 				i;
 	StringInfoData json;
 
-	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 ORDER BY o.objkind, o.objhash", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
-	n = SPI_processed;
+	DGMember   *listed = sorted_members(database, &n);
+
 	objects = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));
 	members = palloc_array(Datum, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
-		objects[i] = DatumGetByteaPCopy(cell(i, 1));
-		kinds[i] = strcell(i, 2);
+		objects[i] = listed[i].hash;
+		kinds[i] = (char *) listed[i].kind;
 	}
 	initStringInfo(&json);
 	appendStringInfoString(&json, "{\"format\":\"DGDB1\",\"members\":[");
