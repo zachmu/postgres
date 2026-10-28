@@ -69,7 +69,69 @@ The current policy rejecting non-portable identifiers in stored SQL values
 remains in force. Runtime identities used internally do not grant permission to
 serialize those identifiers into canonical row or index contents.
 
+### Decision: handles derived from content, allocated ones in a catalog (2026-10-28)
+
+This supersedes the handle and key-to-handle trees of the 2026-10-25 decision
+below, which stay described there for the lock-record design they share. Both
+trees were rewritten on every row change, a leaf path each, and the
+key-to-handle tree was keyed by digest, so every fold or batch paid for them
+in chunks and WAL; and a new branch derived and wrote both for every row.
+
+**Derived handles.** A row occurrence's handle, the TID the executor sees, is
+the leading 40 bits of the row's digest whenever that is possible. Nothing
+stores it: it is a pure function of the row, so the same row has the same TID
+on every branch and in every revision, and a branch inherits nothing.
+
+- *Handle to row:* a range lookup in the content tree for the digests with
+  that 40-bit prefix (one descent; almost always one digest). The row whose
+  occurrence count exceeds its allocated handles owns the derived one.
+- *Row to handles:* the derived handle, from the digest, plus the allocated
+  ones the delta holds for the digest (an in-memory probe).
+- *Sequential scans* walk the content tree alone; each entry yields its
+  occurrences. *Index scans* derive the handle from each entry's digest.
+  *Bitmap scans* treat a lossy page, a range of 291 handles, as one digest
+  range of the content tree, scanned once.
+
+**Allocated handles** come from the per-storage counter, above 2^40, for the
+occurrences that cannot take the derived handle:
+- further occurrences of a row already present (duplicates in a keyless table);
+- a row whose prefix another live row holds (about n²/2^41 of n rows);
+- a row whose derived handle a live lock record still names, as the root or
+  current handle of an update chain, or a row the command's own batch removed
+  and adds back. A record's handle must not name a new row while the record
+  describes the old one; a record whose row was deleted by a committed
+  transaction is dead: a row that returns takes the handle and creates a new
+  record, lookups prefer a live record over a dead one, and a locker holding
+  the old row's TID still finds the dead record and learns of the deletion. The journal tolerates a repeated sequence for the same reason: a
+  removal and the addition after it net out.
+
+The catalog `pg_dolt_handle` maps (storage, branch, handle) to digest, with a
+second index by digest. Rows are inserted when the occurrence is written and
+deleted when it is removed, so ordinary MVCC gives each snapshot exactly the
+allocated handles live under it, including a transaction's own, savepoints and
+prepared transactions. A per-backend cache of a stream, keyed by snapshot kind
+and validated like the journal's folds, serves the lookups. Revisions and
+private rewrites number their duplicates for the state alone, from the top of
+the TID space, as does a reader of a branch whose storage has no roots yet.
+
+**What is no longer true below:** the handle tree, the key-to-handle tree, the
+`roothandles` and `rootkeys` columns, branch creation deriving handles by
+diffing, handles derived 1 to n in content order, and "IDs are never reused"
+(a derived handle is the row's; it is reused when the same row returns, unless
+a live record still names it). The counter still restarts above
+the largest allocated handle, now read from `pg_dolt_handle` and the journal.
+
+**Known limitation of the experiment.** Two transactions that concurrently
+insert the first occurrence of byte-identical rows, with no unique constraint
+to stop them, both derive the same handle. Readers then see two occurrences
+with one TID until a later write allocates for one of them; nothing waits or
+fails. A reservation on the derived handle, as unique keys use, would close
+this.
+
 ### Decision: prolly handle trees plus heap lock records (2026-10-25)
+
+> Superseded in part on 2026-10-28, above: the handle and key-to-handle trees
+> are gone. The lock records and the isolation rules stand.
 
 This supersedes an earlier same-day decision to store handles as heap tuples
 per head. Building those for every row made branch creation O(rows), and branch
@@ -118,7 +180,7 @@ largest handle in any root row version, including prepared transactions.
 
 | PostgreSQL concept | Location |
 |---|---|
-| TID | The handle, from the handle tree |
+| TID | The handle: derived from the row's digest, or an allocated one from `pg_dolt_handle` (2026-10-28) |
 | Row visibility (xmin and xmax) | Presence in the snapshot's handle root, chosen through catalog MVCC plus the transaction's own overlay |
 | cmin and cmax | Command IDs on the transaction overlay |
 | Row locks | The lock record's tuple header |
@@ -172,9 +234,10 @@ trees and heap lock records is unchanged.
   second check catches history installs, which replace rows without records.
 
 Two supporting changes:
-- **Handles.** Rows of a branch with no roots of its own get handles derived
-  from content order, 1 to n, so every reader agrees on them. The shared
-  counter allocates above 2^40, so the two ranges never meet.
+- **Handles.** Every row's handle is derived from its content (2026-10-28,
+  above), so every reader on every branch agrees on it. The shared counter
+  allocates above 2^40 for the occurrences that cannot be derived, so the two
+  ranges never meet.
 - **Chunk puts never wait.** A put that finds no committed copy inserts its own,
   keyed by its transaction ID. Waiting on another transaction's in-progress
   copy could deadlock two publishers at commit.

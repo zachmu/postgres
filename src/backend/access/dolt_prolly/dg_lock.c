@@ -59,6 +59,7 @@ typedef struct Records
 	Relation	heap;
 	Relation	key;			/* by first handle */
 	Relation	handle;			/* by current handle */
+	Relation	oid;			/* by identity */
 } Records;
 
 static Records
@@ -69,12 +70,14 @@ records_open(void)
 	r.heap = table_open(DoltLockRelationId, RowExclusiveLock);
 	r.key = index_open(DoltLockKeyIndexId, RowExclusiveLock);
 	r.handle = index_open(DoltLockHandleIndexId, RowExclusiveLock);
+	r.oid = index_open(DoltLockOidIndexId, RowExclusiveLock);
 	return r;
 }
 
 static void
 records_close(Records *r)
 {
+	index_close(r->oid, RowExclusiveLock);
 	index_close(r->handle, RowExclusiveLock);
 	index_close(r->key, RowExclusiveLock);
 	table_close(r->heap, RowExclusiveLock);
@@ -91,14 +94,49 @@ inserter_failed(TupleTableSlot *slot)
 		!TransactionIdDidCommit(xmin);
 }
 
-/* The record whose current handle is |id|; false if there is none. */
+/*
+ * Whether the record version in |slot| was deleted by a committed transaction
+ * and never updated: its row is gone for good, and a new row may take the
+ * handle, with a record of its own. The dead version stays until vacuum.
+ */
+static bool
+tuple_deleted_for_good(HeapTuple tuple)
+{
+	HeapTupleHeader header = tuple->t_data;
+	uint16		infomask = header->t_infomask;
+	TransactionId xmax;
+
+	if ((infomask & HEAP_XMAX_INVALID) || (infomask & HEAP_XMAX_IS_MULTI) || HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+		return false;
+	if (!ItemPointerEquals(&tuple->t_self, &header->t_ctid))
+		return false;
+	xmax = HeapTupleHeaderGetRawXmax(header);
+	return TransactionIdIsValid(xmax) && !TransactionIdIsCurrentTransactionId(xmax) &&
+		!TransactionIdIsInProgress(xmax) && TransactionIdDidCommit(xmax);
+}
+
+static bool
+deleted_for_good(TupleTableSlot *slot)
+{
+	return tuple_deleted_for_good(ExecFetchSlotHeapTuple(slot, false, NULL));
+}
+
+/* Whether the record version at |tid| was deleted for good. */
+static bool record_dead(Records *r, ItemPointer tid);
+
+/*
+ * The record whose current handle is |id|; false if there is none. A live
+ * record wins over one deleted for good, which a row that returned to the
+ * handle may have left behind; a locker of the old row finds the dead one.
+ */
 static bool
 find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid)
 {
 	ScanKeyData keys[4];
 	IndexScanDesc scan;
 	TupleTableSlot *slot = table_slot_create(r->heap, NULL);
-	bool		found = false;
+	bool		found = false,
+				live = false;
 
 	/* Index column positions: (space, file, handle, branch). */
 	ScanKeyInit(&keys[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->spcOid));
@@ -119,9 +157,13 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 		if (DatumGetInt64(slot_getattr(slot, Anum_pg_dolt_lock_lockhandle, &isnull)) == id &&
 			!inserter_failed(slot))
 		{
+			if (found && live)
+				continue;
 			*tid = slot->tts_tid;
 			found = true;
-			break;
+			live = !deleted_for_good(slot);
+			if (live)
+				break;
 		}
 	}
 	index_endscan(scan);
@@ -129,17 +171,21 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 	return found;
 }
 
-/* Add index entries for a new record tuple. The catalog's index descriptions are fixed. */
+/*
+ * Add index entries for a new record tuple version: the current handle and
+ * identity always, the first handle only for a new record. The catalog's
+ * index descriptions are fixed.
+ */
 static void
 index_record(Records *r, HeapTuple tuple, bool key_too)
 {
-	static IndexInfo *infos[2];
-	Relation	indexes[2] = {r->handle, r->key};
+	static IndexInfo *infos[3];
+	Relation	indexes[3] = {r->handle, r->oid, r->key};
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(r->heap), &TTSOpsHeapTuple);
 	EState	   *estate = CreateExecutorState();
 
 	ExecStoreHeapTuple(tuple, slot, false);
-	for (int i = 0; i < (key_too ? 2 : 1); i++)
+	for (int i = 0; i < (key_too ? 3 : 2); i++)
 	{
 		Datum		values[INDEX_MAX_KEYS];
 		bool		nulls[INDEX_MAX_KEYS];
@@ -165,20 +211,22 @@ index_record(Records *r, HeapTuple tuple, bool key_too)
  * a handle's record is never created twice.
  */
 static void
-record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid)
+record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, ItemPointer tid, bool renew)
 {
 	uint32		tag;
 	Datum		values[Natts_pg_dolt_lock];
 	bool		nulls[Natts_pg_dolt_lock] = {false};
 	HeapTuple	tuple;
 
-	if (find_record(r, locator, branch, id, tid))
+	if (find_record(r, locator, branch, id, tid) && !(renew && record_dead(r, tid)))
 		return;
 	tag = hash_bytes_extended((const unsigned char *) branch, strlen(branch),
 							  ((uint64) locator->relNumber << 32) ^ (uint64) id);
 	LockDatabaseObject(DoltLockRelationId, tag, 0, ExclusiveLock);
-	if (!find_record(r, locator, branch, id, tid))
+	if (!find_record(r, locator, branch, id, tid) || (renew && record_dead(r, tid)))
 	{
+		dg_handle_records_note(locator);
+		values[Anum_pg_dolt_lock_oid - 1] = ObjectIdGetDatum(GetNewOidWithIndex(r->heap, DoltLockOidIndexId, Anum_pg_dolt_lock_oid));
 		values[Anum_pg_dolt_lock_lockspace - 1] = ObjectIdGetDatum(locator->spcOid);
 		values[Anum_pg_dolt_lock_lockfile - 1] = ObjectIdGetDatum(locator->relNumber);
 		values[Anum_pg_dolt_lock_lockroot - 1] = Int64GetDatum(id);
@@ -191,6 +239,104 @@ record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, It
 		heap_freetuple(tuple);
 	}
 	UnlockDatabaseObject(DoltLockRelationId, tag, 0, ExclusiveLock);
+}
+
+/*
+ * Whether a record still names |id| on |branch|, as its root or current
+ * handle: a derived handle with such a record must not name a new row, since
+ * the record would describe the old one. A record deleted for good does not
+ * count: its row is gone, and a new row with the handle gets a new record.
+ */
+int
+dg_record_status(RelFileLocator *locator, const char *branch, int64 id)
+{
+	Records		r = records_open();
+	ItemPointerData tid;
+	bool		found = false;
+	bool		dead = false;
+
+	if (find_record(&r, locator, branch, id, &tid))
+	{
+		if (record_dead(&r, &tid))
+			dead = true;
+		else
+			found = true;
+	}
+	if (!found)
+	{
+		ScanKeyData keys[4];
+		SysScanDesc scan;
+		HeapTuple	tuple;
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(r.heap), &TTSOpsHeapTuple);
+
+		ScanKeyInit(&keys[0], Anum_pg_dolt_lock_lockspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->spcOid));
+		ScanKeyInit(&keys[1], Anum_pg_dolt_lock_lockfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(locator->relNumber));
+		ScanKeyInit(&keys[2], Anum_pg_dolt_lock_lockroot, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(id));
+		ScanKeyInit(&keys[3], Anum_pg_dolt_lock_lockbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+		scan = systable_beginscan(r.heap, DoltLockKeyIndexId, true, SnapshotAny, 4, keys);
+		while (!found && HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			ExecStoreHeapTuple(tuple, slot, false);
+			if (inserter_failed(slot))
+				continue;
+			if (deleted_for_good(slot))
+				dead = true;
+			else
+				found = true;
+		}
+		systable_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+	}
+	records_close(&r);
+	return found ? DG_RECORD_LIVE : dead ? DG_RECORD_DEAD : DG_RECORD_NONE;
+}
+
+/*
+ * A fresh record for a row that returned to handle |id| after the row that
+ * had it was deleted for good: lockers of the new row find it live, while
+ * the dead record still answers for the old row.
+ */
+void
+dg_record_renew(RelFileLocator *locator, const char *branch, int64 id)
+{
+	Records		r = records_open();
+	ItemPointerData tid;
+
+	record_for(&r, locator, branch, id, &tid, true);
+	records_close(&r);
+}
+
+/* Whether any row of storage |space|/|file| ever had a record, on any branch. */
+bool
+dg_records_exist(Oid space, RelFileNumber file)
+{
+	Relation	heap = table_open(DoltLockRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_lock_lockspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_lock_lockfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(file));
+	scan = systable_beginscan(heap, DoltLockKeyIndexId, true, SnapshotAny, 2, keys);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(heap, AccessShareLock);
+	return found;
+}
+
+static bool
+record_dead(Records *r, ItemPointer tid)
+{
+	HeapTupleData tuple;
+	Buffer		buffer;
+	bool		dead;
+
+	tuple.t_self = *tid;
+	if (!heap_fetch(r->heap, SnapshotAny, &tuple, &buffer, false))
+		elog(ERROR, "prolly row lock record is missing");
+	dead = tuple_deleted_for_good(&tuple);
+	ReleaseBuffer(buffer);
+	return dead;
 }
 
 /* The current handle of the record version at |tid|. */
@@ -337,7 +483,7 @@ dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTu
 	Buffer		buffer = InvalidBuffer;
 	TM_Result	result;
 
-	record_for(&r, &rel->rd_locator, branch, id, &tuple.t_self);
+	record_for(&r, &rel->rd_locator, branch, id, &tuple.t_self, false);
 	result = heap_lock_tuple(r.heap, &tuple, cid, mode,
 							 wait == LockWaitError ? LockWaitSkip : wait, follow, &buffer, tmfd);
 	if (BufferIsValid(buffer))
@@ -364,7 +510,7 @@ dg_record_update(Relation rel, const char *branch, int64 id, int64 next_id, Comm
 	HeapTupleData probe;
 	Buffer		buffer = InvalidBuffer;
 
-	record_for(&r, &rel->rd_locator, branch, id, &tid);
+	record_for(&r, &rel->rd_locator, branch, id, &tid, false);
 	if (key_change)
 	{
 		probe.t_self = tid;
@@ -416,7 +562,7 @@ dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool
 	ItemPointerData tid;
 	TM_Result	result;
 
-	record_for(&r, &rel->rd_locator, branch, id, &tid);
+	record_for(&r, &rel->rd_locator, branch, id, &tid, false);
 	result = heap_delete(r.heap, &tid, cid, InvalidSnapshot, wait, tmfd, changing_part);
 	successor(&r, result, tmfd, id, next);
 	records_close(&r);
@@ -548,6 +694,8 @@ reservation_key(Relation index, const char *branch, uint64 hash)
 {
 	ReservationKey key;
 
+	/* The key is hashed and compared as bytes: its padding must be zero. */
+	memset(&key, 0, sizeof(key));
 	key.index = index->rd_locator.relNumber;
 	key.branch = hash_bytes_extended((const unsigned char *) branch, strlen(branch), 0);
 	key.key = hash;

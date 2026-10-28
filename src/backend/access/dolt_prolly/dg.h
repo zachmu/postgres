@@ -11,32 +11,39 @@
 #include "utils/memutils.h"
 #include "../../../doltgres/prolly/internal.h"
 
+struct HandleDelta;
+typedef struct DGBatch DGBatch;
+
 /*
- * A relation's trees as one caller sees them. States from dg_load share the
+ * A relation's tree as one caller sees it. States from dg_load share the
  * transaction's working store, which loads missing nodes from the chunk store;
- * other states own a private store. A table state has three trees: content
- * (row digest -> count + row), handles (handle -> row digest) and keys
- * (row digest + handle -> present). An index state uses only content.
+ * other states own a private store. The content tree maps row digest ->
+ * count + row for a table, index key -> count + row for an index. A table's
+ * row handles are derived from its content, with a delta of allocated ones
+ * read from the catalog, or private to the state: see dg_handle.inc.
  */
 typedef struct DGState
 {
 	PLStore    *store;
 	bool		has_root;
 	PLTree		content;
-	PLTree		handles;
-	PLTree		keys;
 	uint64		nextid;			/* next handle, for private states only */
 	bool		shared;			/* store is the transaction's working store */
 	bool		based;			/* derived from committed roots */
-	PLHash		base[3];		/* those committed content, handle, key roots */
+	PLHash		base;			/* that committed content root */
 	MemoryContextCallback cleanup;
+	int64	   *journal_seqs;	/* journal entries folded into the tree, ascending */
+	int			journal_count;
+	struct HandleDelta *delta;	/* allocated handles, by handle and by digest */
+	bool		delta_private;	/* the delta belongs to this state, not the catalog */
+	struct HandleDelta *extra;	/* occurrences the delta does not name, numbered for this state */
 } DGState;
-
-/* Size of a key-to-handle tree key: row digest followed by the handle. */
-#define DG_KEY_SIZE (PL_HASH_SIZE + 8)
 
 /* Handles below this are derived from content; the counter allocates above it. */
 #define DG_DERIVED_HANDLES (UINT64CONST(1) << 40)
+
+/* Handles from this up name occurrences a state numbered for itself, near the top of the TID space. */
+#define DG_SYNTHETIC_HANDLES UINT64CONST(1240000000000)
 typedef struct DGRows
 {
 	PLEntry    *items;
@@ -49,7 +56,8 @@ extern bool dg_object_read(bytea *hash, const char *kind, char **actual, bytea *
 extern Oid	dg_storage_allocate(Relation definition, const char *branch);
 extern Oid	dg_storage_allocate_kind(char relkind, const char *branch);
 extern bool dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot snapshot, PLHash *content);
-extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content);
+extern bool dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load);
+extern bool dg_journal_pending(const char *branch, Snapshot snapshot);
 extern bytea *dg_manifest_put(const char *kind, bytea *payload, struct ArrayType *children);
 
 /* A member of a database object: its hash, kind and, unless a namespace, name. */
@@ -78,6 +86,7 @@ extern Relation dg_storage_index(Relation rel, Oid id);
 extern const char *dg_storage_branch(Relation rel);
 extern void dg_storage_require_write(Relation rel);
 extern bool dg_storage_bound(Relation rel);
+extern void dg_storage_table_locator(Relation index, RelFileLocator *locator);
 extern DGState *dg_storage_am_load(Relation rel, Snapshot snapshot);
 extern DGState *dg_storage_am_load_tid(Relation rel, uint64 id);
 extern DGState *dg_load_bound_tid(Relation rel, uint64 id, const char *branch);
@@ -104,6 +113,22 @@ extern void dg_identity_sync(const char *branch, List *members, List *tables);
 extern void dg_note_modified(Relation rel, const char *branch, uint64 handle, CommandId cid);
 extern bool dg_row_modified(Relation rel, const char *branch, uint64 handle, CommandId *cid);
 extern bool dg_row_committed(Relation rel, uint64 handle);
+extern bool dg_handle_digest(DGState *s, uint64 handle, PLHash *digest);
+extern int	dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *capacity);
+extern double dg_handle_count(DGState *s);
+extern uint64 dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest);
+extern void dg_handle_note(DGState *s, uint64 handle, PLHash digest, bool present);
+extern void dg_handle_install(Relation rel, DGState *s, PLTree contents);
+extern bool dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row);
+extern bool dg_handle_range(uint64 first, uint64 count, PLHash *lower, PLHash *upper);
+/* What lock records say of a handle: none, a live one, or only ones deleted for good. */
+#define DG_RECORD_NONE 0
+#define DG_RECORD_LIVE 1
+#define DG_RECORD_DEAD 2
+extern int	dg_record_status(RelFileLocator *locator, const char *branch, int64 id);
+extern void dg_record_renew(RelFileLocator *locator, const char *branch, int64 id);
+extern bool dg_records_exist(Oid space, RelFileNumber file);
+extern void dg_handle_records_note(RelFileLocator *locator);
 extern void dg_serializable_write(Relation rel);
 extern TM_Result dg_record_lock(Relation rel, const char *branch, int64 id, CommandId cid, LockTupleMode mode,
 								LockWaitPolicy wait, bool follow, TM_FailureData *tmfd, int64 *next);
@@ -113,7 +138,9 @@ extern int64 dg_record_successor(Relation rel, const char *branch, int64 id);
 extern TransactionId dg_record_xwait(Relation rel, const char *branch, int64 id, bool lockers);
 extern TM_Result dg_record_delete(Relation rel, const char *branch, int64 id, CommandId cid, bool wait,
 								  bool changing_part, TM_FailureData *tmfd, int64 *next);
-extern void dg_handle_key(PLHash digest, uint64 handle, uint8 *key);
+
+/* An index entry's key for |row|, as the index AM encodes it. */
+extern void dg_index_entry_key(Relation index, PLSlice row, PLHash digest, StringInfo key);
 
 /* Unique-key reservations; see dg_lock.c. */
 extern bool dg_key_reserve(Relation index, const char *branch, uint64 hash, bool wait);
@@ -127,7 +154,6 @@ extern void dg_stash_put(Oid relid, const DGState *state, uint64 handle, PLSlice
 extern bool dg_stash_get(Oid relid, const DGState *state, uint64 handle, PLSlice *row);
 
 /* A command's pending edits to one relation's trees; see dg_batch.inc. */
-typedef struct DGBatch DGBatch;
 extern DGBatch *dg_batch(Relation rel, CommandId cid);
 extern DGBatch *dg_batch_current(Relation rel);
 extern DGBatch *dg_batch_fresh(Relation rel);
@@ -140,6 +166,8 @@ extern void dg_batch_index_prefix(DGBatch *batch, PLSlice prefix, List **added, 
 extern bool dg_batch_handle_digest(DGBatch *batch, uint64 handle, PLHash *digest);
 extern bool dg_batch_row(DGBatch *batch, PLHash digest, PLSlice *row);
 extern int	dg_batch_handles(DGBatch *batch, PLHash digest, uint64 **handles);
+extern bool dg_batch_blocks_handle(DGBatch *batch, PLHash digest, uint64 handle);
+extern bool dg_batch_has_unique_index(DGBatch *batch);
 extern void dg_batch_finish(Relation rel);
 extern DGState *dg_batch_load(Relation rel);
 extern PLStore *dg_working_store(void);
@@ -150,7 +178,6 @@ extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
-extern void dg_history_handles(DGState *state);
 extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);

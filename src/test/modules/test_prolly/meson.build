@@ -39,5 +39,7 @@ tests += {
     't/033_array_indexes.pl',
     't/034_index_only_visibility.pl',
     't/035_commit_tracked.pl',
+    't/036_row_journal.pl',
+    't/037_derived_handles.pl',
   ]},
 }

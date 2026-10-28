@@ -82,6 +82,8 @@ catalog_headers = [
   'pg_dolt_chunk.h',
   'pg_dolt_root.h',
   'pg_dolt_lock.h',
+  'pg_dolt_journal.h',
+  'pg_dolt_handle.h',
   'pg_dolt_identity.h',
 ]
 

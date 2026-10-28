@@ -307,7 +307,7 @@ dg_storage_open(Oid definition, const char *branch, const char *name,
  * definition: false if it holds none there.
  */
 bool
-dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content)
+dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PLHash *content, bool *load)
 {
 	LockRelId	lock = {resource, MyDatabaseId};
 	Relation	catalog;
@@ -332,6 +332,15 @@ dg_storage_resource_root(Oid resource, const char *branch, Snapshot snapshot, PL
 	locator.spcOid = form.storagespc;
 	locator.dbOid = form.storagedb;
 	locator.relNumber = form.storagefile;
+
+	/*
+	 * An index's content includes the entries its table's journal implies,
+	 * and only a load through its definition knows that table: the caller
+	 * loads instead while any stream on the branch has entries.
+	 */
+	*load = form.storagekind == RELKIND_INDEX && dg_journal_pending(branch, snapshot);
+	if (*load)
+		return false;
 	return dg_storage_content_root(locator, branch, snapshot, content);
 }
 
@@ -495,8 +504,6 @@ dg_storage_require_write(Relation rel)
 static void
 storage_base(DGStorage *storage, DGState *state)
 {
-	Relation	rel = &storage->relation;
-
 	if (!state->has_root && storage->base)
 	{
 		Oid			user;
@@ -508,8 +515,6 @@ storage_base(DGStorage *storage, DGState *state)
 		PG_TRY();
 		{
 			state->content = dg_history_import(state->store, storage->base);
-			if (DG_ROWS_KIND(rel->rd_rel->relkind))
-				dg_history_handles(state);
 		}
 		PG_FINALLY();
 		{
@@ -592,6 +597,36 @@ dg_storage_enable_read(DGStorage *storage, bytea *base)
 {
 	storage->base = DatumGetByteaPCopy(PointerGetDatum(base));
 	return &storage->relation;
+}
+
+/*
+ * The locator of the table a bound |index| orders: the table's binding on
+ * the index's branch, read under the index's snapshot. The index definition
+ * names the table's canonical handle, which has no file of its own.
+ */
+void
+dg_storage_table_locator(Relation index, RelFileLocator *locator)
+{
+	DGStorage  *storage = bound_storage(index);
+	Relation	table = relation_open(storage->definition->rd_index->indrelid, NoLock);
+	char	   *name = dg_qualified_name(get_namespace_name(table->rd_rel->relnamespace), RelationGetRelationName(table));
+	Relation	catalog = table_open(DoltBindingRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			resource;
+
+	relation_close(table, NoLock);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_binding_bindbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(storage->branch));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_binding_bindname, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(name));
+	scan = systable_beginscan(catalog, DoltBindingKeyIndexId, true, storage->snapshot, 2, keys);
+	tuple = systable_getnext(scan);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime storage binding unavailable for %s on branch %s", name, storage->branch)));
+	resource = ((Form_pg_dolt_binding) GETSTRUCT(tuple))->bindrelid;
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	dg_storage_locator(resource, locator);
 }
 
 /*

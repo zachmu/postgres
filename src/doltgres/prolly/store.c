@@ -205,7 +205,10 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 
 		for (size_t i = 0; i < store->unbacked_count; i++)
 			if (store->unbacked[i]->marked)
+			{
+				store->unbacked[i]->unbacked_slot = kept;
 				store->unbacked[kept++] = store->unbacked[i];
+			}
 		store->unbacked_count = kept;
 	}
 	for (size_t i = 0; i < store->capacity; i++)
@@ -240,15 +243,44 @@ pl_store_retain(PLStore *store, const PLHash *roots, size_t count)
 void
 pl_node_pin(PLStore *store, PLNode *node)
 {
+	size_t		i;
+
 	if (node->pinned || node->backed)
 		return;
 	node->pinned = true;
-	for (size_t i = 0; i < store->unbacked_count; i++)
-		if (store->unbacked[i] == node)
-		{
-			store->unbacked[i] = store->unbacked[--store->unbacked_count];
-			break;
-		}
+	i = node->unbacked_slot;
+	if (i >= store->unbacked_count || store->unbacked[i] != node)
+	{
+		for (i = 0; i < store->unbacked_count && store->unbacked[i] != node; i++)
+			;
+		if (i == store->unbacked_count)
+			return;
+	}
+	store->unbacked[i] = store->unbacked[--store->unbacked_count];
+	store->unbacked[i]->unbacked_slot = i;
+}
+
+/* Let a pinned node drop with the next pl_store_drop_unbacked, unless written by then. */
+void
+pl_node_unpin(PLStore *store, PLNode *node)
+{
+	if (!node->pinned)
+		return;
+	node->pinned = false;
+	if (node->backed)
+		return;
+	if (store->unbacked_count == store->unbacked_capacity)
+	{
+		size_t		capacity = store->unbacked_capacity ? store->unbacked_capacity * 2 : 64;
+		PLNode	  **grown = realloc(store->unbacked, capacity * sizeof(*grown));
+
+		if (!grown)
+			return;				/* kept until the store is freed */
+		store->unbacked = grown;
+		store->unbacked_capacity = capacity;
+	}
+	node->unbacked_slot = store->unbacked_count;
+	store->unbacked[store->unbacked_count++] = node;
 }
 
 /* Record that |node| is now in the backing store; it stays listed until dropped. */
@@ -485,7 +517,10 @@ store_buffer(PLStore *store, PLHash hash, const uint8_t *bytes, size_t length, b
 	store->stats.bytes += length;
 	node->backed = backed;
 	if (!backed)
+	{
+		node->unbacked_slot = store->unbacked_count;
 		store->unbacked[store->unbacked_count++] = node;
+	}
 	*out = node;
 	return PL_OK;
 }

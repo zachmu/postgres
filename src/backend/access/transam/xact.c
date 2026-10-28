@@ -5421,6 +5421,12 @@ PushTransaction(void)
 	TransactionState s;
 
 	/*
+	 * Work that must land in the parent, such as writes a child's abort
+	 * must not undo, happens here, while the parent is still current.
+	 */
+	CallSubXactCallbacks(SUBXACT_EVENT_PRE_START_SUB, p->subTransactionId, InvalidSubTransactionId);
+
+	/*
 	 * We keep subtransaction state nodes in TopTransactionContext.
 	 */
 	s = (TransactionState)

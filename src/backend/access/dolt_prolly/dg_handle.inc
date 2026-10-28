@@ -1,0 +1,982 @@
+/* ---------------------------------------------------------------------------
+ * Row handles: derived from content, with a catalog delta for the rest
+ * ---------------------------------------------------------------------------
+ *
+ * A handle names one row occurrence of a table on a branch; the executor
+ * sees it as the row's TID. Most handles are derived: the first occurrence
+ * of a row takes the leading DG_HANDLE_PREFIX_BITS of the row's digest, so
+ * it is a pure function of the row, needs no storage, and is the same on
+ * every branch and in every revision. Resolving a derived handle is a range
+ * lookup in the content tree for the digests with that prefix; the row
+ * whose occurrences exceed its allocated handles owns the derived one.
+ *
+ * Occurrences that cannot take the derived handle get one from the
+ * storage's counter, above DG_DERIVED_HANDLES, and pg_dolt_handle maps those
+ * to their digest: further occurrences of a row already present, rows whose
+ * prefix another live row holds, and rows whose derived handle was recently
+ * used, so that a lock record or an unfolded journal entry still naming it
+ * cannot confuse a reader. Allocated handles are the only handle state
+ * written per row, and a branch inherits none of them from its parent:
+ * creating a branch copies nothing.
+ *
+ * The delta is read through a per-backend cache of a (storage, branch)
+ * stream, keyed by the snapshot kind it was read under and validated the way
+ * the journal's folds are: the same visibility identity and no local writes
+ * since. States that do not read the catalog, revisions and private
+ * rewrites, carry a private delta of their own.
+ *
+ * Nothing canonical depends on a handle: the content and index trees hold
+ * rows and digests only.
+ */
+
+#define DG_HANDLE_PREFIX_BITS 40
+
+typedef struct HandleMapping
+{
+	uint64		handle;			/* hash key */
+	PLHash		digest;
+} HandleMapping;
+
+typedef struct HandleDigest
+{
+	PLHash		digest;			/* hash key */
+	uint64	   *handles;
+	int			count,
+				capacity;
+} HandleDigest;
+
+typedef struct HandleDeltaKey
+{
+	RootKey		key;
+	int			kind;			/* 0: MVCC snapshot; 1: the latest state */
+	int			pad;
+} HandleDeltaKey;
+
+typedef struct HandleDelta HandleDelta;
+
+struct HandleDelta
+{
+	HandleDeltaKey key;			/* hash key, for cached deltas */
+	bool		loaded;
+	Visibility	seen;
+	uint64		local_version;
+	MemoryContext memory;
+	HTAB	   *by_handle;		/* HandleMapping */
+	HTAB	   *by_digest;		/* HandleDigest */
+	int			count;
+};
+
+static HTAB *handle_deltas;
+static uint64 handle_local_version = 1;	/* moves with this backend's own delta writes */
+
+static void handle_delta_tables(HandleDelta *delta);
+static HandleDelta *private_delta(void);
+static void handle_delta_note(HandleDelta *delta, uint64 handle, PLHash digest, bool present);
+static void handle_delta_load(HandleDelta *delta, Snapshot snapshot);
+static uint64 handle_allocate(Relation rel, DGState *s);
+
+static inline uint64
+handle_derived(PLHash digest)
+{
+	return pl_read64(digest.bytes) >> (64 - DG_HANDLE_PREFIX_BITS);
+}
+
+static inline bool
+handle_is_derived(uint64 handle)
+{
+	return handle < DG_DERIVED_HANDLES;
+}
+
+static inline bool
+handle_is_synthetic(uint64 handle)
+{
+	return handle >= DG_SYNTHETIC_HANDLES;
+}
+
+/* The digests deriving |handle|: those in [lower, upper), or from lower on. */
+static bool
+handle_prefix_bounds(uint64 handle, PLHash *lower, PLHash *upper)
+{
+	memset(lower->bytes, 0, PL_HASH_SIZE);
+	pl_write64(lower->bytes, handle << (64 - DG_HANDLE_PREFIX_BITS));
+	if (handle + 1 >= DG_DERIVED_HANDLES)
+		return false;
+	memset(upper->bytes, 0, PL_HASH_SIZE);
+	pl_write64(upper->bytes, (handle + 1) << (64 - DG_HANDLE_PREFIX_BITS));
+	return true;
+}
+
+/* The digest range of the |count| derived handles from |first|; false if unbounded above. */
+bool
+dg_handle_range(uint64 first, uint64 count, PLHash *lower, PLHash *upper)
+{
+	memset(lower->bytes, 0, PL_HASH_SIZE);
+	pl_write64(lower->bytes, first << (64 - DG_HANDLE_PREFIX_BITS));
+	if (first + count >= DG_DERIVED_HANDLES)
+		return false;
+	memset(upper->bytes, 0, PL_HASH_SIZE);
+	pl_write64(upper->bytes, (first + count) << (64 - DG_HANDLE_PREFIX_BITS));
+	return true;
+}
+
+static void
+handle_delta_tables(HandleDelta *delta)
+{
+	HASHCTL		ctl = {0};
+
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(HandleMapping);
+	ctl.hcxt = delta->memory;
+	delta->by_handle = hash_create("prolly handle delta by handle", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ctl.keysize = sizeof(PLHash);
+	ctl.entrysize = sizeof(HandleDigest);
+	delta->by_digest = hash_create("prolly handle delta by digest", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	delta->count = 0;
+}
+
+/* Record, or forget, that allocated |handle| names an occurrence of |digest|. */
+static void
+handle_delta_note(HandleDelta *delta, uint64 handle, PLHash digest, bool present)
+{
+	HandleMapping *mapping;
+	HandleDigest *entry;
+	bool		found;
+
+	if (present)
+	{
+		mapping = hash_search(delta->by_handle, &handle, HASH_ENTER, &found);
+		if (found)
+			return;
+		mapping->digest = digest;
+		entry = hash_search(delta->by_digest, &digest, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->handles = NULL;
+			entry->count = entry->capacity = 0;
+		}
+		if (entry->count == entry->capacity)
+		{
+			MemoryContext old = MemoryContextSwitchTo(delta->memory);
+
+			entry->capacity = entry->capacity ? entry->capacity * 2 : 2;
+			entry->handles = entry->handles ? repalloc(entry->handles, entry->capacity * sizeof(uint64)) :
+				palloc(entry->capacity * sizeof(uint64));
+			MemoryContextSwitchTo(old);
+		}
+		entry->handles[entry->count++] = handle;
+		delta->count++;
+		return;
+	}
+	mapping = hash_search(delta->by_handle, &handle, HASH_REMOVE, NULL);
+	if (!mapping)
+		return;
+	entry = hash_search(delta->by_digest, &digest, HASH_FIND, NULL);
+	if (entry)
+	{
+		for (int i = 0; i < entry->count; i++)
+			if (entry->handles[i] == handle)
+				entry->handles[i] = entry->handles[--entry->count];
+		if (!entry->count)
+			hash_search(delta->by_digest, &digest, HASH_REMOVE, NULL);
+	}
+	delta->count--;
+}
+
+/* Fill |delta| from the catalog rows of its key that |snapshot| sees. */
+static void
+handle_delta_load(HandleDelta *delta, Snapshot snapshot)
+{
+	Relation	catalog = table_open(DoltHandleRelationId, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(catalog);
+	ScanKeyData keys[3];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		registered = snapshot && IsMVCCSnapshot(snapshot);
+	bool		pushed = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed = true;
+	}
+	if (registered)
+		snapshot = RegisterSnapshot(snapshot);
+	else
+		snapshot = SnapshotSelf;
+	MemoryContextReset(delta->memory);
+	handle_delta_tables(delta);
+	ScanKeyInit(&keys[0], Anum_pg_dolt_handle_hdlspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(delta->key.key.space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_handle_hdlfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(delta->key.key.file));
+	ScanKeyInit(&keys[2], Anum_pg_dolt_handle_hdlbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(delta->key.key.branch));
+	scan = systable_beginscan(catalog, DoltHandleKeyIndexId, true, snapshot, 3, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_dolt_handle form = (Form_pg_dolt_handle) GETSTRUCT(tuple);
+		PLHash		digest;
+		bool		isnull;
+		bytea	   *bytes = DatumGetByteaPP(heap_getattr(tuple, Anum_pg_dolt_handle_hdldigest, desc, &isnull));
+
+		if (VARSIZE_ANY_EXHDR(bytes) != PL_HASH_SIZE)
+			elog(ERROR, "invalid prolly handle digest");
+		memcpy(digest.bytes, VARDATA_ANY(bytes), PL_HASH_SIZE);
+		handle_delta_note(delta, (uint64) form->hdlhandle, digest, true);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	if (registered)
+		UnregisterSnapshot(snapshot);
+	if (pushed)
+		PopActiveSnapshot();
+	delta->loaded = true;
+}
+
+/* The cached delta of |key| as |snapshot| sees it, reloaded if anything moved. */
+static struct HandleDelta *
+handle_delta_get(const RootKey *key, Snapshot snapshot)
+{
+	HandleDeltaKey cache_key = {0};
+	HandleDelta *delta;
+	Visibility	seen;
+	bool		found;
+
+	if (!handle_deltas)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(HandleDeltaKey);
+		ctl.entrysize = sizeof(HandleDelta);
+		ctl.hcxt = CacheMemoryContext;
+		handle_deltas = hash_create("prolly handle deltas", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	cache_key.key = *key;
+	cache_key.kind = snapshot && IsMVCCSnapshot(snapshot) ? 0 : 1;
+	delta = hash_search(handle_deltas, &cache_key, HASH_ENTER, &found);
+	if (!found)
+	{
+		memset(((char *) delta) + sizeof(HandleDeltaKey), 0, sizeof(*delta) - sizeof(HandleDeltaKey));
+		delta->memory = AllocSetContextCreate(CacheMemoryContext, "prolly handle delta", ALLOCSET_SMALL_SIZES);
+	}
+	visibility_capture(snapshot, &seen);
+	if (delta->loaded && delta->local_version == handle_local_version && visibility_equal(&delta->seen, &seen))
+		return delta;
+	handle_delta_load(delta, snapshot);
+	delta->seen = seen;
+	delta->local_version = handle_local_version;
+	return delta;
+}
+
+/* A state's delta: its catalog view, or a private, empty one made on demand. */
+static HandleDelta *
+state_delta(DGState *s)
+{
+	if (!s->delta)
+	{
+		s->delta = private_delta();
+		s->delta_private = true;
+	}
+	if (s->delta_private && !s->nextid)
+		s->nextid = DG_DERIVED_HANDLES + 1;
+	return s->delta;
+}
+
+static HandleDelta *
+private_delta(void)
+{
+	HandleDelta *delta = palloc0(sizeof(*delta));
+
+	delta->memory = AllocSetContextCreate(CurrentMemoryContext, "prolly private handle delta", ALLOCSET_SMALL_SIZES);
+	handle_delta_tables(delta);
+	delta->loaded = true;
+	return delta;
+}
+
+/* The allocated handles of |digest| in |s|'s view; the array belongs to the delta. */
+static int
+delta_handles(DGState *s, PLHash digest, uint64 **handles)
+{
+	HandleDelta *delta = state_delta(s);
+	HandleDigest *entry;
+
+	*handles = NULL;
+	if (!delta->count)
+		return 0;
+	entry = hash_search(delta->by_digest, &digest, HASH_FIND, NULL);
+	if (!entry)
+		return 0;
+	*handles = entry->handles;
+	return entry->count;
+}
+
+/*
+ * Occurrences of |digest| beyond those the delta names, |count| of them,
+ * numbered for this state alone: a private state's duplicates, or those of a
+ * branch whose storage has no roots of its own yet. The numbers lie above
+ * every allocated handle, so they can mean nothing else.
+ */
+static int
+extra_handles(DGState *s, PLHash digest, int64 count, uint64 **handles)
+{
+	HandleDigest *entry;
+
+	*handles = NULL;
+	if (count <= 0 && !s->extra)
+		return 0;
+	if (!s->extra)
+	{
+		s->extra = private_delta();
+		s->extra->count = 0;
+	}
+	entry = hash_search(s->extra->by_digest, &digest, HASH_FIND, NULL);
+	while ((entry ? entry->count : 0) < count)
+	{
+		uint64		handle = DG_SYNTHETIC_HANDLES + (uint64) s->extra->count;
+
+		handle_delta_note(s->extra, handle, digest, true);
+		entry = hash_search(s->extra->by_digest, &digest, HASH_FIND, NULL);
+	}
+	if (!entry)
+		return 0;
+	*handles = entry->handles;
+	return entry->count;
+}
+
+
+static PLStatus
+collect_prefix_row(void *arg, PLSlice key, PLSlice value)
+{
+	PrefixRows *rows = arg;
+
+	if (rows->count == lengthof(rows->digests))
+		return PL_STOP;
+	memcpy(rows->digests[rows->count].bytes, key.data, PL_HASH_SIZE);
+	rows->counts[rows->count] = value.len >= 8 ? (int64) pl_read64(value.data) : 0;
+	rows->count++;
+	return PL_OK;
+}
+
+/* The rows of |tree| whose digests derive |handle|: rarely more than one. */
+static PrefixRows
+prefix_rows(const PLTree *tree, uint64 handle)
+{
+	PrefixRows	rows = {0};
+	PLHash		lower,
+				upper;
+	bool		bounded = handle_prefix_bounds(handle, &lower, &upper);
+	PLSlice		lo = {lower.bytes, PL_HASH_SIZE},
+				hi = {upper.bytes, PL_HASH_SIZE};
+	PLStatus	status = pl_scan(tree, &lo, bounded ? &hi : NULL, collect_prefix_row, &rows);
+
+	if (status != PL_STOP)
+		dg_check(status);
+	return rows;
+}
+
+/* The digest row |handle| names in |s|, if the row is live there. */
+bool
+dg_handle_digest(DGState *s, uint64 handle, PLHash *digest)
+{
+	HandleMapping *mapping;
+	PrefixRows	rows;
+
+	if (handle_is_synthetic(handle))
+	{
+		if (!s->extra)
+			return false;
+		mapping = hash_search(s->extra->by_handle, &handle, HASH_FIND, NULL);
+		if (!mapping)
+			return false;
+		*digest = mapping->digest;
+		return true;
+	}
+	if (!handle_is_derived(handle))
+	{
+		HandleDelta *delta = state_delta(s);
+
+		if (!delta->count)
+			return false;
+		mapping = hash_search(delta->by_handle, &handle, HASH_FIND, NULL);
+		if (!mapping)
+			return false;
+		*digest = mapping->digest;
+		return true;
+	}
+	rows = prefix_rows(&s->content, handle);
+	for (int i = 0; i < rows.count; i++)
+	{
+		uint64	   *allocated;
+		int			n = delta_handles(s, rows.digests[i], &allocated);
+
+		if (rows.counts[i] - n >= 1)
+		{
+			*digest = rows.digests[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The handles of row |digest|'s occurrences in |s|, |count| of them if the
+ * caller knows, into |*handles|, a buffer of |*capacity| grown as needed.
+ * The derived handle comes first, for the occurrence no allocated handle
+ * names; a private state allocates for duplicates it meets.
+ */
+int
+dg_handles_of(DGState *s, PLHash digest, int64 count, uint64 **handles, int *capacity)
+{
+	uint64	   *allocated,
+			   *extras;
+	int			n,
+				e,
+				derived,
+				total;
+
+	if (count < 0)
+	{
+		PLValue		value;
+
+		dg_check(pl_get(&s->content, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
+		count = value.present ? (int64) pl_read64(value.bytes.data) : 0;
+	}
+	n = delta_handles(s, digest, &allocated);
+	e = extra_handles(s, digest, count - n - 1, &extras);
+	derived = (int) Max(count - n - e, 0);
+	total = derived + n + e;
+	if (*capacity < total)
+	{
+		*capacity = Max(total, 8);
+		*handles = *handles ? repalloc(*handles, *capacity * sizeof(uint64)) : palloc(*capacity * sizeof(uint64));
+	}
+	for (int i = 0; i < derived; i++)
+		(*handles)[i] = handle_derived(digest);
+	for (int i = 0; i < n; i++)
+		(*handles)[derived + i] = allocated[i];
+	for (int i = 0; i < e; i++)
+		(*handles)[derived + n + i] = extras[i];
+	return total;
+}
+
+/* The number of row occurrences |s| holds: distinct rows plus duplicates. */
+double
+dg_handle_count(DGState *s)
+{
+	return (double) pl_count(&s->content) + (s->delta ? s->delta->count : 0);
+}
+
+/*
+ * Whether |rel| has a unique index: concurrent inserters of identical rows
+ * then serialize on its key reservation, so the derived handle needs no
+ * reservation of its own.
+ */
+static bool
+relation_has_unique_index(Relation rel)
+{
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+	bool		unique = false;
+
+	foreach(lc, indexes)
+	{
+		HeapTuple	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
+
+		if (!HeapTupleIsValid(tuple))
+			continue;
+		unique = ((Form_pg_index) GETSTRUCT(tuple))->indisunique;
+		ReleaseSysCache(tuple);
+		if (unique)
+			break;
+	}
+	list_free(indexes);
+	return unique;
+}
+
+/*
+ * The handle for a new occurrence of |digest| in |s|, recorded through |b|
+ * if the command batches its edits: derived when no live row holds its
+ * prefix, nothing of this command names it, no lock record still names it,
+ * and no other running transaction has reserved it; else allocated. A
+ * journal entry may name it: the stream tolerates a repeated sequence, since
+ * a removal and the addition after it net out.
+ *
+ * Two transactions inserting the first occurrence of identical rows cannot
+ * see each other's, so the first reserves the derived handle until it ends
+ * and the second allocates. A table with a unique index serializes such
+ * inserters on the key already and skips the reservation.
+ */
+uint64
+dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
+{
+	uint64		handle = handle_derived(digest);
+	bool		taken = b && dg_batch_blocks_handle(b, digest, handle);
+
+	if (!taken)
+		taken = prefix_rows(&s->content, handle).count > 0;
+	if (!taken && !s->delta_private && handle_records_exist(rel->rd_locator.dbOid, rel->rd_locator.spcOid, rel->rd_locator.relNumber))
+	{
+		int			status = dg_record_status(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+
+		taken = status == DG_RECORD_LIVE;
+		if (status == DG_RECORD_DEAD)
+			dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
+	}
+	if (!taken && !s->delta_private && !(b ? dg_batch_has_unique_index(b) : relation_has_unique_index(rel)))
+		taken = !dg_key_reserve(rel, dg_relation_branch(rel), handle, false);
+	if (!taken)
+		return handle;
+	return handle_allocate(rel, s);
+}
+
+/* Give a private state's occurrence of |digest| the handle |handle|, or take it away. */
+void
+dg_handle_note(DGState *s, uint64 handle, PLHash digest, bool present)
+{
+	if (handle_is_derived(handle))
+		return;
+	handle_delta_note(state_delta(s), handle, digest, present);
+}
+
+/* ---- The catalog ---- */
+
+static IndexInfo *handle_index_info[2];
+
+static void
+handle_catalog_open(Relation *catalog, Relation *indexes)
+{
+	*catalog = table_open(DoltHandleRelationId, RowExclusiveLock);
+	indexes[0] = index_open(DoltHandleKeyIndexId, RowExclusiveLock);
+	indexes[1] = index_open(DoltHandleDigestIndexId, RowExclusiveLock);
+	for (int i = 0; i < 2; i++)
+		if (!handle_index_info[i])
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			handle_index_info[i] = BuildIndexInfo(indexes[i]);
+			MemoryContextSwitchTo(old);
+		}
+}
+
+static void
+handle_catalog_close(Relation catalog, Relation *indexes)
+{
+	index_close(indexes[1], RowExclusiveLock);
+	index_close(indexes[0], RowExclusiveLock);
+	table_close(catalog, RowExclusiveLock);
+}
+
+static void
+handle_catalog_insert(Relation catalog, Relation *indexes, const RootKey *key, uint64 handle, PLHash digest, CommandId cid)
+{
+	Datum		values[Natts_pg_dolt_handle];
+	bool		nulls[Natts_pg_dolt_handle] = {false};
+	bytea	   *bytes = palloc(VARHDRSZ + PL_HASH_SIZE);
+	HeapTuple	tuple;
+	TupleTableSlot *slot;
+	EState	   *estate;
+
+	SET_VARSIZE(bytes, VARHDRSZ + PL_HASH_SIZE);
+	memcpy(VARDATA(bytes), digest.bytes, PL_HASH_SIZE);
+	values[Anum_pg_dolt_handle_hdlspace - 1] = ObjectIdGetDatum(key->space);
+	values[Anum_pg_dolt_handle_hdlfile - 1] = ObjectIdGetDatum(key->file);
+	values[Anum_pg_dolt_handle_hdlhandle - 1] = Int64GetDatum((int64) handle);
+	values[Anum_pg_dolt_handle_hdlbranch - 1] = CStringGetTextDatum(key->branch);
+	values[Anum_pg_dolt_handle_hdldigest - 1] = PointerGetDatum(bytes);
+	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
+	heap_insert(catalog, tuple, cid, 0, NULL);
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(catalog), &TTSOpsHeapTuple);
+	estate = CreateExecutorState();
+	ExecStoreHeapTuple(tuple, slot, false);
+	for (int i = 0; i < 2; i++)
+	{
+		Datum		ivalues[INDEX_MAX_KEYS];
+		bool		inulls[INDEX_MAX_KEYS];
+
+		FormIndexDatum(handle_index_info[i], slot, estate, ivalues, inulls);
+		index_insert(indexes[i], ivalues, inulls, &tuple->t_self, catalog, UNIQUE_CHECK_NO, false, handle_index_info[i]);
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	heap_freetuple(tuple);
+	pfree(bytes);
+}
+
+/* Delete the row naming |handle|, if this transaction can see one. */
+static void
+handle_catalog_delete(Relation catalog, const RootKey *key, uint64 handle, CommandId cid)
+{
+	ScanKeyData keys[4];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_handle_hdlspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_handle_hdlfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->file));
+	ScanKeyInit(&keys[2], Anum_pg_dolt_handle_hdlbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(key->branch));
+	ScanKeyInit(&keys[3], Anum_pg_dolt_handle_hdlhandle, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum((int64) handle));
+	scan = systable_beginscan(catalog, DoltHandleKeyIndexId, true, SnapshotSelf, 4, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		TM_FailureData failure;
+		TM_Result	result = heap_delete(catalog, &tuple->t_self, cid, InvalidSnapshot, true, &failure, false);
+
+		if (result != TM_Ok && result != TM_Deleted && result != TM_Updated && result != TM_SelfModified)
+			elog(ERROR, "could not delete prolly handle row");
+	}
+	systable_endscan(scan);
+}
+
+/*
+ * Write a command's allocated handle changes: |mappings| name handles added
+ * (present) or removed. Derived handles need no row.
+ */
+static void
+handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid)
+{
+	HASH_SEQ_STATUS status;
+	PendingHandle *mapping;
+	Relation	catalog,
+				indexes[2];
+	bool		opened = false,
+				pushed = false;
+
+	hash_seq_init(&status, mappings);
+	while ((mapping = hash_seq_search(&status)) != NULL)
+	{
+		if (handle_is_derived(mapping->handle))
+			continue;
+		if (!opened)
+		{
+			if (!ActiveSnapshotSet())
+			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				pushed = true;
+			}
+			handle_catalog_open(&catalog, indexes);
+			opened = true;
+		}
+		if (mapping->present)
+			handle_catalog_insert(catalog, indexes, key, mapping->handle, mapping->digest, cid);
+		else
+			handle_catalog_delete(catalog, key, mapping->handle, cid);
+	}
+	if (opened)
+	{
+		handle_catalog_close(catalog, indexes);
+		if (pushed)
+			PopActiveSnapshot();
+		handle_local_version++;
+	}
+}
+
+/* One allocated handle change outside a batch: a history install's. */
+static void
+handle_delta_edit(DGState *s, const RootKey *key, uint64 handle, PLHash digest, bool present, CommandId cid)
+{
+	Relation	catalog,
+				indexes[2];
+
+	if (handle_is_derived(handle))
+		return;
+	if (s->delta_private)
+	{
+		handle_delta_note(state_delta(s), handle, digest, present);
+		return;
+	}
+	handle_catalog_open(&catalog, indexes);
+	if (present)
+		handle_catalog_insert(catalog, indexes, key, handle, digest, cid);
+	else
+		handle_catalog_delete(catalog, key, handle, cid);
+	handle_catalog_close(catalog, indexes);
+	handle_local_version++;
+
+	/* The state keeps using its cached delta: let it see the edit too. */
+	handle_delta_note(state_delta(s), handle, digest, present);
+}
+
+/*
+ * The largest allocated handle any row of |space|/|file| has on any branch,
+ * whatever its visibility: the counter must pass them all.
+ */
+static uint64
+handle_delta_max(Oid space, RelFileNumber file)
+{
+	Relation	catalog = table_open(DoltHandleRelationId, AccessShareLock);
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	uint64		max = 0;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_handle_hdlspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_handle_hdlfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(file));
+	scan = systable_beginscan(catalog, DoltHandleKeyIndexId, true, SnapshotAny, 2, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_dolt_handle form = (Form_pg_dolt_handle) GETSTRUCT(tuple);
+
+		max = Max(max, (uint64) form->hdlhandle);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return max;
+}
+
+/* Whether an allocated |handle| of |key| was inserted by a committed transaction other than this one. */
+static bool
+handle_delta_committed(const RootKey *key, uint64 handle)
+{
+	Relation	catalog = table_open(DoltHandleRelationId, AccessShareLock);
+	ScanKeyData keys[4];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		committed = false;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_handle_hdlspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_handle_hdlfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->file));
+	ScanKeyInit(&keys[2], Anum_pg_dolt_handle_hdlbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(key->branch));
+	ScanKeyInit(&keys[3], Anum_pg_dolt_handle_hdlhandle, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum((int64) handle));
+	scan = systable_beginscan(catalog, DoltHandleKeyIndexId, true, SnapshotAny, 4, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		TransactionId xmin = HeapTupleHeaderGetXmin(tuple->t_data);
+
+		if (!TransactionIdIsCurrentTransactionId(xmin) && TransactionIdDidCommit(xmin))
+			committed = true;
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return committed;
+}
+
+/* The digest an allocated |handle| of |key| names in any row version at all. */
+static bool
+handle_delta_any(const RootKey *key, uint64 handle, PLHash *digest)
+{
+	Relation	catalog = table_open(DoltHandleRelationId, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(catalog);
+	ScanKeyData keys[4];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+
+	ScanKeyInit(&keys[0], Anum_pg_dolt_handle_hdlspace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->space));
+	ScanKeyInit(&keys[1], Anum_pg_dolt_handle_hdlfile, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(key->file));
+	ScanKeyInit(&keys[2], Anum_pg_dolt_handle_hdlbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(key->branch));
+	ScanKeyInit(&keys[3], Anum_pg_dolt_handle_hdlhandle, BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum((int64) handle));
+	scan = systable_beginscan(catalog, DoltHandleKeyIndexId, true, SnapshotAny, 4, keys);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		bytea	   *bytes = DatumGetByteaPP(heap_getattr(tuple, Anum_pg_dolt_handle_hdldigest, desc, &isnull));
+
+		if (VARSIZE_ANY_EXHDR(bytes) == PL_HASH_SIZE)
+		{
+			memcpy(digest->bytes, VARDATA_ANY(bytes), PL_HASH_SIZE);
+			found = true;
+		}
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return found;
+}
+
+typedef struct HandleChange
+{
+	PLHash		digest;
+	int64		delta;
+} HandleChange;
+
+typedef struct HandleChanges
+{
+	HandleChange *items;
+	int			count;
+	int			capacity;
+} HandleChanges;
+
+static PLStatus
+collect_handle_change(void *arg, PLSlice key, PLValue before, PLValue after)
+{
+	HandleChanges *changes = arg;
+	int64		delta = (after.present ? (int64) pl_read64(after.bytes.data) : 0) -
+		(before.present ? (int64) pl_read64(before.bytes.data) : 0);
+
+	if (!delta)
+		return PL_OK;
+	if (changes->count == changes->capacity)
+	{
+		changes->capacity = changes->capacity ? changes->capacity * 2 : 64;
+		changes->items = changes->items ? repalloc_array(changes->items, HandleChange, changes->capacity) :
+			palloc_array(HandleChange, changes->capacity);
+	}
+	memcpy(changes->items[changes->count].digest.bytes, key.data, PL_HASH_SIZE);
+	changes->items[changes->count++].delta = delta;
+	return PL_OK;
+}
+
+/* A fresh allocated handle for |s|: from the storage's counter, or the state's own. */
+static uint64
+handle_allocate(Relation rel, DGState *s)
+{
+	if (s->delta_private)
+	{
+		state_delta(s);
+		return s->nextid++;
+	}
+	return dg_allocate_handle(rel);
+}
+
+/* The row bytes of |digest| in |tree|, copied; false if it holds no such row. */
+static bool
+row_of_digest(const PLTree *tree, PLHash digest, PLSlice *row)
+{
+	PLValue		value;
+	uint8	   *copy;
+
+	dg_check(pl_get(tree, (PLSlice) {digest.bytes, PL_HASH_SIZE}, &value));
+	if (!value.present || value.bytes.len < 8)
+		return false;
+	copy = palloc(Max(value.bytes.len - 8, 1));
+	memcpy(copy, value.bytes.data + 8, value.bytes.len - 8);
+	row->data = copy;
+	row->len = value.bytes.len - 8;
+	return true;
+}
+
+/*
+ * The row version |handle| names, live or not, as a fetch under SnapshotAny
+ * wants it: the executor fetches versions it saw under an older snapshot and
+ * versions this transaction removed. The latest state is tried first, then
+ * the active snapshot's, then the journal's own copy of the row, then the
+ * delta's record of a removed allocated handle with its row from any state
+ * holding it.
+ */
+bool
+dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
+{
+	RootKey		key = root_key(rel, dg_relation_branch(rel));
+	DGState    *s = dg_load_tid(rel, handle);
+	bool		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+
+	dg_release(s);
+	if (found)
+		return true;
+	if (ActiveSnapshotSet())
+	{
+		s = dg_load(rel, GetActiveSnapshot());
+		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+		dg_release(s);
+		if (found)
+			return true;
+	}
+	if (journal_entry_any(&key, handle, digest, row))
+		return true;
+	if (handle_is_derived(handle) || !handle_delta_any(&key, handle, digest))
+		return false;
+	s = dg_load(rel, SnapshotSelf);
+	found = row_of_digest(&s->content, *digest, row);
+	dg_release(s);
+	if (!found && ActiveSnapshotSet())
+	{
+		s = dg_load(rel, GetActiveSnapshot());
+		found = row_of_digest(&s->content, *digest, row);
+		dg_release(s);
+	}
+	return found;
+}
+
+typedef struct InstallExtras
+{
+	Relation	rel;
+	DGState    *s;
+	const RootKey *key;
+	CommandId	cid;
+} InstallExtras;
+
+static PLStatus
+collect_install_extras(void *arg, PLSlice key, PLSlice value)
+{
+	InstallExtras *extras = arg;
+	int64		count = value.len >= 8 ? (int64) pl_read64(value.data) : 0;
+	PLHash		digest;
+	uint64	   *allocated;
+	int			n;
+
+	if (count <= 1)
+		return PL_OK;
+	memcpy(digest.bytes, key.data, PL_HASH_SIZE);
+	n = delta_handles(extras->s, digest, &allocated);
+	while (count - n > 1)
+	{
+		handle_delta_edit(extras->s, extras->key, dg_allocate_handle(extras->rel), digest, true, extras->cid);
+		n = delta_handles(extras->s, digest, &allocated);
+	}
+	return PL_OK;
+}
+
+/*
+ * A storage with no roots of its own, whose content came from history, has no
+ * handle rows for its duplicate rows yet: allocate them before its first save.
+ * Distinct rows, the vast majority, need nothing.
+ */
+static void
+handle_install_extras(Relation rel, DGState *s, const RootKey *key, CommandId cid)
+{
+	InstallExtras extras = {rel, s, key, cid};
+
+	dg_check(pl_scan(&s->content, NULL, NULL, collect_install_extras, &extras));
+}
+
+/*
+ * Replace |s|'s content with |contents|, keeping the handles of occurrences
+ * present in both: only rows the diff adds or removes gain or lose handles,
+ * and only allocated ones are written. Cost is proportional to the
+ * difference, not the table.
+ */
+void
+dg_handle_install(Relation rel, DGState *s, PLTree contents)
+{
+	PLTree		before = s->content;
+	HandleChanges changes = {0};
+	RootKey		key = root_key(rel, dg_relation_branch(rel));
+	CommandId	cid = GetCurrentCommandId(true);
+
+	if (!s->has_root && !s->delta_private)
+		handle_install_extras(rel, s, &key, cid);
+	dg_check(pl_diff(&before, &contents, collect_handle_change, &changes));
+	for (int i = 0; i < changes.count; i++)
+	{
+		HandleChange *change = &changes.items[i];
+		uint64	   *allocated;
+		int			n = delta_handles(s, change->digest, &allocated);
+
+		CHECK_FOR_INTERRUPTS();
+		if (change->delta < 0)
+		{
+			/* Allocated occurrences go first; the derived one needs no write. */
+			for (int64 j = 0; j < -change->delta && n > 0; j++)
+			{
+				uint64		handle = allocated[n - 1];
+
+				handle_delta_edit(s, &key, handle, change->digest, false, cid);
+				n = delta_handles(s, change->digest, &allocated);
+			}
+		}
+		else
+		{
+			PLValue		value;
+			int64		count;
+
+			dg_check(pl_get(&before, (PLSlice) {change->digest.bytes, PL_HASH_SIZE}, &value));
+			count = value.present ? (int64) pl_read64(value.bytes.data) : 0;
+			for (int64 j = 0; j < change->delta; j++)
+			{
+				uint64		handle = count - n >= 1 ? handle_allocate(rel, s) : dg_handle_choose(rel, s, NULL, change->digest);
+
+				handle_delta_edit(s, &key, handle, change->digest, true, cid);
+				count++;
+				n = delta_handles(s, change->digest, &allocated);
+			}
+		}
+	}
+	s->content = contents;
+	if (changes.items)
+		pfree(changes.items);
+}

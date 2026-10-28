@@ -278,8 +278,6 @@ dg_catalog_begin_rewrite(Relation definition)
 	native_mutation_destination->nextid = 1;
 	native_mutation_width = RelationGetDescr(definition)->natts;
 	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->content));
-	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->handles));
-	dg_check(pl_build(native_mutation_source->store, NULL, 0, &native_mutation_destination->keys));
 	MemoryContextSwitchTo(old);
 	return true;
 }
