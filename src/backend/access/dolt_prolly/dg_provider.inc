@@ -175,6 +175,75 @@ provider_member(const char *name, const char *kind)
 	return member->index;
 }
 
+/*
+ * The bootstrap catalogs' rows, which every view shares. A change to a
+ * built-in object goes through one of these caches; any invalidation of them
+ * makes the next view read the catalogs again.
+ */
+static CatalogViewBase *provider_base;
+static bool provider_bootstrap(Oid catalog, HeapTuple tuple, TupleDesc desc);
+
+static void
+provider_base_forget(Datum arg, int cacheid, uint32 hashvalue)
+{
+	if (provider_base)
+		CatalogViewBaseRelease(provider_base);
+	provider_base = NULL;
+}
+
+static CatalogViewBase *
+provider_shared_base(void)
+{
+	static bool registered;
+	CatalogViewBase *base;
+	MemoryContext scratch;
+	MemoryContext previous;
+
+	if (!registered)
+	{
+		const int	caches[] = {RELOID, PROCOID, TYPEOID, NAMESPACEOID, OPEROID, CONSTROID};
+
+		for (int i = 0; i < lengthof(caches); i++)
+			CacheRegisterSyscacheCallback(caches[i], provider_base_forget, (Datum) 0);
+		registered = true;
+	}
+	if (provider_base)
+		return provider_base;
+	base = CatalogViewBaseCreate();
+	scratch = AllocSetContextCreate(CurrentMemoryContext, "bootstrap rows", ALLOCSET_DEFAULT_SIZES);
+	previous = MemoryContextSwitchTo(scratch);
+	PG_TRY();
+	{
+		for (int i = 0; i < lengthof(provider_catalogs); i++)
+		{
+			Relation	rel = table_open(provider_catalogs[i], AccessShareLock);
+			TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+			HeapTuple	tuple;
+			List	   *tuples = NIL;
+
+			while ((tuple = heap_getnext(scan, ForwardScanDirection)))
+				if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rel)))
+					tuples = lappend(tuples, heap_copytuple(tuple));
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+			CatalogViewBaseAddRows(base, provider_catalogs[i], tuples);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(previous);
+		CatalogViewBaseRelease(base);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(previous);
+	MemoryContextDelete(scratch);
+	if (provider_base)
+		CatalogViewBaseRelease(provider_base);
+	provider_base = base;
+	return base;
+}
+
 static int
 provider_catalog_index(Oid id)
 {
@@ -415,6 +484,8 @@ provider_decode_columns(const char *definition)
 
 	JsonbValue	document = json_document(definition);
 	JsonbValue	columns;
+	JsonbValue	statement;
+	bool		index = json_get(&document, "index_definition", &statement);
 
 	n = json_get(&document, "columns", &columns) ? json_length(&columns) : 0;
 	names = palloc_array(char *, Max(n, 1));
@@ -469,6 +540,11 @@ provider_decode_columns(const char *definition)
 		provider_init_entry(desc, i + 1, names[i], type, mods[i]);
 		if (collations[i])
 			TupleDescInitEntryCollation(desc, i + 1, get_collation_oid(stringToQualifiedNameList(collations[i], NULL), false));
+		else if (index)
+		{
+			/* An index's included columns have no collation, as natively. */
+			TupleDescAttr(desc, i)->attcollation = InvalidOid;
+		}
 		TupleDescAttr(desc, i)->attnotnull = notnull[i];
 		TupleDescAttr(desc, i)->attislocal = true;
 		TupleDescAttr(desc, i)->atthasdef = hasdef[i];
@@ -1072,18 +1148,9 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 
 	provider_current_view = view;
 	provider_current_rows = &rows;
+	CatalogViewSetBase(view, provider_shared_base());
 	for (i = 0; i < lengthof(provider_catalogs); i++)
-	{
-		TableScanDesc scan;
-		HeapTuple	tuple;
-
 		rows.relations[i] = table_open(provider_catalogs[i], AccessShareLock);
-		scan = table_beginscan_catalog(rows.relations[i], 0, NULL);
-		while ((tuple = heap_getnext(scan, ForwardScanDirection)))
-			if (provider_bootstrap(provider_catalogs[i], tuple, RelationGetDescr(rows.relations[i])))
-				rows.rows[i] = lappend(rows.rows[i], heap_copytuple(tuple));
-		table_endscan(scan);
-	}
 	run("SELECT o.objhash,o.objkind FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(database)), NULL, true);
 	n = SPI_processed;
 	addresses = palloc_array(bytea *, Max(n, 1));

@@ -80,7 +80,16 @@ struct CatalogView
 	List	   *durable;		/* CatalogViewObjects bound to durable OIDs */
 	List	   *indexes;		/* CatalogViewIndexes over the rows */
 	MemoryContext index_memory;
+	CatalogViewBase *base;		/* shared rows each catalog's rows begin with */
 	dlist_node	link;
+};
+
+/* Rows several views share, which none of them copies. */
+struct CatalogViewBase
+{
+	MemoryContext memory;
+	uint64		references;
+	List	   *catalogs;		/* CatalogViewRows */
 };
 
 /*
@@ -172,6 +181,7 @@ CatalogViewCreate(const char *identity)
 		prune_registered = true;
 	}
 	view->identity = pstrdup(identity);
+	MemoryContextSetIdentifier(memory, view->identity);
 	if (!next_view_serial)
 		elog(ERROR, "catalog context identifier space exhausted");
 	view->serial = next_view_serial++;
@@ -211,6 +221,14 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	MemoryContextSwitchTo(view->rows_memory);
 	rows = palloc0(sizeof(*rows));
 	rows->catalog = catalog;
+	if (view->base)
+	{
+		foreach_ptr(CatalogViewRows, shared, view->base->catalogs)
+		{
+			if (shared->catalog == catalog)
+				rows->tuples = list_copy(shared->tuples);
+		}
+	}
 	foreach(lc, tuples)
 	{
 		HeapTuple	tuple = heap_copytuple(lfirst(lc));
@@ -225,6 +243,56 @@ CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples)
 	}
 	view->catalogs = lappend(view->catalogs, rows);
 	MemoryContextSwitchTo(previous);
+}
+
+CatalogViewBase *
+CatalogViewBaseCreate(void)
+{
+	MemoryContext memory = AllocSetContextCreate(TopMemoryContext, "catalog view base", ALLOCSET_DEFAULT_SIZES);
+	CatalogViewBase *base = MemoryContextAllocZero(memory, sizeof(*base));
+
+	base->memory = memory;
+	base->references = 1;
+	return base;
+}
+
+/* Copy |tuples| into |base| as its rows of |catalog|. */
+void
+CatalogViewBaseAddRows(CatalogViewBase *base, Oid catalog, List *tuples)
+{
+	MemoryContext previous = MemoryContextSwitchTo(base->memory);
+	CatalogViewRows *rows = palloc0(sizeof(*rows));
+	uint32		ordinal = 0;
+
+	rows->catalog = catalog;
+	foreach_ptr(HeapTupleData, source, tuples)
+	{
+		HeapTuple	tuple = heap_copytuple(source);
+
+		ItemPointerSet(&tuple->t_self, CatalogViewBaseBlock + ordinal / MaxOffsetNumber, ordinal % MaxOffsetNumber + 1);
+		ordinal++;
+		rows->tuples = lappend(rows->tuples, tuple);
+	}
+	base->catalogs = lappend(base->catalogs, rows);
+	MemoryContextSwitchTo(previous);
+}
+
+void
+CatalogViewBaseRelease(CatalogViewBase *base)
+{
+	Assert(base->references > 0);
+	if (--base->references == 0)
+		MemoryContextDelete(base->memory);
+}
+
+/* Begin each catalog |view| is given with |base|'s rows of it. */
+void
+CatalogViewSetBase(CatalogView *view, CatalogViewBase *base)
+{
+	if (view->base)
+		CatalogViewBaseRelease(view->base);
+	view->base = base;
+	base->references++;
 }
 
 void
@@ -278,6 +346,8 @@ CatalogViewRelease(CatalogView *view)
 		hash_search(objects, &handle, HASH_REMOVE, NULL);
 	}
 	dlist_delete(&view->link);
+	if (view->base)
+		CatalogViewBaseRelease(view->base);
 	MemoryContextDelete(view->memory);
 }
 

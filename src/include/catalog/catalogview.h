@@ -24,11 +24,20 @@
 
 /* View rows have TIDs from a block range no physical catalog reaches. */
 #define CatalogViewFirstBlock ((BlockNumber) 0xF0000000U)
+/* Rows views share have TIDs from a range of their own. */
+#define CatalogViewBaseBlock ((BlockNumber) 0xF8000000U)
 struct catcache;
 typedef struct CatalogView CatalogView;
+typedef struct CatalogViewBase CatalogViewBase;
 typedef struct CatalogViewScan CatalogViewScan;
 
 extern CatalogView *CatalogViewCreate(const char *identity);
+
+/* Immutable rows shared by views, such as the bootstrap catalogs'. */
+extern CatalogViewBase *CatalogViewBaseCreate(void);
+extern void CatalogViewBaseAddRows(CatalogViewBase *base, Oid catalog, List *tuples);
+extern void CatalogViewBaseRelease(CatalogViewBase *base);
+extern void CatalogViewSetBase(CatalogView *view, CatalogViewBase *base);
 extern void CatalogViewAddRows(CatalogView *view, Oid catalog, List *tuples);
 extern void CatalogViewSeal(CatalogView *view);
 extern void CatalogViewSetPartial(CatalogView *view, bool partial);
