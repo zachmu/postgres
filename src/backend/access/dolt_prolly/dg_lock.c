@@ -59,6 +59,7 @@ typedef struct Records
 	Relation	heap;
 	Relation	key;			/* by first handle */
 	Relation	handle;			/* by current handle */
+	Relation	oid;			/* by identity */
 } Records;
 
 static Records
@@ -69,12 +70,14 @@ records_open(void)
 	r.heap = table_open(DoltLockRelationId, RowExclusiveLock);
 	r.key = index_open(DoltLockKeyIndexId, RowExclusiveLock);
 	r.handle = index_open(DoltLockHandleIndexId, RowExclusiveLock);
+	r.oid = index_open(DoltLockOidIndexId, RowExclusiveLock);
 	return r;
 }
 
 static void
 records_close(Records *r)
 {
+	index_close(r->oid, RowExclusiveLock);
 	index_close(r->handle, RowExclusiveLock);
 	index_close(r->key, RowExclusiveLock);
 	table_close(r->heap, RowExclusiveLock);
@@ -168,17 +171,21 @@ find_record(Records *r, RelFileLocator *locator, const char *branch, int64 id, I
 	return found;
 }
 
-/* Add index entries for a new record tuple. The catalog's index descriptions are fixed. */
+/*
+ * Add index entries for a new record tuple version: the current handle and
+ * identity always, the first handle only for a new record. The catalog's
+ * index descriptions are fixed.
+ */
 static void
 index_record(Records *r, HeapTuple tuple, bool key_too)
 {
-	static IndexInfo *infos[2];
-	Relation	indexes[2] = {r->handle, r->key};
+	static IndexInfo *infos[3];
+	Relation	indexes[3] = {r->handle, r->oid, r->key};
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(r->heap), &TTSOpsHeapTuple);
 	EState	   *estate = CreateExecutorState();
 
 	ExecStoreHeapTuple(tuple, slot, false);
-	for (int i = 0; i < (key_too ? 2 : 1); i++)
+	for (int i = 0; i < (key_too ? 3 : 2); i++)
 	{
 		Datum		values[INDEX_MAX_KEYS];
 		bool		nulls[INDEX_MAX_KEYS];
@@ -219,6 +226,7 @@ record_for(Records *r, RelFileLocator *locator, const char *branch, int64 id, It
 	if (!find_record(r, locator, branch, id, tid) || (renew && record_dead(r, tid)))
 	{
 		dg_handle_records_note(locator);
+		values[Anum_pg_dolt_lock_oid - 1] = ObjectIdGetDatum(GetNewOidWithIndex(r->heap, DoltLockOidIndexId, Anum_pg_dolt_lock_oid));
 		values[Anum_pg_dolt_lock_lockspace - 1] = ObjectIdGetDatum(locator->spcOid);
 		values[Anum_pg_dolt_lock_lockfile - 1] = ObjectIdGetDatum(locator->relNumber);
 		values[Anum_pg_dolt_lock_lockroot - 1] = Int64GetDatum(id);

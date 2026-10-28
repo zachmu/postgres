@@ -23,6 +23,7 @@
 
 CATALOG(pg_dolt_journal,9135,DoltJournalRelationId)
 {
+	Oid			oid;			/* identity: a sequence may repeat */
 	Oid			jrnspace BKI_FORCE_NOT_NULL;	/* tablespace of the storage */
 	Oid			jrnfile BKI_FORCE_NOT_NULL;	/* file number of the storage */
 	int64		jrnseq BKI_FORCE_NOT_NULL;	/* order within the stream */
@@ -39,6 +40,7 @@ typedef FormData_pg_dolt_journal *Form_pg_dolt_journal;
 
 DECLARE_TOAST(pg_dolt_journal, 9137, 9138);
 
+DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_journal_oid_index, 9145, DoltJournalOidIndexId, pg_dolt_journal, btree(oid oid_ops));
 DECLARE_INDEX(pg_dolt_journal_key_index, 9136, DoltJournalKeyIndexId, pg_dolt_journal, btree(jrnspace oid_ops, jrnfile oid_ops, jrnbranch text_ops, jrnseq int8_ops));
 
 #endif							/* PG_DOLT_JOURNAL_H */

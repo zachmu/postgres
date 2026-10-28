@@ -32,6 +32,7 @@
 
 CATALOG(pg_dolt_lock,9129,DoltLockRelationId)
 {
+	Oid			oid;			/* identity: a handle's record may be renewed */
 	Oid			lockspace BKI_FORCE_NOT_NULL;	/* tablespace of the storage */
 	Oid			lockfile BKI_FORCE_NOT_NULL;	/* file number of the storage */
 	int64		lockroot BKI_FORCE_NOT_NULL;	/* first handle; never changes */
@@ -43,6 +44,7 @@ CATALOG(pg_dolt_lock,9129,DoltLockRelationId)
 
 typedef FormData_pg_dolt_lock *Form_pg_dolt_lock;
 
+DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_lock_oid_index, 9144, DoltLockOidIndexId, pg_dolt_lock, btree(oid oid_ops));
 DECLARE_INDEX(pg_dolt_lock_key_index, 9130, DoltLockKeyIndexId, pg_dolt_lock, btree(lockspace oid_ops, lockfile oid_ops, lockroot int8_ops, lockbranch text_ops));
 DECLARE_INDEX(pg_dolt_lock_handle_index, 9131, DoltLockHandleIndexId, pg_dolt_lock, btree(lockspace oid_ops, lockfile oid_ops, lockhandle int8_ops, lockbranch text_ops));
 

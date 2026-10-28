@@ -36,6 +36,8 @@ CATALOG(pg_dolt_handle,9139,DoltHandleRelationId)
 
 typedef FormData_pg_dolt_handle *Form_pg_dolt_handle;
 
+DECLARE_TOAST(pg_dolt_handle, 9142, 9143);
+
 DECLARE_UNIQUE_INDEX_PKEY(pg_dolt_handle_key_index, 9140, DoltHandleKeyIndexId, pg_dolt_handle, btree(hdlspace oid_ops, hdlfile oid_ops, hdlbranch text_ops, hdlhandle int8_ops));
 DECLARE_INDEX(pg_dolt_handle_digest_index, 9141, DoltHandleDigestIndexId, pg_dolt_handle, btree(hdlspace oid_ops, hdlfile oid_ops, hdlbranch text_ops, hdldigest bytea_ops));
 

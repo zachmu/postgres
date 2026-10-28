@@ -223,7 +223,7 @@ journal_read(const RootKey *key, Snapshot snapshot)
  * A removal records the digest only.
  */
 static void
-journal_append_entry(Relation catalog, Relation index, IndexInfo *info, CommandId cid, const RootKey *key,
+journal_append_entry(Relation catalog, Relation index, IndexInfo *info, Relation oid_index, IndexInfo *oid_info, CommandId cid, const RootKey *key,
 					 uint64 handle, bool added, PLHash digest, PLSlice row)
 {
 	Datum		index_values[4];
@@ -235,6 +235,7 @@ journal_append_entry(Relation catalog, Relation index, IndexInfo *info, CommandI
 
 	SET_VARSIZE(digest_bytes, VARHDRSZ + PL_HASH_SIZE);
 	memcpy(VARDATA(digest_bytes), digest.bytes, PL_HASH_SIZE);
+	values[Anum_pg_dolt_journal_oid - 1] = ObjectIdGetDatum(GetNewOidWithIndex(catalog, DoltJournalOidIndexId, Anum_pg_dolt_journal_oid));
 	values[Anum_pg_dolt_journal_jrnspace - 1] = ObjectIdGetDatum(key->space);
 	values[Anum_pg_dolt_journal_jrnfile - 1] = ObjectIdGetDatum(key->file);
 	values[Anum_pg_dolt_journal_jrnseq - 1] = Int64GetDatum((int64) (handle * 2 + (added ? 0 : 1)));
@@ -259,6 +260,8 @@ journal_append_entry(Relation catalog, Relation index, IndexInfo *info, CommandI
 	index_values[2] = values[Anum_pg_dolt_journal_jrnbranch - 1];
 	index_values[3] = values[Anum_pg_dolt_journal_jrnseq - 1];
 	index_insert(index, index_values, index_nulls, &tuple->t_self, catalog, UNIQUE_CHECK_NO, false, info);
+	index_values[0] = values[Anum_pg_dolt_journal_oid - 1];
+	index_insert(oid_index, index_values, index_nulls, &tuple->t_self, catalog, UNIQUE_CHECK_YES, false, oid_info);
 	heap_freetuple(tuple);
 }
 
@@ -273,8 +276,10 @@ journal_batch(DGBatch *b, bool forced)
 	HASH_SEQ_STATUS status;
 	PendingHandle *mapping;
 	Relation	catalog,
-				index;
-	IndexInfo  *info;
+				index,
+				oid_index;
+	IndexInfo  *info,
+			   *oid_info;
 	long		n = hash_get_num_entries(b->handles);
 	bool		pushed = false;
 
@@ -303,6 +308,8 @@ journal_batch(DGBatch *b, bool forced)
 	}
 	catalog = table_open(DoltJournalRelationId, RowExclusiveLock);
 	index = index_open(DoltJournalKeyIndexId, RowExclusiveLock);
+	oid_index = index_open(DoltJournalOidIndexId, RowExclusiveLock);
+	oid_info = BuildIndexInfo(oid_index);
 	info = BuildIndexInfo(index);
 	hash_seq_init(&status, b->handles);
 	while ((mapping = hash_seq_search(&status)) != NULL)
@@ -317,8 +324,9 @@ journal_batch(DGBatch *b, bool forced)
 				elog(ERROR, "prolly batch handle without its row");
 			row = pending->row;
 		}
-		journal_append_entry(catalog, index, info, b->cid, &b->key, mapping->handle, mapping->present, mapping->digest, row);
+		journal_append_entry(catalog, index, info, oid_index, oid_info, b->cid, &b->key, mapping->handle, mapping->present, mapping->digest, row);
 	}
+	index_close(oid_index, RowExclusiveLock);
 	index_close(index, RowExclusiveLock);
 	table_close(catalog, RowExclusiveLock);
 	if (pushed)
