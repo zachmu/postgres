@@ -52,10 +52,23 @@ typedef struct JournalEntries
 				capacity;
 } JournalEntries;
 
+/*
+ * A fold's cache key: the state's key and the kind of load. Loads under an
+ * MVCC snapshot and of the latest state see different sets of a
+ * transaction's own entries, and a writer alternates between them every
+ * statement, so each kind keeps its own fold.
+ */
+typedef struct JournalFoldKey
+{
+	RootKey		key;
+	int			latest;			/* 1: the latest state; 0: an MVCC snapshot */
+	int			pad;
+} JournalFoldKey;
+
 /* The folded trees of one state key, kept across statements while valid. */
 typedef struct JournalFold
 {
-	RootKey		key;			/* hash key: the state's own key */
+	JournalFoldKey key;			/* hash key */
 	RootKey		table_key;		/* whose journal applies */
 	uint64		store_epoch;
 	uint64		roots_generation;
@@ -67,13 +80,109 @@ typedef struct JournalFold
 	int64	   *seqs;			/* entries applied, ascending */
 	int			seq_count,
 				seq_capacity;
-	PLHash	   *pinned;			/* nodes kept for the result */
+	PLHash	   *pinned;			/* nodes kept for the result, one pin each */
 	int			pinned_count,
 				pinned_capacity;
+	HTAB	   *pinned_set;		/* the same, to pin each node once */
 } JournalFold;
 
 static HTAB *journal_folds;
-static uint64 journal_local_version = 1;	/* moves with this backend's own journal writes */
+/*
+ * What this backend wrote to the journal, as fold validity sees it: an epoch
+ * that moves when a transaction ends, which may discard or reveal writes to
+ * any storage, and a version per storage that moves with each write to that
+ * storage's stream. A write to one table leaves the folds of the others valid.
+ */
+static uint64 journal_local_epoch = 1;
+
+typedef struct JournalVersion
+{
+	Oid			space;			/* hash key */
+	RelFileNumber file;
+	uint64		version;
+	CommandId	last_cid;		/* the command of this transaction's last write to the stream */
+} JournalVersion;
+
+static HTAB *journal_versions;
+
+static JournalVersion *
+journal_version_entry(Oid space, RelFileNumber file, bool enter)
+{
+	struct
+	{
+		Oid			space;
+		RelFileNumber file;
+	}			key = {space, file};
+
+	if (!journal_versions)
+	{
+		HASHCTL		ctl = {0};
+
+		if (!enter)
+			return NULL;
+		ctl.keysize = sizeof(key);
+		ctl.entrysize = sizeof(JournalVersion);
+		ctl.hcxt = TopMemoryContext;
+		journal_versions = hash_create("prolly journal versions", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return hash_search(journal_versions, &key, enter ? HASH_ENTER : HASH_FIND, NULL);
+}
+
+/* The version a fold of |table_key|'s stream must have been built at to stand. */
+static uint64
+journal_local_version_of(const RootKey *table_key)
+{
+	JournalVersion *entry = journal_version_entry(table_key->space, table_key->file, false);
+
+	return (journal_local_epoch << 32) + (entry ? entry->version : 0);
+}
+
+/* This backend changed |space|/|file|'s stream in command |cid|. */
+static void
+journal_local_write(Oid space, RelFileNumber file, CommandId cid)
+{
+	JournalVersion *entry = journal_version_entry(space, file, true);
+
+	if (entry->space != space || entry->file != file || entry->version == 0)
+	{
+		entry->space = space;
+		entry->file = file;
+		entry->version = 0;
+	}
+	entry->version++;
+	entry->last_cid = cid;
+}
+
+/*
+ * Whether a fold built under |built| sees the same stream as a load under
+ * |now|: the same snapshot but for a later command, when this transaction
+ * wrote nothing to the stream since the fold was built (its version stands)
+ * and all it wrote before was visible to the fold. A later command sees
+ * more of the transaction's own writes and nothing else.
+ */
+static bool
+journal_same_stream(const Visibility *built, const Visibility *now, const RootKey *table_key)
+{
+	Visibility	a = *built,
+				b = *now;
+	JournalVersion *entry;
+
+	if (built->overflow || now->overflow || built->cid == InvalidCommandId || now->cid == InvalidCommandId ||
+		now->cid < built->cid)
+		return false;
+	a.cid = b.cid = 0;
+	if (memcmp(&a, &b, sizeof(a)) != 0)
+		return false;
+	entry = journal_version_entry(table_key->space, table_key->file, false);
+	return !entry || entry->version == 0 || entry->last_cid < built->cid;
+}
+
+/* A subtransaction rolled back: its writes leave every stream it touched. */
+static void
+journal_local_invalidate(void)
+{
+	journal_local_epoch++;
+}
 
 /* Storages this transaction journaled, whose readers must notice at commit. */
 typedef struct JournalTouched
@@ -93,7 +202,7 @@ static RootKey journal_index_table(Relation index, const char *branch, Relation 
 static void journal_state_seqs(DGState *s, const JournalFold *fold);
 
 static void
-journal_touch(Oid db, Oid space, RelFileNumber file)
+journal_touch(Oid db, Oid space, RelFileNumber file, CommandId cid)
 {
 	MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
 
@@ -101,7 +210,7 @@ journal_touch(Oid db, Oid space, RelFileNumber file)
 		if (journal_touched[i].db == db && journal_touched[i].space == space && journal_touched[i].file == file)
 		{
 			MemoryContextSwitchTo(old);
-			journal_local_version++;
+			journal_local_write(space, file, cid);
 			return;
 		}
 	if (journal_touched_count == journal_touched_capacity)
@@ -114,7 +223,7 @@ journal_touch(Oid db, Oid space, RelFileNumber file)
 	journal_touched[journal_touched_count].space = space;
 	journal_touched[journal_touched_count].file = file;
 	journal_touched_count++;
-	journal_local_version++;
+	journal_local_write(space, file, cid);
 	MemoryContextSwitchTo(old);
 }
 
@@ -139,7 +248,7 @@ journal_xact_end(bool committed)
 	}
 	journal_touched = NULL;
 	journal_touched_count = journal_touched_capacity = 0;
-	journal_local_version++;
+	journal_local_epoch++;
 }
 
 static void
@@ -332,7 +441,7 @@ journal_batch(DGBatch *b, bool forced)
 	if (pushed)
 		PopActiveSnapshot();
 	handle_delta_write(&b->key, b->handles, b->cid);
-	journal_touch(MyDatabaseId, b->key.space, b->key.file);
+	journal_touch(MyDatabaseId, b->key.space, b->key.file, b->cid);
 	return true;
 }
 
@@ -379,7 +488,7 @@ journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid)
 	table_close(catalog, RowExclusiveLock);
 	if (pushed)
 		PopActiveSnapshot();
-	journal_touch(MyDatabaseId, key->space, key->file);
+	journal_touch(MyDatabaseId, key->space, key->file, cid);
 }
 
 /* ---------------------------------------------------------------------------
@@ -540,18 +649,23 @@ journal_apply_index(Relation index, PLStore *store, PLTree *tree, const JournalE
  */
 
 static JournalFold *
-journal_fold_find(const RootKey *key, bool enter)
+journal_fold_find(const RootKey *key, bool latest, bool enter)
 {
+	JournalFoldKey fold_key;
+
+	memset(&fold_key, 0, sizeof(fold_key));
+	fold_key.key = *key;
+	fold_key.latest = latest ? 1 : 0;
 	if (!journal_folds)
 	{
 		HASHCTL		ctl = {0};
 
-		ctl.keysize = sizeof(RootKey);
+		ctl.keysize = sizeof(JournalFoldKey);
 		ctl.entrysize = sizeof(JournalFold);
 		ctl.hcxt = CacheMemoryContext;
 		journal_folds = hash_create("prolly journal folds", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	return hash_search(journal_folds, key, enter ? HASH_ENTER : HASH_FIND, NULL);
+	return hash_search(journal_folds, &fold_key, enter ? HASH_ENTER : HASH_FIND, NULL);
 }
 
 /* Release the nodes a fold kept; they drop with the next transaction if unwritten. */
@@ -567,14 +681,35 @@ journal_fold_unpin(JournalFold *fold)
 				pl_node_unpin(working_store, node);
 		}
 	fold->pinned_count = 0;
+	if (fold->pinned_set)
+		hash_destroy(fold->pinned_set);
+	fold->pinned_set = NULL;
 }
 
 static void
 journal_fold_pin_tree(JournalFold *fold, PLStore *store, PLHash root)
 {
 	PLNode	   *node = pl_find_local(store, root);
+	bool		found;
 
-	if (!node || node->backed || node->pinned)
+	/*
+	 * Another fold may pin the same unwritten nodes, as folds of one table
+	 * under different snapshots share subtrees: each fold pins a node once
+	 * and releases its own pin, so neither drops the other's nodes.
+	 */
+	if (!node || node->backed)
+		return;
+	if (!fold->pinned_set)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(PLHash);
+		ctl.entrysize = sizeof(PLHash);
+		ctl.hcxt = CacheMemoryContext;
+		fold->pinned_set = hash_create("prolly fold pins", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	hash_search(fold->pinned_set, &root, HASH_ENTER, &found);
+	if (found)
 		return;
 	check_stack_depth();
 	for (uint32 i = 0; node->level && i < node->count; i++)
@@ -645,7 +780,8 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	bool		is_table = rel->rd_rel->relkind != RELKIND_INDEX;
 	uint64		roots_gen = roots_generation();
 	Visibility	seen;
-	JournalFold *fold = journal_fold_find(&key, false);
+	bool		latest = !(snapshot && IsMVCCSnapshot(snapshot));
+	JournalFold *fold = journal_fold_find(&key, latest, false);
 	PLHash		current = s->content.root;
 	JournalEntries entries;
 	MemoryContext old;
@@ -656,7 +792,8 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 
 	/* Nothing moved since the last fold: its result stands. */
 	if (fold && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
-		visibility_equal(&fold->seen, &seen) && fold->local_version == journal_local_version &&
+		(visibility_equal(&fold->seen, &seen) || journal_same_stream(&fold->seen, &seen, &table_key)) &&
+		fold->local_version == journal_local_version_of(&table_key) &&
 		fold->table == is_table && pl_hash_equal(fold->base, current))
 	{
 		if (fold->seq_count)
@@ -667,8 +804,8 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	entries = journal_read(&table_key, snapshot ? snapshot : SnapshotSelf);
 	if (!fold)
 	{
-		fold = journal_fold_find(&key, true);
-		memset(((char *) fold) + sizeof(RootKey), 0, sizeof(*fold) - sizeof(RootKey));
+		fold = journal_fold_find(&key, latest, true);
+		memset(((char *) fold) + sizeof(JournalFoldKey), 0, sizeof(*fold) - sizeof(JournalFoldKey));
 	}
 
 	/*
@@ -684,7 +821,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		fold->seq_count = 0;
 		fold->store_epoch = store_epoch;
 		fold->roots_generation = roots_gen;
-		fold->local_version = journal_local_version;
+		fold->local_version = journal_local_version_of(&table_key);
 		fold->seen = seen;
 		fold->table = is_table;
 		fold->table_key = table_key;
@@ -766,7 +903,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	fold->folded = current;
 	fold->store_epoch = store_epoch;
 	fold->roots_generation = roots_gen;
-	fold->local_version = journal_local_version;
+	fold->local_version = journal_local_version_of(&table_key);
 	fold->seen = seen;
 	fold->table = is_table;
 	fold->table_key = table_key;
