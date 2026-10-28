@@ -73,8 +73,14 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 			Oid			target = provider_view_dependency(view, kinds[i], targets[i]);
 			int			column = 0;
 
+			/*
+			 * A native object it used can be dropped without it, as native
+			 * DDL cannot see versioned dependents. The view then fails when
+			 * used, as its query names the missing object, while the rest of
+			 * the schema still loads.
+			 */
 			if (!OidIsValid(target))
-				elog(ERROR, "versioned view %s depends on missing %s %s", name, kinds[i], targets[i]);
+				continue;
 			if (columns[i])
 			{
 				/* A versioned table's columns are numbered as its definition lists them. */
