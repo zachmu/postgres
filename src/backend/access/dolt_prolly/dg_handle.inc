@@ -852,8 +852,34 @@ bool
 dg_handle_version(Relation rel, uint64 handle, PLHash *digest, PLSlice *row)
 {
 	RootKey		key = root_key(rel, dg_relation_branch(rel));
-	DGState    *s = dg_load_tid(rel, handle);
-	bool		found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
+	DGBatch    *b = batch_find(&key);
+	DGState    *s;
+	bool		found;
+
+	/*
+	 * A version the pending batch added or removed is answered from the
+	 * batch: loading the table for it would flush the batch, and an AFTER
+	 * trigger fetching each row a statement wrote would then journal and
+	 * refold the table once per row.
+	 */
+	if (b && b->table)
+	{
+		PendingHandle *mapping = hash_search(b->handles, &handle, HASH_FIND, NULL);
+		PendingRow *pending = mapping ? hash_search(b->rows, &mapping->digest, HASH_FIND, NULL) : NULL;
+
+		if (pending)
+		{
+			uint8	   *copy = palloc(Max(pending->row.len, 1));
+
+			memcpy(copy, pending->row.data, pending->row.len);
+			*digest = mapping->digest;
+			row->data = copy;
+			row->len = pending->row.len;
+			return true;
+		}
+	}
+	s = dg_load_tid(rel, handle);
+	found = dg_handle_digest(s, handle, digest) && row_of_digest(&s->content, *digest, row);
 
 	dg_release(s);
 	if (found)
