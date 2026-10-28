@@ -541,4 +541,23 @@
 { opcmethod => 'dolt_prolly_index', opcname => 'dolt_array_ops',
   opcfamily => 'dolt_prolly_index/dolt_array_ops', opcintype => 'anyarray' },
 
+
+# Additional native ordering families.
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_oid_ops',
+  opcfamily => 'dolt_prolly_index/dolt_oid_ops', opcintype => 'oid' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_bit_ops',
+  opcfamily => 'dolt_prolly_index/dolt_bit_ops', opcintype => 'bit' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_varbit_ops',
+  opcfamily => 'dolt_prolly_index/dolt_varbit_ops', opcintype => 'varbit' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_network_ops',
+  opcfamily => 'dolt_prolly_index/dolt_network_ops', opcintype => 'inet' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_jsonb_ops',
+  opcfamily => 'dolt_prolly_index/dolt_jsonb_ops', opcintype => 'jsonb' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_record_ops',
+  opcfamily => 'dolt_prolly_index/dolt_record_ops', opcintype => 'record' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_range_ops',
+  opcfamily => 'dolt_prolly_index/dolt_range_ops', opcintype => 'anyrange' },
+{ opcmethod => 'dolt_prolly_index', opcname => 'dolt_multirange_ops',
+  opcfamily => 'dolt_prolly_index/dolt_multirange_ops', opcintype => 'anymultirange' },
+
 ]

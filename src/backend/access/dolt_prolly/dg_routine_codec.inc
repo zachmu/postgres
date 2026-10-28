@@ -12,7 +12,8 @@ routine_type_name(Oid id)
 	if (!OidIsValid(id))
 		return pstrdup("");
 	element = get_element_type(id);
-	if (OidIsValid(element))
+	/* Vectors are distinct named types, not aliases for ordinary arrays. */
+	if (OidIsValid(element) && get_array_type(element) == id)
 		return psprintf("%s[]", routine_type_name(element));
 	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(id));
 	if (!HeapTupleIsValid(tuple))

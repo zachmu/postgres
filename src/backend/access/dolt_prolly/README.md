@@ -59,7 +59,7 @@ to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL I
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
 XIDs, tuple padding and lock bits are not in canonical row encodings.
-Identifier-bearing SQL types are rejected pending portable translation.
+Explicit identifier-bearing SQL values are supported; incidental runtime identifiers are excluded from canonical encodings.
 Row fetches resolve the handle to a digest, then look up the actual tuple in the
 canonical content tree. Both trees physically live in the relation's chunk container.
 
@@ -166,14 +166,14 @@ pointers. Domains use their base-type codec: assignment still enforces domain
 constraints, but reads do not revalidate already stored values. Enums use their
 standard binary label serialization, which omits enum value OIDs. Only reviewed
 built-in binary codecs may use the generic binary path. Opaque custom base-type
-serializers and user-defined ranges/multiranges are rejected for now: a binary
-I/O pair does not prove that its payload excludes local identifiers. In particular,
-a custom range can delegate to PostgreSQL's array/composite binary senders, which
-embed type OIDs even when the element/field values themselves are portable.
+serializers remain rejected: a binary I/O pair alone does not establish a safe
+encoding. User-defined ranges/multiranges with audited scalar subtypes are
+supported. Range subtypes that delegate to PostgreSQL's array/composite binary
+senders remain rejected because those senders embed incidental type OIDs.
 
 Explicit exceptions to generic binary I/O:
 
-* Empty `int2vector` values retain the one-dimensional, zero-based catalog
+* Empty `int2vector` and `oidvector` values retain the one-dimensional, zero-based catalog
   vector layout instead of the ordinary empty-array layout.
 * PostgreSQL 18's binary `tsquery` receiver rejects a zero-item query. The adapter
   recognizes its exact four-byte zero-count payload and reconstructs an empty
@@ -184,13 +184,26 @@ format definitions, not SQL equality. Numeric scales and signed floating-point
 zeros can retain distinct bytes. Comparisons, ordering and uniqueness still
 belong to PostgreSQL's operators and the index adapter.
 
+Explicit user `oid` values are stored numerically and ordered as unsigned 32-bit
+integers. The same applies inside domains, arrays, records and supported ranges.
+Their numeric contents are not translated: changing a user-provided OID changes
+the stored value. Incidental type OIDs in container headers are still stripped;
+canonical metadata still uses symbolic identities.
+
 These formats are experimental and tied to this PostgreSQL/type-codec version.
-Until identifier translation is implemented, the following SQL types are rejected:
-`oid`, `oidvector`, every `reg*` alias, `aclitem`, `pg_node_tree`, `xid`, `xid8`,
-`cid`, `tid`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`, and `refcursor`. This also
-rejects catalog composites whose fields include those types. Their numbers or
-names identify local catalog objects, transactions, physical locations or
-session objects; they are not portable value encodings.
+Explicit user values also support every `reg*` alias, `aclitem`,
+`pg_node_tree`, `xid`, `xid8`, `cid`, `tid`, `pg_lsn`,
+`txid_snapshot`, `pg_snapshot`, and `refcursor`, including nested
+containers and catalog composites. These values retain their supplied identifiers;
+they do not imply portable resolution of those identifiers on another server.
+This permission does not extend to incidental identifiers in tuple/container
+headers or canonical schema metadata. It also does not imply ordered index
+support for every such type.
+
+`aclitem` has no native binary I/O pair: its `DGA1` encoding stores a
+four-byte marker, two unsigned 32-bit role identifiers, and an unsigned 64-bit
+privilege mask, all integers in network byte order. `pg_node_tree` stores its
+explicit text payload directly because its native receiver rejects input.
 
 Validation recursively checks domains, array elements and composite fields at
 table creation and before encoding/decoding or rebuilding an index. It validates
@@ -221,11 +234,16 @@ ordering and INCLUDE; immediate unique/primary-key constraints;
 insert/update/delete and RETURNING; joins; transaction/savepoint rollback;
 transactional TRUNCATE; retained reader snapshots and crash recovery.
 
-Ordered index keys still support only boolean, int2/int4/int8, text with C-like
-collation, and bytea. New types may appear in other table columns and INCLUDE
-payloads. Their binary serialization is not an order-preserving key encoding;
-new ordered opclasses require separate implementation. Non-C index collations
-and custom comparators remain rejected.
+Ordered index keys support integers, explicit OIDs, booleans, text/bytea,
+floating-point/numeric, date/time/interval, UUID, money, MAC addresses, enums,
+bit/varbit, inet/cidr, JSONB, records, ranges and multiranges. Arrays and domains
+of supported types are supported recursively. Keys preserve PostgreSQL ordering
+and normalize SQL-equal values for uniqueness independently of row serialization.
+Non-C index collations and custom comparators remain rejected, including nested
+record field/range collations. JSONB uses the database default collation and is
+currently indexable only when that collation is C-like. Ranges require the
+subtype's default comparison procedure. `json` has no native B-tree comparison
+family and remains unindexable by this ordered AM.
 
 Internal-only types `gtsvector`, `pg_ndistinct`, `pg_dependencies`, `pg_mcv_list`,
 `pg_brin_bloom_summary` and `pg_brin_minmax_multi_summary` are explicitly rejected.
@@ -270,11 +288,11 @@ encoding isolation, XML parsing settings, binary float/numeric fidelity, and
 unchanged domain constraint enforcement. XML cases run when PostgreSQL was built
 with libxml.
 
-`004_portability.pl` tests rejected identifier types through domains and nested
-composite arrays, NULL/empty/CTAS bypass attempts, opaque custom OID senders,
-user ranges, and nested type changes affecting scans and index rebuilds. It also
-checks identical serialized roots for enum/array/composite values instantiated
-with independently allocated runtime type OIDs.
+`004_portability.pl` retains rejection tests for opaque custom senders and
+range senders containing incidental array type identities.
+`039_explicit_identifiers.pl` verifies explicit identifiers through domains and
+nested composites, history and restart, preserves vector-domain identity, and
+checks that incidental composite type OIDs do not affect serialized roots.
 
 `005_native.pl` verifies built-in availability without extension installation,
 unchanged heap/btree defaults and availability of upstream AMs, diagnostic

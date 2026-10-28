@@ -4,6 +4,8 @@
  * Arrays/composites recurse so nested TOAST pointers and padding never persist.
  */
 #include "dg.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include "access/htup_details.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type_d.h"
@@ -12,6 +14,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/cash.h"
@@ -23,6 +26,12 @@
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
 #include "utils/inet.h"
+#include "utils/varbit.h"
+#include "utils/jsonb.h"
+#include "utils/rangetypes.h"
+#include "utils/multirangetypes.h"
+#include "utils/pg_locale.h"
+#include "catalog/pg_collation_d.h"
 #include "executor/executor.h"
 #include "utils/expandeddatum.h"
 #include "nodes/makefuncs.h"
@@ -110,9 +119,31 @@ check_type_recursive(Oid type, List *ancestors)
 		switch (type)
 		{
 				/*
-				 * Scalar senders below serialize values, never local object
-				 * IDs.
+				 * Scalar codecs serialize explicit SQL values, including identifiers
+				 * requested by the user, but never incidental runtime headers.
 				 */
+			case REGPROCOID:
+			case REGPROCEDUREOID:
+			case REGOPEROID:
+			case REGOPERATOROID:
+			case REGCLASSOID:
+			case REGCOLLATIONOID:
+			case REGTYPEOID:
+			case REGROLEOID:
+			case REGNAMESPACEOID:
+			case REGCONFIGOID:
+			case REGDICTIONARYOID:
+			case XIDOID:
+			case XID8OID:
+			case CIDOID:
+			case TIDOID:
+			case LSNOID:
+			case TXID_SNAPSHOTOID:
+			case PG_SNAPSHOTOID:
+			case REFCURSOROID:
+			case ACLITEMOID:
+			case PG_NODE_TREEOID:
+			case OIDOID: /* User data, not an incidental encoding header. */
 			case BOOLOID:
 			case BYTEAOID:
 			case CHAROID:
@@ -334,6 +365,8 @@ decode_array(Oid type, Oid element, PLSlice bytes)
 	/* Catalog vectors keep one zero-length dimension, unlike empty arrays. */
 	if (count == 0 && type == INT2VECTOROID)
 		return PointerGetDatum(buildint2vector(NULL, 0));
+	if (count == 0 && type == OIDVECTOROID)
+		return PointerGetDatum(buildoidvector(NULL, 0));
 	values = palloc0(sizeof(*values) * Max(count, 1));
 	nulls = palloc(sizeof(*nulls) * Max(count, 1));
 	for (i = 0; i < count; i++)
@@ -422,7 +455,7 @@ encode_value(Oid type, Datum value)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID)
+	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
 	{
 		struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
 
@@ -443,6 +476,17 @@ encode_value(Oid type, Datum value)
 		};
 	}
 
+	if (type == ACLITEMOID)
+	{
+		AclItem *acl = DatumGetAclItemP(value);
+
+		data = palloc(20);
+		memcpy(data, "DGA1", 4);
+		pl_write32(data + 4, acl->ai_grantee);
+		pl_write32(data + 8, acl->ai_grantor);
+		pl_write64(data + 12, acl->ai_privs);
+		return (PLSlice) {data, 20};
+	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return encode_array(element, value);
@@ -466,7 +510,7 @@ decode_value(Oid type, PLSlice bytes)
 
 	check_stack_depth();
 	type = getBaseType(type);
-	if (type == TEXTOID || type == BYTEAOID)
+	if (type == TEXTOID || type == BYTEAOID || type == PG_NODE_TREEOID)
 	{
 		struct varlena *v = palloc(VARHDRSZ + bytes.len);
 
@@ -484,6 +528,17 @@ decode_value(Oid type, PLSlice bytes)
 		return type == BOOLOID ? BoolGetDatum(n != 0) : type == INT2OID ? Int16GetDatum(n) : type == INT4OID ? Int32GetDatum(n) : Int64GetDatum(n);
 	}
 
+	if (type == ACLITEMOID)
+	{
+		AclItem *acl = palloc(sizeof(AclItem));
+
+		if (bytes.len != 20 || memcmp(bytes.data, "DGA1", 4))
+			elog(ERROR, "invalid prolly ACL item encoding");
+		acl->ai_grantee = pl_read32(bytes.data + 4);
+		acl->ai_grantor = pl_read32(bytes.data + 8);
+		acl->ai_privs = pl_read64(bytes.data + 12);
+		return PointerGetDatum(acl);
+	}
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return decode_array(type, element, bytes);
@@ -673,7 +728,7 @@ decode_plan_build(DecodePlan *plan, TupleDesc desc)
 		if (column->dropped)
 			continue;
 		column->base = getBaseType(attr->atttypid);
-		if (column->base == TEXTOID || column->base == BYTEAOID)
+		if (column->base == TEXTOID || column->base == BYTEAOID || column->base == PG_NODE_TREEOID)
 			column->kind = DECODE_BYTES;
 		else if (column->base == BOOLOID || column->base == INT2OID || column->base == INT4OID || column->base == INT8OID)
 			column->kind = DECODE_INTEGER;
@@ -688,7 +743,7 @@ decode_plan_build(DecodePlan *plan, TupleDesc desc)
 			column->kind = DECODE_UUID;
 		else if (column->base == NUMERICOID)
 			column->kind = DECODE_NUMERIC;
-		else if (OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
+		else if (column->base == ACLITEMOID || OidIsValid(get_element_type(column->base)) || get_typtype(column->base) == TYPTYPE_COMPOSITE)
 			column->kind = DECODE_GENERAL;
 		else
 		{
@@ -1600,13 +1655,53 @@ bool
 dg_key_ordered(Oid type)
 {
 	Oid			element;
+	char		kind;
 
+	check_stack_depth();
 	type = getBaseType(type);
 	element = get_element_type(type);
 	if (OidIsValid(element))
 		return dg_key_ordered(element);
+	kind = get_typtype(type);
+	if (kind == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
+		bool		supported = true;
+
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute a = TupleDescAttr(desc, i);
+
+			if (!a->attisdropped &&
+				(!dg_key_ordered(a->atttypid) ||
+				 (OidIsValid(a->attcollation) && !pg_newlocale_from_collation(a->attcollation)->collate_is_c)))
+				supported = false;
+		}
+		ReleaseTupleDesc(desc);
+		return supported;
+	}
+	if (kind == TYPTYPE_MULTIRANGE)
+		return dg_key_ordered(get_multirange_range(type));
+	if (kind == TYPTYPE_RANGE)
+	{
+		TypeCacheEntry *range = lookup_type_cache(type, TYPECACHE_RANGE_INFO);
+		TypeCacheEntry *subtype = lookup_type_cache(range->rngelemtype->type_id, TYPECACHE_CMP_PROC);
+
+		/* A custom subtype ordering cannot use the default type's key bytes. */
+		return range->rng_cmp_proc_finfo.fn_oid == subtype->cmp_proc &&
+			(!OidIsValid(range->rng_collation) || pg_newlocale_from_collation(range->rng_collation)->collate_is_c) &&
+			dg_key_ordered(subtype->type_id);
+	}
 	switch (type)
 	{
+		case JSONBOID:
+			/* jsonb compares strings using the database default collation. */
+			return pg_newlocale_from_collation(DEFAULT_COLLATION_OID)->collate_is_c;
+		case OIDOID:
+		case BITOID:
+		case VARBITOID:
+		case INETOID:
+		case CIDROID:
 		case BOOLOID:
 		case INT2OID:
 		case INT4OID:
@@ -1632,7 +1727,7 @@ dg_key_ordered(Oid type)
 		case MACADDR8OID:
 			return true;
 		default:
-			return get_typtype(type) == TYPTYPE_ENUM;
+			return kind == TYPTYPE_ENUM;
 	}
 }
 
@@ -1699,17 +1794,239 @@ key_array(Datum value)
 	return (PLSlice) {(uint8 *) out.data, out.len};
 }
 
+/* Escaped, terminated components preserve ordering and delimit nested keys. */
+static void
+key_component(StringInfo out, PLSlice key)
+{
+	for (size_t i = 0; i < key.len; i++)
+	{
+		appendStringInfoChar(out, key.data[i]);
+		if (!key.data[i])
+			appendStringInfoChar(out, 255);
+	}
+	appendStringInfoChar(out, 0);
+	appendStringInfoChar(out, 0);
+}
+
+/* bitcmp compares padded bytes, then bit length. Mask the final byte so this
+ * also encodes network prefixes without including their host bits. Escaping
+ * terminates the byte string before the length, retaining prefix ordering. */
+static void
+key_bits(StringInfo out, const unsigned char *data, int bits)
+{
+	int         bytes = (bits + 7) / 8;
+	uint8       length[4];
+
+	for (int i = 0; i < bytes; i++)
+	{
+		uint8 byte = data[i];
+
+		if (i == bytes - 1 && bits % 8)
+			byte &= 0xff << (8 - bits % 8);
+		appendStringInfoChar(out, byte);
+		if (!byte)
+			appendStringInfoChar(out, 255);
+	}
+	appendStringInfoChar(out, 0);
+	appendStringInfoChar(out, 0);
+	pl_write32(length, bits);
+	appendBinaryStringInfo(out, (char *) length, sizeof(length));
+}
+
+static PLSlice
+key_network(Datum value)
+{
+	inet	   *ip = DatumGetInetPP(value);
+	StringInfoData out;
+
+	initStringInfo(&out);
+	appendStringInfoChar(&out, ip_family(ip) == PGSQL_AF_INET ? 1 : 2);
+	key_bits(&out, ip_addr(ip), ip_bits(ip));
+	appendBinaryStringInfo(&out, (char *) ip_addr(ip), ip_addrsize(ip));
+	if ((Pointer) ip != DatumGetPointer(value))
+		pfree(ip);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
+static void
+key_bound(StringInfo out, TypeCacheEntry *range, RangeBound *bound)
+{
+	appendStringInfoChar(out, bound->infinite ? (bound->lower ? 0 : 2) : 1);
+	if (!bound->infinite)
+	{
+		key_component(out, dg_key_value(range->rngelemtype->type_id, bound->val));
+		appendStringInfoChar(out, bound->lower ? !bound->inclusive : bound->inclusive);
+	}
+}
+
+static PLSlice
+key_range(Datum value)
+{
+	RangeType  *r = DatumGetRangeTypeP(value);
+	TypeCacheEntry *type = lookup_type_cache(RangeTypeGetOid(r), TYPECACHE_RANGE_INFO);
+	RangeBound	lower,
+				upper;
+	bool		empty;
+	StringInfoData out;
+
+	initStringInfo(&out);
+	range_deserialize(type, r, &lower, &upper, &empty);
+	appendStringInfoChar(&out, empty ? 0 : 1);
+	if (!empty)
+	{
+		key_bound(&out, type, &lower);
+		key_bound(&out, type, &upper);
+	}
+	if ((Pointer) r != DatumGetPointer(value))
+		pfree(r);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
+static PLSlice
+key_multirange(Datum value)
+{
+	MultirangeType *r = DatumGetMultirangeTypeP(value);
+	TypeCacheEntry *type = lookup_type_cache(MultirangeTypeGetOid(r), TYPECACHE_MULTIRANGE_INFO);
+	StringInfoData out;
+
+	initStringInfo(&out);
+	for (uint32 i = 0; i < r->rangeCount; i++)
+	{
+		RangeBound	lower,
+				upper;
+
+		appendStringInfoChar(&out, 1);
+		multirange_get_bounds(type->rngtype, r, i, &lower, &upper);
+		key_bound(&out, type->rngtype, &lower);
+		key_bound(&out, type->rngtype, &upper);
+	}
+	appendStringInfoChar(&out, 0);
+	if ((Pointer) r != DatumGetPointer(value))
+		pfree(r);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
+static PLSlice
+key_record(Datum value)
+{
+	HeapTupleHeader header = DatumGetHeapTupleHeader(value);
+	TupleDesc	desc = lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(header), HeapTupleHeaderGetTypMod(header));
+	HeapTupleData tuple;
+	Datum	   *values = palloc_array(Datum, desc->natts);
+	bool	   *nulls = palloc_array(bool, desc->natts);
+	StringInfoData out;
+
+	tuple.t_len = HeapTupleHeaderGetDatumLength(header);
+	tuple.t_data = header;
+	heap_deform_tuple(&tuple, desc, values, nulls);
+	initStringInfo(&out);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute a = TupleDescAttr(desc, i);
+
+		if (a->attisdropped)
+			continue;
+		appendStringInfoChar(&out, nulls[i] ? 2 : 1);
+		if (!nulls[i])
+			key_component(&out, dg_key_value(a->atttypid, values[i]));
+	}
+	ReleaseTupleDesc(desc);
+	pfree(values);
+	pfree(nulls);
+	if ((Pointer) header != DatumGetPointer(value))
+		pfree(header);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
+/* Mirror compareJsonbContainers, including its top-level raw-scalar array
+ * ordering anomaly: [] sorts below null, then scalars, then nonempty arrays. */
+static PLSlice
+key_jsonb(Datum value)
+{
+	Jsonb	   *json = DatumGetJsonbP(value);
+	JsonbIterator *it = JsonbIteratorInit(&json->root);
+	JsonbValue	v;
+	JsonbIteratorToken token;
+	StringInfoData out;
+	bool		root = true;
+
+	initStringInfo(&out);
+	while ((token = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+	{
+		if (token == WJB_END_ARRAY || token == WJB_END_OBJECT)
+			continue;
+		appendStringInfoChar(&out, v.type);
+		switch (v.type)
+		{
+			case jbvArray:
+				key_component(&out, key_int64(v.val.array.nElems));
+				if (root)
+					appendStringInfoChar(&out, v.val.array.rawScalar ? 0 : 1);
+				break;
+			case jbvObject:
+				key_component(&out, key_int64(v.val.object.nPairs));
+				break;
+			case jbvString:
+				key_component(&out, (PLSlice) {(uint8 *) v.val.string.val, v.val.string.len});
+				break;
+			case jbvNumeric:
+				key_component(&out, key_numeric(v.val.numeric));
+				break;
+			case jbvBool:
+				appendStringInfoChar(&out, v.val.boolean);
+				break;
+			case jbvNull:
+				break;
+			default:
+				elog(ERROR, "unexpected jsonb key token");
+		}
+		root = false;
+	}
+	if ((Pointer) json != DatumGetPointer(value))
+		pfree(json);
+	return (PLSlice) {(uint8 *) out.data, out.len};
+}
+
 /* The key bytes of |value| of |type|. */
 PLSlice
 dg_key_value(Oid type, Datum value)
 {
+	check_stack_depth();
 	type = getBaseType(type);
 	if (OidIsValid(get_element_type(type)))
 		return key_array(value);
+	switch (get_typtype(type))
+	{
+		case TYPTYPE_COMPOSITE:
+			return key_record(value);
+		case TYPTYPE_RANGE:
+			return key_range(value);
+		case TYPTYPE_MULTIRANGE:
+			return key_multirange(value);
+	}
 	if (key_is_row(type))
 		return encode_value(type, value);
 	switch (type)
 	{
+		case OIDOID:
+			return key_int64((int64) DatumGetObjectId(value));
+		case INETOID:
+		case CIDROID:
+			return key_network(value);
+		case JSONBOID:
+			return key_jsonb(value);
+		case BITOID:
+		case VARBITOID:
+			{
+				VarBit	   *bits = DatumGetVarBitP(value);
+				StringInfoData out;
+
+				initStringInfo(&out);
+				key_bits(&out, VARBITS(bits), VARBITLEN(bits));
+				if ((Pointer) bits != DatumGetPointer(value))
+					pfree(bits);
+				return (PLSlice) {(uint8 *) out.data, out.len};
+			}
 		case VARCHAROID:
 			{
 				struct varlena *v = PG_DETOAST_DATUM_PACKED(value);
