@@ -889,6 +889,91 @@ json_value(const char *json, const char *key)
 	return value ? json_text(value) : NULL;
 }
 
+/*
+ * Definition JSON read natively. A document is a jbvBinary value over a copy
+ * of its parsed container, valid for the caller's memory context.
+ */
+static JsonbValue
+json_document(const char *json)
+{
+	Jsonb	   *parsed = json_parse(json);
+	Jsonb	   *copy = palloc(VARSIZE(parsed));
+	JsonbValue	result;
+
+	memcpy(copy, parsed, VARSIZE(parsed));
+	result.type = jbvBinary;
+	result.val.binary.data = &copy->root;
+	result.val.binary.len = VARSIZE(copy) - VARHDRSZ;
+	return result;
+}
+
+/* Field |key| of object |object|; false when it is absent or JSON null. */
+static bool
+json_get(JsonbValue *object, const char *key, JsonbValue *result)
+{
+	if (object->type != jbvBinary || !JsonContainerIsObject(object->val.binary.data))
+		return false;
+	if (!getKeyJsonValueFromContainer(object->val.binary.data, key, strlen(key), result))
+		return false;
+	return result->type != jbvNull;
+}
+
+/* The number of elements of |array|, 0 if it is not an array. */
+static int
+json_length(JsonbValue *array)
+{
+	if (array->type != jbvBinary || !JsonContainerIsArray(array->val.binary.data) ||
+		JsonContainerIsScalar(array->val.binary.data))
+		return 0;
+	return JsonContainerSize(array->val.binary.data);
+}
+
+/* Element |index| of |array|. */
+static JsonbValue
+json_element(JsonbValue *array, int index)
+{
+	JsonbValue *element = getIthJsonbValueFromContainer(array->val.binary.data, index);
+
+	if (!element)
+		elog(ERROR, "JSON array element %d is missing", index);
+	return *element;
+}
+
+/* Element |index| of |array| as ->> gives it, or NULL. */
+static char *
+json_item_text(JsonbValue *array, int index)
+{
+	JsonbValue	element;
+
+	if (index >= json_length(array))
+		return NULL;
+	element = json_element(array, index);
+	return json_text(&element);
+}
+
+/* Element |index| of |array| as JSON text, as (->)::text gives it, or NULL. */
+static char *
+json_item_json(JsonbValue *array, int index)
+{
+	JsonbValue	element;
+	Jsonb	   *encoded;
+
+	if (index >= json_length(array))
+		return NULL;
+	element = json_element(array, index);
+	encoded = JsonbValueToJsonb(&element);
+	return JsonbToCString(NULL, &encoded->root, VARSIZE(encoded));
+}
+
+/* Field |key| of |object| as ->> gives it, or NULL. */
+static char *
+json_field_text(JsonbValue *object, const char *key)
+{
+	JsonbValue	value;
+
+	return json_get(object, key, &value) ? json_text(&value) : NULL;
+}
+
 /* Doltgres derives the default committer email from the role and the client
  * address; local (socket or bootstrap) sessions use localhost. */
 static char *
