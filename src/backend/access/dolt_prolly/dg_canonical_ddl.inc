@@ -107,6 +107,9 @@ adopt_schema(Oid schema)
 		PopActiveSnapshot();
 	}
 	PG_END_TRY();
+	/* Adoption may replace working membership; refresh the caller too. */
+	if (ActiveSnapshotSet())
+		UpdateActiveSnapshotCommandId();
 }
 
 /* Whether CREATE TABLE makes a prolly table rather than a native one. */

@@ -70,31 +70,20 @@ strip_identifier(const char *ident)
 	return out.data;
 }
 
-/* Rebuild a tuple descriptor from a retained DGTABLE1 schema. Only pg_catalog
- * types are captured, so names resolve without versioned type catalogs. */
+/* A retained row must use its revision's type definitions, not the current
+ * session's pg_type rows. The catalog provider already reconstructs the full
+ * tuple descriptor, including user types and collations. */
 static TupleDesc
-schema_descriptor(const char *json, int *nkeys, int **keys)
+schema_descriptor(const char *json, CatalogView *view, int *nkeys, int **keys)
 {
-	TupleDesc	desc;
-	int			n,
-				i;
+	Oid			handle = CatalogViewLookupObject(view, RelationRelationId, json_value(json, "name"));
+	Relation	relation = relation_open(handle, AccessShareLock);
+	TupleDesc	desc = CreateTupleDescCopy(RelationGetDescr(relation));
+	int			n = desc->natts;
+	int			i;
 	char	   *pk;
 
-	run("SELECT c->>'name',(SELECT t.oid FROM pg_type t WHERE t.typname=c->>'type' AND t.typnamespace='pg_catalog'::regnamespace),coalesce((c->>'typmod')::int,-1),CASE WHEN c->'collation' IS NULL OR jsonb_typeof(c->'collation')='null' THEN 0 ELSE (SELECT co.oid FROM pg_collation co JOIN pg_namespace n ON n.oid=co.collnamespace WHERE n.nspname=c->'collation'->>0 AND co.collname=c->'collation'->>1) END FROM jsonb_array_elements($1::jsonb->'columns') WITH ORDINALITY AS x(c,ord) ORDER BY ord", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
-	n = SPI_processed;
-	desc = CreateTemplateTupleDesc(n);
-	for (i = 0; i < n; i++)
-	{
-		char	   *name = strcell(i, 1);
-		Oid			type = DatumGetObjectId(cell(i, 2));
-		int32		typmod = DatumGetInt32(cell(i, 3));
-		Oid			collation = DatumGetObjectId(cell(i, 4));
-
-		if (!OidIsValid(type))
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("retained schema uses an unknown type for column %s", name)));
-		TupleDescInitEntry(desc, i + 1, name, type, typmod, 0);
-		TupleDescInitEntryCollation(desc, i + 1, collation);
-	}
+	relation_close(relation, AccessShareLock);
 	run("SELECT regexp_replace(c->>1,'^PRIMARY KEY \\((.*)\\)$','\\1') FROM jsonb_array_elements($1::jsonb->'constraints') c WHERE c->>1 LIKE 'PRIMARY KEY (%'", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	pk = SPI_processed ? strcell(0, 1) : NULL;
 	*nkeys = 0;
@@ -213,7 +202,7 @@ diff_table_at(bytea *db, const char *name, bool rows)
 		return t;
 	t->present = true;
 	t->schema = metadata(schema, "schema");
-	t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
+	t->desc = schema_descriptor(t->schema, provider_view(db), &t->nkeys, &t->keys);
 	t->keyed = t->nkeys > 0;
 	if (!rows)
 		return t;
@@ -237,7 +226,6 @@ diff_table_working(const char *name, bool rows)
 	Oid			handle,
 				resource;
 	DGStorage  *storage;
-	Relation	rel;
 
 	if (!db || !database_member(db, name, &schema, &chunk))
 		return t;
@@ -248,11 +236,7 @@ diff_table_working(const char *name, bool rows)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("runtime catalog binding unavailable for %s on branch %s", name, dg_current_branch())));
 	t->present = true;
 	t->schema = metadata(schema, "schema");
-	t->desc = schema_descriptor(t->schema, &t->nkeys, &t->keys);
-	rel = relation_open(handle, AccessShareLock);
-	FreeTupleDesc(t->desc);
-	t->desc = CreateTupleDescCopy(RelationGetDescr(rel));
-	relation_close(rel, AccessShareLock);
+	t->desc = schema_descriptor(t->schema, view, &t->nkeys, &t->keys);
 	t->keyed = t->nkeys > 0;
 	if (!rows)
 		return t;
