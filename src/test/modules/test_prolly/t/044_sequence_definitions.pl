@@ -12,6 +12,25 @@ my $a=$node->background_psql('postgres',on_error_stop=>0);
 my $b=$node->background_psql('postgres',on_error_stop=>0);
 sub sql { $a->query_safe($_[0]); }
 sub fails { my($q,$pattern,$label)=@_;$a->query($q);like($a->{stderr},$pattern,$label);$a->{stderr}=''; }
+# Allocation snapshots must not make unchanged definitions dirty.
+sql(q{CREATE TABLE shared_serial(id serial PRIMARY KEY); INSERT INTO shared_serial DEFAULT VALUES;
+    SELECT dolt_commit('-Am','first row'); SELECT dolt_branch('serial_old');
+    INSERT INTO shared_serial DEFAULT VALUES; SELECT dolt_commit('-Am','second row');
+    SELECT dolt_checkout('serial_old')});
+is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'shared allocation leaves older branch clean');
+is(sql(q{SELECT conflicts FROM dolt_merge('main')}), '0', 'shared allocation permits fast-forward');
+is(sql(q{SELECT count(*) FROM shared_serial}), '2', 'merge imports the newer rows');
+sql(q{SELECT nextval('shared_serial_id_seq'); SELECT dolt_add('-A')});
+is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'staging allocation alone has no schema change');
+fails(q{SELECT dolt_commit('-Am','allocation only')}, qr/nothing to commit/, 'allocation alone cannot create a commit');
+sql(q{ALTER SEQUENCE shared_serial_id_seq RESTART WITH 50});
+is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'shared RESTART is not a definition edit');
+sql(q{ALTER SEQUENCE shared_serial_id_seq INCREMENT 2});
+is(sql(q{SELECT count(*) FROM dolt_status}), '1', 'real sequence definition change stays visible');
+sql(q{SELECT dolt_reset('--hard'); SELECT dolt_checkout('main')});
+is(sql(q{SELECT nextval('shared_serial_id_seq')}), '50', 'reset and checkout preserve the shared restart');
+sql(q{DROP TABLE shared_serial; SELECT dolt_commit('-Am','remove fixture')});
+
 sql(q{CREATE SEQUENCE s CACHE 3});
 is(sql(q{SELECT nextval('s')}),'1','first cached allocation');
 sql(q{SELECT dolt_commit('-Am','base'); SELECT dolt_branch('other')});
