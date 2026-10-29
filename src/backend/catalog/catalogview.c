@@ -25,6 +25,7 @@
 #include "utils/sortsupport.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_statistic.h"
 #include "utils/inval.h"
 #include "utils/fmgroids.h"
 #include "utils/typcache.h"
@@ -466,6 +467,9 @@ CatalogViewBeginScanSnapshot(Relation relation, int nkeys, ScanKey keys, Snapsho
 	bool		has_bound_key = false;
 	int			i;
 
+	/* Statistics are physical: a branch's tables keep theirs by durable OID. */
+	if (RelationGetRelid(relation) == StatisticRelationId)
+		return NULL;
 
 	for (i = 0; i < nkeys; i++)
 	{
@@ -984,6 +988,11 @@ CatalogViewRejectBranchWrite(Relation relation, ItemPointer tid, HeapTuple tuple
 
 		if (TupleDescAttr(desc, i)->atttypid != OIDOID)
 			continue;
+
+		/* A branch's table keeps its statistics under its durable OID. */
+		if (RelationGetRelid(relation) == StatisticRelationId && i + 1 == Anum_pg_statistic_starelid)
+			continue;
+
 		value = heap_getattr(tuple, i + 1, desc, &isnull);
 		if (!isnull && DatumGetObjectId(value) >= FirstDurableObjectId)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

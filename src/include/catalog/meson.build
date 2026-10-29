@@ -85,6 +85,7 @@ catalog_headers = [
   'pg_dolt_journal.h',
   'pg_dolt_handle.h',
   'pg_dolt_identity.h',
+  'pg_dolt_sequence.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.

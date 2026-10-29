@@ -23,6 +23,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalogview.h"
+#include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_dolt_binding.h"
 #include "catalog/pg_dolt_identity.h"
@@ -219,7 +220,11 @@ branch_identities(const char *branch, bool remove)
 		if (form->identkind == DOLT_IDENTITY_RELATION)
 			CacheInvalidateRelcacheInDatabase(form->identoid);
 		if (remove)
+		{
+			if (form->identkind == DOLT_IDENTITY_RELATION)
+				RemoveStatistics(form->identoid, 0);
 			CatalogTupleDelete(catalog, &tuple->t_self);
+		}
 	}
 	systable_endscan(scan);
 	table_close(catalog, remove ? RowExclusiveLock : AccessShareLock);
@@ -289,7 +294,10 @@ identity_retain(const char *branch, List *members)
 		if (lc)
 			continue;
 		if (((Form_pg_dolt_identity) GETSTRUCT(tuple))->identkind == DOLT_IDENTITY_RELATION)
+		{
 			CacheInvalidateRelcacheInDatabase(((Form_pg_dolt_identity) GETSTRUCT(tuple))->identoid);
+			RemoveStatistics(((Form_pg_dolt_identity) GETSTRUCT(tuple))->identoid, 0);
+		}
 		CatalogTupleDelete(catalog, &tuple->t_self);
 		removed = true;
 	}
@@ -300,6 +308,31 @@ identity_retain(const char *branch, List *members)
 		CacheInvalidateRelcacheByRelid(DoltIdentityRelationId);
 		CommandCounterIncrement();
 	}
+}
+
+/* The durable OIDs of the relations of |branch|, or of every branch if NULL. */
+List *
+dg_identity_relations(const char *branch)
+{
+	Relation	catalog = table_open(DoltIdentityRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	if (branch)
+		ScanKeyInit(&key, Anum_pg_dolt_identity_identbranch, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(branch));
+	scan = systable_beginscan(catalog, DoltIdentityNameIndexId, true, NULL, branch ? 1 : 0, &key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_dolt_identity form = (Form_pg_dolt_identity) GETSTRUCT(tuple);
+
+		if (form->identkind == DOLT_IDENTITY_RELATION)
+			result = lappend_oid(result, form->identoid);
+	}
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+	return result;
 }
 
 /* The durable OID of the relation a pg_dolt_binding row supplies storage for. */

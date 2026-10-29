@@ -1811,6 +1811,7 @@ heap_drop_with_catalog(Oid relid)
 {
 	Relation	rel;
 	HeapTuple	tuple;
+	char		relkind;
 	Oid			parentOid = InvalidOid,
 				defaultPartOid = InvalidOid;
 
@@ -1827,6 +1828,7 @@ heap_drop_with_catalog(Oid relid)
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
+	relkind = ((Form_pg_class) GETSTRUCT(tuple))->relkind;
 	if (((Form_pg_class) GETSTRUCT(tuple))->relispartition)
 	{
 		/*
@@ -1920,7 +1922,11 @@ heap_drop_with_catalog(Oid relid)
 	/*
 	 * Remove any associated relation synchronization states.
 	 */
-	RemoveSubscriptionRel(InvalidOid, relid);
+	/* Sequences cannot have table synchronization state. Their branch-local
+	 * catalog handles must never be used to scan the physical subscription
+	 * catalog. */
+	if (relkind != RELKIND_SEQUENCE)
+		RemoveSubscriptionRel(InvalidOid, relid);
 
 	/*
 	 * Forget any ON COMMIT action for the rel

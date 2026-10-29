@@ -1411,6 +1411,8 @@ journal_fold_loaded(Relation rel, const char *branch, Snapshot snapshot, DGState
 		table_key = journal_index_table(rel, branch, &table);
 	else
 		table_key = root_key(rel, branch);
+	if (batch_group_snapshot && loading_for_batch)
+		snapshot = batch_group_snapshot;
 	journal_fold_state(rel, &table_key, table, branch, snapshot, s);
 	if (table)
 		relation_close(table, NoLock);

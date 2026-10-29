@@ -74,7 +74,9 @@ is(sql(q{SELECT convalidated FROM pg_constraint WHERE conrelid='t'::regclass AND
 rejects(q{ALTER TABLE t VALIDATE CONSTRAINT payload_check},'validation failure retains NOT VALID schema');
 sql(q{UPDATE t SET payload='five' WHERE id=5; ALTER TABLE t VALIDATE CONSTRAINT payload_check});
 is(sql(q{SELECT convalidated FROM pg_constraint WHERE conrelid='t'::regclass AND conname='payload_check'}),'t','validation publishes its catalog update');
-rejects(q{ALTER TABLE t ALTER COLUMN newer SET DEFAULT 't'::regclass::int},'expression codec rejects nonportable OID-valued constants');
+sql(q{ALTER TABLE t ALTER COLUMN newer SET DEFAULT 't'::regclass::int});
+like(sql(q{SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef WHERE adrelid='t'::regclass AND adnum=(SELECT attnum FROM pg_attribute WHERE attrelid='t'::regclass AND attname='newer')}),qr/t.*regclass/,'explicit regclass constants retain symbolic names');
+sql(q{ALTER TABLE t ALTER COLUMN newer DROP DEFAULT});
 # TODO: native validation and defaults under the caller's role, once the
 # ownership and ACL design settles who owns a versioned table.
 sql(q{SET TimeZone='America/Los_Angeles'; SET DateStyle='SQL, DMY'; ALTER TABLE owned ALTER COLUMN moment SET DEFAULT '2001-02-03 04:05:06+00'::timestamptz});

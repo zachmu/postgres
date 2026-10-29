@@ -27,6 +27,8 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/doltbranch.h"
+#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -1096,6 +1098,30 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 
 	table_endscan(scan);
 	table_close(pgclass, AccessShareLock);
+
+	/* The current branch's tables, which pg_class holds no rows for. */
+	if (dg_catalog_active() && dg_current_branch())
+	{
+		ListCell   *lc;
+
+		foreach(lc, dg_identity_relations(dg_current_branch()))
+		{
+			Oid			relid = lfirst_oid(lc);
+			HeapTuple	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+			MemoryContext oldcontext;
+
+			if (!HeapTupleIsValid(classtup))
+				continue;
+			if (((Form_pg_class) GETSTRUCT(classtup))->relkind == RELKIND_RELATION &&
+				vacuum_is_permitted_for_relation(relid, (Form_pg_class) GETSTRUCT(classtup), options))
+			{
+				oldcontext = MemoryContextSwitchTo(vac_context);
+				vacrels = lappend(vacrels, makeVacuumRelation(NULL, relid, NIL));
+				MemoryContextSwitchTo(oldcontext);
+			}
+			ReleaseSysCache(classtup);
+		}
+	}
 
 	return vacrels;
 }

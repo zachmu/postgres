@@ -17,6 +17,7 @@
 #include <math.h>
 
 #include "access/detoast.h"
+#include "access/doltcatalog.h"
 #include "access/genam.h"
 #include "access/multixact.h"
 #include "access/relation.h"
@@ -27,6 +28,7 @@
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_inherits.h"
 #include "commands/dbcommands.h"
@@ -147,10 +149,10 @@ analyze_rel(Oid relid, RangeVar *relation,
 		return;
 
 	/*
-	 * TODO: statistics for a branch's tables, stored per durable OID. Until
-	 * then a versioned table has none; its physical catalogs hold no rows.
+	 * A branch's table keeps statistics under its durable OID; revisions and
+	 * tables mid-DDL keep none.
 	 */
-	if (onerel->rd_catalogview)
+	if (onerel->rd_catalogview && !dg_relation_analyzable(onerel))
 	{
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -202,6 +204,13 @@ analyze_rel(Oid relid, RangeVar *relation,
 		acquirefunc = acquire_sample_rows;
 		/* Also get regular table's size */
 		relpages = RelationGetNumberOfBlocks(onerel);
+
+		/* A prolly table has no blocks: its rows are sampled from its trees. */
+		if (onerel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID)
+		{
+			acquirefunc = dg_acquire_sample_rows;
+			relpages = 1;
+		}
 	}
 	else if (onerel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 	{
@@ -638,7 +647,11 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	 * that an individual index's pg_class entry won't be updated during
 	 * VACUUM if the index AM returns NULL from its amvacuumcleanup() routine.
 	 */
-	if (!inh)
+	/*
+	 * A branch's table has no physical pg_class row to update; the planner
+	 * sizes it from its trees.
+	 */
+	if (!inh && !onerel->rd_catalogview)
 	{
 		BlockNumber relallvisible = 0;
 		BlockNumber relallfrozen = 0;

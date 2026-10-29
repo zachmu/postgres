@@ -579,6 +579,7 @@ static bool callbacks_registered;
 
 /* Pending edits, in dg_batch.inc. */
 static bool loading_for_batch;
+static Snapshot batch_group_snapshot;	/* the stream view a table and its indexes reload under together */
 static HTAB *batches;
 static HTAB *journal_marks;		/* (relid, cid, subxid) of batches that were journaled */
 static bool journal_batch(DGBatch *b, bool forced);

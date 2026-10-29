@@ -93,6 +93,13 @@ provider_view_rule(DGProviderRows *rows, CatalogView *view, const char *name, Oi
 					column = provider_attribute(provider_columns(provider_definition_list[j]), columns[i]);
 					versioned = true;
 				}
+				else if (j >= 0 && !strcmp(provider_definition_kinds[j], "sequence"))
+				{
+					column = !strcmp(columns[i], "last_value") ? 1 :
+						!strcmp(columns[i], "log_cnt") ? 2 :
+						!strcmp(columns[i], "is_called") ? 3 : 0;
+					versioned = true;
+				}
 				else if (j >= 0 && !strcmp(provider_definition_kinds[j], "view"))
 				{
 					int			count;

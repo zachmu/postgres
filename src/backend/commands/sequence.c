@@ -19,6 +19,7 @@
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/sequence.h"
+#include "access/doltcatalog.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -30,6 +31,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_sequence.h"
+#include "catalog/catalogview.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
 #include "commands/defrem.h"
@@ -214,7 +216,8 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 
 	/* now initialize the sequence's data */
 	tuple = heap_form_tuple(tupDesc, value, null);
-	fill_seq_with_data(rel, tuple);
+	if (!CatalogViewIsProvisional(rel->rd_catalogview))
+		fill_seq_with_data(rel, tuple);
 
 	/* process OWNED BY if given */
 	if (owned_by)
@@ -426,6 +429,42 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	END_CRIT_SECTION();
 
 	UnlockReleaseBuffer(buf);
+}
+
+void
+SequenceSetOwnedBy(Relation rel, List *owned_by, bool for_identity)
+{
+	process_owned_by(rel, owned_by, for_identity);
+}
+
+/* Initialize and inspect a catalog-independent allocator using native WAL. */
+void
+SequenceInitializeResource(Relation rel, int64 start)
+{
+	TupleDesc	desc = CreateTemplateTupleDesc(3);
+	Datum		values[3] = {Int64GetDatum(start), Int64GetDatum(0), BoolGetDatum(false)};
+	bool		nulls[3] = {false};
+	HeapTuple	tuple;
+
+	TupleDescInitEntry(desc, 1, "last_value", INT8OID, -1, 0);
+	TupleDescInitEntry(desc, 2, "log_cnt", INT8OID, -1, 0);
+	TupleDescInitEntry(desc, 3, "is_called", BOOLOID, -1, 0);
+	tuple = heap_form_tuple(desc, values, nulls);
+	fill_seq_with_data(rel, tuple);
+	heap_freetuple(tuple);
+	FreeTupleDesc(desc);
+}
+
+void
+SequenceReadResource(Relation rel, int64 *last, bool *called)
+{
+	Buffer		buffer;
+	HeapTupleData tuple;
+	Form_pg_sequence_data data = read_seq_tuple(rel, &buffer, &tuple);
+
+	*last = data->last_value;
+	*called = data->is_called;
+	UnlockReleaseBuffer(buffer);
 }
 
 /*
@@ -653,6 +692,8 @@ nextval_internal(Oid relid, bool check_permissions)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied for sequence %s",
 						RelationGetRelationName(seqrel))));
+
+	dg_catalog_sequence_check(seqrel);
 
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
@@ -970,6 +1011,8 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	maxv = pgsform->seqmax;
 	minv = pgsform->seqmin;
 	ReleaseSysCache(pgstuple);
+
+	dg_catalog_sequence_check(seqrel);
 
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
@@ -1818,12 +1861,21 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
 
-		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+		int64		last;
+		bool		called;
 
-		values[0] = Int64GetDatum(seq->last_value);
-		values[1] = BoolGetDatum(seq->is_called);
-
-		UnlockReleaseBuffer(buf);
+		if (dg_catalog_sequence_retained(seqrel, &last, &called))
+		{
+			values[0] = Int64GetDatum(last);
+			values[1] = BoolGetDatum(called);
+		}
+		else
+		{
+			seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+			values[0] = Int64GetDatum(seq->last_value);
+			values[1] = BoolGetDatum(seq->is_called);
+			UnlockReleaseBuffer(buf);
+		}
 	}
 	else
 		memset(isnull, true, sizeof(isnull));
@@ -1872,12 +1924,13 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
 
-		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
-
-		is_called = seq->is_called;
-		result = seq->last_value;
-
-		UnlockReleaseBuffer(buf);
+		if (!dg_catalog_sequence_retained(seqrel, &result, &is_called))
+		{
+			seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+			is_called = seq->is_called;
+			result = seq->last_value;
+			UnlockReleaseBuffer(buf);
+		}
 	}
 	sequence_close(seqrel, NoLock);
 
