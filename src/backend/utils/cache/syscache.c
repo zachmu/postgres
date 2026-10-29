@@ -216,6 +216,10 @@ SelectCacheView(int cacheId, int nkeys, Datum *keys)
 	bool		bound = false;
 	int			i;
 
+	/* Statistics are physical: a branch's tables keep theirs by durable OID. */
+	if (cache->cc_reloid == StatisticRelationId)
+		return NULL;
+
 	for (i = 0; i < nkeys; i++)
 		if ((keys[i] <= UINT32_MAX || (int64) keys[i] < 0) &&
 			(DatumGetObjectId(keys[i]) >= FirstCatalogViewObjectId ||

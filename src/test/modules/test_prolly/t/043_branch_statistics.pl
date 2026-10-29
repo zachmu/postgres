@@ -65,7 +65,9 @@ sql(q{VACUUM ANALYZE t});
 is(sql(q{SELECT count(*) FROM pg_statistic WHERE starelid = 't'::regclass}), '3', 'VACUUM ANALYZE collects statistics');
 
 # Another branch's table has its own OID and statistics.
-sql(q{SELECT dolt_commit('-Am', 'tables'); SELECT dolt_branch('feature')});
+my $commit = sql(q{SELECT dolt_commit('-Am', 'tables'); SELECT dolt_branch('feature')});
+($commit) = $commit =~ /([0-9a-f]{64})/;
+is(sql(qq{SELECT count(*) FROM t AS OF '$commit' WHERE k = 3}), '2000', 'a revision of an analyzed table is planned without its statistics');
 my $feature_t = on_branch('feature', q{SELECT 't'::regclass::oid});
 isnt($feature_t, $main_t, 'the table has another OID on another branch');
 is(sql(qq{SELECT count(*) FROM pg_statistic WHERE starelid = $feature_t}), '0', 'a new branch starts without statistics');
