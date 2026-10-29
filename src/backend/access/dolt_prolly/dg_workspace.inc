@@ -1068,7 +1068,7 @@ require_clean_branch(const char *name)
 				staged = read_ref(psprintf("staged/%s", name));
 	bytea	   *db = child(head.target, 1);
 
-	if ((working.target && !same(working.target, db)) || (staged.target && !same(staged.target, db)))
+	if ((working.target && !database_same(working.target, db)) || (staged.target && !database_same(staged.target, db)))
 		unsupported("renaming or copying a branch with uncommitted changes");
 	if (!strcmp(name, dg_current_branch()) && state_differs(working_state(), head_state()))
 		unsupported("renaming or copying the session branch with uncommitted changes");
@@ -1377,7 +1377,7 @@ apply_commit(FunctionCallInfo fcinfo, bool revert)
 	if (!revert && list_length(revisions) != 1)
 		unsupported("cherry-picking more than one commit");
 	head = read_ref(branch_ref("heads"));
-	if (!same(capture_visible().hash, child(head.target, 1)) || !same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
+	if (!database_same(capture_visible().hash, child(head.target, 1)) || !database_same(read_ref(branch_ref("staged")).target, child(head.target, 1)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("cannot %s with uncommitted changes", revert ? "revert" : "cherry-pick")));
 	foreach(lc, revisions)
 	{
