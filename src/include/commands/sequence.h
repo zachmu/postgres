@@ -55,8 +55,10 @@ extern int64 nextval_internal(Oid relid, bool check_permissions);
 extern Datum nextval(PG_FUNCTION_ARGS);
 extern List *sequence_options(Oid relid);
 
+extern void SequenceCheckState(int64 last, int64 min, int64 max);
 extern void SequenceSetOwnedBy(Relation rel, List *owned_by, bool for_identity);
-extern void SequenceInitializeResource(Relation rel, int64 start);
+extern void SequenceInitializeResource(Relation rel, int64 start, bool called);
+extern void SequenceAlterDefinition(ParseState *pstate, Oid id, AlterSeqStmt *stmt, int64 *last, bool *called);
 extern void SequenceReadResource(Relation rel, int64 *last, bool *called);
 
 extern ObjectAddress DefineSequence(ParseState *pstate, CreateSeqStmt *seq);

@@ -1,25 +1,57 @@
-/* Sequence definitions and snapshots are portable; allocation is local and shared. */
-static Oid
-sequence_resource(const char *name, int64 start, int64 increment, bool create)
+/* Allocation identity excludes ownership and snapshots, but includes every
+ * option affecting the generated values or a bare RESTART. */
+static bytea *
+sequence_key(const char *definition)
 {
-	List	   *parts = stringToQualifiedNameList(name, NULL);
+	run("SELECT sha256(convert_to(jsonb_build_array($1::jsonb->'type',$1::jsonb->'start',$1::jsonb->'increment',$1::jsonb->'min',$1::jsonb->'max',$1::jsonb->'cache',$1::jsonb->'cycle')::text,'UTF8'))", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+	return DatumGetByteaPCopy(cell(0, 1));
+}
+
+static void
+sequence_lock(const char *definition, LOCKMODE mode)
+{
+	char	   *name = json_value(definition, "name");
+	bytea	   *key = sequence_key(definition);
+
+	LockDatabaseObject(DoltSequenceRelationId,
+					   hash_bytes((unsigned char *) name, strlen(name)),
+					   hash_bytes((unsigned char *) VARDATA_ANY(key), VARSIZE_ANY_EXHDR(key)), mode);
+}
+
+/* Registry replacement is transactional. Old files remain retained; cached
+ * native values are invalidated by observing the new physical locator. */
+static Oid
+sequence_state(const char *definition, bool create, bool replace)
+{
+	List	   *parts = stringToQualifiedNameList(json_value(definition, "name"), NULL);
+	bytea	   *key = sequence_key(definition);
 	Oid			result;
+	bool		found;
 
 	if (list_length(parts) != 2)
 		elog(ERROR, "sequence identity is not qualified");
-	if (create)
+	if (create && !replace)
 	{
-		LockDatabaseObject(DoltSequenceRelationId, hash_bytes((const unsigned char *) name, strlen(name)), 0, ExclusiveLock);
-		PushActiveSnapshot(GetLatestSnapshot());
+		/*
+		 * Existing counters need no write lock for a metadata binding. The
+		 * allocator itself locks and refreshes the registry before use.
+		 */
+		result = sequence_state(definition, false, false);
+		if (OidIsValid(result))
+			return result;
 	}
-	run("SELECT seqstorage FROM pg_dolt_sequence WHERE seqnamespace=$1::name AND seqname=$2::name", 2,
-		VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(strVal(linitial(parts))), CStringGetTextDatum(strVal(lsecond(parts)))), NULL, true);
 	if (create)
-		PopActiveSnapshot();
-	if (SPI_processed)
-		return DatumGetObjectId(cell(0, 1));
-	if (!create)
-		return InvalidOid;
+		sequence_lock(definition, ExclusiveLock);
+	PushActiveSnapshot(GetLatestSnapshot());
+	run("SELECT seqstorage FROM pg_dolt_sequence WHERE seqnamespace=$1::name AND seqname=$2::name AND seqdefinition=$3", 3,
+		VC_TYPES(TEXTOID, TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(strVal(linitial(parts))), CStringGetTextDatum(strVal(lsecond(parts))), PointerGetDatum(key)), NULL, true);
+	found = SPI_processed != 0;
+	result = found ? DatumGetObjectId(cell(0, 1)) : InvalidOid;
+	PopActiveSnapshot();
+	if ((found && !replace) || !create)
+		return result;
+	SequenceCheckState(pg_strtoint64(json_value(definition, "last_value")),
+		pg_strtoint64(json_value(definition, "min")), pg_strtoint64(json_value(definition, "max")));
 	result = dg_storage_allocate_kind(RELKIND_SEQUENCE, NULL);
 	{
 		RelationData rel = {0};
@@ -33,13 +65,19 @@ sequence_resource(const char *name, int64 start, int64 increment, bool create)
 		rel.rd_lockInfo.lockRelId.relId = result;
 		rel.rd_lockInfo.lockRelId.dbId = MyDatabaseId;
 		dg_storage_locator(result, &rel.rd_locator);
-		SequenceInitializeResource(&rel, start);
+		SequenceInitializeResource(&rel, pg_strtoint64(json_value(definition, "last_value")), !strcmp(json_value(definition, "is_called"), "true"));
 		RelationCloseSmgr(&rel);
 	}
-	run("INSERT INTO pg_dolt_sequence VALUES($1::name,$2::name,$3,$4)", 4,
-		VC_TYPES(TEXTOID, TEXTOID, OIDOID, INT8OID), VC_ARGS(CStringGetTextDatum(strVal(linitial(parts))), CStringGetTextDatum(strVal(lsecond(parts))), ObjectIdGetDatum(result), Int64GetDatum(increment)), NULL, false);
+	run(found ? "UPDATE pg_dolt_sequence SET seqstorage=$3 WHERE seqnamespace=$1::name AND seqname=$2::name AND seqdefinition=$4" : "INSERT INTO pg_dolt_sequence VALUES($1::name,$2::name,$3,$4)", 4,
+		VC_TYPES(TEXTOID, TEXTOID, OIDOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(strVal(linitial(parts))), CStringGetTextDatum(strVal(lsecond(parts))), ObjectIdGetDatum(result), PointerGetDatum(key)), NULL, false);
 	CommandCounterIncrement();
 	return result;
+}
+
+static Oid
+sequence_resource(const char *definition, bool create)
+{
+	return sequence_state(definition, create, false);
 }
 
 static char *
@@ -110,12 +148,15 @@ sequence_number(const char *definition, const char *field)
 static char *
 sequence_capture(const char *definition)
 {
-	Oid			resource = sequence_resource(json_value(definition, "name"), 0, 0, false);
+	Oid			resource;
 	RelationData rel = {0};
 	FormData_pg_class form = {0};
 	int64		last;
 	bool		called;
 
+	/* Replaced files remain retained, so a snapshot can inspect the last
+	 * committed registry entry without blocking unrelated branch DDL. */
+	resource = sequence_resource(definition, false);
 	if (!OidIsValid(resource))
 		return (char *) definition;
 	form.relkind = RELKIND_SEQUENCE;
@@ -131,42 +172,108 @@ sequence_capture(const char *definition)
 	return strcell(0, 1);
 }
 
-/* Allocation is shared, but a retained revision is never a write capability. */
+/* Refresh on every open, even with a cached relcache entry and under repeatable
+ * read: allocation and RESTART are global, not snapshot-visible table data. */
 void
-dg_catalog_sequence_check(Relation rel)
+dg_catalog_sequence_refresh(Relation rel)
 {
-	HeapTuple	tuple;
-	Form_pg_sequence seq;
-	int64		increment;
-	const char *name;
 	Oid			caller;
 	int			security,
 				nest;
+	CatalogView *previous;
 
-	if (!rel->rd_catalogview)
+	if (catalog_api_depth || rel->rd_rel->relkind != RELKIND_SEQUENCE || !CatalogViewIsDurable(RelationGetRelid(rel)))
 		return;
-	if (!CatalogViewIsDurable(RelationGetRelid(rel)))
-		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot advance a sequence in an immutable revision")));
-	name = CatalogViewObjectIdentity(RelationGetRelid(rel), RelationRelationId);
-	tuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(RelationGetRelid(rel)));
-	seq = (Form_pg_sequence) GETSTRUCT(tuple);
-	increment = seq->seqincrement;
-	ReleaseSysCache(tuple);
 	GetUserIdAndSecContext(&caller, &security);
+	previous = CatalogViewSwitch(NULL);
 	PG_TRY();
 	{
-		List	   *parts = stringToQualifiedNameList(name, NULL);
+		char	   *definition;
+		Oid			resource;
+		RelFileLocator locator;
 
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
-		run("SELECT seqincrement FROM pg_dolt_sequence WHERE seqnamespace=$1::name AND seqname=$2::name", 2,
-			VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(strVal(linitial(parts))), CStringGetTextDatum(strVal(lsecond(parts)))), NULL, true);
-		if (SPI_processed != 1 || ((DatumGetInt64(cell(0, 1)) > 0) != (increment > 0)))
-			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("unable to advance sequence state, possibly due to having incompatible state on different branches")));
+		definition = metadata(CatalogViewObjectSchema(RelationGetRelid(rel)), "schema");
+		sequence_lock(definition, ShareLock);
+		resource = sequence_resource(definition, false);
+		if (!OidIsValid(resource))
+			elog(ERROR, "sequence allocator is missing");
+		PushActiveSnapshot(GetLatestSnapshot());
+		dg_storage_locator(resource, &locator);
+		PopActiveSnapshot();
+		if (!RelFileLocatorEquals(locator, rel->rd_locator))
+			RelationCloseSmgr(rel);
+		rel->rd_locator = locator;
+		rel->rd_rel->relfilenode = locator.relNumber;
 		end_api(nest);
 	}
 	PG_FINALLY();
 	{
+		CatalogViewSwitch(previous);
+		SetUserIdAndSecContext(caller, security);
+	}
+	PG_END_TRY();
+}
+
+void
+dg_catalog_sequence_check(Relation rel)
+{
+	if (rel->rd_catalogview && !CatalogViewIsDurable(RelationGetRelid(rel)))
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot advance a sequence in an immutable revision")));
+}
+
+/* Validate with PostgreSQL's native option parser, then publish the definition's
+ * counter. New definitions inherit the old allocator state unless RESTART says
+ * otherwise. No physical pg_sequence row is changed. */
+static void
+sequence_alter(ParseState *pstate, Oid id, AlterSeqStmt *stmt)
+{
+	Oid			caller;
+	int			security,
+				nest;
+	char	   *definition;
+	int64		last;
+	bool		called;
+	CatalogView *view = CatalogViewCurrent();
+	bool		restart = false;
+
+	foreach_node(DefElem, option, stmt->options)
+		if (!strcmp(option->defname, "restart"))
+			restart = true;
+	GetUserIdAndSecContext(&caller, &security);
+	PG_TRY();
+	{
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+		nest = begin_api();
+		definition = sequence_encode(id);
+		CatalogViewSwitch(NULL);
+
+		/*
+		 * Exclude concurrent allocations until we have taken the initial
+		 * value.
+		 */
+		sequence_lock(definition, ExclusiveLock);
+		definition = sequence_capture(definition);
+		last = sequence_number(definition, "last_value");
+		called = !strcmp(json_value(definition, "is_called"), "true");
+		end_api(nest);
+		CatalogViewSwitch(view);
+		SetUserIdAndSecContext(caller, security);
+		SequenceAlterDefinition(pstate, id, stmt, &last, &called);
+		CommandCounterIncrement();
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
+		nest = begin_api();
+		definition = sequence_encode(id);
+		CatalogViewSwitch(NULL);
+		run("SELECT ($1::jsonb || jsonb_build_object('last_value',$2::bigint,'is_called',$3::boolean))::text", 3, VC_TYPES(TEXTOID, INT8OID, BOOLOID), VC_ARGS(CStringGetTextDatum(definition), Int64GetDatum(last), BoolGetDatum(called)), NULL, true);
+		definition = strcell(0, 1);
+		sequence_state(definition, true, restart);
+		end_api(nest);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(view);
 		SetUserIdAndSecContext(caller, security);
 	}
 	PG_END_TRY();

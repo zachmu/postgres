@@ -172,7 +172,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 		{
 			char	   *definition = metadata(schemas[i], "schema");
 
-			relid = sequence_resource(names[i], sequence_number(definition, "start"), sequence_number(definition, "increment"), true);
+			relid = sequence_resource(definition, true);
 			binding_record(branch, names[i], schemas[i], relid);
 			continue;
 		}

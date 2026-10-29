@@ -39,12 +39,6 @@ dg_catalog_sequence_ddl(ParseState *pstate, Node *statement)
 		return false;
 	if (previous)
 		unsupported("sequence DDL in immutable catalog context");
-	if (!creating)
-	{
-		foreach_node(DefElem, option, ((AlterSeqStmt *) statement)->options)
-			if (strcmp(option->defname, "owned_by"))
-				unsupported("versioned ALTER SEQUENCE options other than OWNED BY");
-	}
 	if (creating)
 		ns = RangeVarGetAndCheckCreationNamespace(rv, NoLock, &existing);
 	else
@@ -81,7 +75,7 @@ dg_catalog_sequence_ddl(ParseState *pstate, Node *statement)
 		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, security | SECURITY_LOCAL_USERID_CHANGE);
 		nest = begin_api();
 		current = capture(true);
-		provider_populate(view, current.hash, dg_current_branch());
+		provider_populate(view, current.hash, NULL);
 		end_api(nest);
 		CatalogViewBeginMutation(view);
 		CatalogViewSetStorageHandler(view, sequence_storage_effect);
@@ -106,13 +100,10 @@ dg_catalog_sequence_ddl(ParseState *pstate, Node *statement)
 		else
 		{
 			Oid			id = RangeVarGetRelid(rv, NoLock, false);
-			Relation	rel = sequence_open(id, NoLock);
 
-			if (!object_ownercheck(RelationRelationId, id, caller))
-				aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SEQUENCE, RelationGetRelationName(rel));
-			foreach_node(DefElem, option, ((AlterSeqStmt *) statement)->options)
-				SequenceSetOwnedBy(rel, castNode(List, option->arg), ((AlterSeqStmt *) statement)->for_identity);
-			sequence_close(rel, NoLock);
+			if (get_rel_relkind(id) != RELKIND_SEQUENCE)
+				ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", get_rel_name(id))));
+			sequence_alter(pstate, id, (AlterSeqStmt *) statement);
 			ObjectAddressSet(address, RelationRelationId, id);
 		}
 		CommandCounterIncrement();
@@ -126,7 +117,7 @@ dg_catalog_sequence_ddl(ParseState *pstate, Node *statement)
 			if (!creating)
 				definition = sequence_capture(definition);
 			{
-				Oid			resource = sequence_resource(json_value(definition, "name"), sequence_number(definition, "start"), sequence_number(definition, "increment"), true);
+				Oid			resource = sequence_resource(definition, true);
 				bytea	   *schema = put("schema", definition, NULL, 0);
 
 				binding_record(dg_current_branch(), json_value(definition, "name"), schema, resource);

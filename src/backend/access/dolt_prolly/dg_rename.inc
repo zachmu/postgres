@@ -49,6 +49,14 @@ rename_encode(CatalogView *view, const char *kind, const char *name, const char 
 				VC_ARGS(CStringGetTextDatum(result), CStringGetTextDatum(dg_qualified_name(get_namespace_name(get_rel_namespace(relid)), get_rel_name(relid)))), NULL, true);
 			result = strcell(0, 1);
 		}
+		else if (!strcmp(kind, "sequence"))
+		{
+			char	   *state = sequence_capture(old);
+
+			result = sequence_encode(CatalogViewLookupObject(view, RelationRelationId, name));
+			run("SELECT ($1::jsonb || jsonb_build_object('last_value',$2::jsonb->'last_value','is_called',$2::jsonb->'is_called'))::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(result), CStringGetTextDatum(state)), NULL, true);
+			result = strcell(0, 1);
+		}
 		else if (!strcmp(kind, "view"))
 			result = view_encode(CatalogViewLookupObject(view, RelationRelationId, name));
 		else if (!strcmp(kind, "routine"))
@@ -183,6 +191,8 @@ rename_publish(CatalogView *view, Capture current, List *targets)
 			{
 				payload = object_payload(kinds[i], definition);
 				member = object_member(kinds[i], definition);
+				if (!strcmp(kinds[i], "sequence"))
+					binding_record(dg_current_branch(), name, child(member, 1), sequence_resource(definition, true));
 			}
 		}
 		if (used)
@@ -389,13 +399,15 @@ rename_subject(Node *statement, char **kind, char **name, List **references)
 		case OBJECT_INDEX:
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
+		case OBJECT_SEQUENCE:
 			{
 				Oid			relid = RangeVarGetRelid(relation, NoLock, true);
 
 				if (!OidIsValid(relid) || relid < FirstDurableObjectId)
 					return false;
 				*kind = get_rel_relkind(relid) == RELKIND_INDEX ? "index" :
-					get_rel_relkind(relid) == RELKIND_VIEW ? "view" : "table";
+					get_rel_relkind(relid) == RELKIND_VIEW ? "view" :
+					get_rel_relkind(relid) == RELKIND_SEQUENCE ? "sequence" : "table";
 				*name = CatalogViewObjectIdentity(relid, RelationRelationId);
 				if (!strcmp(*kind, "index"))
 				{
@@ -537,9 +549,12 @@ dg_catalog_rename(ParseState *pstate, Node *statement)
 				found = rename_schema_members(found, root, name);
 			foreach_ptr(List, reference, references)
 			{
-				if (!strcmp(linitial(reference), "table") && strcmp(kind, "table") && strcmp(kind, "view"))
+				if (!strcmp(linitial(reference), "table") && strcmp(kind, "table") && strcmp(kind, "view") && strcmp(kind, "sequence"))
 				{
-					/* An index's table lists it; the table itself is re-encoded. */
+					/*
+					 * An index's table lists it; the table itself is
+					 * re-encoded.
+					 */
 					if (!rename_targeted(found, "table", lsecond(reference)))
 						found = lappend(found, reference);
 				}

@@ -54,6 +54,23 @@ references_walker(Node *node, List **references)
 		references_add(references, "routine", name);
 	if (IsA(node, TypeName) && (name = references_name(((TypeName *) node)->names)))
 		references_add(references, "type", name);
+	if (IsA(node, TypeCast))
+	{
+		TypeCast   *cast = (TypeCast *) node;
+
+		if (cast->typeName->names && !strcmp(strVal(llast(cast->typeName->names)), "regclass") && IsA(cast->arg, A_Const))
+		{
+			A_Const    *value = (A_Const *) cast->arg;
+
+			if (!value->isnull && IsA(&value->val, String))
+			{
+				List	   *parts = stringToQualifiedNameList(strVal(&value->val), NULL);
+
+				if (list_length(parts) == 2 && (name = references_name(parts)))
+					references_add(references, "table", name);
+			}
+		}
+	}
 	return raw_expression_tree_walker(node, references_walker, references);
 }
 
