@@ -669,7 +669,13 @@ mutation_identity(Oid relid, AlterTableCmd *action)
 				options = lappend(options, option);
 		}
 		if (options)
-			unsupported("versioned identity sequence options");
+		{
+			AlterSeqStmt *stmt = makeNode(AlterSeqStmt);
+
+			stmt->options = options;
+			stmt->for_identity = true;
+			sequence_alter(pstate, getIdentitySequence(rel, attr->attnum, false), stmt);
+		}
 	}
 	else
 	{
@@ -1129,7 +1135,7 @@ native_alter_publish(Capture current, VersionRef working, const char *name, Alte
 		{
 			char	   *captured = sequence_capture(seqdef);
 			bytea	   *member = object_member("sequence", captured);
-			Oid			resource = sequence_resource(json_value(seqdef, "name"), sequence_number(seqdef, "start"), sequence_number(seqdef, "increment"), true);
+			Oid			resource = sequence_resource(seqdef, true);
 
 			binding_record(dg_current_branch(), json_value(seqdef, "name"), child(member, 1), resource);
 			if (used)

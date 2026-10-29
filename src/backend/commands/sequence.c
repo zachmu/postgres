@@ -439,10 +439,10 @@ SequenceSetOwnedBy(Relation rel, List *owned_by, bool for_identity)
 
 /* Initialize and inspect a catalog-independent allocator using native WAL. */
 void
-SequenceInitializeResource(Relation rel, int64 start)
+SequenceInitializeResource(Relation rel, int64 start, bool called)
 {
 	TupleDesc	desc = CreateTemplateTupleDesc(3);
-	Datum		values[3] = {Int64GetDatum(start), Int64GetDatum(0), BoolGetDatum(false)};
+	Datum		values[3] = {Int64GetDatum(start), Int64GetDatum(0), BoolGetDatum(called)};
 	bool		nulls[3] = {false};
 	HeapTuple	tuple;
 
@@ -465,6 +465,38 @@ SequenceReadResource(Relation rel, int64 *last, bool *called)
 	*last = data->last_value;
 	*called = data->is_called;
 	UnlockReleaseBuffer(buffer);
+}
+
+/* Validate and change a provisional sequence definition without touching its
+ * allocator. The branch publisher owns the transactional state replacement. */
+void
+SequenceAlterDefinition(ParseState *pstate, Oid id, AlterSeqStmt *stmt,
+						int64 *last, bool *called)
+{
+	Relation	seqrel = sequence_open(id, NoLock);
+	Relation	catalog = table_open(SequenceRelationId, RowExclusiveLock);
+	HeapTuple	tuple = SearchSysCacheCopy1(SEQRELID, ObjectIdGetDatum(id));
+	FormData_pg_sequence_data data = {0};
+	bool		rewrite;
+	List	   *owned;
+
+	Assert(CatalogViewIsProvisional(seqrel->rd_catalogview));
+	if (!object_ownercheck(RelationRelationId, id, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SEQUENCE, RelationGetRelationName(seqrel));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "sequence definition is missing");
+	data.last_value = *last;
+	data.is_called = *called;
+	init_params(pstate, stmt->options, stmt->for_identity, false,
+				(Form_pg_sequence) GETSTRUCT(tuple), &data, &rewrite, &owned);
+	if (owned)
+		process_owned_by(seqrel, owned, stmt->for_identity);
+	CatalogTupleUpdate(catalog, &tuple->t_self, tuple);
+	*last = data.last_value;
+	*called = data.is_called;
+	heap_freetuple(tuple);
+	table_close(catalog, RowExclusiveLock);
+	sequence_close(seqrel, NoLock);
 }
 
 /*

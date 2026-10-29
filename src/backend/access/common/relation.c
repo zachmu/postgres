@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/doltcatalog.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/catalogview.h"
@@ -70,6 +71,8 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 		   IsBootstrapProcessingMode() ||
 		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
+
+	dg_catalog_sequence_refresh(r);
 
 	/* Make note that we've accessed a temporary relation */
 	if (RelationUsesLocalBuffers(r))
@@ -124,6 +127,8 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 	Assert(canonical || lockmode != NoLock ||
 		   CatalogViewIsDurable(relationId) ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
+
+	dg_catalog_sequence_refresh(r);
 
 	/* Make note that we've accessed a temporary relation */
 	if (RelationUsesLocalBuffers(r))

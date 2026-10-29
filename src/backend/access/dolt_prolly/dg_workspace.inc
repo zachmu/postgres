@@ -310,6 +310,40 @@ conflict_schema(Member * member, const char *kind, const char *name)
 	return member_definition(member);
 }
 
+/* Sequence snapshots do not make a definition edit. Applying a new source
+ * definition joins its global counter; never seed it from the target counter. */
+static bool
+sequence_definition_equal(const char *a, const char *b)
+{
+	if (!a || !b)
+		return a == b;
+	run("SELECT ($1::jsonb - 'last_value' - 'is_called') = ($2::jsonb - 'last_value' - 'is_called')", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(a), CStringGetTextDatum(b)), NULL, true);
+	return DatumGetBool(cell(0, 1));
+}
+
+static bool
+sequence_source_behind(const char *ours, const char *theirs)
+{
+	bytea	   *okey = sequence_key(ours),
+			   *tkey = sequence_key(theirs);
+	int			order = memcmp(VARDATA_ANY(okey), VARDATA_ANY(tkey), VARSIZE_ANY_EXHDR(okey));
+	int64		ov,
+				tv;
+
+	if (!order)
+		return false;
+	/* Opposite-direction merges acquire counter locks in the same order. */
+	sequence_lock(order < 0 ? ours : theirs, ExclusiveLock);
+	sequence_lock(order < 0 ? theirs : ours, ExclusiveLock);
+	ours = sequence_capture(ours);
+	theirs = sequence_capture(theirs);
+	ov = sequence_number(ours, "last_value");
+	tv = sequence_number(theirs, "last_value");
+	if (ov == tv)
+		return !strcmp(json_value(ours, "is_called"), "true") && !strcmp(json_value(theirs, "is_called"), "false");
+	return sequence_number(ours, "increment") > 0 ? tv < ov : tv > ov;
+}
+
 static bytea *
 merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, StringInfo schema_conflicts)
 {
@@ -356,7 +390,22 @@ merge_schemas(bytea *base, bytea *ours, bytea *theirs, List **row_merges, String
 			 * results agree, as a keyless table's matching changes conflict.
 			 */
 			both = table && b && o && t && !merge_same(b, o) && !merge_same(b, t);
-			if (!both && (merge_same(o, t) || merge_same(b, t)))
+			if (!strcmp(key->kind, "sequence") && o && t)
+			{
+				char *od = member_definition(o), *td = member_definition(t);
+
+				if (sequence_definition_equal(od, td) || (b && sequence_definition_equal(member_definition(b), td)))
+					chosen = o, from = sides[1], fromcount = counts[1];
+				else
+				{
+					chosen = t, from = sides[2], fromcount = counts[2];
+					if (sequence_source_behind(od, td))
+						record_schema_conflict(schema_conflicts, "sequence", key->name,
+							conflict_schema(b, "sequence", key->name), od, td,
+							"source sequence counter is behind target; source definition and counter selected");
+				}
+			}
+			else if (!both && (merge_same(o, t) || merge_same(b, t)))
 				chosen = o, from = sides[1], fromcount = counts[1];
 			else if (!both && merge_same(b, o))
 				chosen = t, from = sides[2], fromcount = counts[2];
