@@ -136,56 +136,36 @@ definition_references(const char *kind, const char *definition)
 	/* An index's definition lists its key columns as a table's does. */
 	if (!strcmp(kind, "table") || !strcmp(kind, "index"))
 	{
-		run("SELECT v->>'type',v->>'default' FROM jsonb_array_elements($1::jsonb->'columns') v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
-		{
-			uint64		n = SPI_processed;
-			char	  **types = palloc_array(char *, Max(n, 1));
-			char	  **defaults = palloc_array(char *, Max(n, 1));
+		JsonbValue	document = json_document(definition);
+		JsonbValue	columns;
+		int			n = json_get(&document, "columns", &columns) ? json_length(&columns) : 0;
+		int			ndefaults,
+					nconstraints;
+		Node	  **defaults = schema_defaults(definition, &ndefaults);
+		Constraint **constraints = schema_constraints(definition, &nconstraints);
 
-			for (uint64 i = 0; i < n; i++)
-			{
-				types[i] = strcell(i, 1);
-				defaults[i] = strcell(i, 2);
-			}
-			for (uint64 i = 0; i < n; i++)
-			{
-				references_type(&references, types[i]);
-				references_sql(&references, defaults[i]);
-			}
+		Assert(ndefaults == n);
+		for (int i = 0; i < n; i++)
+		{
+			JsonbValue	column = json_element(&columns, i);
+
+			references_type(&references, json_field_text(&column, "type"));
+			(void) references_walker(defaults[i], &references);
 		}
-		run("SELECT v->>0,v->>1 FROM jsonb_array_elements(COALESCE($1::jsonb->'constraints','[]')) v", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(definition)), NULL, true);
+		for (int i = 0; i < nconstraints; i++)
 		{
-			uint64		n = SPI_processed;
-			char	  **names = palloc_array(char *, Max(n, 1));
-			char	  **defs = palloc_array(char *, Max(n, 1));
-
-			for (uint64 i = 0; i < n; i++)
-			{
-				names[i] = strcell(i, 1);
-				defs[i] = strcell(i, 2);
-			}
-			for (uint64 i = 0; i < n; i++)
-			{
-				Constraint *constraint = references_constraint("ALTER TABLE placeholder", names[i], defs[i]);
-
-				if (constraint->contype == CONSTR_CHECK)
-					(void) references_walker(constraint->raw_expr, &references);
-				else if (constraint->contype == CONSTR_FOREIGN && constraint->pktable->schemaname)
-					references_add(&references, "table", dg_qualified_name(constraint->pktable->schemaname, constraint->pktable->relname));
-			}
+			if (constraints[i]->contype == CONSTR_CHECK)
+				(void) references_walker(constraints[i]->raw_expr, &references);
+			else if (constraints[i]->contype == CONSTR_FOREIGN && constraints[i]->pktable->schemaname)
+				references_add(&references, "table", dg_qualified_name(constraints[i]->pktable->schemaname, constraints[i]->pktable->relname));
 		}
 	}
 	if (!strcmp(kind, "index"))
 	{
-		char	   *sql = json_value(definition, "index_definition");
-		IndexStmt  *index;
+		IndexStmt  *index = schema_index(definition);
 
-		if (sql)
-		{
-			index = castNode(IndexStmt, linitial_node(RawStmt, schema_expression_parse(sql))->stmt);
-			if (index->relation->schemaname)
-				references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
-		}
+		if (index && index->relation->schemaname)
+			references_add(&references, "table", dg_qualified_name(index->relation->schemaname, index->relation->relname));
 	}
 	if (!strcmp(kind, "view") || (!strcmp(kind, "table") && json_value(definition, "matview")) ||
 		(!strcmp(kind, "routine") && json_value(definition, "dependencies")))

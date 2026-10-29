@@ -38,6 +38,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/doltchunk.h"
+#include "access/doltschema.h"
 #include "access/doltsystem.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -3664,6 +3665,26 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&dolt_chunk_cache_size,
 		256 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_schema_cache_size", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Sets the memory for decoded schemas cached per session."),
+			gettext_noop("Least recently used schemas are evicted above this size when a transaction ends."),
+			GUC_UNIT_KB
+		},
+		&dolt_schema_cache_size,
+		32 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+	},
+
+	{
+		{"dolt_shared_schema_cache_size", PGC_SIGHUP, RESOURCES_MEM,
+			gettext_noop("Sets the shared memory for decoded schemas cached for all sessions."),
+			gettext_noop("Least recently used schemas are evicted above this size; 0 disables sharing."),
+			GUC_UNIT_KB
+		},
+		&dolt_shared_schema_cache_size,
+		16 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{
