@@ -81,6 +81,12 @@ ok($node->poll_query_until('postgres',q{SELECT count(*)=1 FROM pg_stat_activity 
 $b->query_safe('COMMIT');
 $a->query_safe('SELECT 1');
 is($b->query_safe(q{SELECT nextval('cached')}),'100','blocked RESTART publishes after the allocator transaction finishes');
+# Join validation uses the existing counter, not the discarded source value.
+sql(q{CREATE SEQUENCE bounds MAXVALUE 10; SELECT setval('bounds',5); ALTER SEQUENCE bounds MAXVALUE 100; SELECT setval('bounds',50)});
+sql(q{ALTER SEQUENCE bounds MAXVALUE 10});
+is(sql(q{SELECT nextval('bounds')}),'6','joining a bounded definition uses its existing valid state');
+fails(q{ALTER SEQUENCE bounds MAXVALUE 3},qr/RESTART value .* cannot be greater than MAXVALUE/,'new counter validates inherited state');
+fails(q{ALTER SEQUENCE bounds RESTART WITH 20},qr/RESTART value .* cannot be greater than MAXVALUE/,'explicit restart validates replacement state');
 # A transaction snapshot must not pin the allocator before first allocation.
 $b->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class});
 sql(q{ALTER SEQUENCE cached RESTART WITH 120});

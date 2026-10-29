@@ -50,6 +50,8 @@ sequence_state(const char *definition, bool create, bool replace)
 	PopActiveSnapshot();
 	if ((found && !replace) || !create)
 		return result;
+	SequenceCheckState(pg_strtoint64(json_value(definition, "last_value")),
+		pg_strtoint64(json_value(definition, "min")), pg_strtoint64(json_value(definition, "max")));
 	result = dg_storage_allocate_kind(RELKIND_SEQUENCE, NULL);
 	{
 		RelationData rel = {0};
@@ -238,7 +240,7 @@ sequence_alter(ParseState *pstate, Oid id, AlterSeqStmt *stmt)
 
 	foreach_node(DefElem, option, stmt->options)
 		if (!strcmp(option->defname, "restart"))
-		restart = true;
+			restart = true;
 	GetUserIdAndSecContext(&caller, &security);
 	PG_TRY();
 	{

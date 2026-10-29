@@ -106,7 +106,7 @@ static void init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel);
 static Form_pg_sequence_data read_seq_tuple(Relation rel,
 											Buffer *buf, HeapTuple seqdatatuple);
 static void init_params(ParseState *pstate, List *options, bool for_identity,
-						bool isInit,
+						bool isInit, bool check_state,
 						Form_pg_sequence seqform,
 						Form_pg_sequence_data seqdataform,
 						bool *need_seq_rewrite,
@@ -165,7 +165,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	}
 
 	/* Check and set all option values */
-	init_params(pstate, seq->options, seq->for_identity, true,
+	init_params(pstate, seq->options, seq->for_identity, true, true,
 				&seqform, &seqdataform,
 				&need_seq_rewrite, &owned_by);
 
@@ -467,6 +467,17 @@ SequenceReadResource(Relation rel, int64 *last, bool *called)
 	UnlockReleaseBuffer(buffer);
 }
 
+void
+SequenceCheckState(int64 last, int64 min, int64 max)
+{
+	if (last < min)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			errmsg("RESTART value (%" PRId64 ") cannot be less than MINVALUE (%" PRId64 ")", last, min)));
+	if (last > max)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			errmsg("RESTART value (%" PRId64 ") cannot be greater than MAXVALUE (%" PRId64 ")", last, max)));
+}
+
 /* Validate and change a provisional sequence definition without touching its
  * allocator. The branch publisher owns the transactional state replacement. */
 void
@@ -487,7 +498,7 @@ SequenceAlterDefinition(ParseState *pstate, Oid id, AlterSeqStmt *stmt,
 		elog(ERROR, "sequence definition is missing");
 	data.last_value = *last;
 	data.is_called = *called;
-	init_params(pstate, stmt->options, stmt->for_identity, false,
+	init_params(pstate, stmt->options, stmt->for_identity, false, false,
 				(Form_pg_sequence) GETSTRUCT(tuple), &data, &rewrite, &owned);
 	if (owned)
 		process_owned_by(seqrel, owned, stmt->for_identity);
@@ -556,7 +567,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	UnlockReleaseBuffer(buf);
 
 	/* Check and set new values */
-	init_params(pstate, stmt->options, stmt->for_identity, false,
+	init_params(pstate, stmt->options, stmt->for_identity, false, true,
 				seqform, newdataform,
 				&need_seq_rewrite, &owned_by);
 
@@ -1330,7 +1341,7 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
  */
 static void
 init_params(ParseState *pstate, List *options, bool for_identity,
-			bool isInit,
+			bool isInit, bool check_state,
 			Form_pg_sequence seqform,
 			Form_pg_sequence_data seqdataform,
 			bool *need_seq_rewrite,
@@ -1625,19 +1636,10 @@ init_params(ParseState *pstate, List *options, bool for_identity,
 		seqdataform->is_called = false;
 	}
 
-	/* crosscheck RESTART (or current value, if changing MIN/MAX) */
-	if (seqdataform->last_value < seqform->seqmin)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("RESTART value (%" PRId64 ") cannot be less than MINVALUE (%" PRId64 ")",
-						seqdataform->last_value,
-						seqform->seqmin)));
-	if (seqdataform->last_value > seqform->seqmax)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("RESTART value (%" PRId64 ") cannot be greater than MAXVALUE (%" PRId64 ")",
-						seqdataform->last_value,
-						seqform->seqmax)));
+	/* Provisional ALTER checks the effective allocator after choosing whether
+	 * to join an existing definition or initialize a new counter. */
+	if (check_state)
+		SequenceCheckState(seqdataform->last_value, seqform->seqmin, seqform->seqmax);
 
 	/* CACHE */
 	if (cache_value != NULL)
