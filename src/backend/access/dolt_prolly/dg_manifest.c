@@ -843,50 +843,9 @@ dg_schema_store(const char *kind, const char *json)
 	return result;
 }
 
-/*
- * Decoded schema objects, by address. An address names immutable content, so
- * its JSON never changes; reading the object still checks its visibility.
- */
-typedef struct DecodedSchema
-{
-	uint8		address[PL_HASH_SIZE];
-	char	   *json;
-} DecodedSchema;
-static HTAB *decoded_schemas;
-static Size decoded_schema_bytes;
-
-#define DECODED_SCHEMA_LIMIT (32 * 1024 * 1024)
-
-static void
-remember_schema(bytea *address, const char *json)
-{
-	DecodedSchema *entry;
-	bool		found;
-
-	if (VARSIZE_ANY_EXHDR(address) != PL_HASH_SIZE)
-		return;
-	if (!decoded_schemas || decoded_schema_bytes > DECODED_SCHEMA_LIMIT)
-	{
-		HASHCTL		ctl = {0};
-
-		if (decoded_schemas)
-			MemoryContextDelete(GetMemoryChunkContext(decoded_schemas));
-		ctl.keysize = PL_HASH_SIZE;
-		ctl.entrysize = sizeof(DecodedSchema);
-		ctl.hcxt = AllocSetContextCreate(TopMemoryContext, "decoded schemas", ALLOCSET_DEFAULT_SIZES);
-		decoded_schemas = hash_create("decoded schemas", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		decoded_schema_bytes = 0;
-	}
-	entry = hash_search(decoded_schemas, VARDATA_ANY(address), HASH_ENTER, &found);
-	if (!found)
-	{
-		entry->json = MemoryContextStrdup(GetMemoryChunkContext(decoded_schemas), json);
-		decoded_schema_bytes += strlen(json) + sizeof(*entry);
-	}
-}
-
+/* The definition of schema object |address|, decoded; see dg_schema_cache.c. */
 char *
-dg_schema_read(bytea *address, const char *kind)
+dg_schema_decode(bytea *address, const char *kind)
 {
 	PLStore    *volatile store = NULL;
 	char	   *result = NULL;
@@ -895,14 +854,9 @@ dg_schema_read(bytea *address, const char *kind)
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
-	DecodedSchema *decoded;
 
 	if (!dg_object_read(address, kind, NULL, &payload, &children))
 		elog(ERROR, "missing retained schema object");
-	decoded = decoded_schemas && VARSIZE_ANY_EXHDR(address) == PL_HASH_SIZE ?
-		hash_search(decoded_schemas, VARDATA_ANY(address), HASH_FIND, NULL) : NULL;
-	if (decoded)
-		return pstrdup(decoded->json);
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	if (n == 0)
 	{
@@ -948,7 +902,5 @@ dg_schema_read(bytea *address, const char *kind)
 		}
 		PG_END_TRY();
 	}
-	result = pg_any_to_server(result, strlen(result), PG_UTF8);
-	remember_schema(address, result);
-	return result;
+	return pg_any_to_server(result, strlen(result), PG_UTF8);
 }

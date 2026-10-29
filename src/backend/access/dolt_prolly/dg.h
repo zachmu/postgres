@@ -9,6 +9,7 @@
 #include "executor/tuptable.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/jsonb.h"
 #include "../../../doltgres/prolly/internal.h"
 
 struct HandleDelta;
@@ -178,6 +179,36 @@ extern void dg_release(DGState *state);
 extern void dg_branch_base(Relation rel, DGState *state);
 extern bytea *dg_schema_store(const char *kind, const char *json);
 extern char *dg_schema_read(bytea *address, const char *kind);
+extern char *dg_schema_decode(bytea *address, const char *kind);
+
+/*
+ * A schema object decoded once, by address; see dg_schema_cache.c. An address
+ * names immutable content, so an entry is never invalidated, only evicted, and
+ * what is derived from its definition alone is kept with it. Callers must not
+ * change an entry, which stays valid until the transaction ends.
+ */
+typedef struct DGSchema
+{
+	char	   *json;			/* the definition */
+	Jsonb	   *document;		/* json, parsed */
+	uint32		parts;			/* DG_SCHEMA_* parts derived so far */
+	TupleDesc	columns;		/* a table's or index's columns, with built-in types */
+	int			ndefaults;
+	Node	  **defaults;		/* each column's raw default, or NULL */
+	int			nconstraints;
+	Node	  **constraints;	/* each table constraint's raw Constraint */
+	Node	   *index;			/* an index's raw IndexStmt */
+} DGSchema;
+
+#define DG_SCHEMA_COLUMNS		0x01
+#define DG_SCHEMA_DEFAULTS		0x02
+#define DG_SCHEMA_CONSTRAINTS	0x04
+#define DG_SCHEMA_INDEX			0x08
+
+extern DGSchema *dg_schema_get(bytea *address, const char *kind);
+extern DGSchema *dg_schema_find(const char *json);
+extern void dg_schema_set_columns(DGSchema *schema, TupleDesc columns);
+extern void dg_schema_set_nodes(DGSchema *schema, uint32 part, int count, Node **nodes);
 extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);

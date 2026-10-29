@@ -442,23 +442,51 @@ provider_copy_columns(TupleDesc desc)
 	return copy;
 }
 
-/* The columns of |definition|, which the caller may change. */
+/* Whether |desc| names only built-in types and collations. */
+static bool
+provider_builtin_columns(TupleDesc desc)
+{
+	for (int i = 0; i < desc->natts; i++)
+		if (TupleDescAttr(desc, i)->atttypid >= FirstNormalObjectId ||
+			TupleDescAttr(desc, i)->attcollation >= FirstNormalObjectId)
+			return false;
+	return true;
+}
+
+/*
+ * The columns of |definition|, which the caller may change. Columns of only
+ * built-in types are the same in every view, and kept with the schema.
+ */
 static TupleDesc
 provider_columns(const char *definition)
 {
+	DGSchema   *schema = dg_schema_find(definition);
 	ProviderColumns *entry;
 	int			types;
 	bool		found;
 	MemoryContext previous;
 
+	if (schema && (schema->parts & DG_SCHEMA_COLUMNS))
+		return provider_copy_columns(schema->columns);
 	if (!provider_column_cache)
-		return provider_decode_columns(definition);
+	{
+		TupleDesc	desc = provider_decode_columns(definition);
+
+		if (schema && provider_builtin_columns(desc))
+			dg_schema_set_columns(schema, desc);
+		return desc;
+	}
 	types = list_length(provider_current_rows->rows[provider_catalog_index(TypeRelationId)]);
 	entry = hash_search(provider_column_cache, &definition, HASH_ENTER, &found);
 	if (!found || entry->types != types)
 	{
 		TupleDesc	desc = provider_decode_columns(definition);
 
+		if (schema && provider_builtin_columns(desc))
+		{
+			dg_schema_set_columns(schema, desc);
+			return desc;
+		}
 		previous = MemoryContextSwitchTo(GetMemoryChunkContext(provider_column_cache));
 		entry->desc = provider_copy_columns(desc);
 		MemoryContextSwitchTo(previous);
@@ -655,6 +683,111 @@ provider_expression_dependencies(DGProviderRows *rows, Oid classid, Oid objid, N
 	(void) provider_routine_references(expression, &context);
 }
 
+/* Copies of |count| cached trees, which the caller may change. */
+static Node **
+schema_node_copies(Node **nodes, int count)
+{
+	Node	  **copies = palloc0_array(Node *, Max(count, 1));
+
+	for (int i = 0; i < count; i++)
+		copies[i] = copyObject(nodes[i]);
+	return copies;
+}
+
+/*
+ * The raw default of each column of table |definition|, or NULL, parsed once
+ * per schema. The caller may change the trees.
+ */
+static Node **
+schema_defaults(const char *definition, int *count)
+{
+	DGSchema   *schema = dg_schema_find(definition);
+	JsonbValue	document;
+	JsonbValue	columns;
+	Node	  **defaults;
+
+	if (schema && (schema->parts & DG_SCHEMA_DEFAULTS))
+		return schema_node_copies(schema->defaults, *count = schema->ndefaults);
+	document = json_document(definition);
+	*count = json_get(&document, "columns", &columns) ? json_length(&columns) : 0;
+	defaults = palloc0_array(Node *, Max(*count, 1));
+	for (int i = 0; i < *count; i++)
+	{
+		JsonbValue	column = json_element(&columns, i);
+		char	   *sql = json_field_text(&column, "default");
+
+		if (sql)
+			defaults[i] = schema_expression_raw(sql);
+	}
+	if (schema)
+		dg_schema_set_nodes(schema, DG_SCHEMA_DEFAULTS, *count, defaults);
+	return defaults;
+}
+
+/*
+ * The raw Constraint of each constraint of table |definition|, parsed once
+ * per schema. The caller may change the trees.
+ */
+static Constraint **
+schema_constraints(const char *definition, int *count)
+{
+	DGSchema   *schema = dg_schema_find(definition);
+	JsonbValue	document;
+	JsonbValue	constraints;
+	Node	  **result;
+
+	if (schema && (schema->parts & DG_SCHEMA_CONSTRAINTS))
+		return (Constraint **) schema_node_copies(schema->constraints, *count = schema->nconstraints);
+	document = json_document(definition);
+	*count = json_get(&document, "constraints", &constraints) ? json_length(&constraints) : 0;
+	result = palloc0_array(Node *, Max(*count, 1));
+	for (int i = 0; i < *count; i++)
+	{
+		JsonbValue	constraint = json_element(&constraints, i);
+		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s",
+															  dg_quote_identifier(json_item_text(&constraint, 0)),
+															  json_item_text(&constraint, 1)));
+		Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
+		AlterTableStmt *alter;
+
+		if (list_length(parsed) != 1 || !IsA(node, AlterTableStmt))
+			elog(ERROR, "invalid canonical constraint");
+		alter = (AlterTableStmt *) node;
+		if (list_length(alter->cmds) != 1 || !IsA(((AlterTableCmd *) linitial(alter->cmds))->def, Constraint))
+			elog(ERROR, "invalid canonical constraint command");
+		result[i] = ((AlterTableCmd *) linitial(alter->cmds))->def;
+	}
+	if (schema)
+		dg_schema_set_nodes(schema, DG_SCHEMA_CONSTRAINTS, *count, result);
+	return (Constraint **) result;
+}
+
+/*
+ * The raw IndexStmt of index |definition|, parsed once per schema, or NULL if
+ * it has none. The caller may change the tree.
+ */
+static IndexStmt *
+schema_index(const char *definition)
+{
+	DGSchema   *schema = dg_schema_find(definition);
+	char	   *sql;
+	List	   *parsed;
+	Node	   *node;
+
+	if (schema && (schema->parts & DG_SCHEMA_INDEX))
+		return copyObject((IndexStmt *) schema->index);
+	sql = json_value(definition, "index_definition");
+	if (!sql)
+		return NULL;
+	parsed = schema_expression_parse(sql);
+	node = ((RawStmt *) linitial(parsed))->stmt;
+	if (list_length(parsed) != 1 || !IsA(node, IndexStmt))
+		elog(ERROR, "invalid canonical index definition");
+	if (schema)
+		dg_schema_set_nodes(schema, DG_SCHEMA_INDEX, 1, &node);
+	return (IndexStmt *) node;
+}
+
 static void
 provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definition)
 {
@@ -663,15 +796,15 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 	TupleDesc	desc = provider_columns(definition);
 	JsonbValue	document = json_document(definition);
 	JsonbValue	columns;
+	int			ndefaults;
+	Node	  **defaults = schema_defaults(definition, &ndefaults);
 
-	if (!json_get(&document, "columns", &columns) || json_length(&columns) != desc->natts)
+	if (!json_get(&document, "columns", &columns) || json_length(&columns) != desc->natts || ndefaults != desc->natts)
 		elog(ERROR, "canonical column count mismatch");
 	for (int i = 0; i < desc->natts; i++)
 	{
 		JsonbValue	column = json_element(&columns, i);
-		char	   *sql;
-		Node	   *raw,
-				   *expression;
+		Node	   *expression;
 		FormData_pg_attrdef form = {0};
 		HeapTuple	tuple;
 		int			slot = provider_catalog_index(AttrDefaultRelationId);
@@ -691,9 +824,7 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		}
 		if (!TupleDescAttr(desc, i)->atthasdef)
 			continue;
-		sql = json_field_text(&column, "default");
-		raw = schema_expression_raw(sql);
-		expression = schema_expression_bind(view, relation, name, desc, raw, i + 1);
+		expression = schema_expression_bind(view, relation, name, desc, defaults[i], i + 1);
 		form.oid = CatalogViewBindObject(view, AttrDefaultRelationId, psprintf("%s/%s", name, NameStr(TupleDescAttr(desc, i)->attname)), InvalidOid);
 		form.adrelid = relation;
 		form.adnum = i + 1;
@@ -733,32 +864,30 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 	Oid			ns = CatalogViewLookupObject(view, NamespaceRelationId, strVal(linitial(parts)));
 	TupleDesc	desc = provider_columns(definition);
 	char	  **names,
-			  **defs,
 			  **metadata;
 	int			n,
 				i;
 
 	JsonbValue	document = json_document(definition);
 	JsonbValue	constraints;
+	Constraint **parsed;
 
 	n = json_get(&document, "constraints", &constraints) ? json_length(&constraints) : 0;
 	names = palloc_array(char *, Max(n, 1));
-	defs = palloc_array(char *, Max(n, 1));
 	metadata = palloc_array(char *, Max(n, 1));
 	for (i = 0; i < n; i++)
 	{
 		JsonbValue	constraint = json_element(&constraints, i);
 
 		names[i] = json_item_text(&constraint, 0);
-		defs[i] = json_item_text(&constraint, 1);
 		metadata[i] = json_item_json(&constraint, 2);
 	}
+	parsed = schema_constraints(definition, &i);
+	if (i != n)
+		elog(ERROR, "canonical constraint count mismatch");
 	for (i = 0; i < n; i++)
 	{
-		List	   *parsed = schema_expression_parse(psprintf("ALTER TABLE placeholder ADD CONSTRAINT %s %s", dg_quote_identifier(names[i]), defs[i]));
-		Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
-		AlterTableStmt *alter;
-		Constraint *constraint;
+		Constraint *constraint = parsed[i];
 		Node	   *expression = NULL;
 		FormData_pg_constraint form = {0};
 		ListCell   *lc;
@@ -767,12 +896,6 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 		int			slot = provider_catalog_index(ConstraintRelationId),
 					k = 0;
 
-		if (list_length(parsed) != 1 || !IsA(node, AlterTableStmt))
-			elog(ERROR, "invalid canonical constraint");
-		alter = (AlterTableStmt *) node;
-		if (list_length(alter->cmds) != 1 || !IsA(((AlterTableCmd *) linitial(alter->cmds))->def, Constraint))
-			elog(ERROR, "invalid canonical constraint command");
-		constraint = (Constraint *) ((AlterTableCmd *) linitial(alter->cmds))->def;
 		switch (constraint->contype)
 		{
 			case CONSTR_PRIMARY:
@@ -854,10 +977,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 static void
 provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, int count, char **definitions, char **kinds)
 {
-	char	   *sql = json_value(definition, "index_definition");
-	List	   *parsed = raw_parser(sql, RAW_PARSE_DEFAULT);
-	Node	   *node = ((RawStmt *) linitial(parsed))->stmt;
-	IndexStmt  *stmt;
+	IndexStmt  *stmt = schema_index(definition);
 	char	   *table;
 	TupleDesc	desc = NULL;
 	FormData_pg_index form = {0};
@@ -872,9 +992,8 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 				k = 0,
 				slot = provider_catalog_index(IndexRelationId);
 
-	if (list_length(parsed) != 1 || !IsA(node, IndexStmt))
+	if (!stmt)
 		elog(ERROR, "invalid canonical index definition");
-	stmt = (IndexStmt *) node;
 	if (stmt->whereClause || stmt->options || strcmp(stmt->accessMethod, "dolt_prolly_index"))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("unsupported canonical index properties")));
 	if (!stmt->relation->schemaname)
