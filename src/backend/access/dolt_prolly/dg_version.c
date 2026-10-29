@@ -143,6 +143,7 @@ branch_ref(const char *prefix)
 	return psprintf("%s/%s", prefix, dg_current_branch());
 }
 static bytea *merge_parent(void);
+static bool database_same(bytea *a, bytea *b);
 static void finish_merge(void);
 static bool canonical_drop(Node *statement);
 static void stage_tables(List *tables);
@@ -1247,6 +1248,14 @@ json_same(const char *a, const char *b)
 				DatumGetCString(DirectFunctionCall1(jsonb_out, DirectFunctionCall1(jsonb_in, CStringGetDatum(b)))));
 }
 
+/* Database payloads fingerprint logical members. Sequence children can hold
+ * different restore seeds for the same definition; ref CAS still uses same(). */
+static bool
+database_same(bytea *a, bytea *b)
+{
+	return same(a, b) || (a && b && json_same(metadata(a, "database"), metadata(b, "database")));
+}
+
 /* Field |key| of |object| as ->> gives it, or NULL. */
 static char *
 json_field_text(JsonbValue *object, const char *key)
@@ -1631,7 +1640,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	database = all ? staged_capture(&full) : staged.target;
 	if (!database)
 		database = parentdb;
-	if (same(database, parentdb) && !allow_empty && !merge_parent())
+	if (database_same(database, parentdb) && !allow_empty && !merge_parent())
 	{
 		if (skip_empty)
 		{

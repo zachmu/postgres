@@ -27,7 +27,7 @@ workspace_clean(void)
 				staged = read_ref(branch_ref("staged"));
 	bytea	   *headdb = child(head.target, 1);
 
-	return same(capture_visible().hash, headdb) && (!staged.target || same(staged.target, headdb));
+	return database_same(capture_visible().hash, headdb) && (!staged.target || database_same(staged.target, headdb));
 }
 
 /* Replace the live tables that |db| defines with their contents in |db|,
@@ -278,7 +278,7 @@ apply_rebase_step(RebaseStep * step)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("%s conflict detected while rebasing commit %s (%s)", schema_conflicts.len ? "schema" : "data", step->hash, json_value(meta, "message")), errhint("abort the rebase with dolt_rebase('--abort') and resolve the conflicting changes before rebasing again")));
 	}
 	database = capture_visible().hash;
-	return same(database, headdb) ? NULL : database;
+	return database_same(database, headdb) ? NULL : database;
 }
 
 static Datum
@@ -420,7 +420,7 @@ stash_push(const char *name)
 			   *headmeta = metadata(head.target, "commit");
 	int64		seq;
 
-	if (same(current.hash, headdb) && same(stageddb, headdb))
+	if (database_same(current.hash, headdb) && database_same(stageddb, headdb))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("No local changes to save")));
 	/* Only tracked tables are stashed; untracked tables stay in place. */
 	foreach(lc, live)

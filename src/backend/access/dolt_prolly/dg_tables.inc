@@ -74,9 +74,9 @@ dolt_branches(PG_FUNCTION_ARGS)
 	run("WITH refs AS (SELECT substr(r.refname,7) AS name,r.reftarget AS h FROM pg_dolt_ref r WHERE r.refname LIKE 'heads/%'),"
 		"c AS (SELECT refs.name,refs.h,convert_from(o.objpayload,'UTF8')::jsonb AS m,o.objchildren[1] AS db FROM refs JOIN pg_dolt_object_visible o ON o.objhash=refs.h) "
 		"SELECT c.name,encode(c.h,'hex'),m->>'committer',m->>'email'," DG_DATE_SQL("m->>'date_us'") ",m->>'message',''::text,''::text,"
-		"CASE WHEN c.name=$1 THEN $2 ELSE coalesce(w.reftarget<>c.db,false) END,"
+		"CASE WHEN c.name=$1 THEN $2 ELSE coalesce(wo.objpayload<>dbo.objpayload,false) END,"
 		"m->>'author',m->>'author_email'," DG_DATE_SQL("m->>'author_date_us'") " "
-		"FROM c LEFT JOIN pg_dolt_ref w ON w.refname='working/' || c.name ORDER BY c.name COLLATE \"C\"",
+		"FROM c LEFT JOIN pg_dolt_ref w ON w.refname='working/' || c.name LEFT JOIN pg_dolt_object_visible wo ON wo.objhash=w.reftarget LEFT JOIN pg_dolt_object_visible dbo ON dbo.objhash=c.db ORDER BY c.name COLLATE \"C\"",
 		2, VC_TYPES(TEXTOID, BOOLOID), VC_ARGS(CStringGetTextDatum(dg_current_branch()), BoolGetDatum(dirty)), NULL, true);
 	return_rows(fcinfo, nest);
 	return (Datum) 0;

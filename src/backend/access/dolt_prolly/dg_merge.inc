@@ -888,7 +888,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	oursdb = child(head.target, 1);
 	their_db = child(theirs, 1);
 	live = capture(true);
-	if (!same(live.hash, oursdb) || !same(read_ref(branch_ref("staged")).target, oursdb))
+	if (!database_same(live.hash, oursdb) || !database_same(read_ref(branch_ref("staged")).target, oursdb))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("error: local changes would be stomped by merge"), errhint("Commit or discard working and staged changes before merging.")));
 	if (ffonly && !same(base, head.target))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("not possible to fast-forward")));
