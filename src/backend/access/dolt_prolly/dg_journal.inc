@@ -778,7 +778,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	RootKey		key = root_key(rel, branch),
 				table_key = *table_key_in;
 	bool		is_table = rel->rd_rel->relkind != RELKIND_INDEX;
-	uint64		roots_gen = roots_generation();
+	uint64		roots_gen = roots_generation(&key) + roots_generation(&table_key);
 	Visibility	seen;
 	bool		latest = !(snapshot && IsMVCCSnapshot(snapshot));
 	JournalFold *fold = journal_fold_find(&key, latest, false);
