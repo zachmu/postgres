@@ -6,7 +6,7 @@ provider_sequence(DGProviderRows *rows, CatalogView *view, const char *definitio
 	FormData_pg_class form = {0};
 	FormData_pg_sequence seq = {0};
 	TupleDesc	desc = CreateTemplateTupleDesc(3);
-	Oid			resource = sequence_resource(name, 0, 0, false);
+	Oid			resource = sequence_resource(definition, false);
 
 	form.oid = CatalogViewFindObject(view, RelationRelationId, name);
 	namestrcpy(&form.relname, strVal(lsecond(parts)));

@@ -1088,8 +1088,8 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 				appendStringInfoChar(&schema_remaining, ',');
 			appendStringInfoString(&schema_remaining, records[i]);
 		}
-		else if (theirs)
-			restore_table(child((bytea *) DatumGetPointer(parents[1]), 1), name);
+		else if (theirs || !strcmp(json_value(records[i], "kind"), "sequence"))
+			restore_table(child((bytea *) DatumGetPointer(parents[theirs ? 1 : 0]), 1), name);
 	}
 	initStringInfo(&updated);
 	appendStringInfo(&updated, "{\"format\":\"DGMERGE1\",\"squash\":%s,\"source\":", json_value(json, "squash") ? json_value(json, "squash") : "false");

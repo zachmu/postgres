@@ -321,7 +321,7 @@ dg_catalog_create(Node *statement, const char *query)
 		foreach_ptr(char, seqdef, sequences)
 		{
 			bytea	   *member = object_member("sequence", seqdef);
-			Oid			resource = sequence_resource(json_value(seqdef, "name"), sequence_number(seqdef, "start"), sequence_number(seqdef, "increment"), true);
+			Oid			resource = sequence_resource(seqdef, true);
 
 			binding_record(dg_current_branch(), json_value(seqdef, "name"), child(member, 1), resource);
 			members[oldcount + k + 1 + foreach_current_index(seqdef)] = PointerGetDatum(member);

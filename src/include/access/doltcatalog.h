@@ -19,6 +19,7 @@ extern bool dg_catalog_routine_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_trigger_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_sequence_retained(Relation rel, int64 *last, bool *called);
 extern void dg_catalog_sequence_check(Relation rel);
+extern void dg_catalog_sequence_refresh(Relation rel);
 extern bool dg_catalog_sequence_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_type_ddl(struct ParseState *pstate, Node *statement);
 extern bool dg_catalog_rename(struct ParseState *pstate, Node *statement);

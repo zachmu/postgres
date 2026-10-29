@@ -32,7 +32,7 @@ is(sql(q{SELECT nextval('s')}),'23','the original branch still uses its sequence
 $b->query_safe(q{CREATE SEQUENCE s START 100});
 is($b->query_safe(q{SELECT seqstart FROM pg_sequence WHERE seqrelid='s'::regclass}),'100','same name can have another definition');
 is(sql(q{SELECT seqstart FROM pg_sequence WHERE seqrelid='s'::regclass}),'10','the original definition is unchanged');
-is(sql(q{SELECT count(*) FROM pg_dolt_sequence}),'1','both definitions have one allocator record');
+is(sql(q{SELECT count(*) FROM pg_dolt_sequence}),'2','different definitions have separate allocator records');
 sql(q{CREATE TABLE t(id serial PRIMARY KEY,v int)});
 sql(q{INSERT INTO t(v) VALUES(1)});
 is(sql(q{SELECT id FROM t}),'1','SERIAL resolves its versioned sequence');
@@ -64,8 +64,9 @@ sql(q{BEGIN; CREATE SEQUENCE rolled_back; ROLLBACK});
 fails(q{SELECT nextval('rolled_back')},qr/does not exist/,'aborted CREATE publishes no definition');
 sql(q{BEGIN; SELECT nextval('s'); ROLLBACK});
 is(sql(q{SELECT nextval('s')}),'25','aborted SQL transactions do not rewind allocation');
-fails(q{ALTER SEQUENCE s INCREMENT 2},qr/unsupported/,'unimplemented ALTER cannot mutate the shared allocator');
-is(sql(q{SELECT seqincrement FROM pg_sequence WHERE seqrelid='s'::regclass}),'1','rejected ALTER leaves the definition unchanged');
+sql(q{ALTER SEQUENCE s INCREMENT 2});
+is(sql(q{SELECT seqincrement FROM pg_sequence WHERE seqrelid='s'::regclass}),'2','ALTER publishes a new allocation definition');
+sql(q{ALTER SEQUENCE s INCREMENT 1});
 # Ordinary object merging carries sequence definitions into the destination.
 sql(q{SELECT dolt_commit('-Am','main sequences')});
 sql(q{SELECT dolt_branch('merge_sequences')});
