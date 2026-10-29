@@ -657,6 +657,21 @@ revision_selected:
 			if (!OidIsValid(handle))
 				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg(working ? "relation %s does not exist on branch %s" : "relation %s does not exist in revision %s", rv->relname, revision)));
 			relkind = get_rel_relkind(handle);
+			if (relkind == RELKIND_SEQUENCE)
+			{
+				if (target)
+					unsupported("direct writes to sequence relations");
+				if (pg_class_aclcheck(handle, user, ACL_SELECT) != ACLCHECK_OK)
+					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_SEQUENCE, rv->relname);
+				rel = relation_open(handle, AccessShareLock);
+				result = CreateTupleDescCopy(RelationGetDescr(rel));
+				relation_close(rel, AccessShareLock);
+				rte->relkind = RELKIND_SEQUENCE;
+				rte->relid = handle;
+				if (!working)
+					rte->dolt_catalog = handle;
+				goto binding_done;
+			}
 			if (relkind == RELKIND_VIEW)
 			{
 				/*

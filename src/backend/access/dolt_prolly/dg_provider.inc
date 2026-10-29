@@ -76,7 +76,7 @@ provider_current(DGProvider *entry, const char *branch)
 }
 
 static const Oid provider_catalogs[] = {
-	NamespaceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
+	NamespaceRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
 	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
@@ -149,7 +149,7 @@ provider_index_members(void)
 		ProviderMember *member;
 		bool		found;
 
-		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view"))
+		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view") && strcmp(kind, "sequence"))
 			continue;
 		name = json_value(provider_definition_list[i], "name");
 		if (strlen(name) >= sizeof(member->name))
@@ -162,7 +162,7 @@ provider_index_members(void)
 
 /*
  * The member of the schema being rebuilt named |name|, or -1: a table, index
- * or view, or only one of |kind| when given.
+ * view or sequence, or only one of |kind| when given.
  */
 static int
 provider_member(const char *name, const char *kind)
@@ -640,6 +640,10 @@ provider_routine_references(Node *node, ProviderRoutineReferences *context)
 	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid >= FirstDurableObjectId)
 		provider_dependency(context->rows, context->classid, context->objid, 0, ProcedureRelationId,
 							((FuncExpr *) node)->funcid, 0, DEPENDENCY_NORMAL);
+	if (IsA(node, Const) && ((Const *) node)->consttype == REGCLASSOID && !((Const *) node)->constisnull &&
+		DatumGetObjectId(((Const *) node)->constvalue) >= FirstDurableObjectId)
+		provider_dependency(context->rows, context->classid, context->objid, 0, RelationRelationId,
+							DatumGetObjectId(((Const *) node)->constvalue), 0, DEPENDENCY_NORMAL);
 	return expression_tree_walker(node, provider_routine_references, context);
 }
 
@@ -676,19 +680,6 @@ provider_defaults(DGProviderRows *rows, CatalogView *view, const char *definitio
 		HeapTuple	tuple;
 		int			slot = provider_catalog_index(AttrDefaultRelationId);
 
-		/* An identity column reaches its global sequence by dependency. */
-		if (TupleDescAttr(desc, i)->attidentity)
-		{
-			CatalogView *previous = CatalogViewSwitch(NULL);
-			List	   *qualified;
-			Oid			sequence;
-
-			qualified = stringToQualifiedNameList(json_field_text(&column, "sequence"), NULL);
-			sequence = get_relname_relid(strVal(lsecond(qualified)), get_namespace_oid(strVal(linitial(qualified)), true));
-			CatalogViewSwitch(previous);
-			if (OidIsValid(sequence))
-				provider_dependency(rows, RelationRelationId, sequence, 0, RelationRelationId, relation, i + 1, DEPENDENCY_INTERNAL);
-		}
 		if (!TupleDescAttr(desc, i)->atthasdef)
 			continue;
 		sql = json_field_text(&column, "default");
@@ -1135,6 +1126,8 @@ provider_table_type(DGProviderRows *rows, CatalogView *view, bytea *database,
 	provider_dependency(rows, TypeRelationId, array.oid, 0, TypeRelationId, type.oid, 0, DEPENDENCY_INTERNAL);
 }
 
+#include "dg_sequence_provider.inc"
+
 static void
 provider_populate(CatalogView *view, bytea *database, const char *branch)
 {
@@ -1169,7 +1162,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	{
 		if (!strcmp(kinds[i], "namespace"))
 			definitions[i] = metadata(addresses[i], "namespace");
-		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
+		else if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view") || !strcmp(kinds[i], "sequence"))
 		{
 			schemas[i] = child(addresses[i], 1);
 			definitions[i] = metadata(schemas[i], "schema");
@@ -1202,7 +1195,7 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 		}
 	/* Bind all class identities before resolving cross-object edges. */
 	for (i = 0; i < n; i++)
-		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index"))
+		if (!strcmp(kinds[i], "table") || !strcmp(kinds[i], "index") || !strcmp(kinds[i], "sequence"))
 			(void) provider_bind(view, branch, RelationRelationId, DOLT_IDENTITY_RELATION,
 								 json_value(definitions[i], "name"), json_value(definitions[i], "name"));
 
@@ -1369,6 +1362,13 @@ provider_populate(CatalogView *view, bytea *database, const char *branch)
 	for (i = 0; i < n; i++)
 		if (!strcmp(kinds[i], "routine"))
 			provider_routine(&rows, view, definitions[i]);
+
+	for (i = 0; i < n; i++)
+		if (!strcmp(kinds[i], "sequence"))
+		{
+			provider_sequence(&rows, view, definitions[i]);
+			CatalogViewObjectSetRetained(view, CatalogViewFindObject(view, RelationRelationId, json_value(definitions[i], "name")), schemas[i], NULL);
+		}
 
 	/*
 	 * Table expressions may call versioned routines, which they name; the

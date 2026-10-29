@@ -114,6 +114,8 @@ definition_references(const char *kind, const char *definition)
 {
 	List	   *references = NIL;
 
+	if (!strcmp(kind, "sequence") && json_value(definition, "owned_table"))
+		references_add(&references, "table", json_value(definition, "owned_table"));
 	/* An index's definition lists its key columns as a table's does. */
 	if (!strcmp(kind, "table") || !strcmp(kind, "index"))
 	{
@@ -310,7 +312,7 @@ database_dependents(const char *json, Datum *members, int count)
 	bytea	  **schemas;
 	char	  **kinds;
 
-	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
+	run("SELECT o.objkind,o.objchildren[1] FROM pg_catalog.pg_dolt_object_visible o WHERE o.objhash=ANY($1) AND o.objkind IN ('table','index','routine','trigger','type','view','sequence')", 1, VC_TYPES(BYTEAARRAYOID), VC_ARGS(PointerGetDatum(links(members, count))), NULL, true);
 	n = SPI_processed;
 	schemas = palloc_array(bytea *, Max(n, 1));
 	kinds = palloc_array(char *, Max(n, 1));

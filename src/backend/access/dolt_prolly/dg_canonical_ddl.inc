@@ -1,7 +1,7 @@
 /* Canonical DDL publishes definitions and local resources, never schema copies. */
 static void native_create_definitions(Capture current, CreateStmt *statement, const char *query, Oid caller,
 									  const char *name, char **table, List **index_names,
-									  List **index_definitions, List **foreign);
+									  List **index_definitions, List **foreign, List **sequences);
 static void
 canonical_empty_cleanup(void *arg)
 {
@@ -180,6 +180,7 @@ dg_catalog_create(Node *statement, const char *query)
 	bool		adopt = false;
 	char	   *name;
 	List	   *foreigncmds = NIL;
+	List	   *sequences = NIL;
 	ListCell   *lc;
 
 	if (!IsA(statement, CreateStmt) || !IsUnderPostmaster || rangevar_projection_hook || catalog_api_depth ||
@@ -283,7 +284,7 @@ dg_catalog_create(Node *statement, const char *query)
 		working = read_ref(branch_ref("working"));
 		current = capture(true);
 		native_create_definitions(current, stmt, query, user, name, &table,
-								  &index_names, &index_definitions, &foreigncmds);
+								  &index_names, &index_definitions, &foreigncmds, &sequences);
 		if (matview_pending)
 		{
 			run("SELECT jsonb_set($1::jsonb,'{matview}',$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(table), CStringGetTextDatum(matview_pending)), NULL, true);
@@ -304,7 +305,7 @@ dg_catalog_create(Node *statement, const char *query)
 		dg_release(empty);
 		run("SELECT unnest(objchildren) FROM pg_dolt_object_visible WHERE objhash=$1", 1, VC_TYPES(BYTEAOID), VC_ARGS(PointerGetDatum(current.hash)), NULL, true);
 		oldcount = SPI_processed;
-		total = oldcount + k + 1;
+		total = oldcount + k + 1 + list_length(sequences);
 		members = palloc_array(Datum, total);
 		for (int i = 0; i < oldcount; i++)
 			members[i] = cell(i, 1);
@@ -316,6 +317,15 @@ dg_catalog_create(Node *statement, const char *query)
 			if (i)
 				appendStringInfoChar(&added, ',');
 			appendStringInfoString(&added, metadata(newmembers[i], i ? "index" : "table"));
+		}
+		foreach_ptr(char, seqdef, sequences)
+		{
+			bytea	   *member = object_member("sequence", seqdef);
+			Oid			resource = sequence_resource(json_value(seqdef, "name"), sequence_number(seqdef, "start"), sequence_number(seqdef, "increment"), true);
+
+			binding_record(dg_current_branch(), json_value(seqdef, "name"), child(member, 1), resource);
+			members[oldcount + k + 1 + foreach_current_index(seqdef)] = PointerGetDatum(member);
+			appendStringInfo(&added, ",%s", metadata(member, "sequence"));
 		}
 		appendStringInfoChar(&added, ']');
 		run("SELECT jsonb_set($1::jsonb,'{members}',($1::jsonb->'members')||$2::jsonb)::text", 2, VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(current.json), CStringGetTextDatum(added.data)), NULL, true);
