@@ -29,6 +29,8 @@ sql(q{ALTER SEQUENCE shared_serial_id_seq INCREMENT 2});
 is(sql(q{SELECT count(*) FROM dolt_status}), '1', 'real sequence definition change stays visible');
 sql(q{SELECT dolt_reset('--hard'); SELECT dolt_checkout('main')});
 is(sql(q{SELECT nextval('shared_serial_id_seq')}), '50', 'reset and checkout preserve the shared restart');
+is(sql(q{SELECT dirty FROM dolt_branches WHERE name='serial_old'}), 'f',
+    'inactive branch is not dirty after allocation-only staging');
 sql(q{DROP TABLE shared_serial; SELECT dolt_commit('-Am','remove fixture')});
 
 sql(q{CREATE SEQUENCE s CACHE 3});

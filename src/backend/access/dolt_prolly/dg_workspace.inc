@@ -201,7 +201,10 @@ merge_member(Member * members, int count, const char *kind, const char *name)
 static bool
 merge_same(Member * a, Member * b)
 {
-	return (!a && !b) || (a && b && same(a->hash, b->hash));
+	return (!a && !b) || (a && b &&
+		(same(a->hash, b->hash) ||
+		 (!strcmp(a->kind, "sequence") && !strcmp(b->kind, "sequence") &&
+		  json_same(a->payload, b->payload))));
 }
 
 static char *
