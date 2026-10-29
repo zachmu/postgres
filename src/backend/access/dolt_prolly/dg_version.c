@@ -1852,7 +1852,12 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 2)
 		table = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	if (table)
-		table = resolve_object_argument(table, from, to, true);
+	{
+		/* As in Dolt, a name that names nothing has no changes. */
+		table = resolve_object_argument(table, from, to, false);
+		if (!table)
+			table = "";
+	}
 
 	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
