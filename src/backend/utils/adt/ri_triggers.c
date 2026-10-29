@@ -23,7 +23,11 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/relscan.h"
+#include "access/skey.h"
+#include "access/stratnum.h"
 #include "access/doltcatalog.h"
 #include "access/doltbranch.h"
 #include "catalog/catalogview.h"
@@ -34,6 +38,7 @@
 #include "access/xact.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_proc.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
@@ -118,6 +123,7 @@ typedef struct RI_ConstraintInfo
 	NameData	conname;		/* name of the FK constraint */
 	Oid			pk_relid;		/* referenced relation */
 	Oid			fk_relid;		/* referencing relation */
+	Oid			conindid;		/* the referenced key's unique index */
 	char		confupdtype;	/* foreign key's ON UPDATE action */
 	char		confdeltype;	/* foreign key's ON DELETE action */
 	int			ndelsetcols;	/* number of columns referenced in ON DELETE
@@ -264,6 +270,137 @@ ri_unlockable(Relation rel)
 		CatalogViewIsLeased(RelationGetRelid(rel));
 }
 
+/*
+ * Check a foreign key against a prolly referenced table without SPI: look the
+ * key up in the referenced table's unique index and lock the row it finds
+ * FOR KEY SHARE, as the planned SELECT ... FOR KEY SHARE would, with the
+ * same snapshot and the same treatment of concurrent updates and deletes.
+ * Planning and running a query per checked row costs far more than the
+ * lookup. Returns false, leaving *found unset, when the constraint needs the
+ * general query: a canonical binding, a partitioned or temporal key, or an
+ * index or operator the lookup cannot use.
+ */
+static bool
+ri_fast_check(const RI_ConstraintInfo *riinfo, Relation fk_rel, Relation pk_rel,
+			  TupleTableSlot *newslot, bool *found)
+{
+	Relation	idxrel;
+	ScanKeyData skeys[RI_MAX_NUMKEYS];
+	Datum		vals[RI_MAX_NUMKEYS];
+	char		nulls[RI_MAX_NUMKEYS];
+	int			keycol[RI_MAX_NUMKEYS];	/* the riinfo key at each index column */
+	IndexScanDesc scan;
+	TupleTableSlot *slot;
+	Snapshot	snapshot;
+	CommandId	cid;
+	int			lockflags;
+
+	if (pk_rel->rd_rel->relam != DOLT_PROLLY_TABLE_AM_OID || ri_unlockable(pk_rel) ||
+		pk_rel->rd_rel->relkind != RELKIND_RELATION || riinfo->hasperiod ||
+		!OidIsValid(riinfo->conindid))
+		return false;
+	idxrel = index_open(riinfo->conindid, AccessShareLock);
+	if (!idxrel->rd_index->indisunique || !idxrel->rd_index->indisvalid ||
+		idxrel->rd_index->indnkeyatts != riinfo->nkeys ||
+		!heap_attisnull(idxrel->rd_indextuple, Anum_pg_index_indexprs, NULL) ||
+		!heap_attisnull(idxrel->rd_indextuple, Anum_pg_index_indpred, NULL))
+	{
+		index_close(idxrel, AccessShareLock);
+		return false;
+	}
+	ri_ExtractValues(fk_rel, newslot, riinfo, false, vals, nulls);
+	for (int j = 0; j < riinfo->nkeys; j++)
+	{
+		int			i;
+		Oid			op;
+		Oid			lefttype,
+					righttype;
+
+		for (i = 0; i < riinfo->nkeys; i++)
+			if (riinfo->pk_attnums[i] == idxrel->rd_index->indkey.values[j])
+				break;
+		op = i < riinfo->nkeys ? riinfo->pf_eq_oprs[i] : InvalidOid;
+		if (!OidIsValid(op) ||
+			get_op_opfamily_strategy(op, idxrel->rd_opfamily[j]) != BTEqualStrategyNumber)
+		{
+			index_close(idxrel, AccessShareLock);
+			return false;
+		}
+		op_input_types(op, &lefttype, &righttype);
+		keycol[j] = i;
+		ScanKeyEntryInitialize(&skeys[j], 0, j + 1, BTEqualStrategyNumber, righttype,
+							   idxrel->rd_indcollation[j], get_opcode(op), vals[i]);
+	}
+
+	/* The snapshot and command a SPI query in this trigger would run under. */
+	dg_catalog_foreign_lock(pk_rel);
+	CommandCounterIncrement();
+	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	PushActiveSnapshot(snapshot);
+	cid = GetCurrentCommandId(true);
+	lockflags = TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS;
+	if (!IsolationUsesXactSnapshot())
+		lockflags |= TUPLE_LOCK_FLAG_FIND_LAST_VERSION;
+
+	*found = false;
+	slot = table_slot_create(pk_rel, NULL);
+	scan = index_beginscan(pk_rel, idxrel, snapshot, NULL, riinfo->nkeys, 0);
+	index_rescan(scan, skeys, riinfo->nkeys, NULL, 0);
+	while (!*found && index_getnext_slot(scan, ForwardScanDirection, slot))
+	{
+		TM_FailureData tmfd;
+		ItemPointerData tid = slot->tts_tid;
+		TM_Result	result = table_tuple_lock(pk_rel, &tid, snapshot, slot, cid, LockTupleKeyShare,
+											  LockWaitBlock, lockflags, &tmfd);
+
+		switch (result)
+		{
+			case TM_Ok:
+
+				/*
+				 * Following an update to the latest version, recheck the key
+				 * on it, as EvalPlanQual rechecks the query's quals.
+				 */
+				*found = true;
+				for (int j = 0; j < riinfo->nkeys && tmfd.traversed; j++)
+				{
+					int			i = keycol[j];
+					bool		isnull;
+					Datum		pkval = slot_getattr(slot, riinfo->pk_attnums[i], &isnull);
+
+					if (isnull ||
+						!DatumGetBool(OidFunctionCall2Coll(get_opcode(riinfo->pf_eq_oprs[i]),
+														   idxrel->rd_indcollation[j], pkval, vals[i])))
+						*found = false;
+				}
+				break;
+			case TM_SelfModified:
+				/* As LockRows: a row this transaction already changed is not returned. */
+				break;
+			case TM_Updated:
+			case TM_Deleted:
+				if (IsolationUsesXactSnapshot())
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("could not serialize access due to concurrent update")));
+				if (result == TM_Updated)
+					elog(ERROR, "unexpected table_tuple_lock status: %u", result);
+				break;
+			case TM_Invisible:
+				elog(ERROR, "attempted to lock invisible tuple");
+				break;
+			default:
+				elog(ERROR, "unrecognized table_tuple_lock status: %u", result);
+		}
+	}
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	PopActiveSnapshot();
+	UnregisterSnapshot(snapshot);
+	index_close(idxrel, AccessShareLock);
+	return true;
+}
+
 static Datum
 RI_FKey_check(TriggerData *trigdata)
 {
@@ -367,6 +504,19 @@ RI_FKey_check(TriggerData *trigdata)
 			 * of MATCH.
 			 */
 			break;
+	}
+
+	{
+		bool		found;
+
+		if (ri_fast_check(riinfo, fk_rel, pk_rel, newslot, &found))
+		{
+			if (!found)
+				ri_ReportViolation(riinfo, pk_rel, fk_rel, newslot, NULL,
+								   RI_PLAN_CHECK_LOOKUPPK, false, false);
+			table_close(pk_rel, RowShareLock);
+			return PointerGetDatum(NULL);
+		}
 	}
 
 	SPI_connect();
@@ -2341,6 +2491,7 @@ ri_LoadConstraintInfo(Oid constraintOid)
 												  ObjectIdGetDatum(riinfo->constraint_root_id));
 	memcpy(&riinfo->conname, &conForm->conname, sizeof(NameData));
 	riinfo->pk_relid = conForm->confrelid;
+	riinfo->conindid = conForm->conindid;
 	riinfo->fk_relid = conForm->conrelid;
 	riinfo->confupdtype = conForm->confupdtype;
 	riinfo->confdeltype = conForm->confdeltype;

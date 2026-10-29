@@ -1079,6 +1079,15 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 		return result;
 
 	/*
+	 * A caller that found the row by its TID, as a foreign key check does
+	 * through an index, already holds the version it locked: a TID names one
+	 * row version, so there is nothing to fetch again.
+	 */
+	if (!traversed && !TTS_EMPTY(slot) && slot->tts_tableOid == RelationGetRelid(rel) &&
+		ItemPointerEquals(&slot->tts_tid, tid))
+		return TM_Ok;
+
+	/*
 	 * A key-share lock may hold a version a committed non-key update replaced,
 	 * as heap allows; fetch whichever version the TID names.
 	 */
