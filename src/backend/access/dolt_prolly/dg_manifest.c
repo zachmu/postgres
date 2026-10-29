@@ -2,6 +2,8 @@
 #include "dg.h"
 #include "catalog/pg_dolt_object.h"
 #include "catalog/pg_dolt_ref.h"
+#include "catalog/heap.h"
+#include "catalog/pg_dolt_identity.h"
 #include "utils/inval.h"
 #include "access/relation.h"
 #include "catalog/pg_type_d.h"
@@ -28,7 +30,7 @@
 
 #define DG_SCHEMA_TREE "DGSCHEMA2"
 
-static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type", "view"};
+static const char *const kinds[] = {"chunk", "schema", "table", "index", "database", "commit", "namespace", "tag", "merge", "routine", "rebase", "stash", "trigger", "type", "view", "sequence"};
 
 static void
 manifest_begin(void)
@@ -258,7 +260,7 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 	if (ARR_NDIM(children) > 1 || (ARR_NDIM(children) == 1 && ARR_LBOUND(children)[0] != 1))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest children must be a one-dimensional array with lower bound 1")));
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &links, &nulls, &n);
-	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3) || (id == 9 && n != 1) || (id == 10 && n != 2) || (id == 11 && n != 3))
+	if (((id == 1 || id == 6) && n > 1) || ((id == 2 || id == 3) && n != 2) || (id == 5 && n < 1) || (id == 7 && n != 1) || (id == 8 && n != 3) || ((id == 9 || id == 15) && n != 1) || (id == 10 && n != 2) || (id == 11 && n != 3))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid manifest child count for %s", kind)));
 	if ((id == 1 || id == 6) && n == 1 &&
 		(VARSIZE_ANY_EXHDR(payload) != strlen(DG_SCHEMA_TREE) ||
@@ -275,10 +277,10 @@ put_object(const char *kind, bytea *payload, ArrayType *children)
 		child = object_kind(DatumGetByteaPP(links[i]));
 		valid = (id == 0 || id == 1 || id == 6) ? strcmp(child, "chunk") == 0 :
 			(id == 2 || id == 3) ? strcmp(child, i == 0 ? "schema" : "chunk") == 0 :
-			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0) :
+			id == 4 ? (strcmp(child, "table") == 0 || strcmp(child, "index") == 0 || strcmp(child, "namespace") == 0 || strcmp(child, "routine") == 0 || strcmp(child, "trigger") == 0 || strcmp(child, "type") == 0 || strcmp(child, "view") == 0 || strcmp(child, "sequence") == 0) :
 			id == 5 ? strcmp(child, i == 0 ? "database" : "commit") == 0 :
 			(id == 7 || id == 8) ? strcmp(child, "commit") == 0 :
-			(id == 9 || id == 12 || id == 13 || id == 14) ? strcmp(child, "schema") == 0 :
+			(id == 9 || id == 12 || id == 13 || id == 14 || id == 15) ? strcmp(child, "schema") == 0 :
 			id == 10 ? strcmp(child, "commit") == 0 :
 			id == 11 ? strcmp(child, i < 2 ? "database" : "commit") == 0 : false;
 		if (!valid)
@@ -631,6 +633,61 @@ dolt_manifest_read(PG_FUNCTION_ARGS)
 	return record_result(fcinfo, 2);
 }
 
+static bool
+hash_equal(bytea *a, bytea *b)
+{
+	return VARSIZE_ANY_EXHDR(a) == VARSIZE_ANY_EXHDR(b) && !memcmp(VARDATA_ANY(a), VARDATA_ANY(b), VARSIZE_ANY_EXHDR(a));
+}
+
+/* The schema of table or index member |hash|. */
+static bytea *
+member_schema(bytea *hash)
+{
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	if (!dg_object_read(hash, NULL, NULL, NULL, &children))
+		return NULL;
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
+	return n < 1 || nulls[0] ? NULL : DatumGetByteaPP(values[0]);
+}
+
+/*
+ * Statistics describe a relation's columns as its schema defines them: those
+ * of |branch|'s tables and indexes whose schema working set |now| changes from
+ * |old| are removed. The others' remain current; those of relations it drops
+ * go with their identities.
+ */
+static void
+drop_changed_statistics(const char *branch, bytea *old, bytea *now)
+{
+	int			count;
+	DGMember   *members = dg_database_members(old, &count);
+
+	for (int i = 0; i < count; i++)
+	{
+		bytea	   *current,
+				   *before,
+				   *after;
+		Oid			oid;
+
+		if (!members[i].name || (strcmp(members[i].kind, "table") && strcmp(members[i].kind, "index")))
+			continue;
+		current = now ? dg_database_member(now, members[i].kind, members[i].name) : NULL;
+		if (!current || hash_equal(current, members[i].hash))
+			continue;
+		before = member_schema(members[i].hash);
+		after = member_schema(current);
+		if (before && after && hash_equal(before, after))
+			continue;
+		oid = dg_identity_lookup(branch, DOLT_IDENTITY_RELATION, members[i].name);
+		if (OidIsValid(oid))
+			RemoveStatistics(oid, 0);
+	}
+}
+
 Datum
 dolt_manifest_cas(PG_FUNCTION_ARGS)
 {
@@ -639,6 +696,7 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	char		nulls[] = "    ";
 	uint8		random[PL_HASH_SIZE];
 	bytea	   *token;
+	bytea	   *previous = NULL;
 	text	   *name;
 
 	manifest_begin();
@@ -678,9 +736,16 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 	else if (PG_ARGISNULL(2))
 		manifest_execute("DELETE FROM pg_catalog.pg_dolt_ref WHERE refname=$1 AND reftoken=$2", 2, types, args, nulls, false, 0);
 	else
-		manifest_execute("UPDATE pg_catalog.pg_dolt_ref SET reftarget=$3,reftoken=$4 WHERE refname=$1 AND reftoken=$2", 4, types, args, nulls, false, 0);
+		manifest_execute("UPDATE pg_catalog.pg_dolt_ref SET reftarget=$3,reftoken=$4 WHERE refname=$1 AND reftoken=$2 RETURNING old.reftarget", 4, types, args, nulls, false, 0);
 	if (SPI_processed != 1)
 		ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("manifest ref changed; reread and retry transaction")));
+	if (!PG_ARGISNULL(1) && !PG_ARGISNULL(2))
+	{
+		bool		isnull;
+		Datum		value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+		previous = isnull ? NULL : DatumGetByteaPCopy(value);
+	}
 	/* Branch and tag moves feed dolt_reflog. */
 	if (!PG_ARGISNULL(2) && (strncmp(text_to_cstring(name), "heads/", 6) == 0 || strncmp(text_to_cstring(name), "tags/", 5) == 0))
 		manifest_execute("INSERT INTO pg_catalog.pg_dolt_reflog(reflogname,reflogtime,reflogtarget) VALUES($1,clock_timestamp(),$3)", 4, types, args, nulls, false, 0);
@@ -696,6 +761,8 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 		const char *branch = text_to_cstring(name) + 8;
 
 		dg_identity_invalidate_branch(branch);
+		if (previous)
+			drop_changed_statistics(branch, previous, PG_ARGISNULL(2) ? NULL : PG_GETARG_BYTEA_PP(2));
 
 		/* The branch's OIDs name exactly the objects of its new schema. */
 		if (!PG_ARGISNULL(2))
@@ -707,7 +774,7 @@ dolt_manifest_cas(PG_FUNCTION_ARGS)
 
 			for (int i = 0; i < count; i++)
 			{
-				if (!listed[i].name || (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index")))
+				if (!listed[i].name || (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index") && strcmp(listed[i].kind, "sequence")))
 					continue;
 				members = lappend(members, (char *) listed[i].name);
 				if (!strcmp(listed[i].kind, "table"))

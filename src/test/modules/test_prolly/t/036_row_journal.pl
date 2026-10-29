@@ -66,6 +66,45 @@ $r->query_safe('COMMIT');
 is($r->query_safe(q{SELECT count(*) FROM t WHERE id > 3000}), '2', 'and sees it in the next transaction');
 $r->quit;
 
+# A session keeps the entries it read across transactions, with its own
+# changes: what it sees must match a fresh session after others' commits, its
+# own commits, aborts, savepoint rollbacks, interleaved commits and folds.
+my $a = $node->background_psql('postgres');
+my $b = $node->background_psql('postgres');
+my $count = q{SELECT count(*), coalesce(sum(k), 0) FROM t WHERE id > 7000};
+sub agree
+{
+	my ($label) = @_;
+	my $fresh = sql($count);
+	is($a->query_safe($count), $fresh, "$label: the first session agrees");
+	is($b->query_safe($count), $fresh, "$label: the second session agrees");
+}
+agree('before any change');
+$b->query_safe(q{INSERT INTO t VALUES (7001, 1, 'b')});
+agree('after another session commits');
+$a->query_safe(q{INSERT INTO t VALUES (7002, 2, 'a'); UPDATE t SET k = 3 WHERE id = 7001});
+agree('after its own commit');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7003, 4, 'a'); SELECT count(*) FROM t; ROLLBACK});
+agree('after its own abort');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7004, 5, 'a'); SAVEPOINT s; INSERT INTO t VALUES (7005, 6, 'a'); SELECT count(*) FROM t; ROLLBACK TO s; COMMIT});
+agree('after a savepoint rollback');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7006, 7, 'a')});
+$b->query_safe(q{INSERT INTO t VALUES (7007, 8, 'b'); DELETE FROM t WHERE id = 7002});
+$a->query_safe(q{COMMIT});
+agree('after interleaved commits');
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $old = $b->query_safe($count);
+$a->query_safe(q{INSERT INTO t VALUES (7008, 9, 'a')});
+is($b->query_safe($count), $old, 'an older snapshot does not see a later commit');
+$b->query_safe('COMMIT');
+agree('after the older snapshot ends');
+$a->query_safe(join(';', 'BEGIN', (map { "INSERT INTO t VALUES ($_, 1, 'many')" } 7101 .. 7400), 'COMMIT'));
+agree('after a fold consumes the stream');
+$b->query_safe(q{UPDATE t SET k = k + 1 WHERE id BETWEEN 7101 AND 7103});
+agree('after writes past the fold');
+$a->quit;
+$b->quit;
+
 # A stream past its bound folds: the journal empties and the roots move.
 my $before = journal_rows();
 sql(join(';', map { "INSERT INTO t VALUES ($_, 5, 'fold')" } 4001 .. 4300));
@@ -73,6 +112,28 @@ ok(journal_rows() < $before + 300, 'the stream folded');
 isnt(roots(), $root, 'into new roots');
 is(sql(q{SELECT count(*) FROM t WHERE v = 'fold'}), '300', 'every folded row remains');
 is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 5}), sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(*) FROM t WHERE k = 5}), 'index and table agree after the fold');
+
+# A batch past the stream's bound folds the stream with it, and its indexes'
+# batches must save exactly the entries the table's took out of the journal,
+# though other transactions commit before the fold: unrelated ones, which
+# make the batches reload, or writers adding to the stream.
+sql(q{CREATE TABLE f(id int PRIMARY KEY, k int, v text); CREATE INDEX f_k ON f(k); INSERT INTO f SELECT g, g, 'x' FROM generate_series(1, 1000) g});
+my $index_k = q{SET enable_seqscan = off; SET enable_bitmapscan = off; };
+my $table_k = q{SET enable_indexscan = off; SET enable_bitmapscan = off; };
+my $fw = $node->background_psql('postgres');
+sql(join(';', map { "UPDATE f SET v = 'u$_' WHERE id = $_" } 1 .. 120));
+$fw->query_safe(q{BEGIN; UPDATE f SET k = k + 5000 WHERE id BETWEEN 111 AND 120});
+sql(q{SELECT pg_current_xact_id()});
+$fw->query_safe('COMMIT');
+is(sql($index_k . q{SELECT count(*) FROM f WHERE k > 5000}), '10', 'an index batch reloaded after its table folded the stream keeps the folded entries');
+is(sql($index_k . q{SELECT count(*) FROM f WHERE k > 0}), sql($table_k . q{SELECT count(*) FROM f WHERE k > 0}), 'index and table agree');
+sql(join(';', map { "UPDATE f SET v = 'w$_' WHERE id = $_" } 1 .. 120));
+$fw->query_safe(q{BEGIN; UPDATE f SET k = k + 5000 WHERE id BETWEEN 101 AND 110});
+sql(q{UPDATE f SET v = 'other' WHERE id = 500});
+$fw->query_safe('COMMIT');
+is(sql($index_k . q{SELECT v FROM f WHERE k = 500}), 'other', 'the index holds a concurrent writer\'s entry the table folded');
+is(sql($index_k . q{SELECT string_agg(id || v, ',' ORDER BY id) FROM f WHERE k > 0}), sql($table_k . q{SELECT string_agg(id || v, ',' ORDER BY id) FROM f WHERE k > 0}), 'index and table agree');
+$fw->quit;
 
 # Version control folds what it needs: commits, status, branches, resets.
 sql(q{INSERT INTO t VALUES (5001, 1, 'before commit')});

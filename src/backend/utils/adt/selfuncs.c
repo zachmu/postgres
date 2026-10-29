@@ -6804,6 +6804,7 @@ get_actual_variable_endpoint(Relation heapRel,
 {
 	bool		have_data = false;
 	SnapshotData SnapshotNonVacuumable;
+	Snapshot	snapshot;
 	IndexScanDesc index_scan;
 	Buffer		vmbuffer = InvalidBuffer;
 	BlockNumber last_heap_block = InvalidBlockNumber;
@@ -6859,9 +6860,22 @@ get_actual_variable_endpoint(Relation heapRel,
 	 */
 	InitNonVacuumableSnapshot(SnapshotNonVacuumable,
 							  GlobalVisTestFor(heapRel));
+	snapshot = &SnapshotNonVacuumable;
+
+	/*
+	 * An AM that establishes index-only visibility itself reads only MVCC
+	 * snapshots, and its index holds no dead entries to skip: probe it with
+	 * the snapshot the query is being planned under.
+	 */
+	if (heapRel->rd_tableam->index_only_visible)
+	{
+		if (!ActiveSnapshotSet())
+			return false;
+		snapshot = GetActiveSnapshot();
+	}
 
 	index_scan = index_beginscan(heapRel, indexRel,
-								 &SnapshotNonVacuumable, NULL,
+								 snapshot, NULL,
 								 1, 0);
 	/* Set it up for index-only scan */
 	index_scan->xs_want_itup = true;
@@ -6872,7 +6886,8 @@ get_actual_variable_endpoint(Relation heapRel,
 	{
 		BlockNumber block = ItemPointerGetBlockNumber(tid);
 
-		if (!VM_ALL_VISIBLE(heapRel,
+		if (!heapRel->rd_tableam->index_only_visible &&
+			!VM_ALL_VISIBLE(heapRel,
 							block,
 							&vmbuffer))
 		{
@@ -6915,7 +6930,7 @@ get_actual_variable_endpoint(Relation heapRel,
 		 * We expect that the index will return data in IndexTuple not
 		 * HeapTuple format.
 		 */
-		if (!index_scan->xs_itup)
+		if (!index_scan->xs_itup && !index_scan->xs_hitup)
 			elog(ERROR, "no data returned for index-only scan");
 
 		/*
@@ -6924,10 +6939,15 @@ get_actual_variable_endpoint(Relation heapRel,
 		if (index_scan->xs_recheck)
 			break;
 
-		/* OK to deconstruct the index tuple */
-		index_deform_tuple(index_scan->xs_itup,
-						   index_scan->xs_itupdesc,
-						   values, isnull);
+		/* OK to deconstruct the index tuple, which an AM may return as a heap tuple */
+		if (index_scan->xs_itup)
+			index_deform_tuple(index_scan->xs_itup,
+							   index_scan->xs_itupdesc,
+							   values, isnull);
+		else
+			heap_deform_tuple(index_scan->xs_hitup,
+							  index_scan->xs_hitupdesc,
+							  values, isnull);
 
 		/* Shouldn't have got a null, but be careful */
 		if (isnull[0])

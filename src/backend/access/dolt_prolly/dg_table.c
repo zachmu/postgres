@@ -20,6 +20,11 @@
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/sampling.h"
+#include "pgstat.h"
+#include "access/doltcatalog.h"
+#include "catalog/pg_am_d.h"
+#include "executor/tuptable.h"
 #include "access/sysattr.h"
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
@@ -705,6 +710,7 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 		handle = dg_handle_choose(rel, dg_batch_state(batch), batch, dg_rowhash(row));
 		dg_batch_insert(batch, row, handle);
 		dg_index_apply(rel, row, 1, handle, cid);
+		pgstat_count_heap_insert(rel, 1);
 		dg_collect();
 	}
 	dg_tid(handle, &slot->tts_tid);
@@ -848,6 +854,7 @@ delete_row(Relation rel, ItemPointer tid, CommandId cid, Snapshot snapshot, Snap
 		return result;
 	remove_row(rel, handle, cid);
 	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
+	pgstat_count_heap_delete(rel);
 	return TM_Ok;
 }
 
@@ -1001,6 +1008,7 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	dg_tid(successor, &slot->tts_tid);
 	slot->tts_tableOid = RelationGetRelid(rel);
 	*indexes = indexed_change ? TU_All : TU_None;
+	pgstat_count_heap_update(rel, false, false);
 	dg_collect();
 	return TM_Ok;
 }
@@ -1079,6 +1087,15 @@ lock_row(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
 		return result;
 
 	/*
+	 * A caller that found the row by its TID, as a foreign key check does
+	 * through an index, already holds the version it locked: a TID names one
+	 * row version, so there is nothing to fetch again.
+	 */
+	if (!traversed && !TTS_EMPTY(slot) && slot->tts_tableOid == RelationGetRelid(rel) &&
+		ItemPointerEquals(&slot->tts_tid, tid))
+		return TM_Ok;
+
+	/*
 	 * A key-share lock may hold a version a committed non-key update replaced,
 	 * as heap allows; fetch whichever version the TID names.
 	 */
@@ -1151,6 +1168,67 @@ analyze_tuple(TableScanDesc s, TransactionId oldest, double *live, double *dead,
 {
 	return false;
 }
+/*
+ * Whether ANALYZE collects statistics for |rel|: a branch's own table, named
+ * by its durable OID, whose pg_statistic rows are keyed by that OID and so
+ * belong to the table on that branch. Revisions and tables mid-DDL keep none.
+ */
+bool
+dg_relation_analyzable(Relation rel)
+{
+	return rel->rd_rel->relam == DOLT_PROLLY_TABLE_AM_OID && DG_ROWS_KIND(rel->rd_rel->relkind) &&
+		CatalogViewIsDurable(RelationGetRelid(rel)) && !CatalogViewIsProvisional(rel->rd_catalogview);
+}
+
+/*
+ * ANALYZE's sample of a prolly table: every row of the snapshot is visited,
+ * as the table has no blocks to sample, and a reservoir keeps |targrows| of
+ * them chosen uniformly, by the selection ANALYZE applies within blocks.
+ */
+int
+dg_acquire_sample_rows(Relation rel, int elevel, HeapTuple *rows, int targrows,
+					   double *totalrows, double *totaldeadrows)
+{
+	Snapshot	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	TableScanDesc scan = table_beginscan(rel, snapshot, 0, NULL);
+	TupleTableSlot *slot = table_slot_create(rel, NULL);
+	ReservoirStateData rstate;
+	double		seen = 0,
+				skip = -1;
+	int			numrows = 0;
+
+	reservoir_init_selection_state(&rstate, targrows);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (numrows < targrows)
+			rows[numrows++] = ExecCopySlotHeapTuple(slot);
+		else
+		{
+			if (skip < 0)
+				skip = reservoir_get_next_S(&rstate, seen, targrows);
+			if (skip <= 0)
+			{
+				int			k = (int) (targrows * sampler_random_fract(&rstate.randstate));
+
+				heap_freetuple(rows[k]);
+				rows[k] = ExecCopySlotHeapTuple(slot);
+			}
+			skip -= 1;
+		}
+		seen += 1;
+	}
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snapshot);
+	*totalrows = seen;
+	*totaldeadrows = 0;
+	ereport(elevel,
+			(errmsg("\"%s\": scanned %.0f rows; %d rows in sample",
+					RelationGetRelationName(rel), seen, numrows)));
+	return numrows;
+}
+
 static double
 build_range(Relation t, Relation i, IndexInfo *info, bool sync, bool any, bool progress, BlockNumber start, BlockNumber n, IndexBuildCallback cb, void *arg, TableScanDesc scan)
 {

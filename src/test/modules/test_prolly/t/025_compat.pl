@@ -18,7 +18,7 @@ sub fails {
 sql(q{CREATE TABLE p(pk int PRIMARY KEY, c1 int) USING dolt_prolly_table; INSERT INTO p SELECT i, i % 7 FROM generate_series(1,100) g(i)});
 sql(q{ANALYZE p; VACUUM p});
 is(sql(q{SELECT count(*) FROM p}),'100','ANALYZE and VACUUM leave prolly rows intact');
-is(sql(q{SELECT count(*) FROM pg_stats WHERE tablename='p'}),'0','ANALYZE samples no prolly rows');
+is(sql(q{SELECT count(*) FROM pg_stats WHERE tablename='p'}),'2','ANALYZE samples prolly rows');
 is(sql(q{SELECT dolt_stats_once()}),'statistics refreshed with ANALYZE','refresh succeeds with prolly tables');
 sql(q{DROP TABLE p});
 sql(q{CREATE TABLE t(pk int PRIMARY KEY, c1 int) USING heap; INSERT INTO t SELECT i, i % 7 FROM generate_series(1,100) g(i)});

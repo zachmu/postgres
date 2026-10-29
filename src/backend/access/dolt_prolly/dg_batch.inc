@@ -260,21 +260,140 @@ journal_marked(Oid relid, CommandId cid, SubTransactionId subxid)
 	return journal_marks && hash_search(journal_marks, &mark, HASH_FIND, NULL) != NULL;
 }
 
+/* Reload |b|'s state, opening |rel| for it. */
 static void
-batch_flush(DGBatch *b)
+batch_reload(DGBatch *b, Relation rel)
+{
+	MemoryContext old = MemoryContextSwitchTo(b->memory);
+
+	/* The writer's lock on the relation outlives its statement. */
+	batch_stamp(b);
+	b->state = batch_load(rel);
+	MemoryContextSwitchTo(old);
+}
+
+/* Apply |b|'s edits to its state and save the result. */
+static void
+batch_apply(DGBatch *b)
+{
+	if (b->table)
+		batch_flush_table(b);
+	else
+		batch_flush_index(b);
+	save_roots(&b->key, b->table, b->state, b->cid, b->subxid);
+}
+
+static void
+batch_forget(DGBatch *b)
 {
 	RootKey		key = b->key;
 	MemoryContext memory = b->memory;
 
+	hash_search(batches, &key, HASH_REMOVE, NULL);
+
+	/* The state's cleanup callback runs with the memory, releasing it. */
+	MemoryContextDelete(memory);
+}
+
+/* The batches of the indexes of table batch |tb| from its command. */
+static List *
+batch_index_group(DGBatch *tb)
+{
+	HASH_SEQ_STATUS status;
+	DGBatch    *b;
+	List	   *group = NIL;
+
+	hash_seq_init(&status, batches);
+	while ((b = hash_seq_search(&status)) != NULL)
+		if (!b->table && b->count && b->cid == tb->cid && b->subxid == tb->subxid &&
+			b->table_space == tb->key.space && b->table_file == tb->key.file &&
+			strcmp(b->key.branch, tb->key.branch) == 0)
+			group = lappend(group, b);
+	return group;
+}
+
+/*
+ * Apply table batch |b|, which cannot be journaled, with its indexes'
+ * batches from the same command. Saving the table's state takes the stream
+ * entries it folded out of the journal, so each index's saved state must have
+ * folded exactly those: the indexes apply at once, before anything else can
+ * load them, and if any state is stale they all reload together, folding the
+ * stream under one snapshot.
+ */
+static void
+batch_apply_group(DGBatch *b, Relation rel)
+{
+	List	   *group = batch_index_group(b);
+	List	   *rels = NIL;
+	bool		stale = batch_stale(b);
+	ListCell   *lc,
+			   *rc;
+
+	foreach(lc, group)
+	{
+		DGBatch    *ib = lfirst(lc);
+
+		rels = lappend(rels, ib->bound ? ib->bound : relation_open(ib->relid, NoLock));
+		stale = stale || batch_stale(ib);
+	}
+	if (stale)
+	{
+		Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+
+		batch_group_snapshot = snapshot;
+		PG_TRY();
+		{
+			batch_reload(b, rel);
+			forboth(lc, group, rc, rels)
+				batch_reload(lfirst(lc), lfirst(rc));
+		}
+		PG_FINALLY();
+		{
+			batch_group_snapshot = NULL;
+		}
+		PG_END_TRY();
+		UnregisterSnapshot(snapshot);
+	}
+	if (journal_batch(b, journal_marked(b->relid, b->cid, b->subxid)))
+		journal_mark(b->relid, b->cid, b->subxid);
+	else
+	{
+		batch_apply(b);
+		forboth(lc, group, rc, rels)
+		{
+			DGBatch    *ib = lfirst(lc);
+			Relation	irel = lfirst(rc);
+
+			batch_apply(ib);
+			if (!ib->bound)
+				relation_close(irel, NoLock);
+			batch_forget(ib);
+		}
+		return;
+	}
+	forboth(lc, group, rc, rels)
+	{
+		if (!((DGBatch *) lfirst(lc))->bound)
+			relation_close(lfirst(rc), NoLock);
+	}
+}
+
+static void
+batch_flush(DGBatch *b)
+{
+	RootKey		key = b->key;
+
 	if (b->count)
 	{
-		Relation	rel = b->bound ? b->bound : relation_open(b->relid, NoLock);
+		Relation	bound = b->bound;
+		Relation	rel = bound ? bound : relation_open(b->relid, NoLock);
 		bool		apply = true;
 
 		/*
 		 * An index's edits follow its table's: the table's batch of the same
 		 * command decides first whether it is journaled, in which case the
-		 * index's edits are implied by the journal and are dropped here.
+		 * index's edits are implied by the journal and are dropped here; if
+		 * it is applied, the index's edits are applied with it.
 		 */
 		if (!b->table)
 		{
@@ -287,40 +406,33 @@ batch_flush(DGBatch *b)
 
 				if (tb && tb->cid == b->cid && tb->subxid == b->subxid)
 					batch_flush(tb);
+				if (!batch_find(&key))
+				{
+					if (!bound)
+						relation_close(rel, NoLock);
+					dg_collect();
+					return;
+				}
 			}
 			apply = !journal_marked(table_relid, b->cid, b->subxid);
 		}
 
-		/* Reload only if someone published roots since the state was loaded. */
-		if (apply && batch_stale(b))
+		if (apply && b->table && !b->bound)
 		{
-			MemoryContext old = MemoryContextSwitchTo(memory);
-
-			/* The writer's lock on the relation outlives its statement. */
-			batch_stamp(b);
-			b->state = batch_load(rel);
-			MemoryContextSwitchTo(old);
-		}
-		if (apply && b->table && !b->bound && journal_batch(b, journal_marked(b->relid, b->cid, b->subxid)))
-		{
-			journal_mark(b->relid, b->cid, b->subxid);
+			batch_apply_group(b, rel);
 			apply = false;
 		}
-		if (apply)
+		else if (apply)
 		{
-			if (b->table)
-				batch_flush_table(b);
-			else
-				batch_flush_index(b);
-			save_roots(&key, b->table, b->state, b->cid, b->subxid);
+			/* Reload only if someone published roots since the state was loaded. */
+			if (batch_stale(b))
+				batch_reload(b, rel);
+			batch_apply(b);
 		}
-		if (!b->bound)
+		if (!bound)
 			relation_close(rel, NoLock);
 	}
-	hash_search(batches, &key, HASH_REMOVE, NULL);
-
-	/* The state's cleanup callback runs with the memory, releasing it. */
-	MemoryContextDelete(memory);
+	batch_forget(b);
 	dg_collect();
 }
 
@@ -473,7 +585,7 @@ dg_batch(Relation rel, CommandId cid)
 static void
 batch_stamp(DGBatch *b)
 {
-	b->generation = roots_generation();
+	b->generation = roots_generation(&b->key);
 	visibility_capture(SnapshotSelf, &b->seen);
 }
 
@@ -482,7 +594,7 @@ batch_stale(DGBatch *b)
 {
 	Visibility	now;
 
-	if (b->generation != roots_generation())
+	if (b->generation != roots_generation(&b->key))
 		return true;
 	visibility_capture(SnapshotSelf, &now);
 	return !visibility_equal(&b->seen, &now);

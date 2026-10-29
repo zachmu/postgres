@@ -66,6 +66,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/doltcatalog.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
@@ -73,6 +74,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/catalogview.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
@@ -2083,6 +2085,39 @@ do_autovacuum(void)
 
 	table_endscan(relScan);
 
+	/*
+	 * Every branch's tables, which pg_class holds no rows for. Their rows are
+	 * versioned, so they need analyzing but never vacuuming.
+	 */
+	foreach(cell, dg_identity_relations(NULL))
+	{
+		Oid			relid = lfirst_oid(cell);
+		HeapTuple	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		PgStat_StatTabEntry *tabentry;
+		AutoVacOpts *relopts;
+		bool		dovacuum;
+		bool		doanalyze;
+		bool		wraparound;
+
+		if (!HeapTupleIsValid(classTup))
+			continue;
+		if (((Form_pg_class) GETSTRUCT(classTup))->relkind == RELKIND_RELATION)
+		{
+			relopts = extract_autovac_opts(classTup, pg_class_desc);
+			tabentry = pgstat_fetch_stat_tabentry_ext(false, relid);
+			relation_needs_vacanalyze(relid, relopts, (Form_pg_class) GETSTRUCT(classTup), tabentry,
+									  effective_multixact_freeze_max_age,
+									  &dovacuum, &doanalyze, &wraparound);
+			if (doanalyze)
+				table_oids = lappend_oid(table_oids, relid);
+			if (relopts)
+				pfree(relopts);
+			if (tabentry)
+				pfree(tabentry);
+		}
+		heap_freetuple(classTup);
+	}
+
 	/* second pass: check TOAST tables */
 	ScanKeyInit(&key,
 				Anum_pg_class_relkind,
@@ -3090,7 +3125,8 @@ relation_needs_vacanalyze(Oid relid,
 	if (PointerIsValid(tabentry) && AutoVacuumingActive())
 	{
 		float4		pcnt_unfrozen = 1;
-		float4		reltuples = classForm->reltuples;
+		/* A branch's table counts its rows only in the cumulative statistics. */
+		float4		reltuples = CatalogViewIsDurable(relid) ? tabentry->live_tuples : classForm->reltuples;
 		int32		relpages = classForm->relpages;
 		int32		relallfrozen = classForm->relallfrozen;
 
@@ -3160,6 +3196,13 @@ relation_needs_vacanalyze(Oid relid,
 	/* ANALYZE refuses to work with pg_statistic */
 	if (relid == StatisticRelationId)
 		*doanalyze = false;
+
+	/* A branch's table keeps no dead rows or transaction IDs to vacuum. */
+	if (CatalogViewIsDurable(relid))
+	{
+		*dovacuum = false;
+		*wraparound = false;
+	}
 }
 
 /*
