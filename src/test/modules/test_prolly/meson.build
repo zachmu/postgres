@@ -45,5 +45,6 @@ tests += {
     't/039_explicit_identifiers.pl',
     't/040_object_diff.pl',
     't/041_trigger_commands.pl',
+    't/042_trigger_record.pl',
   ]},
 }
