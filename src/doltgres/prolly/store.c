@@ -184,7 +184,7 @@ mark_reachable(PLStore *store, PLHash hash)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		mark_reachable(store, child);
 	}
 }
@@ -363,6 +363,82 @@ pl_node_value(const PLNode *node, uint32_t index)
 	return result;
 }
 
+/* The address of node bytes: their SHA-256, truncated to PL_ADDRESS_SIZE bytes. */
+bool
+pl_node_address(PLSlice bytes, PLHash *out)
+{
+	if (!pl_hash_bytes(bytes, out))
+		return false;
+	memset(out->bytes + PL_ADDRESS_SIZE, 0, PL_HASH_SIZE - PL_ADDRESS_SIZE);
+	return true;
+}
+
+size_t
+pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows)
+{
+	size_t		n = PL_ADDRESS_SIZE;
+
+	memcpy(out, hash.bytes, PL_ADDRESS_SIZE);
+	do
+	{
+		uint8_t		byte = rows & 0x7F;
+
+		rows >>= 7;
+		out[n++] = byte | (rows ? 0x80 : 0);
+	} while (rows);
+	return n;
+}
+
+bool
+pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
+{
+	uint64_t	count = 0;
+	size_t		n = PL_ADDRESS_SIZE;
+	int			shift = 0;
+
+	if (value.len <= PL_ADDRESS_SIZE || value.len > PL_CHILD_MAX)
+		return false;
+	if (hash)
+	{
+		memcpy(hash->bytes, value.data, PL_ADDRESS_SIZE);
+		memset(hash->bytes + PL_ADDRESS_SIZE, 0, PL_HASH_SIZE - PL_ADDRESS_SIZE);
+	}
+	for (;;)
+	{
+		uint8_t		byte = value.data[n++];
+
+		count |= (uint64_t) (byte & 0x7F) << shift;
+		if (!(byte & 0x80))
+			break;
+		shift += 7;
+		if (n == value.len || shift > 63)
+			return false;
+	}
+	if (n != value.len)
+		return false;
+	if (rows)
+		*rows = count;
+	return true;
+}
+
+PLHash
+pl_child_hash(const PLNode *node, uint32_t index)
+{
+	PLHash		hash = {{0}};
+
+	(void) pl_child_decode(pl_node_value(node, index), &hash, NULL);
+	return hash;
+}
+
+uint64_t
+pl_child_rows(const PLNode *node, uint32_t index)
+{
+	uint64_t	rows = 0;
+
+	(void) pl_child_decode(pl_node_value(node, index), NULL, &rows);
+	return rows;
+}
+
 uint64_t
 pl_node_rows(const PLNode *node)
 {
@@ -372,7 +448,7 @@ pl_node_rows(const PLNode *node)
 	if (node->level == 0)
 		return node->count;
 	for (i = 0; i < node->count; i++)
-		rows += pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+		rows += pl_child_rows(node, i);
 	return rows;
 }
 
@@ -410,7 +486,7 @@ parse_node(PLNode *node)
 			uint32_t	end = pl_read32(offsets + 4 * (i + 1));
 
 			if (end < start || end > limit || end - start > PL_MAX_ITEM ||
-				(which && node->level && end - start != PL_CHILD_SIZE))
+				(which && node->level && (end - start <= PL_ADDRESS_SIZE || end - start > PL_CHILD_MAX)))
 				return PL_CORRUPT;
 		}
 	}
@@ -420,8 +496,10 @@ parse_node(PLNode *node)
 			return PL_CORRUPT;
 		if (node->level)
 		{
-			uint64_t	child_rows = pl_read64(pl_node_value(node, i).data + PL_HASH_SIZE);
+			uint64_t	child_rows;
 
+			if (!pl_child_decode(pl_node_value(node, i), NULL, &child_rows))
+				return PL_CORRUPT;
 			if (!child_rows || UINT64_MAX - rows < child_rows)
 				return PL_CORRUPT;
 			rows += child_rows;
@@ -559,7 +637,7 @@ pl_store_import(PLStore *store, PLHash hash, PLSlice bytes)
 
 	if (!store || !bytes.data || bytes.len > 2ULL * PL_MAX_ITEM * PL_MAX_ENTRIES + 2048)
 		return PL_INVALID;
-	if (!pl_hash_bytes(bytes, &actual) || !pl_hash_equal(hash, actual))
+	if (!pl_node_address(bytes, &actual) || !pl_hash_equal(hash, actual))
 		return PL_CORRUPT;
 	return store_buffer(store, hash, bytes.data, bytes.len, false, &node);
 }
@@ -611,7 +689,7 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	}
 	bytes.data = data;
 	bytes.len = length;
-	if (!pl_hash_bytes(bytes, &hash))
+	if (!pl_node_address(bytes, &hash))
 	{
 		free(data);
 		return PL_CORRUPT;

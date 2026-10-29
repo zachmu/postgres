@@ -184,6 +184,38 @@ test_tree(void)
 	pl_store_free(store);
 }
 
+/* A child reference is a 20-byte address prefix and a varint row count. */
+static void
+test_child_references(void)
+{
+	const uint64_t counts[] = {1, 127, 128, 16383, 16384, UINT64_C(1) << 35, UINT64_MAX};
+	uint8_t		encoded[PL_CHILD_MAX + 1];
+	PLHash		hash,
+				decoded;
+	uint64_t	rows;
+
+	for (int i = 0; i < PL_HASH_SIZE; i++)
+		hash.bytes[i] = (uint8_t) (i + 1);
+	for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+	{
+		size_t		length = pl_child_encode(encoded, hash, counts[c]);
+
+		CHECK(length > PL_ADDRESS_SIZE && length <= PL_CHILD_MAX);
+		CHECK(pl_child_decode(bytes(encoded, length), &decoded, &rows));
+		CHECK(rows == counts[c]);
+		CHECK(memcmp(decoded.bytes, hash.bytes, PL_ADDRESS_SIZE) == 0);
+		for (int i = PL_ADDRESS_SIZE; i < PL_HASH_SIZE; i++)
+			CHECK(decoded.bytes[i] == 0);
+		/* Truncated or trailing bytes are rejected. */
+		CHECK(!pl_child_decode(bytes(encoded, length - 1), NULL, &rows) || length - 1 == PL_ADDRESS_SIZE + 1);
+		encoded[length] = 0;
+		CHECK(!pl_child_decode(bytes(encoded, length + 1), NULL, &rows) || length + 1 > PL_CHILD_MAX);
+	}
+	CHECK(pl_child_encode(encoded, hash, 100) == PL_ADDRESS_SIZE + 1);
+	CHECK(pl_child_encode(encoded, hash, 5000) == PL_ADDRESS_SIZE + 2);
+	CHECK(!pl_child_decode(bytes(encoded, PL_ADDRESS_SIZE), NULL, &rows));
+}
+
 /* Node sizes and counts by level: leaves below, interior nodes from 1 up. */
 typedef struct LevelSizes
 {
@@ -211,7 +243,7 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		measure(store, child, sizes);
 	}
 }
@@ -981,7 +1013,6 @@ test_import_and_malformed(void)
 	{
 		PLSlice		data;
 		PLHash		hash;
-		unsigned	length;
 		uint8_t    *bad;
 
 		OK(pl_store_export(source, tree.root, &data));
@@ -989,12 +1020,12 @@ test_import_and_malformed(void)
 		CHECK(bad != NULL);
 		memcpy(bad, data.data, data.len);
 		pl_write32(bad + PL_HEADER, 1); /* first key offset must be zero */
-		CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		CHECK(pl_store_import(target, hash, bytes(bad, data.len)) == PL_CORRUPT);
 		memcpy(bad, data.data, data.len);
 		/* Valid local encoding, but nonexistent child address. */
 		bad[PL_HEADER + 8 * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
-		CHECK(EVP_Digest(bad, data.len, hash.bytes, &length, EVP_sha256(), NULL) == 1);
+		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		OK(pl_store_import(target, hash, bytes(bad, data.len)));
 		CHECK(pl_open(target, hash, &untouched) == PL_CORRUPT);
 		CHECK(pl_hash_equal(untouched.root, tree.root));
@@ -1094,7 +1125,7 @@ test_format_and_resolver_lifetime(void)
 	CHECK(serialized.len == 32);
 	for (i = 0; i < 32; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
-	CHECK(strcmp(hex, "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d3ea8049877c6c6a9e0c77218") == 0);
+	CHECK(strcmp(hex, "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d000000000000000000000000") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));
 	OK(pl_merge(&empty, &left, &right, resolve_scratch, scratch, &merged));
@@ -1114,6 +1145,7 @@ main(int argc, char **argv)
 	test_tuple_view();
 	test_tree();
 	test_node_sizes();
+	test_child_references();
 	test_versions();
 	test_random_history();
 	test_apply_batches();

@@ -25,7 +25,14 @@
 #endif
 #define PL_MAX_ENTRIES 512		/* any node's; an interior node's limit */
 #define PL_HEADER 24
-#define PL_CHILD_SIZE 40
+/*
+ * A child reference in an interior node: the first PL_ADDRESS_SIZE bytes of
+ * the child's address, then its row count as a varint. A node's address is
+ * the SHA-256 of its bytes with the bytes past PL_ADDRESS_SIZE zeroed, so the
+ * prefix names it whole.
+ */
+#define PL_ADDRESS_SIZE 20
+#define PL_CHILD_MAX (PL_ADDRESS_SIZE + 10)
 
 typedef struct PLNode
 {
@@ -67,6 +74,11 @@ uint64_t	pl_read64(const uint8_t *p);
 void		pl_write32(uint8_t *p, uint32_t v);
 void		pl_write64(uint8_t *p, uint64_t v);
 bool		pl_hash_bytes(PLSlice bytes, PLHash *out);
+bool		pl_node_address(PLSlice bytes, PLHash *out);
+size_t		pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows);
+bool		pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows);
+PLHash		pl_child_hash(const PLNode *node, uint32_t index);
+uint64_t	pl_child_rows(const PLNode *node, uint32_t index);
 PLNode	   *pl_find(PLStore *store, PLHash hash);
 PLNode	   *pl_find_local(PLStore *store, PLHash hash);
 void		pl_node_set_backed(PLNode *node);

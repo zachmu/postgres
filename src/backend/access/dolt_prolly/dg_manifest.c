@@ -806,7 +806,7 @@ export_node(PLStore *store, PLHash hash, int depth)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		children[i] = PointerGetDatum(export_node(store, child, depth + 1));
 	}
 	return put_object("chunk", bytes(node->data, node->size), children_array(children, count));
@@ -866,7 +866,7 @@ import_node(PLStore *store, bytea *address, int depth)
 		import_node(store, DatumGetByteaP(values[i]), depth + 1);
 	bytes_.data = (uint8 *) VARDATA(payload);
 	bytes_.len = VARSIZE(payload) - VARHDRSZ;
-	if (!pl_hash_bytes(bytes_, &hash))
+	if (!pl_node_address(bytes_, &hash))
 		elog(ERROR, "history chunk hash failed");
 	dg_check(pl_store_import(store, hash, bytes_));
 	pfree(payload);

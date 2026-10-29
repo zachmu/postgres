@@ -423,7 +423,7 @@ collect_unbacked(PLStore *store, PLHash root, Pending *pending)
 	{
 		PLHash		child;
 
-		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		child = pl_child_hash(node, i);
 		collect_unbacked(store, child, pending);
 	}
 	if (node->backed)
