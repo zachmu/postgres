@@ -704,7 +704,7 @@ insert_row(Relation rel, TupleTableSlot *slot, CommandId cid, int options, BulkI
 		row = dg_encode(rel, slot);
 		handle = dg_handle_choose(rel, dg_batch_state(batch), batch, dg_rowhash(row));
 		dg_batch_insert(batch, row, handle);
-		dg_index_apply(rel, row, 1, handle);
+		dg_index_apply(rel, row, 1, handle, cid);
 		dg_collect();
 	}
 	dg_tid(handle, &slot->tts_tid);
@@ -865,7 +865,7 @@ remove_row(Relation rel, uint64 handle, CommandId cid)
 		elog(ERROR, "missing canonical row");
 	row = copy_slice(row);
 	dg_batch_remove(b, row, handle);
-	dg_index_apply(rel, row, -1, handle);
+	dg_index_apply(rel, row, -1, handle, cid);
 	dg_collect();
 }
 
@@ -994,8 +994,8 @@ update_row(Relation rel, ItemPointer tid, TupleTableSlot *slot, CommandId cid, S
 	dg_batch_insert(b, new_row, successor);
 	if (!pl_hash_equal(old_digest, new_digest))
 	{
-		dg_index_apply(rel, old_row, -1, handle);
-		dg_index_apply(rel, new_row, 1, successor);
+		dg_index_apply(rel, old_row, -1, handle, cid);
+		dg_index_apply(rel, new_row, 1, successor, cid);
 	}
 	dg_note_modified(rel, dg_relation_branch(rel), handle, cid);
 	dg_tid(successor, &slot->tts_tid);

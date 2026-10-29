@@ -207,7 +207,7 @@ extern PLSlice dg_recode_composite(Oid type, PLSlice bytes, Oid target, int coun
 extern bool dg_key_ordered(Oid type);
 extern PLSlice dg_key_value(Oid type, Datum value);
 extern PLSlice dg_key_field(Oid type, PLSlice bytes);
-extern void dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle);
+extern void dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandId cid);
 extern bool dg_index_check_unique(Relation table, Relation index, ItemPointer tid, Datum *values, bool *isnull,
 								  IndexUniqueCheck check);
 extern void dg_index_validate(Relation table, Relation index);
