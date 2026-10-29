@@ -21,7 +21,9 @@
 
 #include <ctype.h>
 
+#include "access/doltcatalog.h"
 #include "access/htup_details.h"
+#include "catalog/catalogview.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
@@ -1661,6 +1663,7 @@ regnamespacein(PG_FUNCTION_ARGS)
 	Node	   *escontext = fcinfo->context;
 	Oid			result;
 	List	   *names;
+	CatalogView *previous;
 
 	/* Handle "-" or numeric OID */
 	if (parseDashOrOid(nsp_name_or_oid, &result, escontext))
@@ -1680,7 +1683,20 @@ regnamespacein(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("invalid name syntax")));
 
-	result = get_namespace_oid(strVal(linitial(names)), true);
+	/* As regclass lookup does for relations, resolve SQL namespace names in
+	 * the caller's revision, or the session branch when none is explicit.
+	 * Internal namespace/search-path caches still use physical namespace IDs. */
+	previous = CatalogViewCurrent();
+	CatalogViewSwitch(dg_catalog_session_view());
+	PG_TRY();
+	{
+		result = get_namespace_oid(strVal(linitial(names)), true);
+	}
+	PG_FINALLY();
+	{
+		CatalogViewSwitch(previous);
+	}
+	PG_END_TRY();
 
 	if (!OidIsValid(result))
 		ereturn(escontext, (Datum) 0,
