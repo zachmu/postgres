@@ -1199,6 +1199,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 	PLHash		current = s->content.root;
 	JournalEntries entries;
 	MemoryContext old;
+	JournalFold *sibling;
 
 	if (s->store != dg_working_store())
 		return;
@@ -1244,8 +1245,27 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		return;
 	}
 
+	/*
+	 * The other kind of load's fold of the same trees may have folded exactly
+	 * these entries: a writer's loads see the same stream once its commands
+	 * catch up with it. Take its result rather than apply them again.
+	 */
+	sibling = journal_fold_find(&key, !latest, false);
+	if (sibling && sibling->seq_count == entries.count && sibling->store_epoch == store_epoch &&
+		sibling->roots_generation == roots_gen && pl_hash_equal(sibling->base, current) &&
+		sibling->table == is_table && journal_fold_covered(sibling, &entries))
+	{
+		if (!(fold->seq_count && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
+			  pl_hash_equal(fold->base, current) && fold->table == is_table))
+		{
+			journal_fold_unpin(fold);
+			fold->base = current;
+		}
+		current = sibling->folded;
+	}
+
 	/* Continue from the last result when it is a prefix of what is visible now. */
-	if (fold->seq_count && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
+	else if (fold->seq_count && fold->store_epoch == store_epoch && fold->roots_generation == roots_gen &&
 		pl_hash_equal(fold->base, current) && fold->table == is_table &&
 		journal_fold_covered(fold, &entries))
 	{
