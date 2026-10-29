@@ -1044,7 +1044,10 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 		attr = TupleDescAttr(desc, keys[k] - 1);
 		if (k < form.indnkeyatts)
 		{
-			/* Built-in operator classes for built-in types are kept with the schema. */
+			/*
+			 * A built-in type's default operator class is kept with the
+			 * schema; a named one resolves through the search path.
+			 */
 			types[k] = attr->atttypid;
 			if (schema && (schema->parts & DG_SCHEMA_OPCLASSES) && schema->opclass_types[k] == types[k])
 				classes[k] = schema->opclasses[k];
@@ -1053,7 +1056,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 				classes[k] = ResolveOpClass(elem->opclass, attr->atttypid, "dolt_prolly_index", DOLT_PROLLY_INDEX_AM_OID);
 				resolved = true;
 			}
-			if (types[k] >= FirstNormalObjectId || classes[k] >= FirstNormalObjectId)
+			if (elem->opclass || types[k] >= FirstNormalObjectId || classes[k] >= FirstNormalObjectId)
 				builtin = false;
 			collations[k] = elem->collation ? get_collation_oid(elem->collation, false) : attr->attcollation;
 			if (elem->ordering == SORTBY_DESC)
