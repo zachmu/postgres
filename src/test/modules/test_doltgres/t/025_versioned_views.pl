@@ -26,6 +26,22 @@ is(sql(q{SELECT a||':'||b FROM named}),'10:1','a view over a view, with column n
 is(sql(q{SELECT pg_get_viewdef('positive'::regclass)})," SELECT id,\n    doubled(v) AS w\n   FROM t\n  WHERE (v > 0);",'the definition deparses as native');
 like(sql(q{SELECT array_to_string(reloptions, ',') FROM pg_class WHERE relname='checked'}),qr/check_option=cascaded/,'view options');
 
+# All relation kinds share a namespace, including in a provisional catalog.
+sql(q{CREATE SEQUENCE occupied_seq});
+for my $name ('t', 't_pkey', 'occupied_seq', 'positive')
+{
+    fails("CREATE VIEW $name AS SELECT 1 AS n", qr/relation "$name" already exists/,
+        "CREATE VIEW cannot overwrite $name");
+}
+for my $name ('t', 't_pkey', 'occupied_seq')
+{
+    fails("CREATE OR REPLACE VIEW $name AS SELECT 1 AS n", qr/"$name" is not a view/,
+        "CREATE OR REPLACE VIEW cannot replace $name");
+}
+is(sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM t}),'1,2',
+    'rejected view creation preserves the table and its index');
+sql(q{DROP SEQUENCE occupied_seq});
+
 # Nested utility execution must not mutate the SQL executor's registered snapshot.
 sql(q{CREATE FUNCTION build_nested_view() RETURNS void LANGUAGE sql AS $$
     CREATE OR REPLACE VIEW nested_view AS SELECT 7 AS n;
