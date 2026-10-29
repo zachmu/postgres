@@ -10,6 +10,7 @@ sub sql { return $node->safe_psql('postgres',$_[0]); }
 sub fails { my($q,$pattern,$label)=@_;my($s,$o,$e)=$node->psql('postgres',$q);isnt($s,0,$label);like($e,$pattern,"$label diagnostic"); }
 sql(q{CREATE FUNCTION pg_catalog.test_storage_allocate(oid,text) RETURNS oid AS 'storage_resource','test_storage_allocate' LANGUAGE C STRICT;
 CREATE FUNCTION pg_catalog.test_storage_write(text,text,text,text[],bigint) RETURNS bigint AS 'storage_resource','test_storage_write' LANGUAGE C STRICT;
+CREATE FUNCTION pg_catalog.test_storage_handle(tid) RETURNS bigint AS 'storage_resource','test_storage_handle' LANGUAGE C STRICT;
 CREATE ROLE writer; CREATE ROLE outsider;
 CREATE TABLE t(id int PRIMARY KEY,v int UNIQUE) USING dolt_prolly_table; INSERT INTO t VALUES(1,7)});
 my $legacy=sql(q{SELECT dolt_commit('-Am','integer definition')});
@@ -29,14 +30,17 @@ for my $index ('t_pkey','t_v_key')
  sql("BEGIN; UPDATE pg_dolt_binding SET bindrelid=$id WHERE bindbranch='other' AND bindname='public.$index'; DELETE FROM pg_dolt_binding WHERE bindbranch='legacy' AND bindname='public.$index'; INSERT INTO pg_dolt_binding VALUES($id,'legacy','public.$index',decode('$index_schemas{$index}','hex')); COMMIT");
 }
 my $resources=sql(q{SELECT count(*) FROM pg_dolt_storage});
-# Imported rows get derived handles 1..n; inserts allocate handles above every derived one.
+# Row handles derive from row contents: each row has its own.
+my $imported=sql(q{SELECT test_storage_handle(ctid) FROM "postgres/legacy".public.t WHERE id=1});
 my $inserted=sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY['2','8'],0)});
-cmp_ok($inserted,'>',1,'native insert imports old branch contents and allocates occurrence handle');
-cmp_ok(sql(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'>',$inserted,'second branch writes through its canonical definition');
+isnt($inserted,$imported,'native insert imports old branch contents and gives the new row its own handle');
+isnt(sql(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'','second branch writes through its canonical definition');
 is(sql(q{SELECT a.v,b.v FROM "postgres/legacy".public.t a JOIN "postgres/other".public.t b USING(id)}),'8|text','two incompatible writable schemas share a resource and preserve their roots');
 is(sql(q{SELECT active_branch()}),'main','explicit write binding does not switch session branch');
 is(sql(q{SELECT * FROM "postgres/main".public.t}),'1|main','writes leave another resource and branch untouched');
-cmp_ok(sql(q{SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],1)}),'>',$inserted,'native update uses bound branch and gives the new version a new handle');
+my $updated=sql("SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],$imported)");
+ok($updated ne $imported && $updated ne $inserted,'native update uses bound branch and gives the new version a new handle');
+fails("SELECT test_storage_write('legacy','public.t','update',ARRAY['1','10'],$imported)",qr/was not changed/,'an update of a replaced row version changes nothing');
 is(sql("SELECT test_storage_write('legacy','public.t','delete',ARRAY[]::text[],$inserted)"),'0','native delete uses bound branch');
 is(sql(q{SELECT * FROM "postgres/legacy".public.t}),'1|9','updated branch has correct rows');
 is(sql(q{SELECT * FROM "postgres/other".public.t}),'2|text','other schema remains unchanged after update and delete');
