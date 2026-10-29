@@ -147,12 +147,12 @@ $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 my $old_root = $reader->query_safe(q{SELECT dolt_prolly_root('p')});
 sql(q{UPDATE p SET value='changed after snapshot' WHERE id=1});
 my $old_chunk = $reader->query_safe(q{SELECT encode(dolt_manifest_export('p'),'hex')});
-is($reader->query_safe("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
+is($reader->query_safe("SELECT encode(substr(sha256(payload),1,20),'hex')||repeat('0',24) FROM dolt_manifest_get(".hasharg($old_chunk).")"), $old_root, 'export excludes changes outside reader snapshot');
 $reader->query_safe('COMMIT'); $reader->quit;
 my $root = sql(q{SELECT dolt_prolly_root('p')});
 my $chunk = sql(q{SELECT encode(dolt_manifest_export('p'),'hex')});
 my $indexchunk = sql(q{SELECT encode(dolt_manifest_export('p_pkey'),'hex')});
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex')||repeat('0',24) FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'export preserves canonical node bytes and original hash');
 is(sql(q{SELECT encode(dolt_manifest_export('p'),'hex')}), $chunk, 'export deterministic and deduplicated');
 sql(q{CREATE TABLE same(LIKE p) USING dolt_prolly_table; INSERT INTO same SELECT * FROM p ORDER BY id DESC});
 is(sql(q{SELECT encode(dolt_manifest_export('same'),'hex')}), $chunk, 'export ignores relation identity and insertion history');
@@ -169,7 +169,7 @@ ok($reachable > 1, 'export includes reachable descendants, not just root');
 my $objects = sql('SELECT count(*) FROM pg_dolt_object');
 ok($objects > 10, 'multi-node tree exported as DAG');
 sql('TRUNCATE p; DROP TABLE p');
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex')||repeat('0',24) FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical content survives truncate/drop of original relation');
 cmp_ok(sql('SELECT count(*) FROM pg_dolt_object'), '>=', $objects, 'all historical chunks retained; DROP only publishes a new schema');
 
 # Large opaque payloads exercise heap TOAST separately from prolly page storage.
@@ -221,7 +221,7 @@ $node->stop('immediate'); $node->start;
 sql(q{ROLLBACK PREPARED 'manifest_abort'});
 is(readref('tags/prepare_abort'), '', 'prepared abort remains invisible');
 is(sql('SELECT count(*) FROM h'), '1', 'prepared abort rolls back heap with ref');
-is(sql("SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
+is(sql("SELECT encode(substr(sha256(payload),1,20),'hex')||repeat('0',24) FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'historical bytes survive repeated recovery');
 is(sql("SELECT octet_length(payload) FROM dolt_manifest_get(".hasharg($large).")"), '64000', 'TOAST object survives recovery');
 
 
@@ -238,7 +238,7 @@ my $restore = PostgreSQL::Test::Cluster->new('manifest_restore');
 $restore->init_from_backup($node, 'history');
 $restore->start;
 is($restore->safe_psql('postgres', q{SELECT encode(target,'hex') FROM dolt_manifest_read('tags/captured')}), $commit, 'physical backup preserves history ref');
-is($restore->safe_psql('postgres', "SELECT encode(sha256(payload),'hex') FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'physical backup preserves historical chunks');
+is($restore->safe_psql('postgres', "SELECT encode(substr(sha256(payload),1,20),'hex')||repeat('0',24) FROM dolt_manifest_get(".hasharg($chunk).")"), $root, 'physical backup preserves historical chunks');
 $restore->stop;
 $node->stop;
 done_testing();
