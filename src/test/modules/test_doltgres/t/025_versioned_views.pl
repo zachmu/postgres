@@ -26,6 +26,18 @@ is(sql(q{SELECT a||':'||b FROM named}),'10:1','a view over a view, with column n
 is(sql(q{SELECT pg_get_viewdef('positive'::regclass)})," SELECT id,\n    doubled(v) AS w\n   FROM t\n  WHERE (v > 0);",'the definition deparses as native');
 like(sql(q{SELECT array_to_string(reloptions, ',') FROM pg_class WHERE relname='checked'}),qr/check_option=cascaded/,'view options');
 
+# Nested utility execution must not mutate the SQL executor's registered snapshot.
+sql(q{CREATE FUNCTION build_nested_view() RETURNS void LANGUAGE sql AS $$
+    CREATE OR REPLACE VIEW nested_view AS SELECT 7 AS n;
+$$});
+is(sql(q{SELECT build_nested_view(); SELECT n FROM nested_view}),"\n7",
+    'SQL function creates a versioned view with a private snapshot');
+is(sql(q{SELECT build_nested_view(); SELECT n FROM nested_view}),"\n7",
+    'SQL function replaces a versioned view');
+sql(q{BEGIN; SELECT build_nested_view(); ROLLBACK});
+is(sql(q{SELECT n FROM nested_view}),'7','rollback preserves the previous view');
+sql(q{DROP VIEW nested_view; DROP FUNCTION build_nested_view()});
+
 # ---- updatable views ----
 sql(q{INSERT INTO checked VALUES (3,7)});
 is(sql(q{SELECT v FROM t WHERE id=3}),'7','an insert through an updatable view');
