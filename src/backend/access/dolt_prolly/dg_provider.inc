@@ -149,7 +149,7 @@ provider_index_members(void)
 		ProviderMember *member;
 		bool		found;
 
-		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view"))
+		if (strcmp(kind, "table") && strcmp(kind, "index") && strcmp(kind, "view") && strcmp(kind, "sequence"))
 			continue;
 		name = json_value(provider_definition_list[i], "name");
 		if (strlen(name) >= sizeof(member->name))
@@ -162,7 +162,7 @@ provider_index_members(void)
 
 /*
  * The member of the schema being rebuilt named |name|, or -1: a table, index
- * or view, or only one of |kind| when given.
+ * view or sequence, or only one of |kind| when given.
  */
 static int
 provider_member(const char *name, const char *kind)
