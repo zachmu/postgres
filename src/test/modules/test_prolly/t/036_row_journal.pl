@@ -74,6 +74,28 @@ isnt(roots(), $root, 'into new roots');
 is(sql(q{SELECT count(*) FROM t WHERE v = 'fold'}), '300', 'every folded row remains');
 is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 5}), sql(q{SET enable_indexscan=off; SET enable_bitmapscan=off; SELECT count(*) FROM t WHERE k = 5}), 'index and table agree after the fold');
 
+# A batch past the stream's bound folds the stream with it, and its indexes'
+# batches must save exactly the entries the table's took out of the journal,
+# though other transactions commit before the fold: unrelated ones, which
+# make the batches reload, or writers adding to the stream.
+sql(q{CREATE TABLE f(id int PRIMARY KEY, k int, v text); CREATE INDEX f_k ON f(k); INSERT INTO f SELECT g, g, 'x' FROM generate_series(1, 1000) g});
+my $index_k = q{SET enable_seqscan = off; SET enable_bitmapscan = off; };
+my $table_k = q{SET enable_indexscan = off; SET enable_bitmapscan = off; };
+my $fw = $node->background_psql('postgres');
+sql(join(';', map { "UPDATE f SET v = 'u$_' WHERE id = $_" } 1 .. 120));
+$fw->query_safe(q{BEGIN; UPDATE f SET k = k + 5000 WHERE id BETWEEN 111 AND 120});
+sql(q{SELECT pg_current_xact_id()});
+$fw->query_safe('COMMIT');
+is(sql($index_k . q{SELECT count(*) FROM f WHERE k > 5000}), '10', 'an index batch reloaded after its table folded the stream keeps the folded entries');
+is(sql($index_k . q{SELECT count(*) FROM f WHERE k > 0}), sql($table_k . q{SELECT count(*) FROM f WHERE k > 0}), 'index and table agree');
+sql(join(';', map { "UPDATE f SET v = 'w$_' WHERE id = $_" } 1 .. 120));
+$fw->query_safe(q{BEGIN; UPDATE f SET k = k + 5000 WHERE id BETWEEN 101 AND 110});
+sql(q{UPDATE f SET v = 'other' WHERE id = 500});
+$fw->query_safe('COMMIT');
+is(sql($index_k . q{SELECT v FROM f WHERE k = 500}), 'other', 'the index holds a concurrent writer\'s entry the table folded');
+is(sql($index_k . q{SELECT string_agg(id || v, ',' ORDER BY id) FROM f WHERE k > 0}), sql($table_k . q{SELECT string_agg(id || v, ',' ORDER BY id) FROM f WHERE k > 0}), 'index and table agree');
+$fw->quit;
+
 # Version control folds what it needs: commits, status, branches, resets.
 sql(q{INSERT INTO t VALUES (5001, 1, 'before commit')});
 is(sql(q{SELECT count(*) FROM dolt_status WHERE table_name = 'public.t'}), '1', 'status sees journaled changes');
