@@ -442,8 +442,40 @@ merge_databases(bytea *base, bytea *ours, bytea *theirs, StringInfo conflicts, S
 		validate_working_foreign_keys(dg_current_branch());
 }
 
-/* Workspace selectors include independently versioned schema objects. Keep
- * row-diff resolution table-only: a routine has no row descriptor. */
+/*
+ * Resolve a signature's user types by canonical identity in either compared
+ * state. They may have been dropped on the current branch. Native built-in
+ * aliases still go through PostgreSQL's type parser. No runtime type handle
+ * is needed to match the identity of a retained routine.
+ */
+static char *
+routine_argument_name(TypeName *type, const char *a, const char *b)
+{
+	char	   *types;
+	char	   *name;
+	char	   *arg;
+	Oid			oid = LookupTypeNameOid(NULL, type, true);
+
+	/* Honor native search_path, including implicit pg_catalog precedence. */
+	if (OidIsValid(oid))
+		return routine_type_name(oid);
+
+	if (list_length(type->names) == 1 || list_length(type->names) == 2)
+	{
+		arg = list_length(type->names) == 1 ?
+			pstrdup(quote_identifier(strVal(linitial(type->names)))) :
+			dg_qualified_name(strVal(linitial(type->names)), strVal(lsecond(type->names)));
+		run("SELECT jsonb_build_object('members',coalesce(jsonb_agg(v || jsonb_build_object('kind','table')),'[]'::jsonb))::text FROM (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION SELECT v FROM jsonb_array_elements($2::jsonb->'members') v) m WHERE v->>'kind' IN ('type','table','view')", 2,
+			VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(a), CStringGetTextDatum(b)), NULL, true);
+		types = strcell(0, 1);
+		name = resolve_table_argument(arg, types, types, false);
+		if (name)
+			return type->arrayBounds ? psprintf("%s[]", name) : name;
+	}
+	return routine_type_name(typenameTypeId(NULL, type));
+}
+
+/* Workspace and diff selectors include independently versioned schema objects. */
 static char *
 resolve_object_argument(const char *arg, const char *json_a, const char *json_b, bool required)
 {
@@ -474,7 +506,7 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 		{
 			if (foreach_current_index(type))
 				appendStringInfoChar(&signature, ',');
-			appendStringInfoString(&signature, routine_type_name(typenameTypeId(NULL, type)));
+			appendStringInfoString(&signature, routine_argument_name(type, json_a, json_b));
 		}
 		appendStringInfoChar(&signature, ')');
 		suffix = signature.data;

@@ -18,7 +18,7 @@ typedef struct DiffTable
 {
 	bool		present;
 	char	   *name;			/* qualified logical name */
-	char	   *schema;			/* DGTABLE1 JSON */
+	char	   *schema;			/* canonical definition JSON */
 	TupleDesc	desc;
 	int			nkeys;
 	int		   *keys;			/* 0-based attribute indexes of the key */
@@ -26,6 +26,7 @@ typedef struct DiffTable
 	DGRows		rows;			/* sorted logical rows */
 	DGState    *live;			/* borrowed live state, released by diff_close */
 	PLStore    *store;			/* private store for imported history */
+	char	   *object_kind;	/* non-NULL for a schema-object property view */
 } DiffTable;
 
 typedef struct DiffRow
@@ -300,6 +301,94 @@ diff_table_schema(const char *revision, const char *name)
 	return working ? diff_table_working(name, false) : diff_table_at(db, name, false);
 }
 
+/*
+ * Non-table definitions are already canonical revisioned JSON. Expose their
+ * top-level properties as keyed (property text, value jsonb) rows without
+ * allocating relations or consulting the live physical catalog. JSON null is
+ * a value; an absent property is an absent row. Nested definitions stay intact.
+ */
+static DiffTable *
+diff_object_revision(const char *revision, const char *name, bool rows)
+{
+	bool		working;
+	bytea	   *db = revision_database(revision, &working);
+	char	   *kind;
+	bytea	   *schema;
+	DiffTable  *t;
+	int			i;
+
+	if (working)
+		db = read_ref(branch_ref("working")).target;
+	if (!db)
+		return diff_table_absent(name);
+	run("SELECT o.objkind,o.objchildren[1] FROM pg_dolt_object_visible d CROSS JOIN LATERAL unnest(d.objchildren) ch JOIN pg_dolt_object_visible o ON o.objhash=ch WHERE d.objhash=$1 AND o.objkind IN ('table','routine','view','type','trigger') AND convert_from(o.objpayload,'UTF8')::jsonb->>'name'=$2", 2,
+		VC_TYPES(BYTEAOID, TEXTOID), VC_ARGS(PointerGetDatum(db), CStringGetTextDatum(name)), NULL, true);
+	if (!SPI_processed)
+		return diff_table_absent(name);
+	if (SPI_processed != 1)
+		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous versioned object name: %s", name)));
+	kind = strcell(0, 1);
+	schema = DatumGetByteaPCopy(cell(0, 2));
+	if (!strcmp(kind, "table"))
+		return rows ? diff_table_revision(revision, name) : diff_table_schema(revision, name);
+
+	t = diff_table_absent(name);
+	t->present = true;
+	t->object_kind = kind;
+	t->schema = metadata(schema, "schema");
+	t->desc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(t->desc, 1, "property", TEXTOID, -1, 0);
+	TupleDescInitEntry(t->desc, 2, "value", JSONBOID, -1, 0);
+	t->nkeys = 1;
+	t->keys = palloc(sizeof(int));
+	t->keys[0] = 0;
+	t->keyed = true;
+	if (!rows)
+		return t;
+
+	run("SELECT key,value FROM jsonb_each($1::jsonb - 'format' - 'name') ORDER BY key COLLATE \"C\"", 1,
+		VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(t->schema)), NULL, true);
+	t->rows.count = t->rows.capacity = SPI_processed;
+	t->rows.items = palloc(sizeof(PLEntry) * Max(t->rows.count, 1));
+	for (i = 0; i < t->rows.count; i++)
+	{
+		PLValue		fields[2];
+
+		fields[0] = DG_VALUE(true, dg_encode_value(TEXTOID, cell(i, 1)));
+		fields[1] = DG_VALUE(true, dg_encode_value(JSONBOID, cell(i, 2)));
+		t->rows.items[i].key = pack_merge_fields(fields, 1);
+		t->rows.items[i].value = pack_merge_fields(fields, 2);
+	}
+	qsort(t->rows.items, t->rows.count, sizeof(PLEntry), entry_compare);
+	return t;
+}
+
+/* Preserve the established missing-table diagnostic for ordinary selectors. */
+static char *
+resolve_diff_argument(const char *arg, const char *a, const char *b)
+{
+	char	   *name;
+
+	/*
+	 * Preserve table precedence and diagnostics, including ambiguity outside
+	 * search_path. Routine signatures and three-part trigger selectors use
+	 * the schema-object resolver instead.
+	 */
+	if (*arg && arg[strlen(arg) - 1] != ')')
+	{
+		List	   *parts = stringToQualifiedNameList(arg, NULL);
+
+		if (list_length(parts) <= 2)
+		{
+			name = resolve_table_argument(arg, a, b, false);
+			if (name)
+				return name;
+		}
+	}
+	name = resolve_object_argument(arg, a, b, false);
+	return name ? name : resolve_table_argument(arg, a, b, true);
+}
+
 /* Walk two logical row sets by key. Keyless cardinality changes emit one row
  * per added or removed occurrence, like Dolt. */
 static void
@@ -309,6 +398,11 @@ diff_rows(DiffTable *from, DiffTable *to, DiffRowFn fn, void *arg)
 				j = 0;
 	bool		keyed = (from->present && from->keyed) || (to->present && to->keyed);
 
+	if (from->present && to->present &&
+		((from->object_kind == NULL) != (to->object_kind == NULL) ||
+		 (from->object_kind && strcmp(from->object_kind, to->object_kind))))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot diff %s: object kind changed between revisions", to->name)));
 	if (from->present && to->present && (from->keyed != to->keyed || (from->keyed && !same_key_columns(from, to))))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot diff %s: primary key changed between revisions", to->name)));
 	for (;;)
@@ -730,10 +824,12 @@ dg_diff_layout(const char *kind, const char *table, const char *from, const char
 	}
 	if (from && to)
 	{
-		char	   *resolved = resolve_table_argument(table, state_json(from), state_json(to), true);
+		char	   *resolved = !strcmp(kind, "diff") ?
+			resolve_diff_argument(table, state_json(from), state_json(to)) :
+			resolve_table_argument(table, state_json(from), state_json(to), true);
 
-		a = diff_table_schema(from, resolved);
-		b = diff_table_schema(to, resolved);
+		a = !strcmp(kind, "diff") ? diff_object_revision(from, resolved, false) : diff_table_schema(from, resolved);
+		b = !strcmp(kind, "diff") ? diff_object_revision(to, resolved, false) : diff_table_schema(to, resolved);
 	}
 	else
 	{
@@ -833,9 +929,9 @@ dolt_diff_rows(PG_FUNCTION_ARGS)
 		nest = begin_api();
 	}
 	diff_emit_prepare(fcinfo, &e, "diff");
-	resolved = resolve_table_argument(table, state_json(from), state_json(to), true);
-	a = diff_table_revision(from, resolved);
-	b = diff_table_revision(to, resolved);
+	resolved = resolve_diff_argument(table, state_json(from), state_json(to));
+	a = diff_object_revision(from, resolved, true);
+	b = diff_object_revision(to, resolved, true);
 	e.schema_from = a;
 	e.schema_to = b;
 	e.from_label = revision_label(from);
@@ -1504,6 +1600,22 @@ row_count(DiffTable *t)
 	return n;
 }
 
+/* Object statistics follow Dolt's one-row-per-schema-object convention. */
+static char **
+changed_diff_objects(const char *a, const char *b, int *count)
+{
+	char	  **names;
+	int			i;
+
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger')), b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger')) SELECT DISTINCT coalesce(a.v->>'name',b.v->>'name') COLLATE \"C\" FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind' WHERE a.v IS NULL OR b.v IS NULL OR a.v->>'content' IS DISTINCT FROM b.v->>'content' OR a.v->>'schema' IS DISTINCT FROM b.v->>'schema' ORDER BY 1", 2,
+		VC_TYPES(TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(a), CStringGetTextDatum(b)), NULL, true);
+	*count = SPI_processed;
+	names = palloc(sizeof(char *) * Max(*count, 1));
+	for (i = 0; i < *count; i++)
+		names[i] = strcell(i, 1);
+	return names;
+}
+
 Datum
 dolt_diff_stat(PG_FUNCTION_ARGS)
 {
@@ -1522,26 +1634,45 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	if (table)
 	{
 		names = palloc(sizeof(char *));
-		names[0] = resolve_table_argument(table, fromjson, tojson, true);
+		names[0] = resolve_diff_argument(table, fromjson, tojson);
 		n = 1;
 	}
 	else
-		names = changed_tables(fromjson, tojson, &n);
+		names = changed_diff_objects(fromjson, tojson, &n);
 	for (i = 0; i < n; i++)
 	{
-		DiffTable  *a = diff_table_revision(from, names[i]),
-				   *b = diff_table_revision(to, names[i]);
+		DiffTable  *a = diff_object_revision(from, names[i], true),
+				   *b = diff_object_revision(to, names[i], true);
 		DiffStat	s = {0};
 		Datum		values[12];
 		bool		nulls[12];
 
 		if (!a->present && !b->present)
 			continue;
-		diff_rows(a, b, stat_row, &s);
-		s.old_rows = row_count(a);
-		s.new_rows = row_count(b);
-		s.old_cells = a->present ? s.old_rows * a->desc->natts : 0;
-		s.new_cells = b->present ? s.new_rows * b->desc->natts : 0;
+		if (a->object_kind || b->object_kind)
+		{
+			if (a->present && b->present &&
+				(!a->object_kind || !b->object_kind || strcmp(a->object_kind, b->object_kind)))
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot diff %s: object kind changed between revisions", names[i])));
+			s.rows_added = !a->present;
+			s.rows_deleted = !b->present;
+			s.rows_modified = a->present && b->present && !same_schema_definition(a->schema, b->schema);
+
+			/*
+			 * Match Dolt's root-object DiffStatProgress: only Adds, Removes
+			 * or Changes is set. Row/cell totals remain zero. Consequently
+			 * rows_unmodified below is -1 for deletion or modification.
+			 */
+		}
+		else
+		{
+			diff_rows(a, b, stat_row, &s);
+			s.old_rows = row_count(a);
+			s.new_rows = row_count(b);
+			s.old_cells = a->present ? s.old_rows * a->desc->natts : 0;
+			s.new_cells = b->present ? s.new_rows * b->desc->natts : 0;
+		}
 		s.rows_unmodified = s.old_rows - s.rows_deleted - s.rows_modified;
 		memset(nulls, false, sizeof(nulls));
 		values[0] = CStringGetTextDatum(b->present ? b->name : a->name);

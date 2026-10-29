@@ -73,3 +73,36 @@ Tests: `src/test/modules/test_prolly/t/020_row_diff.pl`; Doltgres
 `TestUserSpaceDoltTables` diff/history/blame/workspace/column_diff scenarios and
 `TestPostgresDoltDiffFunctions` (the mixed schema-feature originals are excluded
 by the prolly profile).
+
+## Canonical schema-object diffs
+
+The dolt_diff table function also accepts routine signatures, views, versioned
+types, and table.trigger selectors. Tables retain their existing row layout.
+For other objects the layout is:
+
+* to_property text, to_value jsonb, to_commit text, to_commit_date timestamp
+* from_property text, from_value jsonb, from_commit text, from_commit_date timestamp
+* diff_type text (added, removed, modified)
+
+Each top-level canonical definition property is one keyed row. Nested arrays and
+objects remain JSONB values; JSON null differs from a missing side's SQL NULL.
+The internal format marker and object name are excluded. For example, a
+routine body edit changes prosrc; a view edit changes query; enum label
+changes affect labels. This is a read-only view of existing retained schema
+objects, with no physical catalog materialization or storage publication.
+WORKING, STAGED, commits, branches and two-/three-dot ranges follow the table
+diff conventions. Routine argument types can resolve from either retained
+state when they no longer exist in the current catalog.
+
+dolt_diff_stat includes these objects in both its named and all-object forms.
+It counts each added/deleted/modified object as one row and leaves cell counts
+zero (properties are not table cells). Row totals also remain zero, exactly
+matching Dolt/Doltgres. This produces -1 unmodified rows for modified/deleted
+objects. That surprising result is intentional compatibility, covered by shared
+tests; it is not a count of properties. Doltgres does not yet implement detailed dolt_diff rows
+for these objects, so those tests are explicitly fork-only.
+
+This does not implement editable property conflict tables, generated
+per-object history/workspace tables, or versioning standalone sequences.
+Indexes remain part of table schema reporting. A table replaced by a different
+kind of object under the same name is rejected as an incompatible diff.

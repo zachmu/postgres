@@ -43,5 +43,6 @@ tests += {
     't/037_derived_handles.pl',
     't/038_index_types.pl',
     't/039_explicit_identifiers.pl',
+    't/040_object_diff.pl',
   ]},
 }
