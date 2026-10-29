@@ -382,9 +382,11 @@ static pg_noreturn void unique_violation(Relation table, Relation index, Datum *
  * Add |delta| occurrences of table row |row|, the version with |handle|, to
  * every maintained index of |table|. Each index entry carries an occurrence
  * count, like the content tree, so this is one path-local edit per index.
+ * Keep the table command ID: a BEFORE trigger may have advanced the current
+ * command, but these edits must be discarded when that table batch journals.
  */
 void
-dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
+dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle, CommandId cid)
 {
 	bool		opened;
 	List	   *indexes = maintained_indexes(table, &opened);
@@ -395,7 +397,7 @@ dg_index_apply(Relation table, PLSlice row, int64 delta, uint64 handle)
 	foreach(cell, indexes)
 	{
 		Relation	index = lfirst(cell);
-		DGBatch    *batch = dg_batch(index, GetCurrentCommandId(true));
+		DGBatch    *batch = dg_batch(index, cid);
 		StringInfoData key;
 		size_t		prefix;
 		bool		nullkey;
