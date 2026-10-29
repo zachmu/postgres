@@ -386,21 +386,24 @@ view_create(ParseState *pstate, ViewStmt *stmt, int location, int length)
 bool
 dg_catalog_view_ddl(ParseState *pstate, Node *statement, int location, int length)
 {
-	bool		pushed = false;
-
 	if (!IsA(statement, ViewStmt) || !dg_catalog_active() || !creates_versioned_view((ViewStmt *) statement))
 		return false;
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed = true;
-	}
 	if (CatalogViewCurrent())
 		unsupported("view DDL in an immutable revision context");
-	dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
-	view_create(pstate, (ViewStmt *) statement, location, length);
-	if (pushed)
+
+	/* Publication advances the command ID.  A SQL function's active snapshot
+	 * can also be registered by its executor, so never modify that snapshot. */
+	PushCopiedSnapshot(ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot());
+	PG_TRY();
+	{
+		dg_storage_lock_working(dg_current_branch(), GetActiveSnapshot());
+		view_create(pstate, (ViewStmt *) statement, location, length);
+	}
+	PG_FINALLY();
+	{
 		PopActiveSnapshot();
+	}
+	PG_END_TRY();
 	return true;
 }
 
