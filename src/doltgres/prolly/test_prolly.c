@@ -773,6 +773,38 @@ test_apply_batches(void)
 			CHECK(!pl_find_local(backed, empty.root)->backed);
 			pl_node_set_backed(pl_find_local(backed, empty.root));
 		}
+
+		/*
+		 * Pins count, and a pinned node survives collection, with what it
+		 * reaches, though no root names it.
+		 */
+		{
+			PLTree		base_remote = {backed, tree.root},
+						edited;
+			uint8_t		other[4] = {7, 7, 7, 7};
+			PLEdit		edit3 = {{keys[SLOTS / 5], 8}, {true, {other, 4}}};
+			PLNode	   *root;
+
+			OK(pl_apply(&base_remote, &edit3, 1, &edited));
+			root = pl_find_local(backed, edited.root);
+			CHECK(root != NULL && !root->backed && root->level > 0);
+			pl_node_pin(backed, root);
+			pl_node_pin(backed, root);
+			pl_store_retain(backed, &tree.root, 1);
+			CHECK(pl_find_local(backed, edited.root) == root);
+			{
+				PLValue		got;
+
+				OK(pl_get(&edited, edit3.key, &got));
+				CHECK(got.present && got.bytes.len == 4 && memcmp(got.bytes.data, other, 4) == 0);
+			}
+			pl_node_unpin(backed, root);
+			pl_store_retain(backed, &tree.root, 1);
+			CHECK(pl_find_local(backed, edited.root) == root);
+			pl_node_unpin(backed, root);
+			pl_store_retain(backed, &tree.root, 1);
+			CHECK(pl_find_local(backed, edited.root) == NULL);
+		}
 		pl_store_free(backed);
 	}
 

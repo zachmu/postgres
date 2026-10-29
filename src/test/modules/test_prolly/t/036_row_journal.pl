@@ -42,6 +42,14 @@ is(sql(q{SELECT v FROM t WHERE id = 1000}), 'again', 'a deleted key can be reuse
 is(sql(q{BEGIN; INSERT INTO t VALUES (2001, 1, 'a'); UPDATE t SET v = 'b' WHERE id = 2001; SELECT v FROM t WHERE id = 2001; COMMIT}), 'b', 'a later command sees the journaled row');
 is(sql(q{BEGIN; INSERT INTO t VALUES (2002, 1, 'x'); ROLLBACK; SELECT count(*) FROM t WHERE id = 2002}), '0', 'an aborted entry is gone');
 is(sql(q{BEGIN; INSERT INTO t VALUES (2003, 1, 'x'); SAVEPOINT s; DELETE FROM t WHERE id = 2003; ROLLBACK TO s; COMMIT; SELECT v FROM t WHERE id = 2003}), 'x', 'a savepoint rollback forgets only its entry');
+# A fold cached under one command serves later ones only while the stream
+# stays as it saw it: the transaction's own later writes, and a savepoint
+# rollback of them, must show in the next command under the same snapshot.
+is(sql(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t WHERE id >= 2004;
+  INSERT INTO t VALUES (2004, 1, 'a'); SELECT count(*) FROM t WHERE id >= 2004; SELECT count(*) FROM t WHERE id >= 2004;
+  SAVEPOINT s; INSERT INTO t VALUES (2005, 1, 'b'); SELECT count(*) FROM t WHERE id >= 2004;
+  ROLLBACK TO s; SELECT count(*) FROM t WHERE id >= 2004; SET LOCAL enable_seqscan = off; SELECT count(*) FROM t WHERE k = 1 AND id >= 2004; COMMIT}),
+  "0\n1\n1\n2\n1\n1", 'later commands see own writes and lose rolled-back ones');
 my $w = $node->background_psql('postgres');
 $w->query_safe(q{BEGIN; INSERT INTO t VALUES (3001, 1, 'w'); UPDATE t SET v = 'w' WHERE id = 1});
 is(sql(q{SELECT count(*) FROM t WHERE v = 'w'}), '0', 'another session does not see uncommitted entries');
