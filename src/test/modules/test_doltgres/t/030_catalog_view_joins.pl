@@ -9,9 +9,18 @@ $node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\n");
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+# Repository initialization precedes the first versioned object. Empty native
+# schemas created in between must be imported when branch catalogs activate.
+sql(q{CREATE SCHEMA before_activation});
 sql(q{CREATE TABLE indexed(id int PRIMARY KEY, value int);
       CREATE INDEX value_idx ON indexed(value);
       SELECT dolt_commit('-Am','indexes'); SELECT dolt_branch('other')});
+is(sql(q{SELECT count(*) FROM pg_namespace WHERE nspname='before_activation'}),
+    '1', 'empty native schema survives canonical catalog activation');
+sql(q{CREATE TABLE stored_namespaces(id int PRIMARY KEY, ns regnamespace);
+    INSERT INTO stored_namespaces VALUES (1,'public'),(2,'before_activation')});
+is(sql(q{SELECT ns::text FROM stored_namespaces ORDER BY id}),
+    "public\nbefore_activation", 'explicit namespace values resolve and round trip');
 # SQL namespace identities must be the same handles exposed by the catalogs.
 sql(q{CREATE SCHEMA ns_identity; CREATE TABLE ns_identity.t(id int PRIMARY KEY)});
 is(sql(q{SELECT n.oid='ns_identity'::regnamespace AND

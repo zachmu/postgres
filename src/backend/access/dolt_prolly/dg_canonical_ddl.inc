@@ -134,6 +134,8 @@ catalog_activate(void)
 	int			security,
 				nest;
 	bool		pushed = false;
+	List	   *namespaces = NIL;
+	ListCell   *lc;
 
 	if (!ActiveSnapshotSet())
 	{
@@ -148,7 +150,19 @@ catalog_activate(void)
 		LockDatabaseObject(DoltRefRelationId, 0, 0, ExclusiveLock);
 		ensure_repository();
 		if (!read_ref("views/enabled").target)
+		{
+			/*
+			 * Native schemas created after repository initialization must join
+			 * the first versioned working set too, including empty schemas.
+			 * Only import at activation: later physical schemas may belong to
+			 * another branch and must never leak into this branch.
+			 */
+			run("SELECT n.oid FROM pg_namespace n WHERE " USER_NAMESPACE,
+				0, NULL, NULL, NULL, true);
+			for (uint64 i = 0; i < SPI_processed; i++)
+				namespaces = lappend_oid(namespaces, DatumGetObjectId(cell(i, 1)));
 			move_ref("views/enabled", empty_ref, read_ref("heads/main").target);
+		}
 		end_api(nest);
 	}
 	PG_FINALLY();
@@ -161,6 +175,8 @@ catalog_activate(void)
 	CommandCounterIncrement();
 	if (ActiveSnapshotSet())
 		UpdateActiveSnapshotCommandId();
+	foreach(lc, namespaces)
+		adopt_schema(lfirst_oid(lc));
 }
 
 /* A materialized view being created: its definition's "matview" object. */
