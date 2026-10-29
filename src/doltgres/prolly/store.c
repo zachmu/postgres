@@ -345,7 +345,7 @@ pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
 static size_t
 offset_width(uint64_t key_bytes, uint64_t value_bytes)
 {
-	return key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
+	return PL_COMPACT_BOOKKEEPING && key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
 }
 
 static uint32_t
@@ -412,6 +412,11 @@ pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows)
 	size_t		n = PL_ADDRESS_SIZE;
 
 	memcpy(out, hash.bytes, PL_ADDRESS_SIZE);
+	if (!PL_COMPACT_BOOKKEEPING)
+	{
+		pl_write64(out + n, rows);
+		return n + 8;
+	}
 	do
 	{
 		uint8_t		byte = rows & 0x7F;
@@ -435,6 +440,14 @@ pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
 	{
 		memcpy(hash->bytes, value.data, PL_ADDRESS_SIZE);
 		memset(hash->bytes + PL_ADDRESS_SIZE, 0, PL_HASH_SIZE - PL_ADDRESS_SIZE);
+	}
+	if (!PL_COMPACT_BOOKKEEPING)
+	{
+		if (value.len != PL_ADDRESS_SIZE + 8)
+			return false;
+		if (rows)
+			*rows = pl_read64(value.data + n);
+		return true;
 	}
 	for (;;)
 	{
@@ -743,17 +756,14 @@ pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PL
 	/*
 	 * Key-local, level-salted fingerprint; no dependence on insertion
 	 * history. An entry ends its node with probability proportional to its
-	 * size, so nodes average their level's target whatever their entries'
-	 * sizes.
+	 * size, so nodes average PL_TARGET_BYTES whatever their entries' sizes.
 	 */
 	uint64_t	fingerprint = UINT64_C(14695981039346656037) ^ level;
-	size_t		target = level ? PL_INTERNAL_TARGET_BYTES : PL_LEAF_TARGET_BYTES;
 	size_t		i;
 
 	if (count < 2)
 		return false;
-	if (count >= (level ? PL_MAX_ENTRIES : PL_LEAF_MAX_ENTRIES) ||
-		bytes >= (level ? PL_INTERNAL_MAX_BYTES : PL_LEAF_MAX_BYTES))
+	if (count >= PL_MAX_ENTRIES || bytes >= PL_MAX_BYTES)
 		return true;
 	if (bytes < PL_MIN_BYTES)
 		return false;
@@ -763,5 +773,5 @@ pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PL
 	fingerprint ^= fingerprint >> 33;
 	fingerprint *= UINT64_C(0xff51afd7ed558ccd);
 	fingerprint ^= fingerprint >> 33;
-	return (fingerprint & 0xFFFFF) < (uint64_t) entry_bytes * 0x100000 / target;
+	return (fingerprint & 0xFFFFF) < (uint64_t) entry_bytes * 0x100000 / PL_TARGET_BYTES;
 }

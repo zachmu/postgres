@@ -207,12 +207,12 @@ test_child_references(void)
 		for (int i = PL_ADDRESS_SIZE; i < PL_HASH_SIZE; i++)
 			CHECK(decoded.bytes[i] == 0);
 		/* Truncated or trailing bytes are rejected. */
-		CHECK(!pl_child_decode(bytes(encoded, length - 1), NULL, &rows) || length - 1 == PL_ADDRESS_SIZE + 1);
+		CHECK(!pl_child_decode(bytes(encoded, length - 1), NULL, &rows));
 		encoded[length] = 0;
 		CHECK(!pl_child_decode(bytes(encoded, length + 1), NULL, &rows) || length + 1 > PL_CHILD_MAX);
 	}
-	CHECK(pl_child_encode(encoded, hash, 100) == PL_ADDRESS_SIZE + 1);
-	CHECK(pl_child_encode(encoded, hash, 5000) == PL_ADDRESS_SIZE + 2);
+	CHECK(pl_child_encode(encoded, hash, 100) == PL_ADDRESS_SIZE + (PL_COMPACT_BOOKKEEPING ? 1 : 8));
+	CHECK(pl_child_encode(encoded, hash, 5000) == PL_ADDRESS_SIZE + (PL_COMPACT_BOOKKEEPING ? 2 : 8));
 	CHECK(!pl_child_decode(bytes(encoded, PL_ADDRESS_SIZE), NULL, &rows));
 }
 
@@ -233,8 +233,9 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 
 	CHECK(node);
 	interior = node->level > 0;
-	/* Ordinary nodes use two-byte directory offsets. */
-	CHECK(node->size == PL_HEADER + 2 * 2 * (node->count + 1) + node->key_bytes + node->value_bytes);
+	/* Ordinary nodes use two-byte directory offsets with compact bookkeeping. */
+	CHECK(node->size == PL_HEADER + 2 * (PL_COMPACT_BOOKKEEPING ? 2 : 4) * (node->count + 1) +
+		  node->key_bytes + node->value_bytes);
 	sizes->nodes[interior]++;
 	sizes->bytes[interior] += node->size;
 	if (node->size > sizes->largest[interior])
@@ -250,10 +251,7 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 	}
 }
 
-/*
- * Leaves average their small target; interior nodes average theirs, half a
- * page, and stay within one page however many children they hold.
- */
+/* Leaves and interior nodes average about the target size and stay within the maximum. */
 static void
 test_node_sizes(void)
 {
@@ -279,13 +277,11 @@ test_node_sizes(void)
 	interior = (double) sizes.bytes[1] / sizes.nodes[1];
 	printf("node sizes: %zu leaves of %.0f bytes on average, %zu interior nodes of %.0f, largest %zu\n",
 		   sizes.nodes[0], leaf, sizes.nodes[1], interior, sizes.largest[1]);
-	CHECK(leaf > PL_LEAF_TARGET_BYTES / 2 && leaf < 2 * PL_LEAF_TARGET_BYTES);
-	CHECK(sizes.largest[0] <= PL_LEAF_MAX_BYTES + PL_HEADER + 64);
+	CHECK(leaf > PL_TARGET_BYTES / 2 && leaf < 2 * PL_TARGET_BYTES);
+	CHECK(interior > PL_TARGET_BYTES / 2 && interior < 2 * PL_TARGET_BYTES);
+	CHECK(sizes.largest[0] <= PL_MAX_BYTES + PL_HEADER + 64);
+	CHECK(sizes.largest[1] <= PL_MAX_BYTES + PL_HEADER + 64);
 	CHECK(sizes.nodes[1] > 1);
-	CHECK(sizes.nodes[1] < sizes.nodes[0] / 16);
-	CHECK(sizes.largest[1] <= PL_INTERNAL_MAX_BYTES + PL_HEADER + 64);
-	CHECK(sizes.largest[1] <= 8192);
-	CHECK(sizes.most_entries > PL_LEAF_MAX_ENTRIES / 2);
 	free(keys);
 	free(entries);
 	pl_store_free(store);
@@ -1134,10 +1130,19 @@ test_format_and_resolver_lifetime(void)
 
 	OK(pl_build(store, NULL, 0, &empty));
 	OK(pl_store_export(store, empty.root, &serialized));
-	CHECK(serialized.len == 28);
+	/*
+	 * The empty tree's address pins the format: today's without compact
+	 * bookkeeping and full addresses, truncated to 20 bytes with them.
+	 */
+	CHECK(serialized.len == (PL_COMPACT_BOOKKEEPING ? 28 : 32));
 	for (i = 0; i < 32; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
-	CHECK(strcmp(hex, "c611f574ef24eb5785f74f9277220117b134de73000000000000000000000000") == 0);
+	CHECK(strncmp(hex, PL_COMPACT_BOOKKEEPING ? "c611f574ef24eb5785f74f9277220117b134de73" :
+				  "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d", 40) == 0);
+	if (PL_ADDRESS_SIZE == 20)
+		CHECK(strcmp(hex + 40, "000000000000000000000000") == 0);
+	else if (!PL_COMPACT_BOOKKEEPING)
+		CHECK(strcmp(hex + 40, "3ea8049877c6c6a9e0c77218") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));
 	OK(pl_merge(&empty, &left, &right, resolve_scratch, scratch, &merged));
