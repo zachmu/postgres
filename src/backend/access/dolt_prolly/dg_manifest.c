@@ -623,7 +623,8 @@ member_schema(bytea *hash)
 /*
  * Statistics describe a relation's columns as its schema defines them: those
  * of |branch|'s tables and indexes whose schema working set |now| changes from
- * |old|, or which it drops, are removed. The others' remain current.
+ * |old| are removed. The others' remain current; those of relations it drops
+ * go with their identities.
  */
 static void
 drop_changed_statistics(const char *branch, bytea *old, bytea *now)
@@ -641,10 +642,10 @@ drop_changed_statistics(const char *branch, bytea *old, bytea *now)
 		if (!members[i].name || (strcmp(members[i].kind, "table") && strcmp(members[i].kind, "index")))
 			continue;
 		current = now ? dg_database_member(now, members[i].kind, members[i].name) : NULL;
-		if (current && hash_equal(current, members[i].hash))
+		if (!current || hash_equal(current, members[i].hash))
 			continue;
 		before = member_schema(members[i].hash);
-		after = current ? member_schema(current) : NULL;
+		after = member_schema(current);
 		if (before && after && hash_equal(before, after))
 			continue;
 		oid = dg_identity_lookup(branch, DOLT_IDENTITY_RELATION, members[i].name);

@@ -88,6 +88,11 @@ is(sql(q{SELECT count(*) FROM pg_statistic WHERE starelid = 't'::regclass}), '3'
 $node->restart;
 is(sql(qq{SELECT count(*) FROM pg_statistic WHERE starelid IN ($main_t, $feature_t)}), '6', 'statistics survive a restart');
 
+# Dropping a table removes its statistics.
+my $u = sql(q{SELECT 'u'::regclass::oid});
+sql(q{DROP TABLE u});
+is(sql(qq{SELECT count(*) FROM pg_statistic WHERE starelid = $u}), '0', 'dropping a table removes its statistics');
+
 # Deleting a branch removes its tables' statistics.
 sql(q{SELECT dolt_branch('-D', 'feature')});
 is(sql(qq{SELECT count(*) FROM pg_statistic WHERE starelid = $feature_t}), '0', 'deleting a branch removes its statistics');
