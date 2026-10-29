@@ -70,6 +70,7 @@ typedef struct DGMember
 } DGMember;
 extern DGMember *dg_database_members(bytea *database, int *count);
 extern bytea *dg_database_member(bytea *database, const char *kind, const char *name);
+extern bytea *dg_member_child(bytea *hash, int index, bool *known);
 extern void dg_initialize_resource(Relation rel, const char *branch);
 extern void dg_storage_record(Relation source);
 extern DGStorage *dg_storage_open(Oid definition, const char *branch, const char *name, bytea *schema, Oid resource, Snapshot snapshot);
@@ -198,17 +199,22 @@ typedef struct DGSchema
 	int			nconstraints;
 	Node	  **constraints;	/* each table constraint's raw Constraint */
 	Node	   *index;			/* an index's raw IndexStmt */
+	int			nopclasses;
+	Oid		   *opclass_types;	/* each index key's built-in type */
+	Oid		   *opclasses;		/* and the operator class resolved for it */
 } DGSchema;
 
 #define DG_SCHEMA_COLUMNS		0x01
 #define DG_SCHEMA_DEFAULTS		0x02
 #define DG_SCHEMA_CONSTRAINTS	0x04
 #define DG_SCHEMA_INDEX			0x08
+#define DG_SCHEMA_OPCLASSES		0x10
 
 extern DGSchema *dg_schema_get(bytea *address, const char *kind);
 extern DGSchema *dg_schema_find(const char *json);
 extern void dg_schema_set_columns(DGSchema *schema, TupleDesc columns);
 extern void dg_schema_set_nodes(DGSchema *schema, uint32 part, int count, Node **nodes);
+extern void dg_schema_set_opclasses(DGSchema *schema, int count, Oid *types, Oid *opclasses);
 extern bytea *dg_history_export_tree(const PLTree * tree);
 extern PLTree dg_history_import(PLStore *store, bytea *address);
 extern void dg_history_install(Relation rel, DGState *state, PLTree contents);

@@ -266,6 +266,12 @@ schema_serialize(DGSchema *schema, StringInfo buf)
 		put_nodes(buf, schema->nconstraints, schema->constraints);
 	if (schema->parts & DG_SCHEMA_INDEX)
 		put_node(buf, schema->index);
+	if (schema->parts & DG_SCHEMA_OPCLASSES)
+	{
+		appendBinaryStringInfo(buf, &schema->nopclasses, sizeof(schema->nopclasses));
+		appendBinaryStringInfo(buf, schema->opclass_types, sizeof(Oid) * schema->nopclasses);
+		appendBinaryStringInfo(buf, schema->opclasses, sizeof(Oid) * schema->nopclasses);
+	}
 }
 
 typedef struct Reader
@@ -366,6 +372,14 @@ schema_deserialize(const SchemaKey *key, char *data, Size len, MemoryContext par
 		schema->constraints = get_nodes(&reader, &schema->nconstraints);
 	if (schema->parts & DG_SCHEMA_INDEX)
 		schema->index = get_node(&reader);
+	if (schema->parts & DG_SCHEMA_OPCLASSES)
+	{
+		get(&reader, &schema->nopclasses, sizeof(schema->nopclasses));
+		schema->opclass_types = palloc_array(Oid, Max(schema->nopclasses, 1));
+		schema->opclasses = palloc_array(Oid, Max(schema->nopclasses, 1));
+		get(&reader, schema->opclass_types, sizeof(Oid) * schema->nopclasses);
+		get(&reader, schema->opclasses, sizeof(Oid) * schema->nopclasses);
+	}
 	if (reader.offset != reader.len)
 		elog(ERROR, "malformed shared schema entry");
 	MemoryContextSwitchTo(previous);
@@ -392,6 +406,9 @@ schema_check_serialized(CachedSchema *entry, StringInfo buf)
 	for (int i = 0; i < a->nconstraints; i++)
 		Assert(equal(a->constraints[i], b->constraints[i]));
 	Assert(equal(a->index, b->index));
+	Assert(a->nopclasses == b->nopclasses);
+	for (int i = 0; i < a->nopclasses; i++)
+		Assert(a->opclass_types[i] == b->opclass_types[i] && a->opclasses[i] == b->opclasses[i]);
 	MemoryContextDelete(copy->memory);
 }
 #endif
@@ -668,4 +685,20 @@ dg_schema_set_nodes(DGSchema *schema, uint32 part, int count, Node **nodes)
 			elog(ERROR, "unrecognized schema part %u", part);
 	}
 	schema_derived(entry, part);
+}
+
+/* Keep the operator classes resolved for an index's keys, all built in. */
+void
+dg_schema_set_opclasses(DGSchema *schema, int count, Oid *types, Oid *opclasses)
+{
+	CachedSchema *entry = (CachedSchema *) schema;
+
+	if (schema->parts & DG_SCHEMA_OPCLASSES)
+		return;
+	schema->nopclasses = count;
+	schema->opclass_types = MemoryContextAlloc(entry->memory, sizeof(Oid) * Max(count, 1));
+	schema->opclasses = MemoryContextAlloc(entry->memory, sizeof(Oid) * Max(count, 1));
+	memcpy(schema->opclass_types, types, sizeof(Oid) * count);
+	memcpy(schema->opclasses, opclasses, sizeof(Oid) * count);
+	schema_derived(entry, DG_SCHEMA_OPCLASSES);
 }

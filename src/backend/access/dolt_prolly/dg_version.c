@@ -531,7 +531,11 @@ object_child(bytea *hash, int index)
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
+	bool		known;
+	bytea	   *member = dg_member_child(hash, index, &known);
 
+	if (known)
+		return member;
 	if (!object_read(hash, NULL, NULL, NULL, &children))
 		return NULL;
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);

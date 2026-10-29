@@ -977,6 +977,7 @@ provider_constraints(DGProviderRows *rows, CatalogView *view, const char *defini
 static void
 provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, int count, char **definitions, char **kinds)
 {
+	DGSchema   *schema = dg_schema_find(definition);
 	IndexStmt  *stmt = schema_index(definition);
 	char	   *table;
 	TupleDesc	desc = NULL;
@@ -984,7 +985,10 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	int16	   *keys,
 			   *options;
 	Oid		   *classes,
+			   *types,
 			   *collations;
+	bool		resolved = false,
+				builtin = true;
 	ListCell   *lc;
 	List	   *elements;
 	HeapTuple	tuple;
@@ -1027,6 +1031,7 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 	keys = palloc0_array(int16, form.indnatts);
 	options = palloc0_array(int16, form.indnkeyatts);
 	classes = palloc0_array(Oid, form.indnkeyatts);
+	types = palloc0_array(Oid, form.indnkeyatts);
 	collations = palloc0_array(Oid, form.indnkeyatts);
 	foreach(lc, elements)
 	{
@@ -1039,7 +1044,17 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 		attr = TupleDescAttr(desc, keys[k] - 1);
 		if (k < form.indnkeyatts)
 		{
-			classes[k] = ResolveOpClass(elem->opclass, attr->atttypid, "dolt_prolly_index", DOLT_PROLLY_INDEX_AM_OID);
+			/* Built-in operator classes for built-in types are kept with the schema. */
+			types[k] = attr->atttypid;
+			if (schema && (schema->parts & DG_SCHEMA_OPCLASSES) && schema->opclass_types[k] == types[k])
+				classes[k] = schema->opclasses[k];
+			else
+			{
+				classes[k] = ResolveOpClass(elem->opclass, attr->atttypid, "dolt_prolly_index", DOLT_PROLLY_INDEX_AM_OID);
+				resolved = true;
+			}
+			if (types[k] >= FirstNormalObjectId || classes[k] >= FirstNormalObjectId)
+				builtin = false;
 			collations[k] = elem->collation ? get_collation_oid(elem->collation, false) : attr->attcollation;
 			if (elem->ordering == SORTBY_DESC)
 				options[k] |= INDOPTION_DESC;
@@ -1049,6 +1064,8 @@ provider_index(DGProviderRows *rows, CatalogView *view, const char *definition, 
 		provider_dependency(rows, RelationRelationId, form.indexrelid, 0, RelationRelationId, form.indrelid, keys[k], DEPENDENCY_AUTO);
 		k++;
 	}
+	if (schema && resolved && builtin)
+		dg_schema_set_opclasses(schema, form.indnkeyatts, types, classes);
 	tuple = provider_fixed(rows->relations[slot], &form, sizeof(form), Anum_pg_index_indisreplident);
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indkey, PointerGetDatum(buildint2vector(keys, form.indnatts)));
 	tuple = provider_set(rows->relations[slot], tuple, Anum_pg_index_indclass, PointerGetDatum(buildoidvector(classes, form.indnkeyatts)));

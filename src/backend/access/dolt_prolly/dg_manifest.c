@@ -348,6 +348,8 @@ typedef struct CachedMember
 	uint8		hash[PL_HASH_SIZE];
 	char	   *kind;
 	char	   *name;
+	int			nchildren;
+	bytea	  **children;		/* a definition's schema and content */
 } CachedMember;
 
 typedef struct CachedDatabase
@@ -404,15 +406,29 @@ member_describe(bytea *hash)
 	bool		found;
 	char	   *kind;
 	bytea	   *payload;
+	ArrayType  *children;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+	MemoryContext previous;
 
 	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_FIND, NULL);
 	if (member)
 		return member;
-	if (!dg_object_read(hash, NULL, &kind, &payload, NULL))
+	if (!dg_object_read(hash, NULL, &kind, &payload, &children))
 		elog(ERROR, "database member is not visible");
+	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
 	member = hash_search(cached_members, VARDATA_ANY(hash), HASH_ENTER, &found);
 	member->kind = MemoryContextStrdup(member_memory, kind);
 	member->name = NULL;
+	member->nchildren = n;
+	previous = MemoryContextSwitchTo(member_memory);
+	member->children = palloc0_array(bytea *, Max(n, 1));
+	for (int i = 0; i < n; i++)
+		if (!nulls[i])
+			member->children[i] = DatumGetByteaPCopy(values[i]);
+	MemoryContextSwitchTo(previous);
+	member_cache_bytes += n * (VARHDRSZ + PL_HASH_SIZE + sizeof(bytea *));
 	if (strcmp(kind, "namespace") && VARSIZE_ANY_EXHDR(payload) > 0 && *VARDATA_ANY(payload) == '{')
 	{
 		/* A JSON object payload names its member, as ->>'name' reads it. */
@@ -483,6 +499,24 @@ database_describe(bytea *database)
 	}
 	member_cache_bytes += sizeof(*cached) + n * (sizeof(DGMember) + 96);
 	return cached;
+}
+
+/*
+ * Child |index| of member |hash| of a database read earlier, or NULL if that
+ * member is not cached. A member's children are fixed by its hash, and
+ * visible while it is.
+ */
+bytea *
+dg_member_child(bytea *hash, int index, bool *known)
+{
+	CachedMember *member = NULL;
+
+	if (cached_members && VARSIZE_ANY_EXHDR(hash) == PL_HASH_SIZE)
+		member = hash_search(cached_members, VARDATA_ANY(hash), HASH_FIND, NULL);
+	*known = member != NULL;
+	if (!member || index < 1 || index > member->nchildren || !member->children[index - 1])
+		return NULL;
+	return DatumGetByteaPCopy(PointerGetDatum(member->children[index - 1]));
 }
 
 /* The members of visible database object |database|, in its child order. */
