@@ -48,7 +48,7 @@ CREATE OPERATOR CLASS misleading_ops FOR TYPE int USING dolt_prolly_index AS
   OPERATOR 3 <>, FUNCTION 1 btint4cmp(int,int);
 CREATE INDEX bad_operators ON p(id misleading_ops);
 DROP OPERATOR CLASS misleading_ops USING dolt_prolly_index;
-ALTER TABLE p ALTER COLUMN id TYPE text;
+ALTER TABLE p ALTER COLUMN id TYPE text COLLATE "C";
 CREATE TABLE bad_type(v gtsvector) USING dolt_prolly_table;
 INSERT INTO u VALUES(1,1) ON CONFLICT DO NOTHING;
 SELECT * FROM p FOR UPDATE;
