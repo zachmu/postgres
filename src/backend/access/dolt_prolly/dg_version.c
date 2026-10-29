@@ -535,7 +535,11 @@ object_child(bytea *hash, int index)
 	Datum	   *values;
 	bool	   *nulls;
 	int			n;
+	bool		known;
+	bytea	   *member = dg_member_child(hash, index, &known);
 
+	if (known)
+		return member;
 	if (!object_read(hash, NULL, NULL, NULL, &children))
 		return NULL;
 	deconstruct_array(children, BYTEAOID, -1, false, TYPALIGN_INT, &values, &nulls, &n);
@@ -673,6 +677,14 @@ sorted_members(bytea *database, int *count)
 }
 static CatalogView *provider_branch_view(const char *branch, bytea *database);
 static char *json_value(const char *json, const char *key);
+static JsonbValue json_document(const char *json);
+static bool json_get(JsonbValue *object, const char *key, JsonbValue *result);
+static int	json_length(JsonbValue *array);
+static JsonbValue json_element(JsonbValue *array, int index);
+static char *json_field_text(JsonbValue *object, const char *key);
+static Node **schema_defaults(const char *definition, int *count);
+static Constraint **schema_constraints(const char *definition, int *count);
+static IndexStmt *schema_index(const char *definition);
 static char *json_set_string(const char *json, const char *key, const char *value);
 
 static char *database_dependents(const char *json, Datum *members, int count);
@@ -901,12 +913,18 @@ static int	parsed_json_next;
 static Jsonb *
 json_parse(const char *json)
 {
-	Size		len = strlen(json);
-	uint32		hash = hash_bytes((const unsigned char *) json, len);
+	DGSchema   *schema = dg_schema_find(json);
+	Size		len;
+	uint32		hash;
 	ParsedJson *entry;
 	Jsonb	   *value;
 	MemoryContext previous;
 
+	/* A schema definition was parsed when it was decoded. */
+	if (schema)
+		return schema->document;
+	len = strlen(json);
+	hash = hash_bytes((const unsigned char *) json, len);
 	for (int i = 0; i < PARSED_JSON_ENTRIES; i++)
 	{
 		entry = &parsed_json[i];
