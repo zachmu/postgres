@@ -47,6 +47,7 @@ tests += {
     't/040_object_diff.pl',
     't/041_trigger_commands.pl',
     't/042_trigger_record.pl',
-    't/043_branch_statistics.pl',
+    't/043_sequences.pl',
+    't/044_branch_statistics.pl',
   ]},
 }

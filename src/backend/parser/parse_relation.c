@@ -2544,7 +2544,7 @@ addRangeTableEntryForDolt(ParseState *pstate, RangeVar *rv)
 		FreeTupleDesc(desc);
 		return item;
 	}
-	if (rte->relkind == RELKIND_VIEW && !rte->dolt_catalog)
+	if ((rte->relkind == RELKIND_VIEW || rte->relkind == RELKIND_SEQUENCE) && !rte->dolt_catalog)
 	{
 		/* A versioned view, as its revision has it. */
 		Relation	rel = relation_open(rte->relid, AccessShareLock);

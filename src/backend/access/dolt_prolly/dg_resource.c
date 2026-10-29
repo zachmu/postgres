@@ -140,10 +140,10 @@ dg_storage_allocate_kind(char relkind, const char *branch)
 
 	if (XactReadOnly)
 		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot allocate storage in a read-only transaction")));
-	if (!DG_ROWS_KIND(relkind) && relkind != RELKIND_INDEX)
+	if (!DG_ROWS_KIND(relkind) && relkind != RELKIND_INDEX && relkind != RELKIND_SEQUENCE)
 		elog(ERROR, "storage allocation requires a prolly table or index");
 	form.relkind = relkind;
-	form.relam = relkind == RELKIND_INDEX ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
+	form.relam = relkind == RELKIND_SEQUENCE ? InvalidOid : relkind == RELKIND_INDEX ? DOLT_PROLLY_INDEX_AM_OID : DOLT_PROLLY_TABLE_AM_OID;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	catalog = table_open(DoltStorageRelationId, RowExclusiveLock);
 	do
@@ -173,7 +173,8 @@ dg_storage_allocate_kind(char relkind, const char *branch)
 	(void) RelationCreateStorage(resource->rd_locator, RELPERSISTENCE_PERMANENT, true);
 	PG_TRY();
 	{
-		dg_initialize_resource(resource, branch);
+		if (relkind != RELKIND_SEQUENCE)
+			dg_initialize_resource(resource, branch);
 	}
 	PG_FINALLY();
 	{

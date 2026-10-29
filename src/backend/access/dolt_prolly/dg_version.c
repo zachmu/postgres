@@ -87,6 +87,10 @@
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
 #include "commands/sequence.h"
+#include "access/sequence.h"
+#include "catalog/pg_sequence.h"
+#include "catalog/pg_dolt_sequence.h"
+#include "common/hashfn.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "parser/parse_utilcmd.h"
@@ -636,7 +640,7 @@ catalog_contains(bytea *db, const char *name)
 	if (!db)
 		return true;
 	return dg_database_member(db, "table", name) || dg_database_member(db, "index", name) ||
-		dg_database_member(db, "view", name);
+		dg_database_member(db, "view", name) || dg_database_member(db, "sequence", name);
 }
 
 static CatalogView *provider_view(bytea *database);
@@ -695,6 +699,7 @@ canonical_database(const char *json, Datum *members, int count)
 #include "dg_expression_codec.inc"
 #include "dg_foreign_codec.inc"
 #include "dg_routine_codec.inc"
+#include "dg_sequence_codec.inc"
 #include "dg_type_codec.inc"
 #include "dg_dependents.inc"
 
@@ -757,6 +762,16 @@ capture_canonical(bytea *database, bool persist, bool definitions_only)
 			appendStringInfoChar(&json, ',');
 		if (!strcmp(kinds[i], "namespace"))
 			appendStringInfo(&json, "{\"kind\":\"namespace\",\"definition\":%s}", payload);
+		else if (!strcmp(kinds[i], "sequence"))
+		{
+			char	   *definition = metadata(child(objects[i], 1), "schema");
+
+			if (!definitions_only)
+				definition = sequence_capture(definition);
+			appendStringInfoString(&json, object_payload("sequence", definition));
+			if (persist)
+				members[i] = PointerGetDatum(object_member("sequence", definition));
+		}
 		else if (!strcmp(kinds[i], "routine") || !strcmp(kinds[i], "trigger") || !strcmp(kinds[i], "type") || !strcmp(kinds[i], "view"))
 			appendStringInfoString(&json, payload);
 		else
@@ -1821,7 +1836,7 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	if (table)
 		table = resolve_object_argument(table, from, to, true);
 
-	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
+	run("WITH a AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),b AS (SELECT v FROM jsonb_array_elements($2::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')),d AS (SELECT a.v av,b.v bv FROM a FULL JOIN b ON a.v->>'name'=b.v->>'name' AND a.v->>'kind'=b.v->>'kind') SELECT coalesce(av->>'name',''),coalesce(bv->>'name',''),CASE WHEN av IS NULL THEN 'added' WHEN bv IS NULL THEN 'dropped' ELSE 'modified' END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'content') IS DISTINCT FROM (bv->>'content') ELSE (av->>'schema') IS DISTINCT FROM (bv->>'schema') END,CASE WHEN coalesce(av->>'kind',bv->>'kind')='table' THEN (av->>'schema') IS DISTINCT FROM (bv->>'schema') ELSE av IS NULL OR bv IS NULL END FROM d WHERE ((av->>'content') IS DISTINCT FROM (bv->>'content') OR (av->>'schema') IS DISTINCT FROM (bv->>'schema')) AND ($3::text IS NULL OR coalesce(av->>'name',bv->>'name')=$3) ORDER BY coalesce(av->>'name',bv->>'name') COLLATE \"C\"", 3, VC_TYPES(TEXTOID, TEXTOID, TEXTOID), VC_ARGS(CStringGetTextDatum(from), CStringGetTextDatum(to), table ? CStringGetTextDatum(table) : (Datum) 0), table ? NULL : "  n", true);
 	if (table && SPI_processed > 1)
 		ereport(ERROR, (errcode(ERRCODE_AMBIGUOUS_ALIAS), errmsg("ambiguous table name: %s", table)));
 	return_rows(fcinfo, nest);
@@ -1881,6 +1896,7 @@ static void validate_working_foreign_keys(const char *branch);
 #include "dg_catalog_ddl.inc"
 #include "dg_canonical_ddl.inc"
 #include "dg_routine_ddl.inc"
+#include "dg_sequence_ddl.inc"
 
 #include "dg_alter.inc"
 #include "dg_schema_merge.inc"
