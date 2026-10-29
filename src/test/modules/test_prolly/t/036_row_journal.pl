@@ -66,6 +66,45 @@ $r->query_safe('COMMIT');
 is($r->query_safe(q{SELECT count(*) FROM t WHERE id > 3000}), '2', 'and sees it in the next transaction');
 $r->quit;
 
+# A session keeps the entries it read across transactions, with its own
+# changes: what it sees must match a fresh session after others' commits, its
+# own commits, aborts, savepoint rollbacks, interleaved commits and folds.
+my $a = $node->background_psql('postgres');
+my $b = $node->background_psql('postgres');
+my $count = q{SELECT count(*), coalesce(sum(k), 0) FROM t WHERE id > 7000};
+sub agree
+{
+	my ($label) = @_;
+	my $fresh = sql($count);
+	is($a->query_safe($count), $fresh, "$label: the first session agrees");
+	is($b->query_safe($count), $fresh, "$label: the second session agrees");
+}
+agree('before any change');
+$b->query_safe(q{INSERT INTO t VALUES (7001, 1, 'b')});
+agree('after another session commits');
+$a->query_safe(q{INSERT INTO t VALUES (7002, 2, 'a'); UPDATE t SET k = 3 WHERE id = 7001});
+agree('after its own commit');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7003, 4, 'a'); SELECT count(*) FROM t; ROLLBACK});
+agree('after its own abort');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7004, 5, 'a'); SAVEPOINT s; INSERT INTO t VALUES (7005, 6, 'a'); SELECT count(*) FROM t; ROLLBACK TO s; COMMIT});
+agree('after a savepoint rollback');
+$a->query_safe(q{BEGIN; INSERT INTO t VALUES (7006, 7, 'a')});
+$b->query_safe(q{INSERT INTO t VALUES (7007, 8, 'b'); DELETE FROM t WHERE id = 7002});
+$a->query_safe(q{COMMIT});
+agree('after interleaved commits');
+$b->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $old = $b->query_safe($count);
+$a->query_safe(q{INSERT INTO t VALUES (7008, 9, 'a')});
+is($b->query_safe($count), $old, 'an older snapshot does not see a later commit');
+$b->query_safe('COMMIT');
+agree('after the older snapshot ends');
+$a->query_safe(join(';', 'BEGIN', (map { "INSERT INTO t VALUES ($_, 1, 'many')" } 7101 .. 7400), 'COMMIT'));
+agree('after a fold consumes the stream');
+$b->query_safe(q{UPDATE t SET k = k + 1 WHERE id BETWEEN 7101 AND 7103});
+agree('after writes past the fold');
+$a->quit;
+$b->quit;
+
 # A stream past its bound folds: the journal empties and the roots move.
 my $before = journal_rows();
 sql(join(';', map { "INSERT INTO t VALUES ($_, 5, 'fold')" } 4001 .. 4300));

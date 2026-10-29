@@ -35,6 +35,9 @@
 #include "access/doltchunk.h"
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/parallel.h"
+#include "access/twophase.h"
+#include "access/xlog.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -586,6 +589,7 @@ static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
 static uint64 journal_max_handle(Oid space, RelFileNumber file);
 static void journal_xact_end(bool committed);
+static void journal_pre_commit(void);
 static void journal_local_invalidate(void);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
@@ -906,6 +910,8 @@ store_xact(XactEvent event, void *arg)
 					batch_flush_all();
 					publish_all();
 					working_close(true);
+					if (event == XACT_EVENT_PRE_COMMIT)
+						journal_pre_commit();
 				}
 				PG_FINALLY();
 				{
@@ -1400,7 +1406,7 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->space = space;
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
-			pg_atomic_write_u64(&candidate->journal_generation, 1);
+			pg_atomic_write_u64(&candidate->journal_generation, UINT64CONST(1) << 16);
 			pg_atomic_write_u64(&candidate->roots_generation, 1);
 			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
@@ -1914,7 +1920,7 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 	 * dg_storage_resource_root sends its callers to a full load instead.
 	 */
 	{
-		JournalEntries entries = journal_read(&key, snapshot ? snapshot : SnapshotSelf);
+		JournalEntries entries = journal_entries(&key, snapshot ? snapshot : SnapshotSelf);
 
 		if (entries.count)
 		{

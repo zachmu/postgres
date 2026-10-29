@@ -36,6 +36,10 @@
 /* Entries a stream may hold; a batch that would exceed it folds instead. */
 #define DG_JOURNAL_STREAM_MAX 256
 
+/* A storage's shared word: a generation, and committers under way in the low bits. */
+#define JOURNAL_WORD_GENERATION	(UINT64CONST(1) << 16)
+#define JOURNAL_WORD_COMMITTERS	(JOURNAL_WORD_GENERATION - 1)
+
 typedef struct JournalEntry
 {
 	int64		seq;
@@ -48,6 +52,7 @@ typedef struct JournalEntry
 typedef struct JournalEntries
 {
 	JournalEntry *items;
+	ItemPointerData *tids;		/* of the catalog rows, when read from the catalog */
 	int			count,
 				capacity;
 } JournalEntries;
@@ -177,24 +182,33 @@ journal_same_stream(const Visibility *built, const Visibility *now, const RootKe
 	return !entry || entry->version == 0 || entry->last_cid < built->cid;
 }
 
-/* A subtransaction rolled back: its writes leave every stream it touched. */
-static void
-journal_local_invalidate(void)
-{
-	journal_local_epoch++;
-}
-
 /* Storages this transaction journaled, whose readers must notice at commit. */
 typedef struct JournalTouched
 {
 	Oid			db,
 				space;
 	RelFileNumber file;
+	bool		counted;		/* counted as a committer in the storage's word */
+	uint64		before;			/* the word before */
 } JournalTouched;
 
 static JournalTouched *journal_touched;
 static int	journal_touched_count,
 			journal_touched_capacity;
+static bool journal_committing;	/* past pre-commit: a new touch counts at once */
+static List *journal_retired;	/* row memory of dropped stream caches, freed at transaction end */
+static void journal_count_committer(JournalTouched *touched);
+static void journal_streams_drop(Oid space, RelFileNumber file);
+static pg_atomic_uint64 *journal_word(Oid space, RelFileNumber file);
+
+/* A subtransaction rolled back: its writes leave every stream it touched. */
+static void
+journal_local_invalidate(void)
+{
+	journal_local_epoch++;
+	for (int i = 0; i < journal_touched_count; i++)
+		journal_streams_drop(journal_touched[i].space, journal_touched[i].file);
+}
 
 static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
 static PLTree journal_table_base(Relation table, const RootKey *table_key, Snapshot snapshot, const char *branch, DGState **state);
@@ -222,33 +236,77 @@ journal_touch(Oid db, Oid space, RelFileNumber file, CommandId cid)
 	journal_touched[journal_touched_count].db = db;
 	journal_touched[journal_touched_count].space = space;
 	journal_touched[journal_touched_count].file = file;
+	journal_touched[journal_touched_count].counted = false;
 	journal_touched_count++;
 	journal_local_write(space, file, cid);
 	MemoryContextSwitchTo(old);
+
+	/* Claim the storage's slot now: the commit must find its word. */
+	(void) journal_word(space, file);
+	if (journal_committing)
+		journal_count_committer(&journal_touched[journal_touched_count - 1]);
 }
 
-/* At commit: readers of the touched storages must refold. */
+/* |touched|'s storage has a committer under way: this transaction. */
+static void
+journal_count_committer(JournalTouched *touched)
+{
+	touched->before = pg_atomic_fetch_add_u64(journal_word(touched->space, touched->file), JOURNAL_WORD_GENERATION + 1);
+	touched->counted = true;
+}
+
+/*
+ * Before the commit becomes visible, count it as a committer of every storage
+ * whose streams it changed: a reader then neither builds a cache nor keeps
+ * one until the commit is visible and counted out.
+ */
+static void
+journal_pre_commit(void)
+{
+	for (int i = 0; i < journal_touched_count; i++)
+		if (!journal_touched[i].counted)
+			journal_count_committer(&journal_touched[i]);
+	journal_committing = true;
+}
+
+static void journal_stream_committed(Oid space, RelFileNumber file, uint64 before, uint64 after);
+
+/*
+ * At transaction end: count this transaction out of the storages it counted
+ * itself a committer of, which moves their generation again. Its caches of
+ * their streams stay current after a commit no other committer interleaved
+ * with, its own entries now committed; any other end drops them.
+ */
 static void
 journal_xact_end(bool committed)
 {
-	/*
-	 * Only a claimed slot can be cached by anyone; claiming one here would
-	 * read catalogs, which a commit callback may not do.
-	 */
-	if (committed)
-	{
-		shared_handles();
-		for (int i = 0; i < journal_touched_count; i++)
-		{
-			HandleSlot *slot = handle_slot_find(journal_touched[i].db, journal_touched[i].space, journal_touched[i].file);
+	ListCell   *lc;
 
-			if (slot)
-				pg_atomic_fetch_add_u64(&slot->journal_generation, 1);
-		}
+	/* The slots were claimed at the touch: finding them reads no catalogs. */
+	shared_handles();
+	for (int i = 0; i < journal_touched_count; i++)
+	{
+		JournalTouched *touched = &journal_touched[i];
+		HandleSlot *slot = handle_slot_find(touched->db, touched->space, touched->file);
+		uint64		after = 0;
+
+		if (slot && touched->counted)
+			after = pg_atomic_fetch_add_u64(&slot->journal_generation, JOURNAL_WORD_GENERATION - 1);
+		else if (slot && committed)
+			pg_atomic_fetch_add_u64(&slot->journal_generation, JOURNAL_WORD_GENERATION);
+		if (committed && touched->counted)
+			journal_stream_committed(touched->space, touched->file, touched->before, after);
+		else
+			journal_streams_drop(touched->space, touched->file);
 	}
 	journal_touched = NULL;
 	journal_touched_count = journal_touched_capacity = 0;
+	journal_committing = false;
 	journal_local_epoch++;
+	foreach(lc, journal_retired)
+		MemoryContextDelete(lfirst(lc));
+	list_free(journal_retired);
+	journal_retired = NIL;
 }
 
 static void
@@ -295,7 +353,10 @@ journal_read(const RootKey *key, Snapshot snapshot)
 			entries.capacity = entries.capacity ? entries.capacity * 2 : 32;
 			entries.items = entries.items ? repalloc(entries.items, entries.capacity * sizeof(JournalEntry)) :
 				palloc(entries.capacity * sizeof(JournalEntry));
+			entries.tids = entries.tids ? repalloc(entries.tids, entries.capacity * sizeof(ItemPointerData)) :
+				palloc(entries.capacity * sizeof(ItemPointerData));
 		}
+		entries.tids[entries.count] = tuple->t_self;
 		entry = &entries.items[entries.count++];
 		entry->seq = form->jrnseq;
 		entry->handle = (uint64) form->jrnhandle;
@@ -324,6 +385,344 @@ journal_read(const RootKey *key, Snapshot snapshot)
 		PopActiveSnapshot();
 	table_close(catalog, AccessShareLock);
 	return entries;
+}
+
+/* ---------------------------------------------------------------------------
+ * The stream cache: a backend's decoded copy of each stream it reads
+ * ---------------------------------------------------------------------------
+ *
+ * A load folds the entries of its table's stream that its snapshot sees, and
+ * a writer's every new snapshot would scan the stream's rows from the catalog
+ * again though almost all of them are the ones the last load read. Instead a
+ * backend keeps the entries it read, decoded, with what it later wrote and
+ * deleted itself, and answers loads from them while no other transaction has
+ * changed the stream.
+ *
+ * Other transactions' changes show in a word per storage in shared memory: a
+ * generation in the high bits and, in the low bits, the number of
+ * transactions committing changes to the storage's streams. A committer adds
+ * one to both before its commit becomes visible and moves the second back
+ * after: while the word stands still and shows no committer, no transaction
+ * has made a change to the storage's streams visible.
+ *
+ * A cache is built only from a word showing no committer, and holds the
+ * entries committed when it was read: those that a snapshot taken right after
+ * the word was read sees. A later snapshot that sees all that one did sees the
+ * same, and the backend's own changes, by command. Prepared transactions
+ * become visible in another backend, which cannot account for them, and a
+ * standby replays commits without any: neither uses the cache.
+ */
+
+typedef struct StreamEntry
+{
+	JournalEntry entry;
+	ItemPointerData tid;
+	bool		own;			/* written by this transaction */
+	CommandId	added;			/* when own: the command that wrote it */
+	CommandId	removed;		/* the command of this transaction that deleted it, or invalid */
+} StreamEntry;
+
+typedef struct JournalStream
+{
+	RootKey		key;			/* hash key */
+	MemoryContext memory;		/* rows */
+	StreamEntry *items;
+	int			count,
+				capacity;
+	uint64		word;			/* the storage's word the entries are current for */
+	TransactionId xmax;			/* the snapshot the entries were read under */
+	TransactionId *xip;
+	int			xcnt;
+	bool		valid;
+} JournalStream;
+
+static HTAB *journal_streams;
+
+static bool
+journal_cache_enabled(void)
+{
+	return max_prepared_xacts == 0 && !RecoveryInProgress() && !IsParallelWorker();
+}
+
+static pg_atomic_uint64 *
+journal_word(Oid space, RelFileNumber file)
+{
+	return &handle_slot_claim(MyDatabaseId, space, file)->journal_generation;
+}
+
+static JournalStream *
+journal_stream_find(const RootKey *key, bool enter)
+{
+	bool		found;
+	JournalStream *stream;
+
+	if (!journal_streams)
+	{
+		HASHCTL		ctl = {0};
+
+		if (!enter)
+			return NULL;
+		ctl.keysize = sizeof(RootKey);
+		ctl.entrysize = sizeof(JournalStream);
+		ctl.hcxt = TopMemoryContext;
+		journal_streams = hash_create("prolly journal streams", 32, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	stream = hash_search(journal_streams, key, enter ? HASH_ENTER : HASH_FIND, &found);
+	if (stream && !found)
+	{
+		memset(((char *) stream) + sizeof(RootKey), 0, sizeof(*stream) - sizeof(RootKey));
+		stream->memory = AllocSetContextCreate(TopMemoryContext, "prolly journal stream", ALLOCSET_SMALL_SIZES);
+	}
+	return stream;
+}
+
+/* Forget |stream|'s entries. Rows a load still holds stay until transaction end. */
+static void
+journal_stream_drop(JournalStream *stream)
+{
+	MemoryContext old;
+
+	if (!stream->valid)
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	journal_retired = lappend(journal_retired, stream->memory);
+	MemoryContextSwitchTo(old);
+	stream->memory = AllocSetContextCreate(TopMemoryContext, "prolly journal stream", ALLOCSET_SMALL_SIZES);
+	stream->items = NULL;
+	stream->count = stream->capacity = 0;
+	stream->xip = NULL;
+	stream->valid = false;
+}
+
+/* Drop the caches of every stream of storage |space|/|file|, or of all with InvalidOid. */
+static void
+journal_streams_drop(Oid space, RelFileNumber file)
+{
+	HASH_SEQ_STATUS status;
+	JournalStream *stream;
+
+	if (!journal_streams)
+		return;
+	hash_seq_init(&status, journal_streams);
+	while ((stream = hash_seq_search(&status)) != NULL)
+		if (!OidIsValid(space) || (stream->key.space == space && stream->key.file == file))
+			journal_stream_drop(stream);
+}
+
+/* Whether |snapshot| sees every transaction that |stream|'s read saw as finished. */
+static bool
+journal_stream_covers(const JournalStream *stream, Snapshot snapshot)
+{
+	if (snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->suboverflowed ||
+		TransactionIdPrecedes(snapshot->xmax, stream->xmax))
+		return false;
+	for (uint32 i = 0; i < snapshot->xcnt + snapshot->subxcnt; i++)
+	{
+		TransactionId xid = i < snapshot->xcnt ? snapshot->xip[i] : snapshot->subxip[i - snapshot->xcnt];
+		bool		running = false;
+
+		if (!TransactionIdPrecedes(xid, stream->xmax))
+			continue;
+		for (int j = 0; j < stream->xcnt && !running; j++)
+			running = TransactionIdEquals(stream->xip[j], xid);
+		if (!running)
+			return false;
+	}
+	return true;
+}
+
+/* Insert |item| after the entries of |stream| with sequences up to its own. */
+static void
+journal_stream_insert(JournalStream *stream, const StreamEntry *item)
+{
+	int			at = stream->count;
+
+	if (stream->count == stream->capacity)
+	{
+		MemoryContext old = MemoryContextSwitchTo(stream->memory);
+
+		stream->capacity = stream->capacity ? stream->capacity * 2 : 64;
+		stream->items = stream->items ? repalloc(stream->items, stream->capacity * sizeof(StreamEntry)) :
+			palloc(stream->capacity * sizeof(StreamEntry));
+		MemoryContextSwitchTo(old);
+	}
+	while (at > 0 && stream->items[at - 1].entry.seq > item->entry.seq)
+		at--;
+	memmove(&stream->items[at + 1], &stream->items[at], (stream->count - at) * sizeof(StreamEntry));
+	stream->items[at] = *item;
+	stream->count++;
+}
+
+/*
+ * Read |key|'s stream into its cache, as of a snapshot taken after the word
+ * was read: false when a committer is under way, or this transaction has
+ * already changed the storage's streams, whose rows the cache would have to
+ * take with their commands.
+ */
+static bool
+journal_stream_build(JournalStream *stream, const RootKey *key)
+{
+	uint64		word = pg_atomic_read_u64(journal_word(key->space, key->file));
+	Snapshot	latest;
+	JournalEntries entries;
+	MemoryContext old;
+
+	if (word & JOURNAL_WORD_COMMITTERS)
+		return false;
+	for (int i = 0; i < journal_touched_count; i++)
+		if (journal_touched[i].space == key->space && journal_touched[i].file == key->file)
+			return false;
+	pg_memory_barrier();
+	latest = RegisterSnapshot(GetLatestSnapshot());
+	if (latest->suboverflowed)
+	{
+		UnregisterSnapshot(latest);
+		return false;
+	}
+	old = MemoryContextSwitchTo(stream->memory);
+	entries = journal_read(key, latest);
+	stream->items = palloc(Max(entries.count, 16) * sizeof(StreamEntry));
+	stream->capacity = Max(entries.count, 16);
+	stream->count = 0;
+	for (int i = 0; i < entries.count; i++)
+	{
+		StreamEntry *item = &stream->items[stream->count++];
+
+		item->entry = entries.items[i];
+		item->tid = entries.tids[i];
+		item->own = false;
+		item->added = item->removed = InvalidCommandId;
+	}
+	stream->xmax = latest->xmax;
+	stream->xcnt = latest->xcnt + latest->subxcnt;
+	stream->xip = palloc(Max(stream->xcnt, 1) * sizeof(TransactionId));
+	memcpy(stream->xip, latest->xip, latest->xcnt * sizeof(TransactionId));
+	memcpy(stream->xip + latest->xcnt, latest->subxip, latest->subxcnt * sizeof(TransactionId));
+	MemoryContextSwitchTo(old);
+	UnregisterSnapshot(latest);
+	stream->word = word;
+	stream->valid = true;
+	return true;
+}
+
+/*
+ * The entries of |key|'s stream that |snapshot| sees, in sequence order:
+ * from the cache when it is current and the snapshot sees all its read did,
+ * else from the catalog. The rows stay valid until transaction end.
+ */
+static JournalEntries
+journal_entries(const RootKey *key, Snapshot snapshot)
+{
+	JournalStream *stream;
+	JournalEntries result = {0};
+	bool		self = snapshot == SnapshotSelf;
+	CommandId	cid;
+
+	if (!journal_cache_enabled() || (!self && snapshot->snapshot_type != SNAPSHOT_MVCC))
+		return journal_read(key, snapshot);
+	stream = journal_stream_find(key, true);
+	if (stream->valid && pg_atomic_read_u64(journal_word(key->space, key->file)) != stream->word)
+		journal_stream_drop(stream);
+	if (!stream->valid && !journal_stream_build(stream, key))
+		return journal_read(key, snapshot);
+	if (!self && !journal_stream_covers(stream, snapshot))
+		return journal_read(key, snapshot);
+
+	/*
+	 * SnapshotSelf sees every committed entry, which while the word stands are
+	 * those the cache read, and all of this transaction's changes.
+	 */
+	cid = self ? InvalidCommandId : snapshot->curcid;
+	result.items = palloc(Max(stream->count, 1) * sizeof(JournalEntry));
+	result.capacity = Max(stream->count, 1);
+	for (int i = 0; i < stream->count; i++)
+	{
+		StreamEntry *item = &stream->items[i];
+
+		if (item->removed != InvalidCommandId && (self || item->removed < cid))
+			continue;
+		if (item->own && !self && item->added >= cid)
+			continue;
+		result.items[result.count++] = item->entry;
+	}
+	return result;
+}
+
+/* This transaction appended an entry to |key|'s stream in command |cid|. */
+static void
+journal_stream_appended(const RootKey *key, const JournalEntry *entry, ItemPointer tid, CommandId cid)
+{
+	JournalStream *stream = journal_stream_find(key, false);
+	StreamEntry item = {0};
+	MemoryContext old;
+
+	if (!stream || !stream->valid)
+		return;
+	item.entry = *entry;
+	if (entry->row.len)
+	{
+		old = MemoryContextSwitchTo(stream->memory);
+		item.entry.row.data = palloc(entry->row.len);
+		memcpy(unconstify(uint8 *, item.entry.row.data), entry->row.data, entry->row.len);
+		MemoryContextSwitchTo(old);
+	}
+	item.tid = *tid;
+	item.own = true;
+	item.added = cid;
+	item.removed = InvalidCommandId;
+	journal_stream_insert(stream, &item);
+}
+
+/* This transaction deleted the entry at |tid| of |key|'s stream in command |cid|. */
+static void
+journal_stream_removed(const RootKey *key, ItemPointer tid, CommandId cid)
+{
+	JournalStream *stream = journal_stream_find(key, false);
+
+	if (!stream || !stream->valid)
+		return;
+	for (int i = 0; i < stream->count; i++)
+		if (ItemPointerEquals(&stream->items[i].tid, tid) && stream->items[i].removed == InvalidCommandId)
+		{
+			stream->items[i].removed = cid;
+			return;
+		}
+	journal_stream_drop(stream);
+}
+
+/* A commit left |space|/|file|'s word |after| + 1 from |before|: whether only this transaction moved it. */
+static void
+journal_stream_committed(Oid space, RelFileNumber file, uint64 before, uint64 after)
+{
+	HASH_SEQ_STATUS status;
+	JournalStream *stream;
+
+	if (!journal_streams)
+		return;
+	hash_seq_init(&status, journal_streams);
+	while ((stream = hash_seq_search(&status)) != NULL)
+	{
+		int			kept = 0;
+
+		if (stream->key.space != space || stream->key.file != file || !stream->valid)
+			continue;
+		if (stream->word != before || after != before + JOURNAL_WORD_GENERATION + 1)
+		{
+			journal_stream_drop(stream);
+			continue;
+		}
+		for (int i = 0; i < stream->count; i++)
+		{
+			if (stream->items[i].removed != InvalidCommandId)
+				continue;
+			stream->items[kept] = stream->items[i];
+			stream->items[kept].own = false;
+			stream->items[kept].added = InvalidCommandId;
+			kept++;
+		}
+		stream->count = kept;
+		stream->word = before + 2 * JOURNAL_WORD_GENERATION;
+	}
 }
 
 /*
@@ -364,6 +763,17 @@ journal_append_entry(Relation catalog, Relation index, IndexInfo *info, Relation
 		nulls[Anum_pg_dolt_journal_jrnrow - 1] = true;
 	tuple = heap_form_tuple(RelationGetDescr(catalog), values, nulls);
 	heap_insert(catalog, tuple, cid, 0, NULL);
+	{
+		JournalEntry entry = {
+			.seq = (int64) (handle * 2 + (added ? 0 : 1)),
+			.handle = handle,
+			.added = added,
+			.digest = digest,
+			.row = added ? row : (PLSlice) {NULL, 0},
+		};
+
+		journal_stream_appended(key, &entry, &tuple->t_self, cid);
+	}
 	index_values[0] = values[Anum_pg_dolt_journal_jrnspace - 1];
 	index_values[1] = values[Anum_pg_dolt_journal_jrnfile - 1];
 	index_values[2] = values[Anum_pg_dolt_journal_jrnbranch - 1];
@@ -483,6 +893,10 @@ journal_consume(const RootKey *key, const int64 *seqs, int count, CommandId cid)
 		result = heap_delete(catalog, &tuple->t_self, cid, InvalidSnapshot, true, &tmfd, false);
 		if (result != TM_Ok && result != TM_Deleted && result != TM_Updated && result != TM_SelfModified)
 			elog(ERROR, "could not delete a prolly journal entry");
+		if (result == TM_Ok)
+			journal_stream_removed(key, &tuple->t_self, cid);
+		else
+			journal_streams_drop(key->space, key->file);
 	}
 	systable_endscan(scan);
 	table_close(catalog, RowExclusiveLock);
@@ -801,7 +1215,7 @@ journal_fold_state(Relation rel, const RootKey *table_key_in, Relation table, co
 		return;
 	}
 
-	entries = journal_read(&table_key, snapshot ? snapshot : SnapshotSelf);
+	entries = journal_entries(&table_key, snapshot ? snapshot : SnapshotSelf);
 	if (!fold)
 	{
 		fold = journal_fold_find(&key, latest, true);
