@@ -26,6 +26,7 @@
 #include "catalog/pg_dolt_ref.h"
 #include "storage/bufmgr.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -185,6 +186,19 @@ dg_storage_allocate_kind(char relkind, const char *branch)
 	return id;
 }
 
+/*
+ * Pending statistics must not name a private descriptor once it is freed. A
+ * descriptor copied from its definition shares the definition's entry, which
+ * stays linked to the definition.
+ */
+static void
+storage_unlink_statistics(Relation rel)
+{
+	if (rel->pgstat_info && rel->pgstat_info->relation == rel)
+		pgstat_unlink_relation(rel);
+	rel->pgstat_info = NULL;
+}
+
 static void
 storage_cleanup(void *arg)
 {
@@ -195,6 +209,7 @@ storage_cleanup(void *arg)
 	 * descriptor owns the smgr pin, so memory-context cleanup handles it.
 	 */
 	RelationCloseSmgr(&storage->relation);
+	storage_unlink_statistics(&storage->relation);
 }
 
 DGStorage *
@@ -364,6 +379,7 @@ dg_storage_close(DGStorage *storage)
 	foreach(lc, storage->indexes)
 		dg_storage_close_relation((Relation) lfirst(lc));
 	RelationCloseSmgr(&storage->relation);
+	storage_unlink_statistics(&storage->relation);
 	UnregisterSnapshot(storage->snapshot);
 	relation_close(storage->definition, NoLock);
 	storage->definition = NULL;

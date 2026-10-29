@@ -36,6 +36,11 @@ my $inserted=sql(q{SELECT test_storage_write('legacy','public.t','insert',ARRAY[
 isnt($inserted,$imported,'native insert imports old branch contents and gives the new row its own handle');
 isnt(sql(q{SELECT test_storage_write('other','public.t','insert',ARRAY['2','text'],0)}),'','second branch writes through its canonical definition');
 is(sql(q{SELECT a.v,b.v FROM "postgres/legacy".public.t a JOIN "postgres/other".public.t b USING(id)}),'8|text','two incompatible writable schemas share a resource and preserve their roots');
+# A write counts its rows in statistics under a private storage descriptor:
+# flushing them after the descriptor is freed must not touch it.
+is(sql(q{SELECT test_storage_write('other','public.t','insert',ARRAY['7','flushed'],0) > 0; SELECT pg_stat_force_next_flush(); SELECT 'flushed'}),"t\n\nflushed",'statistics flush after a storage write');
+sql(q{SELECT test_storage_write('other','public.t','delete',ARRAY[]::text[],(SELECT test_storage_handle(ctid) FROM "postgres/other".public.t WHERE id=7))});
+
 is(sql(q{SELECT active_branch()}),'main','explicit write binding does not switch session branch');
 is(sql(q{SELECT * FROM "postgres/main".public.t}),'1|main','writes leave another resource and branch untouched');
 my $updated=sql("SELECT test_storage_write('legacy','public.t','update',ARRAY['1','9'],$imported)");
