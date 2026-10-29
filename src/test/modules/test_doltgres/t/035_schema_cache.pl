@@ -54,7 +54,7 @@ $node->reload;
 my $fresh=sql($describe);
 my $cold=object_reads('SELECT count(*) FROM child, parent, plain');
 is(object_reads('SELECT count(*) FROM child, parent, plain'), $cold, 'without sharing, each new session decodes every schema');
-$node->append_conf('postgresql.conf',"dolt_shared_schema_cache_size=64MB\n");
+$node->append_conf('postgresql.conf',"dolt_shared_schema_cache_size=16MB\n");
 $node->reload;
 my $warm=object_reads('SELECT count(*) FROM child, parent, plain');
 cmp_ok($cold - $warm, '>=', 8, "with sharing, a new session decodes no table or index schema ($cold reads, then $warm)");

@@ -39,7 +39,7 @@
 #include "mb/pg_wchar.h"
 
 int			dolt_schema_cache_size = 32 * 1024; /* kB */
-int			dolt_shared_schema_cache_size = 64 * 1024;	/* kB */
+int			dolt_shared_schema_cache_size = 16 * 1024;	/* kB */
 
 /* Hashed and compared as bytes: padding must be zero. */
 typedef struct SchemaKey

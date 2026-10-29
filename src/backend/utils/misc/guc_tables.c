@@ -3684,7 +3684,7 @@ struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_KB
 		},
 		&dolt_shared_schema_cache_size,
-		64 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
+		16 * 1024, 0, MAX_KILOBYTES, NULL, NULL, NULL
 	},
 
 	{
