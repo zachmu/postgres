@@ -585,7 +585,7 @@ dg_batch(Relation rel, CommandId cid)
 static void
 batch_stamp(DGBatch *b)
 {
-	b->generation = roots_generation();
+	b->generation = roots_generation(&b->key);
 	visibility_capture(SnapshotSelf, &b->seen);
 }
 
@@ -594,7 +594,7 @@ batch_stale(DGBatch *b)
 {
 	Visibility	now;
 
-	if (b->generation != roots_generation())
+	if (b->generation != roots_generation(&b->key))
 		return true;
 	visibility_capture(SnapshotSelf, &now);
 	return !visibility_equal(&b->seen, &now);

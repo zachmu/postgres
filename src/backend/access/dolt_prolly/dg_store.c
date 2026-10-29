@@ -35,6 +35,9 @@
 #include "access/doltchunk.h"
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/parallel.h"
+#include "access/twophase.h"
+#include "access/xlog.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -181,7 +184,7 @@ typedef struct RootsCacheEntry
 } RootsCacheEntry;
 
 static HTAB *roots_cache;
-static uint64 roots_generation(void);
+static uint64 roots_generation(const RootKey *key);
 
 static RootsCacheEntry *
 roots_cache_find(const RootKey *key, bool enter)
@@ -202,7 +205,7 @@ roots_cache_find(const RootKey *key, bool enter)
 static Roots
 roots_read(const RootKey *key, Snapshot snapshot)
 {
-	uint64		generation = roots_generation();
+	uint64		generation = roots_generation(key);
 	RootsCacheEntry *cached = roots_cache_find(key, false);
 	Relation	catalog;
 	ScanKeyData keys[3];
@@ -242,7 +245,7 @@ roots_read(const RootKey *key, Snapshot snapshot)
 	 * its xmax shows.
 	 */
 	if (roots.present && latest && TransactionIdIsValid(xmin) && !TransactionIdIsCurrentTransactionId(xmin) &&
-		IsMVCCSnapshot(snapshot) && !XidInMVCCSnapshot(xmin, snapshot) && generation == roots_generation())
+		IsMVCCSnapshot(snapshot) && !XidInMVCCSnapshot(xmin, snapshot) && generation == roots_generation(key))
 	{
 		RootsCacheEntry *entry = roots_cache_find(key, true);
 
@@ -587,6 +590,7 @@ static DGState *load_unfolded(Relation rel, Snapshot snap, bool *foldable);
 static void journal_fold_roots(PLHash **roots, int *count, int *capacity);
 static uint64 journal_max_handle(Oid space, RelFileNumber file);
 static void journal_xact_end(bool committed);
+static void journal_pre_commit(void);
 static void journal_local_invalidate(void);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
@@ -609,8 +613,8 @@ static void batch_flush_key(const RootKey *key);
 static void batch_flush_all(void);
 static void batch_discard(SubTransactionId subxid);
 static void save_roots(const RootKey *key, bool table, DGState *s, CommandId cid, SubTransactionId subxid);
-static uint64 roots_generation(void);
-static void roots_generation_bump(void);
+static uint64 roots_generation(const RootKey *key);
+static void roots_generation_bump(const RootKey *key, bool claim);
 static void handle_table_init(void *ptr);
 static bool journal_entry_any(const RootKey *key, uint64 handle, PLHash *digest, PLSlice *row);
 static void writer_forget(TransactionId xid, int slot);
@@ -828,7 +832,7 @@ roots_write(Relation catalog, const RootKey *key, ItemPointer tid, const Roots *
 	else
 		CatalogTupleInsert(catalog, tuple);
 	heap_freetuple(tuple);
-	roots_generation_bump();
+	roots_generation_bump(key, true);
 }
 
 /* Publish every written relation, in a fixed order to avoid deadlocks. */
@@ -907,6 +911,8 @@ store_xact(XactEvent event, void *arg)
 					batch_flush_all();
 					publish_all();
 					working_close(true);
+					if (event == XACT_EVENT_PRE_COMMIT)
+						journal_pre_commit();
 				}
 				PG_FINALLY();
 				{
@@ -927,7 +933,14 @@ store_xact(XactEvent event, void *arg)
 			 * stale, so the generation moves again.
 			 */
 			if (event == XACT_EVENT_COMMIT && overlays)
-				roots_generation_bump();
+			{
+				HASH_SEQ_STATUS status;
+				Overlay    *overlay;
+
+				hash_seq_init(&status, overlays);
+				while ((overlay = hash_seq_search(&status)) != NULL)
+					roots_generation_bump(&overlay->key, false);
+			}
 
 			/*
 			 * Later pre-commit work, and parallel workers, which publish
@@ -1250,13 +1263,14 @@ typedef struct HandleSlot
 	pg_atomic_uint32 used;
 	pg_atomic_uint64 next;
 	pg_atomic_uint64 journal_generation;	/* bumped when a journal write to the storage commits */
+	pg_atomic_uint64 roots_generation;	/* bumped by every write of the storage's roots */
 	pg_atomic_uint32 records;	/* whether any row of the storage ever had a lock record */
 } HandleSlot;
 
 typedef struct HandleTable
 {
 	slock_t		mutex;
-	pg_atomic_uint64 roots_generation;	/* bumped by every roots write */
+	pg_atomic_uint64 roots_generation;	/* bumped when prepared roots become visible */
 	HandleSlot	slots[DG_HANDLE_SLOTS];
 } HandleTable;
 
@@ -1272,28 +1286,46 @@ shared_handles(void)
 	return handle_table;
 }
 
+static HandleSlot *handle_slot_claim(Oid db, Oid space, RelFileNumber file);
+static HandleSlot *handle_slot_find(Oid db, Oid space, RelFileNumber file);
+
 /*
- * A counter every roots write advances before its commit: while it stands
- * still, no transaction has published roots, so trees loaded under it are
- * still the latest.
+ * A counter every write of a storage's roots advances before its commit, and
+ * again as the commit becomes visible: while it stands still, no transaction
+ * has published the storage's roots, so trees loaded under it are still the
+ * latest. A prepared transaction's roots become visible in another backend,
+ * which cannot tell which storages they name: that moves every storage's.
  */
 static uint64
-roots_generation(void)
+roots_generation(const RootKey *key)
 {
-	return pg_atomic_read_u64(&shared_handles()->roots_generation);
+	HandleSlot *slot = handle_slot_claim(MyDatabaseId, key->space, key->file);
+
+	return (pg_atomic_read_u64(&shared_handles()->roots_generation) << 32) +
+		pg_atomic_read_u64(&slot->roots_generation);
 }
 
+/*
+ * A write of |key|'s roots, which claims the storage's slot so that its commit
+ * finds it; a commit callback, which may not read catalogs, only finds it.
+ */
 static void
-roots_generation_bump(void)
+roots_generation_bump(const RootKey *key, bool claim)
 {
-	pg_atomic_fetch_add_u64(&shared_handles()->roots_generation, 1);
+	HandleSlot *slot;
+
+	shared_handles();
+	slot = claim ? handle_slot_claim(MyDatabaseId, key->space, key->file) :
+		handle_slot_find(MyDatabaseId, key->space, key->file);
+	if (slot)
+		pg_atomic_fetch_add_u64(&slot->roots_generation, 1);
 }
 
 /* A prepared transaction's roots became visible: COMMIT PREPARED calls this. */
 void
 dg_roots_published(void)
 {
-	roots_generation_bump();
+	pg_atomic_fetch_add_u64(&shared_handles()->roots_generation, 1);
 }
 
 static void
@@ -1375,7 +1407,8 @@ handle_slot_claim(Oid db, Oid space, RelFileNumber file)
 			candidate->space = space;
 			candidate->file = file;
 			pg_atomic_write_u64(&candidate->next, Max(max, DG_DERIVED_HANDLES) + 1);
-			pg_atomic_write_u64(&candidate->journal_generation, 1);
+			pg_atomic_write_u64(&candidate->journal_generation, UINT64CONST(1) << 16);
+			pg_atomic_write_u64(&candidate->roots_generation, 1);
 			pg_atomic_write_u32(&candidate->records, dg_records_exist(space, file) ? 1 : 0);
 			pg_write_barrier();
 			pg_atomic_write_u32(&candidate->used, 1);
@@ -1888,7 +1921,7 @@ dg_storage_content_root(RelFileLocator locator, const char *branch, Snapshot sna
 	 * dg_storage_resource_root sends its callers to a full load instead.
 	 */
 	{
-		JournalEntries entries = journal_read(&key, snapshot ? snapshot : SnapshotSelf);
+		JournalEntries entries = journal_entries(&key, snapshot ? snapshot : SnapshotSelf);
 
 		if (entries.count)
 		{
