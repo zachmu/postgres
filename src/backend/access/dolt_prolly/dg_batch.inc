@@ -706,9 +706,16 @@ dg_batch_remove(DGBatch *b, PLSlice row, uint64 handle)
 	for (int i = 0; i < pending->handle_count; i++)
 		if (pending->handles[i] == handle)
 			pending->handles[i] = pending->handles[--pending->handle_count];
-	mapping = hash_search(b->handles, &handle, HASH_ENTER, NULL);
-	mapping->digest = digest;
-	mapping->present = false;
+	mapping = hash_search(b->handles, &handle, HASH_ENTER, &found);
+	/* An insert cancelled before the batch was flushed never existed in the
+	 * base state.  Do not journal a deletion (or reserve a tombstone) for it. */
+	if (found && mapping->present && !dg_handle_digest(b->state, handle, &digest))
+		hash_search(b->handles, &handle, HASH_REMOVE, NULL);
+	else
+	{
+		mapping->digest = digest;
+		mapping->present = false;
+	}
 	b->count++;
 	MemoryContextSwitchTo(old);
 }

@@ -165,6 +165,30 @@ sql(q{INSERT INTO t VALUES (4, 1, 'four')});
 is(sql(q{SELECT count(*) FROM (SELECT DISTINCT ctid FROM t) x}), '4', 'a new handle does not collide after the restart');
 is(sql(q{SET enable_seqscan=off; SELECT count(*) FROM t WHERE k = 1}), '4', 'the index agrees');
 
+# Cancelling a speculative row must not journal a deletion of a nonexistent row.
+# Test both the stream cache and the prepared-transaction uncached read path.
+for my $prepared (0, 10)
+{
+    $node->append_conf('postgresql.conf', "max_prepared_transactions=$prepared\n");
+    $node->restart;
+    sql(q{CREATE TABLE spec(a int, b int, c int);
+      CREATE UNIQUE INDEX spec_key ON spec(b,c) NULLS NOT DISTINCT;
+      INSERT INTO spec VALUES (1,1,1);
+      INSERT INTO spec VALUES (4,1,2),(5,2,1),(6,NULL,1),(7,NULL,1),
+        (12,1,1),(8,1,NULL),(9,1,NULL),(10,NULL,NULL),(11,NULL,NULL)
+        ON CONFLICT DO NOTHING});
+    is(sql(q{SELECT string_agg(a::text, ',' ORDER BY a) FROM spec}), '1,4,5,6,8,10',
+        "cancelled speculative rows leave no journal deletions ($prepared)");
+    is(sql(q{SET enable_seqscan=off; SELECT a FROM spec WHERE b=1 AND c=2}), '4',
+        "unique index agrees after cancellation ($prepared)");
+    sql(q{BEGIN; INSERT INTO spec VALUES (20,3,3),(21,3,3) ON CONFLICT DO NOTHING; ROLLBACK});
+    is(sql(q{SELECT count(*) FROM spec}), '6', "rollback discards speculative batch ($prepared)");
+    $node->restart;
+    is(sql(q{SELECT string_agg(a::text, ',' ORDER BY a) FROM spec}), '1,4,5,6,8,10',
+        "cancelled speculative rows stay absent after restart ($prepared)");
+    sql(q{DROP TABLE spec});
+}
+
 # A crash loses the shared handle slots; the first commit after it must not claim one.
 $node->stop('immediate');
 $node->start;
