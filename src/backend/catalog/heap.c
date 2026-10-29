@@ -1194,6 +1194,9 @@ heap_create_with_catalog(const char *relname,
 	 * by catching it here we can emit a nicer error message.
 	 */
 	existing_relid = get_relname_relid(relname, relnamespace);
+	if (!OidIsValid(existing_relid) && CatalogViewCurrent())
+		existing_relid = get_relname_relid(relname,
+										 CatalogViewNamespace(CatalogViewCurrent(), relnamespace));
 	if (!OidIsValid(existing_relid))
 		existing_relid = BranchRelnameGetRelid(relname, relnamespace);
 	if (existing_relid != InvalidOid)
