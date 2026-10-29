@@ -628,14 +628,17 @@ pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PL
 	/*
 	 * Key-local, level-salted fingerprint; no dependence on insertion
 	 * history. An entry ends its node with probability proportional to its
-	 * size, so nodes average PL_TARGET_BYTES whatever their entries' sizes.
+	 * size, so nodes average their level's target whatever their entries'
+	 * sizes.
 	 */
 	uint64_t	fingerprint = UINT64_C(14695981039346656037) ^ level;
+	size_t		target = level ? PL_INTERNAL_TARGET_BYTES : PL_LEAF_TARGET_BYTES;
 	size_t		i;
 
 	if (count < 2)
 		return false;
-	if (count >= PL_MAX_ENTRIES || bytes >= PL_MAX_BYTES)
+	if (count >= (level ? PL_MAX_ENTRIES : PL_LEAF_MAX_ENTRIES) ||
+		bytes >= (level ? PL_INTERNAL_MAX_BYTES : PL_LEAF_MAX_BYTES))
 		return true;
 	if (bytes < PL_MIN_BYTES)
 		return false;
@@ -645,5 +648,5 @@ pl_boundary(uint32_t level, uint32_t count, size_t bytes, size_t entry_bytes, PL
 	fingerprint ^= fingerprint >> 33;
 	fingerprint *= UINT64_C(0xff51afd7ed558ccd);
 	fingerprint ^= fingerprint >> 33;
-	return (fingerprint & 0xFFFFF) < (uint64_t) entry_bytes * 0x100000 / PL_TARGET_BYTES;
+	return (fingerprint & 0xFFFFF) < (uint64_t) entry_bytes * 0x100000 / target;
 }

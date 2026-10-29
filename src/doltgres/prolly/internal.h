@@ -5,12 +5,25 @@
 #include <string.h>
 
 #define PL_MAX_DEPTH 32
-#define PL_MAX_ENTRIES 128
 #define PL_MIN_BYTES 256
-#ifndef PL_TARGET_BYTES
-#define PL_TARGET_BYTES 1024
+
+/*
+ * Node sizes by level. Leaves stay small, so an edit rewrites and rehashes
+ * little. Interior nodes target half a page and stay within one: a path is
+ * then short, and every interior node is one chunk store tuple.
+ */
+#ifndef PL_LEAF_TARGET_BYTES
+#define PL_LEAF_TARGET_BYTES 1024
 #endif
-#define PL_MAX_BYTES (4 * PL_TARGET_BYTES)
+#define PL_LEAF_MAX_BYTES (4 * PL_LEAF_TARGET_BYTES)
+#define PL_LEAF_MAX_ENTRIES 128
+#ifndef PL_INTERNAL_TARGET_BYTES
+#define PL_INTERNAL_TARGET_BYTES 4096
+#endif
+#ifndef PL_INTERNAL_MAX_BYTES
+#define PL_INTERNAL_MAX_BYTES 7168
+#endif
+#define PL_MAX_ENTRIES 512		/* any node's; an interior node's limit */
 #define PL_HEADER 24
 #define PL_CHILD_SIZE 40
 

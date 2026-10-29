@@ -184,6 +184,79 @@ test_tree(void)
 	pl_store_free(store);
 }
 
+/* Node sizes and counts by level: leaves below, interior nodes from 1 up. */
+typedef struct LevelSizes
+{
+	size_t		nodes[2],
+				bytes[2],
+				largest[2];
+	uint32_t	most_entries;
+} LevelSizes;
+
+static void
+measure(PLStore *store, PLHash hash, LevelSizes *sizes)
+{
+	PLNode	   *node = pl_find(store, hash);
+	int			interior;
+
+	CHECK(node);
+	interior = node->level > 0;
+	sizes->nodes[interior]++;
+	sizes->bytes[interior] += node->size;
+	if (node->size > sizes->largest[interior])
+		sizes->largest[interior] = node->size;
+	if (interior && node->count > sizes->most_entries)
+		sizes->most_entries = node->count;
+	for (uint32_t i = 0; node->level && i < node->count; i++)
+	{
+		PLHash		child;
+
+		memcpy(child.bytes, pl_node_value(node, i).data, PL_HASH_SIZE);
+		measure(store, child, sizes);
+	}
+}
+
+/*
+ * Leaves average their small target; interior nodes average theirs, half a
+ * page, and stay within one page however many children they hold.
+ */
+static void
+test_node_sizes(void)
+{
+	PLStore    *store = test_store_create();
+	size_t		n = 200000;
+	PLEntry    *entries = calloc(n, sizeof(*entries));
+	uint8_t		(*keys)[8] = calloc(n, 8);
+	LevelSizes	sizes = {0};
+	PLTree		tree;
+	double		leaf,
+				interior;
+
+	CHECK(store && entries && keys);
+	for (size_t i = 0; i < n; i++)
+	{
+		pl_key_int64((int64_t) i, keys[i]);
+		entries[i] = (PLEntry) {{keys[i], 8}, slice("a value of some forty bytes for each row")};
+	}
+	OK(pl_build(store, entries, n, &tree));
+	OK(pl_validate(&tree));
+	measure(store, tree.root, &sizes);
+	leaf = (double) sizes.bytes[0] / sizes.nodes[0];
+	interior = (double) sizes.bytes[1] / sizes.nodes[1];
+	printf("node sizes: %zu leaves of %.0f bytes on average, %zu interior nodes of %.0f, largest %zu\n",
+		   sizes.nodes[0], leaf, sizes.nodes[1], interior, sizes.largest[1]);
+	CHECK(leaf > PL_LEAF_TARGET_BYTES / 2 && leaf < 2 * PL_LEAF_TARGET_BYTES);
+	CHECK(sizes.largest[0] <= PL_LEAF_MAX_BYTES + PL_HEADER + 64);
+	CHECK(sizes.nodes[1] > 1);
+	CHECK(sizes.nodes[1] < sizes.nodes[0] / 16);
+	CHECK(sizes.largest[1] <= PL_INTERNAL_MAX_BYTES + PL_HEADER + 64);
+	CHECK(sizes.largest[1] <= 8192);
+	CHECK(sizes.most_entries > PL_LEAF_MAX_ENTRIES / 2);
+	free(keys);
+	free(entries);
+	pl_store_free(store);
+}
+
 typedef struct DiffResult
 {
 	unsigned	inserts,
@@ -1040,6 +1113,7 @@ main(int argc, char **argv)
 	test_tuples();
 	test_tuple_view();
 	test_tree();
+	test_node_sizes();
 	test_versions();
 	test_random_history();
 	test_apply_batches();
