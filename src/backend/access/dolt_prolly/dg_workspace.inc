@@ -98,6 +98,14 @@ selected_objects(Member * members, int count, List *tables)
 		if (!strcmp(members[i].kind, "trigger") &&
 			name_selected(tables, json_value(metadata(child(members[i].hash, 1), "schema"), "table")))
 			result = lappend(result, members[i].name);
+	for (i = 0; i < count; i++)
+		if (!strcmp(members[i].kind, "sequence"))
+		{
+			char *owned = json_value(metadata(child(members[i].hash, 1), "schema"), "owned_table");
+
+			if (owned && name_selected(tables, owned))
+				result = lappend(result, members[i].name);
+		}
 	return result;
 }
 
@@ -534,7 +542,7 @@ resolve_object_argument(const char *arg, const char *json_a, const char *json_b,
 
 	/* parse_ident(...,false) stops at the signature, retaining quoted names.
 	 * Compare the full suffix as well, so overloads never select each other. */
-	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
+	run("WITH members AS (SELECT v FROM jsonb_array_elements($1::jsonb->'members') v UNION ALL SELECT v FROM jsonb_array_elements($2::jsonb->'members') v), names AS (SELECT DISTINCT v->>'name' AS name FROM members WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence')), path AS (SELECT s,ord FROM (SELECT CASE WHEN btrim(s)='\"$user\"' THEN current_user::text ELSE btrim(btrim(s),'\"') END AS s,ord FROM unnest(string_to_array($5,',')) WITH ORDINALITY p(s,ord)) x WHERE EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=x.s)) SELECT name,path.ord IS NOT NULL FROM names LEFT JOIN path ON (parse_ident(name,false))[1]=path.s WHERE ($3::text IS NOT NULL AND name=$3) OR ($3::text IS NULL AND substr(name,length(quote_ident((parse_ident(name,false))[1]))+2)=$4) ORDER BY path.ord NULLS LAST,name COLLATE \"C\"", 5, VC_TYPES(TEXTOID,TEXTOID,TEXTOID,TEXTOID,TEXTOID), VC_ARGS(CStringGetTextDatum(json_a),CStringGetTextDatum(json_b),qualified ? CStringGetTextDatum(qualified) : (Datum) 0,CStringGetTextDatum(local),CStringGetTextDatum(api_search_path ? api_search_path : "public")), qualified ? NULL : "  n  ", true);
 	if (!SPI_processed)
 	{
 		if (!required)
@@ -551,7 +559,7 @@ state_objects(const char *json)
 {
 	List *result = NIL;
 
-	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
+	run("SELECT v->>'name' FROM jsonb_array_elements($1::jsonb->'members') v WHERE v->>'kind' IN ('table','routine','view','type','trigger','sequence') ORDER BY v->>'name' COLLATE \"C\"", 1, VC_TYPES(TEXTOID), VC_ARGS(CStringGetTextDatum(json)), NULL, true);
 	for (int i = 0; i < SPI_processed; i++)
 		result = lappend(result, strcell(i, 1));
 	return result;
@@ -675,8 +683,8 @@ restore_table(bytea *db, const char *name)
 static void
 drop_objects(List *names)
 {
-	const char *kinds[] = {"view", "table", "routine", "type"};
-	const char *commands[] = {"VIEW", "TABLE", "ROUTINE", "TYPE"};
+	const char *kinds[] = {"view", "table", "routine", "type", "sequence"};
+	const char *commands[] = {"VIEW", "TABLE", "ROUTINE", "TYPE", "SEQUENCE"};
 	char *json = working_state();
 	int count;
 	Member *members = database_members(capture(true).hash, &count);

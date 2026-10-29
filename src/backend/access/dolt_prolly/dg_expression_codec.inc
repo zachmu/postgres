@@ -145,25 +145,6 @@ schema_expression_sql(Node *expression, Oid relation)
 	return result;
 }
 
-/*
- * Whether a stored expression calls a routine outside pg_catalog. Stored SQL
- * qualifies every such name, and only versioned routines are stored.
- */
-static bool
-schema_expression_calls_routine(Node *node, void *context)
-{
-	if (!node)
-		return false;
-	if (IsA(node, FuncCall) && list_length(((FuncCall *) node)->funcname) > 1 &&
-		strcmp(strVal(linitial(((FuncCall *) node)->funcname)), "pg_catalog"))
-		return true;
-	/* Versioned types are named the same way. */
-	if (IsA(node, TypeName) && list_length(((TypeName *) node)->names) > 1 &&
-		strcmp(strVal(linitial(((TypeName *) node)->names)), "pg_catalog"))
-		return true;
-	return raw_expression_tree_walker(node, schema_expression_calls_routine, context);
-}
-
 static Node *
 schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 					   TupleDesc desc, Node *raw, int attribute)
@@ -190,9 +171,11 @@ schema_expression_bind(CatalogView *view, Oid relation, const char *name,
 	addNSItemToQuery(pstate, nsitem, true, true, true);
 	PG_TRY();
 	{
-		/* Versioned routines the expression names resolve in its own view. */
-		if (schema_expression_calls_routine(raw, NULL))
-			CatalogViewSwitch(view);
+		/*
+		 * Routines, types and regclass constants resolve in their
+		 * definition's view.
+		 */
+		CatalogViewSwitch(view);
 		if (attribute >= 0)
 			schema_expression_gucs();
 		if (attribute > 0)
@@ -369,8 +352,7 @@ schema_expression_bind_domain(CatalogView *view, Node *raw, const char *name, Oi
 	PG_TRY();
 	{
 		schema_expression_gucs();
-		if (schema_expression_calls_routine(raw, NULL))
-			CatalogViewSwitch(view);
+		CatalogViewSwitch(view);
 		if (check)
 		{
 			pstate->p_pre_columnref_hook = schema_expression_domain_value;

@@ -15,12 +15,15 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "utils/rel.h"
+#include "access/htup_details.h"
 
 typedef struct DGCatalogScan
 {
 	CustomScanState css;
 	Relation	catalog;
 	CatalogViewScan *scan;
+	HeapTuple	sequence_tuple;
+	bool		sequence_done;
 } DGCatalogScan;
 static void begin_scan(CustomScanState *css, EState *estate, int eflags);
 static TupleTableSlot *exec_scan(CustomScanState *css);
@@ -78,6 +81,8 @@ create_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist, L
 	scan->custom_private = list_make3(makeString(pstrdup(rte->dolt_branch ? rte->dolt_branch : "")),
 									  makeString(pstrdup(rte->dolt_database)),
 									  makeInteger(rte->dolt_catalog));
+	if (rte->relkind == RELKIND_SEQUENCE)
+		scan->custom_private = lappend(scan->custom_private, makeString(pstrdup(CatalogViewObjectIdentity(rte->dolt_catalog, RelationRelationId))));
 	scan->methods = &scan_methods;
 	return &scan->scan.plan;
 }
@@ -102,6 +107,23 @@ begin_scan(CustomScanState *css, EState *estate, int eflags)
 	CatalogView *view = dg_catalog_view(strVal(lsecond(plan->custom_private)), *branch ? branch : NULL);
 	CatalogView *previous;
 
+	if (list_length(plan->custom_private) == 4)
+	{
+		int64		last;
+		bool		called;
+		Datum		values[3];
+		bool		nulls[3] = {false};
+
+		s->catalog = table_open(CatalogViewLookupObject(view, RelationRelationId, strVal(lfourth(plan->custom_private))), AccessShareLock);
+		if (!dg_catalog_sequence_retained(s->catalog, &last, &called))
+			elog(ERROR, "sequence scan requires a retained revision");
+		values[0] = Int64GetDatum(last);
+		values[1] = Int64GetDatum(0);
+		values[2] = BoolGetDatum(called);
+		s->sequence_tuple = heap_form_tuple(RelationGetDescr(s->catalog), values, nulls);
+		s->sequence_done = false;
+		return;
+	}
 	s->catalog = table_open((Oid) intVal(lthird(plan->custom_private)), AccessShareLock);
 	previous = CatalogViewSwitch(view);
 	PG_TRY();
@@ -125,7 +147,13 @@ next_row(ScanState *ss)
 	HeapTuple	tuple;
 
 	ExecClearTuple(slot);
-	tuple = CatalogViewNext(s->scan, ForwardScanDirection);
+	if (s->sequence_tuple)
+	{
+		tuple = s->sequence_done ? NULL : s->sequence_tuple;
+		s->sequence_done = true;
+	}
+	else
+		tuple = CatalogViewNext(s->scan, ForwardScanDirection);
 	return tuple ? ExecStoreHeapTuple(tuple, slot, false) : slot;
 }
 
@@ -151,6 +179,12 @@ end_scan(CustomScanState *css)
 		CatalogViewEndScan(s->scan);
 		s->scan = NULL;
 	}
+	if (s->sequence_tuple)
+	{
+		ExecClearTuple(css->ss.ss_ScanTupleSlot);
+		heap_freetuple(s->sequence_tuple);
+		s->sequence_tuple = NULL;
+	}
 	if (s->catalog)
 	{
 		table_close(s->catalog, AccessShareLock);
@@ -163,6 +197,8 @@ rescan(CustomScanState *css)
 {
 	DGCatalogScan *s = (DGCatalogScan *) css;
 
-	CatalogViewRescan(s->scan, NULL);
+	if (s->scan)
+		CatalogViewRescan(s->scan, NULL);
+	s->sequence_done = false;
 	ExecScanReScan(&css->ss);
 }

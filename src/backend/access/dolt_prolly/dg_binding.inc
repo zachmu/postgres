@@ -155,7 +155,7 @@ binding_prepare(const char *branch, bytea *database, bool required)
 		n = 0;
 		for (i = 0; i < count; i++)
 		{
-			if (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index"))
+			if (strcmp(listed[i].kind, "table") && strcmp(listed[i].kind, "index") && strcmp(listed[i].kind, "sequence"))
 				continue;
 			names[n] = (char *) listed[i].name;
 			schemas[n] = object_child(listed[i].hash, 1);
@@ -168,6 +168,14 @@ binding_prepare(const char *branch, bytea *database, bool required)
 
 		if (OidIsValid(relid))
 			continue;
+		if (!strcmp(kinds[i], "sequence"))
+		{
+			char	   *definition = metadata(schemas[i], "schema");
+
+			relid = sequence_resource(names[i], sequence_number(definition, "start"), sequence_number(definition, "increment"), true);
+			binding_record(branch, names[i], schemas[i], relid);
+			continue;
+		}
 		run("SELECT DISTINCT b.bindrelid FROM pg_dolt_binding b JOIN pg_dolt_storage s ON s.storageid=b.bindrelid WHERE b.bindname=$1 AND b.bindschema=$2", 2, VC_TYPES(TEXTOID, BYTEAOID), VC_ARGS(CStringGetTextDatum(names[i]), PointerGetDatum(schemas[i])), NULL, true);
 
 		/*
