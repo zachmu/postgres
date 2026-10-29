@@ -46,6 +46,7 @@ test_storage_write(PG_FUNCTION_ARGS)
 	TM_FailureData failure;
 	LockTupleMode mode;
 	TU_UpdateIndexes indexes;
+	TM_Result	outcome = TM_Ok;
 	uint64		result;
 	EState	   *estate;
 	ResultRelInfo info;
@@ -86,13 +87,23 @@ test_storage_write(PG_FUNCTION_ARGS)
 	if (permission == ACL_INSERT)
 		table_tuple_insert(rel, slot, GetCurrentCommandId(true), 0, NULL);
 	else if (permission == ACL_UPDATE)
-		table_tuple_update(rel, &tid, slot, GetCurrentCommandId(true), GetActiveSnapshot(), InvalidSnapshot, true, &failure, &mode, &indexes);
+		outcome = table_tuple_update(rel, &tid, slot, GetCurrentCommandId(true), GetActiveSnapshot(), InvalidSnapshot, true, &failure, &mode, &indexes);
 	else
-		table_tuple_delete(rel, &tid, GetCurrentCommandId(true), GetActiveSnapshot(), InvalidSnapshot, true, &failure, false);
+		outcome = table_tuple_delete(rel, &tid, GetCurrentCommandId(true), GetActiveSnapshot(), InvalidSnapshot, true, &failure, false);
+	if (outcome != TM_Ok)
+		elog(ERROR, "test row handle " INT64_FORMAT " was not changed: %d", PG_GETARG_INT64(4), (int) outcome);
 	result = permission == ACL_DELETE ? 0 : dg_id(&slot->tts_tid);
 	ExecDropSingleTupleTableSlot(slot);
 	dg_storage_close_relation(rel);
 	PG_RETURN_INT64(result);
+}
+
+/* The row handle of a prolly row's TID, as test_storage_write takes it. */
+PG_FUNCTION_INFO_V1(test_storage_handle);
+Datum
+test_storage_handle(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(dg_id(PG_GETARG_ITEMPOINTER(0)));
 }
 
 /* Test-only physical inspection proves SQL CREATE didn't persist schema rows. */

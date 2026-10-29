@@ -73,7 +73,7 @@ sql(q{SELECT dolt_commit('-Am','snapshot advancement')});
 is($reader->query_safe(q{SELECT commit_hash FROM dolt_log('-n','1')}),$oldhead,'history read retains snapshot');
 $reader->query_safe('COMMIT');$reader->quit;
 is(sql(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING'); COMMIT}),'0','live capture reads the working schema under Repeatable Read');
-fails(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','missing')},qr/table not found: public.missing/,'unknown diff table rejected');
+is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD','WORKING','missing')}),'0','an unknown diff table has no changes, as in Dolt');
 my $objects=sql('SELECT count(*) FROM pg_dolt_object');
 sql(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING')});
 is(sql('SELECT count(*) FROM pg_dolt_object'),$objects,'live diff does not persist objects');

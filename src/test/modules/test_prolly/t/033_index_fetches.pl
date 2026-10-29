@@ -8,7 +8,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('fetches');
-$node->init;
+$node->init(extra => ['--encoding=UTF8', '--locale=C']);
 $node->append_conf('postgresql.conf', "default_table_access_method='dolt_prolly_table'\nmax_parallel_workers_per_gather=0\n");
 $node->start;
 sub sql { $node->safe_psql('postgres', $_[0]); }
