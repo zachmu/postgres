@@ -75,9 +75,13 @@ provider_current(DGProvider *entry, const char *branch)
 	return true;
 }
 
+/*
+ * pg_statistic is not among them: a branch's tables keep their statistics
+ * physically, under their durable OIDs, and a revision's tables have none.
+ */
 static const Oid provider_catalogs[] = {
 	NamespaceRelationId, SequenceRelationId, RelationRelationId, AttributeRelationId, ProcedureRelationId, LanguageRelationId,
-	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
+	TypeRelationId, EnumRelationId, OperatorRelationId, RangeRelationId, DescriptionRelationId, DependRelationId, IndexRelationId, ConstraintRelationId, CastRelationId, StatisticExtRelationId, StatisticExtDataRelationId, PublicationRelRelationId, PublicationNamespaceRelationId, InheritsRelationId, RewriteRelationId, TriggerRelationId, PolicyRelationId, AttrDefaultRelationId, SharedDependRelationId, SecLabelRelationId, InitPrivsRelationId
 };
 
 /* Whether branch and revision views supply rows of |catalog|. */
