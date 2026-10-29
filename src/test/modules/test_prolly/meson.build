@@ -42,6 +42,7 @@ tests += {
     't/036_row_journal.pl',
     't/037_derived_handles.pl',
     't/038_index_types.pl',
+    't/039_foreign_key_checks.pl',
     't/039_explicit_identifiers.pl',
   ]},
 }
