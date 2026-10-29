@@ -94,6 +94,37 @@ $first->query_safe(q{BEGIN; INSERT INTO race VALUES (2, 'gone'); ROLLBACK});
 $first->quit;
 is(sql(qq{INSERT INTO race VALUES (2, 'gone') RETURNING $handle < $derived}), 't', 'a reservation of an aborted transaction does not block the derived handle');
 
+# Different rows whose digests share a derived handle's prefix: (604457, 0)
+# and (2316285, 0), found among millions of rows. A primary key does not
+# keep concurrent inserters of them apart; the claim on the handle does.
+sql(q{CREATE TABLE clash(id int PRIMARY KEY, v int)});
+$first = $node->background_psql('postgres');
+$first->query_safe(q{BEGIN; INSERT INTO clash VALUES (604457, 0)});
+sql(q{INSERT INTO clash VALUES (2316285, 0)});
+$first->query_safe('COMMIT');
+$first->quit;
+is(sql(qq{SELECT count(*), count(DISTINCT ctid), count(*) FILTER (WHERE $handle >= $derived) FROM clash}), '2|2|1',
+	'concurrent inserters of rows sharing a prefix take different handles');
+is(sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM clash}), '604457,2316285', 'a scan returns each row once');
+is(sql(q{WITH d AS (DELETE FROM clash WHERE id = 604457 RETURNING id) SELECT string_agg(id::text, ',') FROM d}), '604457',
+	'a delete by key removes its row');
+is(sql(q{SELECT string_agg(id::text, ',') FROM clash}), '2316285', 'and leaves the other');
+
+# A row committed while a long command runs, after the command loaded its
+# state, is invisible to that state: its committer's claim outlives it.
+sql(q{CREATE TABLE late(id int, v int)});
+$first = $node->background_psql('postgres');
+$first->query_until(qr/started/, q{\echo started
+INSERT INTO late SELECT 1, 0 UNION ALL SELECT 2316285, 0 FROM pg_sleep(3);
+});
+sleep(1);
+sql(q{INSERT INTO late VALUES (604457, 0)});
+$first->query_safe('SELECT 1');
+$first->quit;
+is(sql(qq{SELECT count(*), count(DISTINCT ctid), count(*) FILTER (WHERE $handle >= $derived) FROM late WHERE id > 1}), '2|2|1',
+	'a row committed during a command keeps a handle of its own');
+is(sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM late}), '1,604457,2316285', 'and every row is found once');
+
 # Lossy bitmap pages: a page is a digest range, scanned once.
 sql(q{CREATE TABLE big(id int PRIMARY KEY, k int NOT NULL); CREATE INDEX big_k ON big(k)});
 sql(q{INSERT INTO big SELECT g, g % 100 FROM generate_series(1, 20000) g});
