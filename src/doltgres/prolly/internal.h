@@ -25,6 +25,15 @@
 #endif
 #define PL_MAX_ENTRIES 512		/* any node's; an interior node's limit */
 #define PL_HEADER 24
+
+/*
+ * A node's directory holds count + 1 key offsets, then count + 1 value
+ * offsets, each two bytes when the node's keys and values each fit in 64 kB,
+ * as all but nodes holding very large values do, else four. Builders charge
+ * every entry the narrow width.
+ */
+#define PL_NARROW_LIMIT 0xFFFF
+#define PL_ENTRY_OVERHEAD 4
 /*
  * A child reference in an interior node: the first PL_ADDRESS_SIZE bytes of
  * the child's address, then its row count as a varint. A node's address is

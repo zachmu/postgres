@@ -341,13 +341,45 @@ pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
 	store->fetch_arg = arg;
 }
 
+/* The width of a directory offset for keys and values of these sizes. */
+static size_t
+offset_width(uint64_t key_bytes, uint64_t value_bytes)
+{
+	return key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
+}
+
+static uint32_t
+read_offset(const uint8_t *p, size_t width)
+{
+	return width == 2 ? ((uint32_t) p[0] << 8) | p[1] : pl_read32(p);
+}
+
+static void
+write_offset(uint8_t *p, size_t width, uint32_t v)
+{
+	if (width == 2)
+	{
+		p[0] = (uint8_t) (v >> 8);
+		p[1] = (uint8_t) v;
+	}
+	else
+		pl_write32(p, v);
+}
+
+static size_t
+directory_size(uint32_t count, size_t width)
+{
+	return 2 * width * ((size_t) count + 1);
+}
+
 PLSlice
 pl_node_key(const PLNode *node, uint32_t index)
 {
+	size_t		width = offset_width(node->key_bytes, node->value_bytes);
 	const uint8_t *offsets = node->data + PL_HEADER;
-	uint32_t	start = pl_read32(offsets + 4 * index);
-	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) + start,
-	pl_read32(offsets + 4 * (index + 1)) - start};
+	uint32_t	start = read_offset(offsets + width * index, width);
+	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) + start,
+	read_offset(offsets + width * (index + 1), width) - start};
 
 	return result;
 }
@@ -355,10 +387,11 @@ pl_node_key(const PLNode *node, uint32_t index)
 PLSlice
 pl_node_value(const PLNode *node, uint32_t index)
 {
-	const uint8_t *offsets = node->data + PL_HEADER + 4 * (node->count + 1);
-	uint32_t	start = pl_read32(offsets + 4 * index);
-	PLSlice		result = {node->data + PL_HEADER + 8 * (node->count + 1) +
-	node->key_bytes + start, pl_read32(offsets + 4 * (index + 1)) - start};
+	size_t		width = offset_width(node->key_bytes, node->value_bytes);
+	const uint8_t *offsets = node->data + PL_HEADER + width * (node->count + 1);
+	uint32_t	start = read_offset(offsets + width * index, width);
+	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) +
+	node->key_bytes + start, read_offset(offsets + width * (index + 1), width) - start};
 
 	return result;
 }
@@ -458,7 +491,8 @@ parse_node(PLNode *node)
 {
 	uint32_t	i,
 				which;
-	size_t		directory;
+	size_t		directory,
+				width;
 	uint64_t	rows = 0;
 
 	if (node->size < PL_HEADER || memcmp(node->data, node_magic, 8) != 0)
@@ -470,20 +504,21 @@ parse_node(PLNode *node)
 	if (node->level >= PL_MAX_DEPTH || node->count > PL_MAX_ENTRIES ||
 		(node->level && !node->count))
 		return PL_CORRUPT;
-	directory = PL_HEADER + 8 * ((size_t) node->count + 1);
+	width = offset_width(node->key_bytes, node->value_bytes);
+	directory = PL_HEADER + directory_size(node->count, width);
 	if (directory + (uint64_t) node->key_bytes + node->value_bytes != node->size)
 		return PL_CORRUPT;
 	for (which = 0; which < 2; which++)
 	{
-		const uint8_t *offsets = node->data + PL_HEADER + which * 4 * (node->count + 1);
+		const uint8_t *offsets = node->data + PL_HEADER + which * width * (node->count + 1);
 		uint32_t	limit = which ? node->value_bytes : node->key_bytes;
 
-		if (pl_read32(offsets) != 0 || pl_read32(offsets + 4 * node->count) != limit)
+		if (read_offset(offsets, width) != 0 || read_offset(offsets + width * node->count, width) != limit)
 			return PL_CORRUPT;
 		for (i = 0; i < node->count; i++)
 		{
-			uint32_t	start = pl_read32(offsets + 4 * i);
-			uint32_t	end = pl_read32(offsets + 4 * (i + 1));
+			uint32_t	start = read_offset(offsets + width * i, width);
+			uint32_t	end = read_offset(offsets + width * (i + 1), width);
 
 			if (end < start || end > limit || end - start > PL_MAX_ITEM ||
 				(which && node->level && (end - start <= PL_ADDRESS_SIZE || end - start > PL_CHILD_MAX)))
@@ -648,7 +683,8 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	size_t		key_bytes = 0,
 				value_bytes = 0,
 				length,
-				start;
+				start,
+				width;
 	uint32_t	i;
 	uint8_t    *data;
 	PLHash		hash;
@@ -662,7 +698,8 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	}
 	if (key_bytes > UINT32_MAX || value_bytes > UINT32_MAX)
 		return PL_INVALID;
-	length = PL_HEADER + 8 * ((size_t) count + 1) + key_bytes + value_bytes;
+	width = offset_width(key_bytes, value_bytes);
+	length = PL_HEADER + directory_size(count, width) + key_bytes + value_bytes;
 	data = calloc(1, length);
 	if (!data)
 		return PL_NOMEM;
@@ -671,21 +708,21 @@ pl_save(PLStore *store, uint32_t level, const PLEntry *entries, uint32_t count, 
 	pl_write32(data + 12, count);
 	pl_write32(data + 16, (uint32_t) key_bytes);
 	pl_write32(data + 20, (uint32_t) value_bytes);
-	start = PL_HEADER + 8 * (count + 1);
+	start = PL_HEADER + directory_size(count, width);
 	key_bytes = value_bytes = 0;
 	for (i = 0; i < count; i++)
 	{
 		if (entries[i].key.len)
 			memcpy(data + start + key_bytes, entries[i].key.data, entries[i].key.len);
 		key_bytes += entries[i].key.len;
-		pl_write32(data + PL_HEADER + 4 * (i + 1), (uint32_t) key_bytes);
+		write_offset(data + PL_HEADER + width * (i + 1), width, (uint32_t) key_bytes);
 	}
 	for (i = 0; i < count; i++)
 	{
 		if (entries[i].value.len)
 			memcpy(data + start + key_bytes + value_bytes, entries[i].value.data, entries[i].value.len);
 		value_bytes += entries[i].value.len;
-		pl_write32(data + PL_HEADER + 4 * (count + 1) + 4 * (i + 1), (uint32_t) value_bytes);
+		write_offset(data + PL_HEADER + width * (count + 1) + width * (i + 1), width, (uint32_t) value_bytes);
 	}
 	bytes.data = data;
 	bytes.len = length;

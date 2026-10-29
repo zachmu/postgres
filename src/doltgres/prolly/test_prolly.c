@@ -233,6 +233,8 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 
 	CHECK(node);
 	interior = node->level > 0;
+	/* Ordinary nodes use two-byte directory offsets. */
+	CHECK(node->size == PL_HEADER + 2 * 2 * (node->count + 1) + node->key_bytes + node->value_bytes);
 	sizes->nodes[interior]++;
 	sizes->bytes[interior] += node->size;
 	if (node->size > sizes->largest[interior])
@@ -1014,17 +1016,19 @@ test_import_and_malformed(void)
 		PLSlice		data;
 		PLHash		hash;
 		uint8_t    *bad;
+		size_t		width;
 
 		OK(pl_store_export(source, tree.root, &data));
 		bad = malloc(data.len);
 		CHECK(bad != NULL);
 		memcpy(bad, data.data, data.len);
-		pl_write32(bad + PL_HEADER, 1); /* first key offset must be zero */
+		width = pl_read32(bad + 16) <= PL_NARROW_LIMIT && pl_read32(bad + 20) <= PL_NARROW_LIMIT ? 2 : 4;
+		bad[PL_HEADER + width - 1] = 1; /* first key offset must be zero */
 		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		CHECK(pl_store_import(target, hash, bytes(bad, data.len)) == PL_CORRUPT);
 		memcpy(bad, data.data, data.len);
 		/* Valid local encoding, but nonexistent child address. */
-		bad[PL_HEADER + 8 * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
+		bad[PL_HEADER + 2 * width * (pl_read32(bad + 12) + 1) + pl_read32(bad + 16)] ^= 128;
 		CHECK(pl_node_address(bytes(bad, data.len), &hash));
 		OK(pl_store_import(target, hash, bytes(bad, data.len)));
 		CHECK(pl_open(target, hash, &untouched) == PL_CORRUPT);
@@ -1059,6 +1063,14 @@ test_large_and_binary_tuples(void)
 	CHECK(got.present && got.bytes.len == 0);
 	OK(pl_get(&tree, entries[1].key, &got));
 	CHECK(got.present && got.bytes.len == 100000);
+	CHECK(memcmp(got.bytes.data, large, 100000) == 0);
+	{
+		/* Values past 64 kB keep four-byte directory offsets: tuple size is not limited. */
+		PLNode	   *leaf = pl_find(store, tree.root);
+
+		CHECK(leaf && leaf->level == 0);
+		CHECK(leaf->size == PL_HEADER + 2 * 4 * (leaf->count + 1) + leaf->key_bytes + leaf->value_bytes);
+	}
 	edit = (PLEdit)
 	{
 		entries[1].key,
@@ -1122,10 +1134,10 @@ test_format_and_resolver_lifetime(void)
 
 	OK(pl_build(store, NULL, 0, &empty));
 	OK(pl_store_export(store, empty.root, &serialized));
-	CHECK(serialized.len == 32);
+	CHECK(serialized.len == 28);
 	for (i = 0; i < 32; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
-	CHECK(strcmp(hex, "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d000000000000000000000000") == 0);
+	CHECK(strcmp(hex, "c611f574ef24eb5785f74f9277220117b134de73000000000000000000000000") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));
 	OK(pl_merge(&empty, &left, &right, resolve_scratch, scratch, &merged));
