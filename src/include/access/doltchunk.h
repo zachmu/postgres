@@ -28,7 +28,8 @@
 #ifndef DOLTCHUNK_H
 #define DOLTCHUNK_H
 
-#define DOLT_CHUNK_HASH_SIZE 32
+/* The prolly hash size, PL_HASH_SIZE: SHA-256 truncated, as Dolt's addresses are. */
+#define DOLT_CHUNK_HASH_SIZE 20
 
 typedef enum DoltChunkIntent
 {

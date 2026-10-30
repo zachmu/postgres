@@ -198,6 +198,8 @@ verify(const uint8 *hash, const uint8 *data, Size length)
 		pg_cryptohash_final(ctx, actual, sizeof(actual)) < 0)
 		elog(ERROR, "could not compute chunk hash: %s", pg_cryptohash_error(ctx));
 	pg_cryptohash_free(ctx);
+
+	/* A chunk's hash is its SHA-256 truncated to DOLT_CHUNK_HASH_SIZE bytes. */
 	if (memcmp(actual, hash, DOLT_CHUNK_HASH_SIZE) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),

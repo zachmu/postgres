@@ -227,7 +227,7 @@ hash_argument(bytea *hash)
 	return (const uint8 *) VARDATA_ANY(hash);
 }
 
-/* Pack a bytea[] of hashes into consecutive 32-byte hashes. */
+/* Pack a bytea[] of hashes into consecutive DOLT_CHUNK_HASH_SIZE-byte hashes. */
 static uint8 *
 packed_hashes(ArrayType *array, int *n)
 {
@@ -455,7 +455,7 @@ synthetic_chunk(int32 seed, int64 i, uint8 *hash, uint8 *data, Size size)
 	{
 		uint64		word = splitmix64(&state);
 
-		memcpy(hash + offset, &word, 8);
+		memcpy(hash + offset, &word, Min(8, DOLT_CHUNK_HASH_SIZE - offset));
 	}
 	for (offset = 0; data && offset < size; offset += 8)
 	{

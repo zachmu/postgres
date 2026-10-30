@@ -6,7 +6,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define PL_HASH_SIZE 32
+/*
+ * Every content hash: SHA-256 truncated to this many bytes, as Dolt's
+ * addresses are. Nodes, rows and version objects are all addressed by it.
+ */
+#define PL_HASH_SIZE 20
+#define PL_SHA256_SIZE 32
 #define PL_MAX_ITEM (16U * 1024U * 1024U)
 
 typedef enum PLStatus

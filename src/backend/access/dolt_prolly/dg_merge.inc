@@ -265,13 +265,13 @@ canonical_rows(const PLTree * logical, bool keyed)
 	for (i = 0; i < rows.count; i++)
 	{
 		PLHash		hash = dg_rowhash(rows.items[i].value);
-		uint8	   *key = palloc(32),
+		uint8	   *key = palloc(PL_HASH_SIZE),
 				   *value = palloc(8 + rows.items[i].value.len);
 
-		memcpy(key, hash.bytes, 32);
+		memcpy(key, hash.bytes, PL_HASH_SIZE);
 		pl_write64(value, 1);
 		memcpy(value + 8, rows.items[i].value.data, rows.items[i].value.len);
-		items[i].key = DG_SLICE(key, 32);
+		items[i].key = DG_SLICE(key, PL_HASH_SIZE);
 		items[i].value = DG_SLICE(value, 8 + rows.items[i].value.len);
 	}
 	qsort(items, rows.count, sizeof(*items), entry_compare);

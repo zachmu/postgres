@@ -437,7 +437,7 @@ unhex(const char *s)
 {
 	bytea	   *v = DatumGetByteaP(DirectFunctionCall2(binary_decode, CStringGetTextDatum(s), CStringGetTextDatum("hex")));
 
-	if (VARSIZE_ANY_EXHDR(v) != 32)
+	if (VARSIZE_ANY_EXHDR(v) != PL_HASH_SIZE)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid commit hash")));
 	return v;
 }
@@ -1433,9 +1433,9 @@ resolve(const char *revision)
 		}
 		if (!hash)
 			resolved_ref = NULL;
-		if (!hash && strlen(base) == 64)
+		if (!hash && strlen(base) == 2 * PL_HASH_SIZE)
 			hash = unhex(base);
-		else if (!hash && strlen(base) >= 8 && strlen(base) < 64 &&
+		else if (!hash && strlen(base) >= 8 && strlen(base) < 2 * PL_HASH_SIZE &&
 				 strspn(base, "0123456789abcdef") == strlen(base))
 		{
 			Oid			user;
