@@ -15,20 +15,14 @@
 #define PL_HEADER 24
 
 /*
- * Compact bookkeeping: child row counts as varints, and directory offsets of
- * two bytes in nodes whose keys and values each fit in 64 kB, as all but nodes
- * holding very large values do, else four. Without it, row counts take eight
- * bytes and offsets four. Builders charge every entry the usual width.
+ * A node's directory offsets take two bytes when its keys and values each fit
+ * in 64 kB, as all but nodes holding very large values do, else four. Builders
+ * charge every entry the narrow width.
  */
-#ifndef PL_COMPACT_BOOKKEEPING
-#define PL_COMPACT_BOOKKEEPING 1
-#endif
-#define PL_NARROW_LIMIT (PL_COMPACT_BOOKKEEPING ? 0xFFFF : 0)
-#define PL_ENTRY_OVERHEAD (PL_COMPACT_BOOKKEEPING ? 4 : 8)
-/*
- * A child reference in an interior node: the child's address, then its row
- * count, a varint with compact bookkeeping and eight bytes without.
- */
+#define PL_NARROW_LIMIT 0xFFFF
+#define PL_ENTRY_OVERHEAD 4
+
+/* A child reference in an interior node: the child's address, then its row count as a varint. */
 #define PL_CHILD_MAX (PL_HASH_SIZE + 10)
 
 typedef struct PLNode
@@ -40,6 +34,7 @@ typedef struct PLNode
 	uint32_t	count;
 	uint32_t	key_bytes;
 	uint32_t	value_bytes;
+	uint8_t		offset_width;	/* bytes per directory offset, from the sizes above */
 	bool		backed;			/* known to be in the backing store */
 	bool		marked;			/* reachable, during pl_store_retain */
 	uint32_t	pins;			/* holders keeping it until written, across pl_store_drop_unbacked */

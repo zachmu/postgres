@@ -350,7 +350,7 @@ pl_store_set_fetch(PLStore *store, PLFetchFn fetch, void *arg)
 static size_t
 offset_width(uint64_t key_bytes, uint64_t value_bytes)
 {
-	return PL_COMPACT_BOOKKEEPING && key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
+	return key_bytes <= PL_NARROW_LIMIT && value_bytes <= PL_NARROW_LIMIT ? 2 : 4;
 }
 
 static uint32_t
@@ -380,7 +380,7 @@ directory_size(uint32_t count, size_t width)
 PLSlice
 pl_node_key(const PLNode *node, uint32_t index)
 {
-	size_t		width = offset_width(node->key_bytes, node->value_bytes);
+	size_t		width = node->offset_width;
 	const uint8_t *offsets = node->data + PL_HEADER;
 	uint32_t	start = read_offset(offsets + width * index, width);
 	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) + start,
@@ -392,7 +392,7 @@ pl_node_key(const PLNode *node, uint32_t index)
 PLSlice
 pl_node_value(const PLNode *node, uint32_t index)
 {
-	size_t		width = offset_width(node->key_bytes, node->value_bytes);
+	size_t		width = node->offset_width;
 	const uint8_t *offsets = node->data + PL_HEADER + width * (node->count + 1);
 	uint32_t	start = read_offset(offsets + width * index, width);
 	PLSlice		result = {node->data + PL_HEADER + directory_size(node->count, width) +
@@ -414,11 +414,6 @@ pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows)
 	size_t		n = PL_HASH_SIZE;
 
 	memcpy(out, hash.bytes, PL_HASH_SIZE);
-	if (!PL_COMPACT_BOOKKEEPING)
-	{
-		pl_write64(out + n, rows);
-		return n + 8;
-	}
 	do
 	{
 		uint8_t		byte = rows & 0x7F;
@@ -440,14 +435,6 @@ pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
 		return false;
 	if (hash)
 		memcpy(hash->bytes, value.data, PL_HASH_SIZE);
-	if (!PL_COMPACT_BOOKKEEPING)
-	{
-		if (value.len != PL_HASH_SIZE + 8)
-			return false;
-		if (rows)
-			*rows = pl_read64(value.data + n);
-		return true;
-	}
 	for (;;)
 	{
 		uint8_t		byte = value.data[n++];
@@ -466,21 +453,31 @@ pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
 	return true;
 }
 
+/*
+ * A child's address and row count, read without checks: a node's child
+ * references were validated by pl_child_decode when the node was parsed.
+ */
 PLHash
 pl_child_hash(const PLNode *node, uint32_t index)
 {
-	PLHash		hash = {{0}};
+	PLHash		hash;
 
-	(void) pl_child_decode(pl_node_value(node, index), &hash, NULL);
+	memcpy(hash.bytes, pl_node_value(node, index).data, PL_HASH_SIZE);
 	return hash;
 }
 
 uint64_t
 pl_child_rows(const PLNode *node, uint32_t index)
 {
+	const uint8_t *p = pl_node_value(node, index).data + PL_HASH_SIZE;
 	uint64_t	rows = 0;
+	int			shift = 0;
 
-	(void) pl_child_decode(pl_node_value(node, index), NULL, &rows);
+	do
+	{
+		rows |= (uint64_t) (*p & 0x7F) << shift;
+		shift += 7;
+	} while (*p++ & 0x80);
 	return rows;
 }
 
@@ -517,6 +514,7 @@ parse_node(PLNode *node)
 		(node->level && !node->count))
 		return PL_CORRUPT;
 	width = offset_width(node->key_bytes, node->value_bytes);
+	node->offset_width = (uint8_t) width;
 	directory = PL_HEADER + directory_size(node->count, width);
 	if (directory + (uint64_t) node->key_bytes + node->value_bytes != node->size)
 		return PL_CORRUPT;

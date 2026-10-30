@@ -211,8 +211,8 @@ test_child_references(void)
 		encoded[length] = 0;
 		CHECK(!pl_child_decode(bytes(encoded, length + 1), NULL, &rows) || length + 1 > PL_CHILD_MAX);
 	}
-	CHECK(pl_child_encode(encoded, hash, 100) == PL_HASH_SIZE + (PL_COMPACT_BOOKKEEPING ? 1 : 8));
-	CHECK(pl_child_encode(encoded, hash, 5000) == PL_HASH_SIZE + (PL_COMPACT_BOOKKEEPING ? 2 : 8));
+	CHECK(pl_child_encode(encoded, hash, 100) == PL_HASH_SIZE + 1);
+	CHECK(pl_child_encode(encoded, hash, 5000) == PL_HASH_SIZE + 2);
 	CHECK(!pl_child_decode(bytes(encoded, PL_HASH_SIZE), NULL, &rows));
 }
 
@@ -233,9 +233,9 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 
 	CHECK(node);
 	interior = node->level > 0;
-	/* Ordinary nodes use two-byte directory offsets with compact bookkeeping. */
-	CHECK(node->size == PL_HEADER + 2 * (PL_COMPACT_BOOKKEEPING ? 2 : 4) * (node->count + 1) +
-		  node->key_bytes + node->value_bytes);
+	/* Ordinary nodes use two-byte directory offsets. */
+	CHECK(node->offset_width == 2);
+	CHECK(node->size == PL_HEADER + 2 * 2 * (node->count + 1) + node->key_bytes + node->value_bytes);
 	sizes->nodes[interior]++;
 	sizes->bytes[interior] += node->size;
 	if (node->size > sizes->largest[interior])
@@ -246,7 +246,13 @@ measure(PLStore *store, PLHash hash, LevelSizes *sizes)
 	{
 		PLHash		child;
 
+		PLHash		decoded;
+		uint64_t	rows;
+
 		child = pl_child_hash(node, i);
+		/* The unchecked reads agree with the validating decoder. */
+		CHECK(pl_child_decode(pl_node_value(node, i), &decoded, &rows));
+		CHECK(pl_hash_equal(child, decoded) && rows == pl_child_rows(node, i));
 		measure(store, child, sizes);
 	}
 }
@@ -1065,6 +1071,7 @@ test_large_and_binary_tuples(void)
 		PLNode	   *leaf = pl_find(store, tree.root);
 
 		CHECK(leaf && leaf->level == 0);
+		CHECK(leaf->offset_width == 4);
 		CHECK(leaf->size == PL_HEADER + 2 * 4 * (leaf->count + 1) + leaf->key_bytes + leaf->value_bytes);
 	}
 	edit = (PLEdit)
@@ -1130,17 +1137,11 @@ test_format_and_resolver_lifetime(void)
 
 	OK(pl_build(store, NULL, 0, &empty));
 	OK(pl_store_export(store, empty.root, &serialized));
-	/*
-	 * The empty tree's address pins the format: its SHA-256 truncated to the
-	 * hash size, which without compact bookkeeping is the original format.
-	 */
-	CHECK(serialized.len == (PL_COMPACT_BOOKKEEPING ? 28 : 32));
+	/* The empty tree's address pins the format: its SHA-256 truncated to the hash size. */
+	CHECK(serialized.len == 28);
 	for (i = 0; i < PL_HASH_SIZE; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
-	CHECK(strncmp(hex, PL_COMPACT_BOOKKEEPING ? "c611f574ef24eb5785f74f9277220117b134de73" :
-				  "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d", 40) == 0);
-	if (PL_HASH_SIZE == 32 && !PL_COMPACT_BOOKKEEPING)
-		CHECK(strcmp(hex + 40, "3ea8049877c6c6a9e0c77218") == 0);
+	CHECK(strcmp(hex, "c611f574ef24eb5785f74f9277220117b134de73") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));
 	OK(pl_merge(&empty, &left, &right, resolve_scratch, scratch, &merged));
