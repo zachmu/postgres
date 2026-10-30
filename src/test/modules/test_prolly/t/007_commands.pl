@@ -15,7 +15,7 @@ sub fails {
 is(sql('SELECT message FROM dolt_log()'),'Initialize data repository','repository initialized with the database');
 sql(q{CREATE SCHEMA empty_space; CREATE TABLE t(id int PRIMARY KEY,v text COLLATE "C") USING dolt_prolly_table; INSERT INTO t VALUES(1,'one')});
 my $first=sql(q{SELECT dolt_commit('-Am','first','--author','Test Author <author@example.com>','--date','2020-01-02 03:04:05+00')});
-like($first,qr/^[0-9a-f]{64}$/,'commit returns native SHA256 hash');
+like($first,qr/^[0-9a-f]{40}$/,'commit returns a native 20-byte hash');
 is(sql('SELECT count(*) FROM dolt_log()'),'2','repository initialization and first user commit');
 is(sql("SELECT message,author,author_email,author_date FROM dolt_log('$first') LIMIT 1"),'first|Test Author|author@example.com|2020-01-02 03:04:05','log metadata matches commit arguments');
 is(sql(q{SELECT message FROM dolt_log('HEAD~1')}),'Initialize data repository','repository ancestor');
@@ -38,7 +38,7 @@ is(sql(q{SELECT * FROM dolt_diff_summary('HEAD','STAGED')}),'','staging not auto
 is(sql(q{SELECT status FROM dolt_add('.')}),'0','add stages all');
 sql(q{UPDATE t SET v='three' WHERE id=1});
 my $second=sql(q{SELECT hash FROM dolt_commit('-m','staged version')});
-like($second,qr/^[0-9a-f]{64}$/,'commit named hash column');
+like($second,qr/^[0-9a-f]{40}$/,'commit named hash column');
 is(sql(q{SELECT * FROM dolt_diff_summary('HEAD','WORKING','t')}),'public.t|public.t|modified|t|f','unstaged later change survives commit');
 is(sql("SELECT * FROM dolt_diff_summary('$first','$second','public.t')"),'public.t|public.t|modified|t|f','historical diff');
 my $third=sql(q{SELECT dolt_commit('-A','-m','all current')});
@@ -49,7 +49,7 @@ my $empty=sql(q{SELECT dolt_commit('--allow-empty','-m','empty allowed')});
 isnt($empty,$third,'allow empty creates history node');
 is(sql(q{SELECT count(*) FROM dolt_diff_summary('HEAD~1','HEAD')}),'0','empty commit has identical state');
 fails(q{BEGIN; SELECT dolt_commit('-Am','invalid'); COMMIT},qr/transaction block/,'commit rejects explicit transaction');
-is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'64','scalar-wrapped command accepted');
+is(sql(q{SELECT length(upper(dolt_commit('--allow-empty','-m','wrapped')))}),'40','scalar-wrapped command accepted');
 fails(q{SELECT dolt_commit('-Am','invalid') WHERE (SELECT true)},qr/standalone SELECT/,'subquery-wrapped command rejected');
 fails(q{SELECT dolt_commit('-Am','invalid') FROM t},qr/standalone SELECT/,'per-row invocation rejected');
 fails(q{SELECT dolt_commit('--amend','-m','invalid')},qr/unsupported/,'unsupported flag explicit');

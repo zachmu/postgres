@@ -47,15 +47,15 @@ unauthorized tables. The function is a diagnostic, not a branch/ref API.
 
 ### Canonical and runtime trees
 
-A table content tree maps a SHA-256 digest of canonical row bytes to an
-eight-byte occurrence count followed by the packed tuple. Internal routing keys
-therefore stay fixed at 32 bytes; tuple payloads stay in leaves. A digest
+A table content tree maps a digest of canonical row bytes, SHA-256 truncated to
+20 bytes as every content hash is, to an eight-byte occurrence count followed by
+the packed tuple. Internal routing keys therefore stay fixed at 20 bytes; tuple payloads stay in leaves. A digest
 collision between unequal rows is rejected. This multiset representation handles keyless duplicate rows and does not
 change when rows are inserted in a different order. Primary-key enforcement is
 performed by the unique ordered index, not by changing table content keys.
 
 A separate runtime tree maps monotonically allocated 64-bit occurrence handles
-to those 32-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
+to those 20-byte canonical row keys. Those handles are adapted into PostgreSQL ItemPointers;
 they are not disk addresses. Updates allocate a new handle. The handle tree and
 allocator counter are explicitly outside the canonical table root. Heap-style
 XIDs, tuple padding and lock bits are not in canonical row encodings.
