@@ -13,9 +13,9 @@
  * Occurrences that cannot take the derived handle get one from the
  * storage's counter, above DG_DERIVED_HANDLES, and pg_dolt_handle maps those
  * to their digest: further occurrences of a row already present, rows whose
- * prefix another live row holds, and rows whose derived handle was recently
- * used, so that a lock record or an unfolded journal entry still naming it
- * cannot confuse a reader. Allocated handles are the only handle state
+ * prefix another live row or another transaction's claim holds, and rows
+ * whose derived handle was recently used, so that a lock record or an
+ * unfolded journal entry still naming it cannot confuse a reader. Allocated handles are the only handle state
  * written per row, and a branch inherits none of them from its parent:
  * creating a branch copies nothing.
  *
@@ -464,44 +464,113 @@ dg_handle_count(DGState *s)
 }
 
 /*
- * Whether |rel| has a unique index: concurrent inserters of identical rows
- * then serialize on its key reservation, so the derived handle needs no
- * reservation of its own.
+ * Claims on derived handles. A transaction that gives a new row its derived
+ * handle claims the handle first, so that no other transaction gives a
+ * different row with the same prefix, or an identical row, the same handle.
+ * A claim must outlast its transaction: another writer may have loaded its
+ * state before the claimant committed, and then cannot see the claimant's
+ * row. It may be forgotten once the claimant precedes every running
+ * transaction's xmin, since every state loaded since includes its rows.
+ *
+ * Claims are a fixed array of transaction IDs, found by hashing (storage,
+ * branch, handle). Handles that share a slot share its claim: a transaction
+ * may take any handle of a slot it holds, and another transaction's live
+ * claim makes a new row take an allocated handle, which costs a catalog row
+ * but nothing else.
  */
-static bool
-relation_has_unique_index(Relation rel)
+#define DG_HANDLE_CLAIM_SLOTS (1 << 20)
+
+typedef struct HandleClaims
 {
-	List	   *indexes = RelationGetIndexList(rel);
-	ListCell   *lc;
-	bool		unique = false;
+	pg_atomic_uint32 slots[DG_HANDLE_CLAIM_SLOTS];
+} HandleClaims;
 
-	foreach(lc, indexes)
+static HandleClaims *handle_claims;
+
+/* The horizon of the current command: claims made before it are forgotten. */
+static TransactionId claim_horizon;
+static LocalTransactionId claim_horizon_lxid;
+static CommandId claim_horizon_cid;
+
+static void
+handle_claims_init(void *ptr)
+{
+	HandleClaims *claims = ptr;
+
+	for (int i = 0; i < DG_HANDLE_CLAIM_SLOTS; i++)
+		pg_atomic_init_u32(&claims->slots[i], InvalidTransactionId);
+}
+
+/*
+ * The oldest xmin of any running transaction, computed once per command: an
+ * older value only keeps claims longer.
+ */
+static TransactionId
+handle_claim_horizon(void)
+{
+	if (claim_horizon_lxid != MyProc->vxid.lxid || claim_horizon_cid != GetCurrentCommandId(false))
 	{
-		HeapTuple	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(lfirst_oid(lc)));
-
-		if (!HeapTupleIsValid(tuple))
-			continue;
-		unique = ((Form_pg_index) GETSTRUCT(tuple))->indisunique;
-		ReleaseSysCache(tuple);
-		if (unique)
-			break;
+		claim_horizon = GetOldestNonRemovableTransactionId(NULL);
+		claim_horizon_lxid = MyProc->vxid.lxid;
+		claim_horizon_cid = GetCurrentCommandId(false);
 	}
-	list_free(indexes);
-	return unique;
+	return claim_horizon;
+}
+
+/* Claim derived |handle| of |rel| on |branch|; false if another transaction holds it. */
+static bool
+handle_claim(Relation rel, const char *branch, uint64 handle)
+{
+	struct
+	{
+		Oid			db,
+					space;
+		RelFileNumber file;
+		uint32		branch;
+		uint64		handle;
+	}			key;
+	TransactionId me = GetTopTransactionId();
+	pg_atomic_uint32 *slot;
+	uint32		owner;
+	bool		found;
+
+	if (!handle_claims)
+		handle_claims = GetNamedDSMSegment("dolt derived handle claims", sizeof(HandleClaims),
+										   handle_claims_init, &found);
+
+	/* The key is hashed as bytes: its padding must be zero. */
+	memset(&key, 0, sizeof(key));
+	key.db = rel->rd_locator.dbOid;
+	key.space = rel->rd_locator.spcOid;
+	key.file = rel->rd_locator.relNumber;
+	key.branch = hash_bytes((const unsigned char *) branch, strlen(branch));
+	key.handle = handle;
+	slot = &handle_claims->slots[hash_bytes_extended((const unsigned char *) &key, sizeof(key), 0) % DG_HANDLE_CLAIM_SLOTS];
+	owner = pg_atomic_read_u32(slot);
+	for (;;)
+	{
+		if (owner == me)
+			return true;
+		if (TransactionIdIsValid(owner) && !TransactionIdPrecedes(owner, handle_claim_horizon()))
+			return false;
+		if (pg_atomic_compare_exchange_u32(slot, &owner, me))
+			return true;
+	}
 }
 
 /*
  * The handle for a new occurrence of |digest| in |s|, recorded through |b|
  * if the command batches its edits: derived when no live row holds its
  * prefix, nothing of this command names it, no lock record still names it,
- * and no other running transaction has reserved it; else allocated. A
- * journal entry may name it: the stream tolerates a repeated sequence, since
- * a removal and the addition after it net out.
+ * and no other transaction's claim covers it; else allocated. A journal
+ * entry may name it: the stream tolerates a repeated sequence, since a
+ * removal and the addition after it net out.
  *
- * Two transactions inserting the first occurrence of identical rows cannot
- * see each other's, so the first reserves the derived handle until it ends
- * and the second allocates. A table with a unique index serializes such
- * inserters on the key already and skips the reservation.
+ * Transactions cannot see one another's uncommitted rows, nor a row
+ * committed after their state was loaded: the claim keeps two of them from
+ * deriving one handle for different rows with the same prefix, or for
+ * identical rows. A unique index does not, since rows that share a prefix
+ * rarely share a key.
  */
 uint64
 dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
@@ -519,8 +588,8 @@ dg_handle_choose(Relation rel, DGState *s, DGBatch *b, PLHash digest)
 		if (status == DG_RECORD_DEAD)
 			dg_record_renew(&rel->rd_locator, dg_relation_branch(rel), (int64) handle);
 	}
-	if (!taken && !s->delta_private && !(b ? dg_batch_has_unique_index(b) : relation_has_unique_index(rel)))
-		taken = !dg_key_reserve(rel, dg_relation_branch(rel), handle, false);
+	if (!taken && !s->delta_private)
+		taken = !handle_claim(rel, dg_relation_branch(rel), handle);
 	if (!taken)
 		return handle;
 	return handle_allocate(rel, s);

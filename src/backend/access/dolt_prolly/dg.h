@@ -169,7 +169,6 @@ extern bool dg_batch_handle_digest(DGBatch *batch, uint64 handle, PLHash *digest
 extern bool dg_batch_row(DGBatch *batch, PLHash digest, PLSlice *row);
 extern int	dg_batch_handles(DGBatch *batch, PLHash digest, uint64 **handles);
 extern bool dg_batch_blocks_handle(DGBatch *batch, PLHash digest, uint64 handle);
-extern bool dg_batch_has_unique_index(DGBatch *batch);
 extern void dg_batch_finish(Relation rel);
 extern DGState *dg_batch_load(Relation rel);
 extern PLStore *dg_working_store(void);

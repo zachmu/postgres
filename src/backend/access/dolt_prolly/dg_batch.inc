@@ -60,7 +60,6 @@ struct DGBatch
 	DGState    *state;			/* the trees the edits apply to */
 	HTAB	   *rows;			/* PendingRow by digest */
 	HTAB	   *handles;		/* PendingHandle by handle */
-	int8		unique_index;	/* whether the table has a unique index */
 	PendingEntry **entries;		/* an index's edits, in arrival order */
 	int			entry_count,
 				entry_capacity;
@@ -538,7 +537,6 @@ dg_batch(Relation rel, CommandId cid)
 	b->cid = cid;
 	b->subxid = GetCurrentSubTransactionId();
 	b->table = rel->rd_rel->relkind != RELKIND_INDEX;
-	b->unique_index = b->table && relation_has_unique_index(rel) ? 1 : 0;
 	b->memory = AllocSetContextCreate(TopTransactionContext, "prolly pending edits", ALLOCSET_DEFAULT_SIZES);
 	b->count = 0;
 	b->entries = NULL;
@@ -799,13 +797,6 @@ dg_batch_handle_digest(DGBatch *b, uint64 handle, PLHash *digest)
  * taking the derived |handle|: an occurrence of the row already added, or
  * any edit naming the handle, as a row removed and re-added would.
  */
-/* Whether the batch's table has a unique index, found when the batch began. */
-bool
-dg_batch_has_unique_index(DGBatch *b)
-{
-	return b->unique_index == 1;
-}
-
 bool
 dg_batch_blocks_handle(DGBatch *b, PLHash digest, uint64 handle)
 {
