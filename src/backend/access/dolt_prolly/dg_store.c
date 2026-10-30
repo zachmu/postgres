@@ -594,7 +594,6 @@ static void journal_pre_commit(void);
 static void journal_local_invalidate(void);
 static bool journal_handle_committed(const RootKey *key, uint64 handle);
 static RootKey journal_index_table(Relation index, const char *branch, Relation *table);
-static bool relation_has_unique_index(Relation rel);
 struct HandleDelta;
 static struct HandleDelta *handle_delta_get(const RootKey *key, Snapshot snapshot);
 static void handle_delta_write(const RootKey *key, HTAB *mappings, CommandId cid);
