@@ -273,6 +273,8 @@ roots_latest(const RootKey *key)
  */
 
 static PLStore *working_store;
+StaticAssertDecl(PL_HASH_SIZE == DOLT_CHUNK_HASH_SIZE, "prolly and chunk store hashes differ in size");
+
 static uint64 store_epoch = 1;	/* moves when the working store is recreated */
 
 /* Parsed nodes kept across transactions, at most. */
@@ -1999,14 +2001,14 @@ dolt_prolly_root(PG_FUNCTION_ARGS)
 {
 	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
 	DGState    *s;
-	char		result[65];
+	char		result[2 * PL_HASH_SIZE + 1];
 	int			i;
 
 	if (rel->rd_tableam != dg_table_routine() &&
 		!(rel->rd_rel->relkind == RELKIND_INDEX && !strcmp(get_am_name(rel->rd_rel->relam), "dolt_prolly_index")))
 		dg_unsupported("root inspection of other AMs");
 	s = dg_load(rel, GetActiveSnapshot());
-	for (i = 0; i < 32; i++)
+	for (i = 0; i < PL_HASH_SIZE; i++)
 		sprintf(result + i * 2, "%02x", s->content.root.bytes[i]);
 	dg_release(s);
 	relation_close(rel, AccessShareLock);

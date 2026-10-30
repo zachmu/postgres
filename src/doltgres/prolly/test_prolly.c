@@ -200,20 +200,20 @@ test_child_references(void)
 	{
 		size_t		length = pl_child_encode(encoded, hash, counts[c]);
 
-		CHECK(length > PL_ADDRESS_SIZE && length <= PL_CHILD_MAX);
+		CHECK(length > PL_HASH_SIZE && length <= PL_CHILD_MAX);
 		CHECK(pl_child_decode(bytes(encoded, length), &decoded, &rows));
 		CHECK(rows == counts[c]);
-		CHECK(memcmp(decoded.bytes, hash.bytes, PL_ADDRESS_SIZE) == 0);
-		for (int i = PL_ADDRESS_SIZE; i < PL_HASH_SIZE; i++)
+		CHECK(memcmp(decoded.bytes, hash.bytes, PL_HASH_SIZE) == 0);
+		for (int i = PL_HASH_SIZE; i < PL_HASH_SIZE; i++)
 			CHECK(decoded.bytes[i] == 0);
 		/* Truncated or trailing bytes are rejected. */
 		CHECK(!pl_child_decode(bytes(encoded, length - 1), NULL, &rows));
 		encoded[length] = 0;
 		CHECK(!pl_child_decode(bytes(encoded, length + 1), NULL, &rows) || length + 1 > PL_CHILD_MAX);
 	}
-	CHECK(pl_child_encode(encoded, hash, 100) == PL_ADDRESS_SIZE + (PL_COMPACT_BOOKKEEPING ? 1 : 8));
-	CHECK(pl_child_encode(encoded, hash, 5000) == PL_ADDRESS_SIZE + (PL_COMPACT_BOOKKEEPING ? 2 : 8));
-	CHECK(!pl_child_decode(bytes(encoded, PL_ADDRESS_SIZE), NULL, &rows));
+	CHECK(pl_child_encode(encoded, hash, 100) == PL_HASH_SIZE + (PL_COMPACT_BOOKKEEPING ? 1 : 8));
+	CHECK(pl_child_encode(encoded, hash, 5000) == PL_HASH_SIZE + (PL_COMPACT_BOOKKEEPING ? 2 : 8));
+	CHECK(!pl_child_decode(bytes(encoded, PL_HASH_SIZE), NULL, &rows));
 }
 
 /* Node sizes and counts by level: leaves below, interior nodes from 1 up. */
@@ -1131,17 +1131,15 @@ test_format_and_resolver_lifetime(void)
 	OK(pl_build(store, NULL, 0, &empty));
 	OK(pl_store_export(store, empty.root, &serialized));
 	/*
-	 * The empty tree's address pins the format: today's without compact
-	 * bookkeeping and full addresses, truncated to 20 bytes with them.
+	 * The empty tree's address pins the format: its SHA-256 truncated to the
+	 * hash size, which without compact bookkeeping is the original format.
 	 */
 	CHECK(serialized.len == (PL_COMPACT_BOOKKEEPING ? 28 : 32));
-	for (i = 0; i < 32; i++)
+	for (i = 0; i < PL_HASH_SIZE; i++)
 		snprintf(hex + 2 * i, 3, "%02x", empty.root.bytes[i]);
 	CHECK(strncmp(hex, PL_COMPACT_BOOKKEEPING ? "c611f574ef24eb5785f74f9277220117b134de73" :
 				  "4b1e28e6c3a8ed67c9b4b4cdb924805bf39c217d", 40) == 0);
-	if (PL_ADDRESS_SIZE == 20)
-		CHECK(strcmp(hex + 40, "000000000000000000000000") == 0);
-	else if (!PL_COMPACT_BOOKKEEPING)
+	if (PL_HASH_SIZE == 32 && !PL_COMPACT_BOOKKEEPING)
 		CHECK(strcmp(hex + 40, "3ea8049877c6c6a9e0c77218") == 0);
 	OK(pl_build(store, a, 2, &left));
 	OK(pl_build(store, b, 2, &right));

@@ -43,6 +43,7 @@ pl_write64(uint8_t *p, uint64_t v)
 bool
 pl_hash_bytes(PLSlice bytes, PLHash *out)
 {
+	uint8_t		digest[PL_SHA256_SIZE];
 #ifdef PL_POSTGRES
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 	bool		ok;
@@ -51,15 +52,19 @@ pl_hash_bytes(PLSlice bytes, PLHash *out)
 		return false;
 	ok = pg_cryptohash_init(ctx) == 0 &&
 		pg_cryptohash_update(ctx, bytes.data, bytes.len) == 0 &&
-		pg_cryptohash_final(ctx, out->bytes, PL_HASH_SIZE) == 0;
+		pg_cryptohash_final(ctx, digest, sizeof(digest)) == 0;
 	pg_cryptohash_free(ctx);
-	return ok;
+	if (!ok)
+		return false;
 #else
 	unsigned int length = 0;
 
-	return EVP_Digest(bytes.data, bytes.len, out->bytes, &length,
-					  EVP_sha256(), NULL) == 1 && length == PL_HASH_SIZE;
+	if (EVP_Digest(bytes.data, bytes.len, digest, &length, EVP_sha256(), NULL) != 1 ||
+		length != PL_SHA256_SIZE)
+		return false;
 #endif
+	memcpy(out->bytes, digest, PL_HASH_SIZE);
+	return true;
 }
 
 int
@@ -396,22 +401,19 @@ pl_node_value(const PLNode *node, uint32_t index)
 	return result;
 }
 
-/* The address of node bytes: their SHA-256, truncated to PL_ADDRESS_SIZE bytes. */
+/* The address of node bytes: their hash, like any other content's. */
 bool
 pl_node_address(PLSlice bytes, PLHash *out)
 {
-	if (!pl_hash_bytes(bytes, out))
-		return false;
-	memset(out->bytes + PL_ADDRESS_SIZE, 0, PL_HASH_SIZE - PL_ADDRESS_SIZE);
-	return true;
+	return pl_hash_bytes(bytes, out);
 }
 
 size_t
 pl_child_encode(uint8_t *out, PLHash hash, uint64_t rows)
 {
-	size_t		n = PL_ADDRESS_SIZE;
+	size_t		n = PL_HASH_SIZE;
 
-	memcpy(out, hash.bytes, PL_ADDRESS_SIZE);
+	memcpy(out, hash.bytes, PL_HASH_SIZE);
 	if (!PL_COMPACT_BOOKKEEPING)
 	{
 		pl_write64(out + n, rows);
@@ -431,19 +433,16 @@ bool
 pl_child_decode(PLSlice value, PLHash *hash, uint64_t *rows)
 {
 	uint64_t	count = 0;
-	size_t		n = PL_ADDRESS_SIZE;
+	size_t		n = PL_HASH_SIZE;
 	int			shift = 0;
 
-	if (value.len <= PL_ADDRESS_SIZE || value.len > PL_CHILD_MAX)
+	if (value.len <= PL_HASH_SIZE || value.len > PL_CHILD_MAX)
 		return false;
 	if (hash)
-	{
-		memcpy(hash->bytes, value.data, PL_ADDRESS_SIZE);
-		memset(hash->bytes + PL_ADDRESS_SIZE, 0, PL_HASH_SIZE - PL_ADDRESS_SIZE);
-	}
+		memcpy(hash->bytes, value.data, PL_HASH_SIZE);
 	if (!PL_COMPACT_BOOKKEEPING)
 	{
-		if (value.len != PL_ADDRESS_SIZE + 8)
+		if (value.len != PL_HASH_SIZE + 8)
 			return false;
 		if (rows)
 			*rows = pl_read64(value.data + n);
@@ -534,7 +533,7 @@ parse_node(PLNode *node)
 			uint32_t	end = read_offset(offsets + width * (i + 1), width);
 
 			if (end < start || end > limit || end - start > PL_MAX_ITEM ||
-				(which && node->level && (end - start <= PL_ADDRESS_SIZE || end - start > PL_CHILD_MAX)))
+				(which && node->level && (end - start <= PL_HASH_SIZE || end - start > PL_CHILD_MAX)))
 				return PL_CORRUPT;
 		}
 	}

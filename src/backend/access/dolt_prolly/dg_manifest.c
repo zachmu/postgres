@@ -119,7 +119,7 @@ static void
 check_hash(bytea *hash)
 {
 	if (VARSIZE_ANY_EXHDR(hash) != PL_HASH_SIZE)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest hashes and revision tokens must be 32 bytes")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("manifest hashes and revision tokens must be %d bytes", PL_HASH_SIZE)));
 }
 
 static int

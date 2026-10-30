@@ -26,15 +26,10 @@
 #define PL_NARROW_LIMIT (PL_COMPACT_BOOKKEEPING ? 0xFFFF : 0)
 #define PL_ENTRY_OVERHEAD (PL_COMPACT_BOOKKEEPING ? 4 : 8)
 /*
- * A child reference in an interior node: the first PL_ADDRESS_SIZE bytes of
- * the child's address, then its row count as a varint. A node's address is
- * the SHA-256 of its bytes with the bytes past PL_ADDRESS_SIZE zeroed, so the
- * prefix names it whole.
+ * A child reference in an interior node: the child's address, then its row
+ * count, a varint with compact bookkeeping and eight bytes without.
  */
-#ifndef PL_ADDRESS_SIZE
-#define PL_ADDRESS_SIZE 20
-#endif
-#define PL_CHILD_MAX (PL_ADDRESS_SIZE + 10)
+#define PL_CHILD_MAX (PL_HASH_SIZE + 10)
 
 typedef struct PLNode
 {

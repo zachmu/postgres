@@ -44,3 +44,7 @@ CREATE FUNCTION test_chunk_bench_get(seed int4, nchunks int8, count int8, rngsee
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_chunk_bench_get_spi(seed int4, nchunks int8, count int8, rngseed int4) RETURNS float8
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A chunk's hash: SHA-256 truncated to the store's hash size.
+CREATE FUNCTION chunk_hash(data bytea) RETURNS bytea
+LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT substr(sha256(data), 1, 20) $$;

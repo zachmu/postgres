@@ -199,9 +199,8 @@ verify(const uint8 *hash, const uint8 *data, Size length)
 		elog(ERROR, "could not compute chunk hash: %s", pg_cryptohash_error(ctx));
 	pg_cryptohash_free(ctx);
 
-	/* A prolly node's address is its SHA-256 truncated to 20 bytes, zero padded. */
-	if (memcmp(actual, hash, DOLT_CHUNK_HASH_SIZE) != 0 &&
-		(memcmp(actual, hash, 20) != 0 || hash[20] != 0 || memcmp(hash + 20, hash + 21, DOLT_CHUNK_HASH_SIZE - 21) != 0))
+	/* A chunk's hash is its SHA-256 truncated to DOLT_CHUNK_HASH_SIZE bytes. */
+	if (memcmp(actual, hash, DOLT_CHUNK_HASH_SIZE) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("dolt chunk content does not match its hash")));
