@@ -135,6 +135,7 @@ typedef struct DeltaTree
 	uint64		keys;
 	uint64		bytes;
 	uint64		next_seq;
+	pg_atomic_uint64 published_seq; /* next_seq once its versions are linked: read without the lock */
 	int64		net;			/* every version's delta, summed */
 	TimestampTz oldest;			/* when the oldest version still held arrived */
 	dsa_pointer settle_queue;	/* keys that gained a version, to settle: key nodes linked by next[0] */
@@ -362,6 +363,7 @@ tree_find(const DoltDeltaTree *key, bool create)
 			tree->count = tree->keys = tree->bytes = 0;
 			tree->net = 0;
 			tree->next_seq = 1;
+			pg_atomic_init_u64(&tree->published_seq, 1);
 			tree->oldest = 0;
 			tree->fold = InvalidTransactionId;
 			memset(&tree->folded, 0, sizeof(tree->folded));
@@ -571,6 +573,8 @@ versions_link(DeltaTree *tree, const DoltDeltaEdit *edits, Pending *pending, int
 		tree->net += v->delta;
 		tree->bytes += offsetof(DeltaVersion, row) + v->rowlen;
 	}
+	pg_write_barrier();
+	pg_atomic_write_u64(&tree->published_seq, tree->next_seq);
 	pg_atomic_fetch_add_u64(&control->bytes, tree->bytes - bytes);
 	LWLockRelease(&tree->lock);
 }
@@ -950,9 +954,12 @@ dolt_delta_seq(const DoltDeltaTree *key)
 	tree = tree_find(key, false);
 	if (!tree)
 		return 0;
-	LWLockAcquire(&tree->lock, LW_SHARED);
-	seq = tree->next_seq;
-	LWLockRelease(&tree->lock);
+	/*
+	 * Read without the lock, which readers take for every row: an append
+	 * publishes the sequence only after linking its versions.
+	 */
+	seq = pg_atomic_read_u64(&tree->published_seq);
+	pg_read_barrier();
 	return seq;
 }
 
@@ -967,9 +974,8 @@ dolt_delta_net(const DoltDeltaTree *key)
 	tree = tree_find(key, false);
 	if (!tree)
 		return 0;
-	LWLockAcquire(&tree->lock, LW_SHARED);
-	net = tree->net;
-	LWLockRelease(&tree->lock);
+	/* An estimate: read without the lock. */
+	net = *(volatile int64 *) &tree->net;
 	return net;
 }
 
@@ -1249,6 +1255,8 @@ settle_apply(DeltaTree *tree, const uint8 *key, uint32 keylen, const xl_dolt_del
 		v->seq = tree->next_seq++;
 		v->lsn = lsn;
 		pg_atomic_fetch_or_u32(&v->flags, VERSION_COMMITTED);
+		pg_write_barrier();
+		pg_atomic_write_u64(&tree->published_seq, tree->next_seq);
 		tree->count++;
 		tree->net += delta;
 		tree->bytes += offsetof(DeltaVersion, row) + rowlen;
