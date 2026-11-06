@@ -1622,22 +1622,29 @@ settle_redo(XLogReaderState *record)
 		elog(PANIC, "dolt_delta_redo: malformed record");
 }
 
+/* Keys a prune visits under one acquisition of the exclusive lock. */
+#define PRUNE_CHUNK 256
+
 /*
  * Remove the versions of |tree| that no reader can count: those of rolled
  * back writers, and those the newest fold's base holds once every snapshot
- * reads that base. Returns how many went.
+ * reads that base. The walk releases the exclusive lock every PRUNE_CHUNK
+ * keys, so that readers and writers are not held up for a whole tree: a key
+ * appended to meanwhile only gains versions the fold does not hold. Returns
+ * how many went.
  */
 static uint64
 tree_prune(DeltaTree *tree, TransactionId horizon)
 {
 	DoltDeltaHorizon held;
 	DoltDeltaHorizon *usable = NULL;
+	TransactionId fold = InvalidTransactionId;
 	uint64		pruned = 0;
-	uint64		bytes;
-	dsa_pointer preds[DELTA_MAX_HEIGHT];
+	uint8	   *resume = NULL;
+	uint32		resumelen = 0;
+	bool		first = true;
 
 	LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
-	bytes = tree->bytes;
 	if (TransactionIdIsValid(tree->fold) && TransactionIdPrecedes(tree->fold, horizon) &&
 		(TransactionIdDidCommit(tree->fold) || TransactionIdDidAbort(tree->fold) ||
 		 !(RecoveryInProgress() || TransactionIdIsInProgress(tree->fold))))
@@ -1653,73 +1660,108 @@ tree_prune(DeltaTree *tree, TransactionId horizon)
 		}
 		else
 		{
+			/* A copy: the lock is released between chunks, and a newer fold may replace the note. */
 			held = tree->folded;
-			held.xip = DsaPointerIsValid(tree->folded_xip) ?
-				(TransactionId *) dsa_get_address(area, tree->folded_xip) : NULL;
+			held.xip = palloc(Max(held.xcnt, 1) * sizeof(TransactionId));
+			if (DsaPointerIsValid(tree->folded_xip))
+				memcpy(held.xip, dsa_get_address(area, tree->folded_xip), held.xcnt * sizeof(TransactionId));
+			else
+				held.xcnt = 0;
 			usable = &held;
+			fold = tree->fold;
 		}
 	}
-	for (int level = 0; level < DELTA_MAX_HEIGHT; level++)
-		preds[level] = tree->head;
-	for (dsa_pointer kp = key_at(tree->head)->next[0]; DsaPointerIsValid(kp);)
+	LWLockRelease(&tree->lock);
+
+	while (first || resume)
 	{
-		DeltaKey   *k = key_at(kp);
-		dsa_pointer next = k->next[0];
-		dsa_pointer keep = InvalidDsaPointer,
-					last = InvalidDsaPointer;
+		dsa_pointer preds[DELTA_MAX_HEIGHT];
+		dsa_pointer kp;
+		uint64		bytes;
+		int			visited = 0;
 
-		for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+		LWLockAcquire(&tree->lock, LW_EXCLUSIVE);
+		bytes = tree->bytes;
+		if (first)
 		{
-			DeltaVersion *v = version_at(dp);
-			dsa_pointer vnext = v->next;
-
-			if (version_prunable(v, usable, horizon))
-			{
-				tree->count--;
-				tree->net -= v->delta;
-				tree->bytes -= offsetof(DeltaVersion, row) + v->rowlen;
-				dsa_free(area, dp);
-				pruned++;
-			}
-			else
-			{
-				v->next = InvalidDsaPointer;
-				if (DsaPointerIsValid(last))
-					version_at(last)->next = dp;
-				else
-					keep = dp;
-				last = dp;
-			}
-			dp = vnext;
-		}
-		k->first = keep;
-		k->last = last;
-		if (!DsaPointerIsValid(keep))
-		{
-			/* No versions left: unlink the key from every level it is on. */
-			for (uint32 level = 0; level < k->height; level++)
-				key_at(preds[level])->next[level] = k->next[level];
-			tree->keys--;
-			tree->bytes -= offsetof(DeltaKey, next) + k->height * sizeof(dsa_pointer) + k->keylen;
-			dsa_free(area, kp);
+			for (int level = 0; level < DELTA_MAX_HEIGHT; level++)
+				preds[level] = tree->head;
+			kp = key_at(tree->head)->next[0];
 		}
 		else
-			for (uint32 level = 0; level < k->height; level++)
-				preds[level] = kp;
-		kp = next;
+			kp = key_search(tree, resume, resumelen, preds);
+		first = false;
+		if (resume)
+			pfree(resume);
+		resume = NULL;
+		for (; DsaPointerIsValid(kp) && visited < PRUNE_CHUNK; visited++)
+		{
+			DeltaKey   *k = key_at(kp);
+			dsa_pointer next = k->next[0];
+			dsa_pointer keep = InvalidDsaPointer,
+						last = InvalidDsaPointer;
+
+			for (dsa_pointer dp = k->first; DsaPointerIsValid(dp);)
+			{
+				DeltaVersion *v = version_at(dp);
+				dsa_pointer vnext = v->next;
+
+				if (version_prunable(v, usable, horizon))
+				{
+					tree->count--;
+					tree->net -= v->delta;
+					tree->bytes -= offsetof(DeltaVersion, row) + v->rowlen;
+					dsa_free(area, dp);
+					pruned++;
+				}
+				else
+				{
+					v->next = InvalidDsaPointer;
+					if (DsaPointerIsValid(last))
+						version_at(last)->next = dp;
+					else
+						keep = dp;
+					last = dp;
+				}
+				dp = vnext;
+			}
+			k->first = keep;
+			k->last = last;
+			if (!DsaPointerIsValid(keep))
+			{
+				/* No versions left: unlink the key from every level it is on. */
+				for (uint32 level = 0; level < k->height; level++)
+					key_at(preds[level])->next[level] = k->next[level];
+				tree->keys--;
+				tree->bytes -= offsetof(DeltaKey, next) + k->height * sizeof(dsa_pointer) + k->keylen;
+				dsa_free(area, kp);
+			}
+			else
+				for (uint32 level = 0; level < k->height; level++)
+					preds[level] = kp;
+			kp = next;
+		}
+		if (DsaPointerIsValid(kp))
+		{
+			resumelen = key_at(kp)->keylen;
+			resume = palloc(Max(resumelen, 1));
+			memcpy(resume, KEY_BYTES(key_at(kp)), resumelen);
+		}
+		else if (usable && tree->fold == fold)
+		{
+			/* Every version the fold holds is gone, unless a newer fold's note replaced it. */
+			tree->fold = InvalidTransactionId;
+			if (DsaPointerIsValid(tree->folded_xip))
+				dsa_free(area, tree->folded_xip);
+			tree->folded_xip = InvalidDsaPointer;
+		}
+		if (!tree->count)
+			tree->oldest = 0;
+		pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
+		LWLockRelease(&tree->lock);
 	}
 	if (usable)
-	{
-		/* Every version the fold holds is gone. */
-		tree->fold = InvalidTransactionId;
-		if (DsaPointerIsValid(tree->folded_xip))
-			dsa_free(area, tree->folded_xip);
-		tree->folded_xip = InvalidDsaPointer;
-	}
-	if (!tree->count)
-		tree->oldest = 0;
-	pg_atomic_fetch_sub_u64(&control->bytes, bytes - tree->bytes);
-	LWLockRelease(&tree->lock);
+		pfree(held.xip);
 	return pruned;
 }
 
